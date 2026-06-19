@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/resocks5-net", "crates/resocks5"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PHPCraftdream/resocks5"
+
+[workspace.dependencies]
+# Shared across both crates — single source of truth for versions.
+tokio = { version = "1.43.0", features = ["full"] }
+anyhow = "1.0.95"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+socket2 = "0.5"
+# `ring` crypto provider (not the default `aws-lc-rs`) so building needs
+# no cmake / C toolchain — pure-Rust-ish build for contributors and CI.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+dashmap = "6"
+crossbeam-queue = "0.3"
+# Application-only.
+chrono = "0.4"
+regex = "1.11.1"
+getrandom = "0.2"
+sha2 = "0.10"
+subtle = "2.6"
+argon2 = "0.5"
+hmac = "0.12"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+ktav = "0.6.0"
+
+[profile.dev]
+opt-level = 0
+codegen-units = 14
+incremental = true
+strip = true
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+incremental = true
+strip = true

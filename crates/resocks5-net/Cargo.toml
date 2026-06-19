@@ -1,0 +1,21 @@
+[package]
+name = "resocks5-net"
+description = "Reusable proxy networking toolkit: SOCKS5/HTTP/HTTPS upstream connectors, a pre-connect TCP pool, a sand-rating soft-weight rotator with exponential decay, and TLS ClientHello fragmentation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+base64.workspace = true
+socket2.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+dashmap.workspace = true
+crossbeam-queue.workspace = true

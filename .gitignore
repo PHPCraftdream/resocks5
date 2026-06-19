@@ -1,0 +1,35 @@
+# Build artifacts
+/target
+*.exe
+
+# IDE / tooling
+/.idea/
+/.crush/
+
+# Runtime config & state — these hold secrets (auth salt, upstream
+# proxy credentials, Argon2 user hashes). NEVER commit them.
+*.ktav
+*.log
+
+# Legacy config / proxy lists (pre-.ktav format) — credentials, keep out.
+resocks5.conf
+socks5_ipv4_list.txt
+socks5_ipv6_list.txt
+http_ipv4_list.txt
+http_ipv6_list.txt
+
+# Local scratch
+data.txt
+res.txt
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local-only dev tooling (not part of resocks5)
+/tools/
+/.githooks/
+
+# Per-session checkpoints written by /checkpoint — internal notes,
+# never published.
+/docs/checkpoints/
