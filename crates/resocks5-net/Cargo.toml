@@ -1,6 +1,7 @@
 [package]
 name = "resocks5-net"
 description = "Reusable proxy networking toolkit: SOCKS5/HTTP/HTTPS upstream connectors, a pre-connect TCP pool, a sand-rating soft-weight rotator with exponential decay, and TLS ClientHello fragmentation."
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
