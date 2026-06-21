@@ -1,0 +1,45 @@
+# Keep the build context lean — `target/` alone can be several GB and would
+# bust the layer cache on every local build, and `*.ktav` files hold secrets
+# (auth salt, upstream credentials, Argon2 hashes) that must never ship.
+
+target/
+.git/
+.gitignore
+.gitattributes
+
+# CI / release tooling
+.github/
+release.sh
+Dockerfile
+.dockerignore
+
+# Editor / local tooling
+.idea/
+.crush/
+.claude/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docs — the image is a binary distribution, not a source dump.
+docs/
+*.md
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+
+# Runtime state — secrets.
+*.ktav
+*.log
+resocks5.conf
+socks5_ipv4_list.txt
+socks5_ipv6_list.txt
+http_ipv4_list.txt
+http_ipv6_list.txt
+
+# Local scratch.
+data.txt
+res.txt

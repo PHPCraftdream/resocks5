@@ -16,8 +16,31 @@ port serves both kinds of client.
 > config format are stable in practice; the [`resocks5-net`](crates/resocks5-net)
 > library API may still change before a 1.0 release.
 
+## Quick demo
+
+```bash
+# 1. first run — creates the three .ktav config files in the CWD, then exits
+resocks5
+
+# 2. add one upstream and one client user
+printf 'socks5_v4: [ user:pass@198.51.100.7:1080 ]\n' >> resocks5.proxy_list.ktav
+resocks5 users add alice        # interactive, no-echo password prompt
+
+# 3. start the proxy (listens on 127.0.0.1:20082 by default)
+resocks5
+
+# 4. SOCKS5 and HTTP CONNECT share the same port — either works:
+curl --socks5-hostname 127.0.0.1:20082 https://ifconfig.me   # → 198.51.100.7
+curl -x http://127.0.0.1:20082           https://ifconfig.me   # → 198.51.100.7
+```
+
+The returned IP is the **upstream's**, not yours — that's the whole point. Add
+more entries to `resocks5.proxy_list.ktav` and resocks5 rotates across them,
+demoting any that fail via the sand-rating model instead of dropping them.
+
 ## Contents
 
+- [Quick demo](#quick-demo)
 - [Features](#features)
 - [Install](#install)
 - [Quick start](#quick-start)
@@ -70,6 +93,27 @@ cargo install --path crates/resocks5
 # …or straight from git:
 cargo install --git https://github.com/PHPCraftdream/resocks5 resocks5
 ```
+
+### Run with Docker
+
+A multi-arch image (`linux/amd64`, `linux/arm64`) is published to ghcr.io on
+every release tag:
+
+```bash
+# latest release (auto-created configs land in the mounted volume)
+docker run --rm -p 20082:20082 \
+  -v "$PWD/resocks5-config:/etc/resocks5" \
+  ghcr.io/phpcraftdream/resocks5:latest
+
+# …or build it yourself
+docker build -t resocks5 .
+docker run --rm -p 20082:20082 -v "$PWD/resocks5-config:/etc/resocks5" resocks5
+```
+
+Mount your `resocks5.*.ktav` at `/etc/resocks5` (the image's working dir). The
+process runs as a non-root user; the three config files are created there on
+first run if they're missing. The image is distroless (~the binary + glibc),
+so there's no shell inside it.
 
 ## Quick start
 
