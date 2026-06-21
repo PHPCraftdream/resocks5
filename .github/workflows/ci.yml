@@ -36,3 +36,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Machine-verifies the `rust-version` declared in the workspace manifest.
+  # Runs on ubuntu AND windows because some deps gate code behind cfg(windows)
+  # (e.g. rpassword's let-chain backend) — a ubuntu-only check would miss it.
+  # `--locked` so a drifted Cargo.lock fails loudly instead of silently
+  # resolving versions above the MSRV.
+  msrv:
+    name: msrv (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked

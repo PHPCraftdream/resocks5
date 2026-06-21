@@ -55,8 +55,9 @@ port serves both kinds of client.
 
 ## Install
 
-Requires a recent stable Rust toolchain. The dependency tree (clap 4,
-rustls 0.23) sets the floor at **Rust 1.74+**. The crate uses the `ring`
+Requires a recent stable Rust toolchain. The dependency tree (rustls 0.23,
+rpassword 7) sets the floor at **Rust 1.88+**, declared as `rust-version` in
+every crate and enforced by the `msrv` job in CI. The crate uses the `ring`
 crypto provider, so no C toolchain or `cmake` is needed to build.
 
 ```bash

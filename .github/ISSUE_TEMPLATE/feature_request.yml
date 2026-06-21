@@ -1,0 +1,51 @@
+name: Feature request
+description: Suggest an idea for resocks5
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea.
+
+        - Search [open issues](https://github.com/PHPCraftdream/resocks5/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) first.
+        - For anything bigger than a one-file change, consider opening a discussion issue before writing code — see [CONTRIBUTING.md](https://github.com/PHPCraftdream/resocks5/blob/main/CONTRIBUTING.md).
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where should this live? If it could be useful to a *different* proxy product, it probably belongs in `resocks5-net`.
+      options:
+        - resocks5 (CLI / server binary)
+        - resocks5-net (library)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that resocks5 doesn't let you, or forces you to work around?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What you'd like resocks5 to do instead. A config knob, a CLI flag, a new library entry point — be specific.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other ways to solve the same problem, and why they don't fit.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, prior art, screenshots — anything that helps.

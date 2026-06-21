@@ -3,6 +3,7 @@ name = "resocks5"
 description = "SOCKS5 + HTTP CONNECT proxy with upstream rotation, per-target proxy caching, a sand-rating soft-weight rotator, and TLS fragmentation."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"

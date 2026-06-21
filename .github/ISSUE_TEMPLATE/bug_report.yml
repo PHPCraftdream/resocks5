@@ -1,0 +1,92 @@
+name: Bug report
+description: Something in resocks5 is broken or behaves wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        - Search [open issues](https://github.com/PHPCraftdream/resocks5/issues?q=is%3Aissue+is%3Aopen+label%3Abug) first to avoid duplicates.
+        - **Security issue?** Do **not** use this form — see [SECURITY.md](https://github.com/PHPCraftdream/resocks5/blob/main/SECURITY.md) for the private reporting channel.
+        - Redact real credentials and upstream proxy addresses before pasting config or logs.
+
+  - type: input
+    id: version
+    attributes:
+      label: resocks5 version
+      description: Output of `resocks5 --version`, or the git commit if built from source.
+      placeholder: "0.1.0 / main @ abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where does the bug live?
+      options:
+        - resocks5 (CLI / server binary)
+        - resocks5-net (library)
+        - SOCKS5 front end
+        - HTTP CONNECT front end
+        - Upstream connector (SOCKS5 / HTTP / HTTPS)
+        - Sand-rating rotator / upstream selection
+        - TCP pool
+        - TLS fragmentation
+        - Auth (Argon2id / verify-cache)
+        - Config / KTAV parsing
+        - CLI user management
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Ubuntu 24.04 x86_64 / Windows 11 / macOS 14 arm64"
+    validations:
+      required: true
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust toolchain (if built from source)
+      description: Output of `rustc --version`. Skip if you used a release binary.
+      placeholder: "rustc 1.88.0 (...)"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the unexpected behaviour. Include any panic backtrace or log output, with secrets redacted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that triggers the bug. If you can, attach a redacted `resocks5.proxy_list.ktav` and the relevant lines of `resocks5.main.ktav`.
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste log lines with secrets redacted. No need for backticks — GitHub wraps it in a code block automatically.
+      render: shell
