@@ -29,6 +29,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     cargo build --release --locked --bin resocks5 && \
     cp target/release/resocks5 /resocks5
 
+# An empty directory to be COPYed into the runtime stage as the working
+# directory. We need it pre-existing in the builder because the runtime
+# image is distroless and has no shell to run a `mkdir` / `chown`.
+RUN mkdir -p /staging-cfg
+
 ############################################
 # Stage 2 — minimal runtime
 ############################################
@@ -41,8 +46,14 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /resocks5 /usr/local/bin/resocks5
 COPY LICENSE-MIT LICENSE-APACHE /licenses/
 
-# resocks5 reads `resocks5.*.ktav` from its working directory. Mount a volume
-# here at runtime (see docker run example in README).
+# resocks5 reads `resocks5.*.ktav` from its working directory and auto-creates
+# them on first launch when missing. We COPY an empty directory from the
+# builder with --chown=65532:65532 (the nonroot UID in distroless cc-debian12)
+# so the runtime user can write its initial configs without EACCES. We can't
+# `RUN mkdir` / `chown` here directly — distroless has no shell. A mounted
+# volume overrides this; the chown only affects the image's empty default
+# directory.
+COPY --from=builder --chown=65532:65532 /staging-cfg /etc/resocks5
 WORKDIR /etc/resocks5
 
 # Default listen port (matches `resocks5.main.ktav` defaults).

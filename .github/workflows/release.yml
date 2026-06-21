@@ -55,23 +55,35 @@ jobs:
           key: release-${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      # We stage the binary and the LICENSE files into a single directory and
+      # archive from there. Earlier versions used `tar -C target/.../release`,
+      # which made the LICENSE paths relative to the target dir (where they
+      # don't exist) and would fail the release on the first v* tag. The zip
+      # path used absolute-style paths and produced a deeply-nested archive
+      # (`target/.../release/resocks5.exe`); the staging dir flattens it too.
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir -p stage
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/resocks5.exe" stage/
+          else
+            cp "target/${{ matrix.target }}/release/resocks5" stage/
+          fi
+          cp LICENSE-MIT LICENSE-APACHE stage/
       - name: Archive (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           asset="resocks5-${{ matrix.target }}.tar.gz"
-          tar -czf "$asset" \
-            -C "target/${{ matrix.target }}/release" resocks5 \
-            LICENSE-MIT LICENSE-APACHE
+          tar -czf "$asset" -C stage .
           echo "asset=$asset" >> "$GITHUB_ENV"
       - name: Archive (zip)
         if: matrix.archive == 'zip'
         shell: bash
         run: |
           asset="resocks5-${{ matrix.target }}.zip"
-          7z a "$asset" \
-            "./target/${{ matrix.target }}/release/resocks5.exe" \
-            LICENSE-MIT LICENSE-APACHE
+          ( cd stage && 7z a "../$asset" . )
           echo "asset=$asset" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
