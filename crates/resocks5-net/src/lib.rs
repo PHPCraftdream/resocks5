@@ -21,6 +21,11 @@
 //! The crate carries no application concerns — no config-file format, no
 //! logging sink, no authentication. Those live in the `resocks5` binary.
 
+// Every public item carries rustdoc. Enforced in CI by the `doc` job
+// (RUSTDOCFLAGS=-D warnings). Kept at `warn` here so a local `cargo build`
+// isn't noisy — only `cargo doc` surfaces it.
+#![warn(missing_docs)]
+
 pub mod connect;
 pub mod pool;
 pub mod rating;

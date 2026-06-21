@@ -54,3 +54,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  # `resocks5-net` sets `#![warn(missing_docs)]`; this job makes it binding by
+  # building rustdoc with `-D warnings`. Also catches broken intra-doc links
+  # and `rustdoc::redundant_explicit_links` drift. Same `--locked` discipline.
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --workspace --locked

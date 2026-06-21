@@ -1,3 +1,5 @@
+//! Protocol-agnostic entry point that dispatches to the per-protocol connector.
+
 use std::time::Duration;
 
 use tokio_rustls::TlsConnector;
@@ -7,6 +9,14 @@ use crate::connect::{connect_http_proxy, connect_socks5_proxy};
 use crate::pool::{AnyUpstream, ProxyPool};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
+/// Connect to `target_addr` through `proxy`, dispatching on its protocol.
+///
+/// SOCKS5 and HTTP CONNECT return an [`AnyUpstream::Plain`]; HTTPS
+/// (TLS-wrapped CONNECT) wraps the stream in TLS and returns
+/// [`AnyUpstream::Tls`]. `tls_connector` is required for HTTPS upstreams and
+/// ignored otherwise — pass `None` unless the pool contains HTTPS proxies. A
+/// ready-made connector is available from
+/// [`make_tls_connector`](crate::connect::make_tls_connector).
 pub async fn connect_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,

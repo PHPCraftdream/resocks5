@@ -1,3 +1,12 @@
+//! Sand-rating model: exponential-decay failure accumulators driving
+//! weighted-random upstream selection.
+//!
+//! Each upstream has a [`Sand`] cell that grows on failure and halves every
+//! `half_life_sec` of silence; selection weight is `exp(-k * level)`, so bad
+//! upstreams are picked less often but never zero. [`Ratings`] is the
+//! thread-safe integrator over a vector of cells. See `docs/ARCHITECTURE.md`
+//! for the full maths and convergence argument.
+
 pub mod policy;
 pub mod rng;
 pub mod sand;
@@ -35,14 +44,17 @@ impl Ratings {
         }
     }
 
+    /// The policy these ratings were constructed with.
     pub fn policy(&self) -> &RatingPolicy {
         &self.policy
     }
 
+    /// Number of upstreams in this set.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().cells.len()
     }
 
+    /// `true` if there are no upstreams.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

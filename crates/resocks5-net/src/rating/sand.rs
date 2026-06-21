@@ -1,3 +1,5 @@
+//! The per-upstream sand accumulator ([`Sand`]).
+
 use std::time::Instant;
 
 use crate::rating::policy::RatingPolicy;

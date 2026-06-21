@@ -1,6 +1,7 @@
 # resocks5
 
 [![CI](https://github.com/PHPCraftdream/resocks5/actions/workflows/ci.yml/badge.svg)](https://github.com/PHPCraftdream/resocks5/actions/workflows/ci.yml)
+[![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-dea584.svg)](#install)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 A SOCKS5 **and** HTTP-CONNECT proxy server that spreads incoming client
@@ -42,6 +43,7 @@ demoting any that fail via the sand-rating model instead of dropping them.
 
 - [Quick demo](#quick-demo)
 - [Features](#features)
+- [Why resocks5](#why-resocks5)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
@@ -75,6 +77,58 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - **Safety rails:** idle/lifetime tunnel timeouts, TCP keepalive, a
   max-concurrent-clients cap, and regex-based banned-target patterns.
 - **Configurable logging** by category, with optional non-blocking file output.
+
+## Why resocks5
+
+resocks5 exists for one reason the established rotating-proxy tools don't
+lean into: **graceful degradation under upstream churn**.
+
+Most proxies either pin a single upstream (no rotation) or use a hard
+circuit-breaker that quarantines a failed upstream for a fixed window. That's
+fragile on small pools — one quarantine cascades into the next — and it's
+weaponizable: an attacker who can trip failures can lock you out of your own
+pool.
+
+resocks5's **sand-rating** model takes the opposite stance. A failed upstream
+is *demoted*, never excluded: its selection weight decays toward (but never
+reaches) zero and recovers on its own as the sand drains. A full outage
+degrades to uniform round-robin instead of a lockout, and a recovering
+upstream is probed for free because its weight never hits zero.
+
+### How it compares
+
+| | resocks5 | 3proxy | gost | glider |
+|---|---|---|---|---|
+| Language | Rust (rustls / `ring`) | C | Go | Go |
+| Front end | SOCKS5 + HTTP CONNECT (auto) | many | many | many |
+| Rotation model | sand-rating soft-weight, self-recovering | round-robin / parent | chaining-first | failover |
+| Per-target stickiness | yes | — | — | — |
+| Auth | Argon2id + HMAC verify-cache | basic | basic | basic |
+| TLS ClientHello fragmentation | yes | no | no | no |
+| Single-port dual-protocol | yes | — | — | — |
+
+**Where resocks5 wins**
+
+- **Rotation that never locks you out** — the sand-rating model's whole
+  reason to exist.
+- **TLS fragmentation** for per-segment, SNI-based DPI, built in.
+- **Rust + rustls** — memory-safe, no `cmake` / C toolchain to build.
+
+**Where the others still win**
+
+- **Protocol breadth** — gost in particular speaks far more wire protocols
+  (shadowsocks, trojan, …) and is a better fit if you need those.
+- **Footprint** — 3proxy is a hand-tuned C binary and uses less memory under
+  extreme connection counts.
+- **Operational maturity** — 3proxy has two decades of production use.
+
+If you need a tunnelling swiss-army knife or a specific exotic protocol, reach
+for gost. If you need the smallest possible binary on a constrained box, 3proxy.
+If your problem is "I have a pool of flaky upstream proxies and I want traffic
+to keep flowing when they misbehave," that's the case resocks5 is built for.
+
+> The table characterises each project's *design focus*, not its absolute
+> capabilities — verify against the current version before committing.
 
 ## Install
 

@@ -1,3 +1,5 @@
+//! Tuning knobs for the sand-rating model ([`RatingPolicy`]).
+
 /// Tunable knobs that control the exponential-decay sand model.
 #[derive(Debug, Clone, Copy)]
 pub struct RatingPolicy {

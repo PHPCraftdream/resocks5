@@ -1,3 +1,12 @@
+//! Upstream connectors and stream plumbing.
+//!
+//! The top-level entry point is `connect_proxy`, which dispatches on the
+//! proxy's [`ProxyProtocol`](crate::types::ProxyProtocol) to the right
+//! handshake. The lower-level pieces — per-protocol handshakes, a
+//! bidirectional tunneller, TCP keepalive, proxy-string parsing, a default
+//! TLS connector, and ClientHello fragmentation — live in the submodules and
+//! are re-exported here for direct use.
+
 pub mod connect_http_proxy;
 pub mod connect_proxy;
 pub mod connect_socks5_proxy;

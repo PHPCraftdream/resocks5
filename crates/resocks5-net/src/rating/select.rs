@@ -1,3 +1,5 @@
+//! Weighted-random selection primitives: single index + full permutation.
+
 use crate::rating::rng::SmallRng;
 
 /// Small epsilon to avoid division by zero in `weighted_order`.

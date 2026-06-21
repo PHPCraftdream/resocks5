@@ -1,3 +1,5 @@
+//! A tiny splitmix64 PRNG, so weighted selection needs no `rand` dependency.
+
 /// Minimal splitmix64 PRNG — no external `rand` dependency required.
 pub struct SmallRng {
     state: u64,

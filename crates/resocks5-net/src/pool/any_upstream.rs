@@ -1,3 +1,5 @@
+//! Type-erased upstream stream: plain TCP, TLS-wrapped, or a direct socket.
+
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -8,13 +10,22 @@ use tokio_rustls::client::TlsStream;
 
 use crate::pool::proxy_pool::UpstreamStream;
 
+/// A connected upstream, abstracted over whether it is plaintext,
+/// TLS-wrapped, or a direct (no-proxy) connection.
+///
+/// Implements [`AsyncRead`] + [`AsyncWrite`] so callers (tunnelling, TLS
+/// fragmentation) can treat all three variants uniformly.
 pub enum AnyUpstream {
+    /// A plaintext tunnelled socket (SOCKS5 or HTTP CONNECT upstream).
     Plain(UpstreamStream),
+    /// A TLS-wrapped tunnel (HTTPS upstream).
     Tls(Box<TlsStream<UpstreamStream>>),
+    /// A direct `TcpStream` to the target (bypass user, no upstream proxy).
     Direct(TcpStream),
 }
 
 impl AnyUpstream {
+    /// Best-effort `&TcpStream` reference for socket-level options.
     pub fn as_tcp(&self) -> Option<&TcpStream> {
         match self {
             AnyUpstream::Plain(s) => Some(s.as_tcp()),
@@ -23,6 +34,7 @@ impl AnyUpstream {
         }
     }
 
+    /// Forward `set_nodelay` to the underlying socket.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             AnyUpstream::Plain(s) => s.set_nodelay(nodelay),

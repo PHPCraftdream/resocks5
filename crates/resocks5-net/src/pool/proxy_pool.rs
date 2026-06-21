@@ -46,7 +46,9 @@ use crate::types::ProxyConfig;
 /// distinguish "our load" from "upstream is broken" — the former
 /// must NOT feed the sand-model failure signal.
 pub struct AtCapacity {
+    /// The host of the upstream whose cap was hit.
     pub host: String,
+    /// The port of the upstream whose cap was hit.
     pub port: u16,
 }
 
@@ -158,6 +160,12 @@ pub(crate) fn upstream_endpoint(proxy: &ProxyConfig) -> String {
     format!("{}:{}", proxy.host, proxy.port)
 }
 
+/// Pre-connect TCP pool plus a per-upstream concurrency cap.
+///
+/// See the module docs for the full lifecycle. Construct with
+/// [`ProxyPool::new`]; `connect_timeout` and the per-upstream cap are fixed
+/// for the pool's lifetime, while the [`PoolConfig`] fields (master switch,
+/// spares, max age) are read via [`enabled`](ProxyPool::enabled).
 pub struct ProxyPool {
     config: PoolConfig,
     /// Maximum time to wait for a TCP `connect` to an upstream. Without
@@ -177,6 +185,12 @@ pub struct ProxyPool {
 }
 
 impl ProxyPool {
+    /// Create a new pool.
+    ///
+    /// `connect_timeout` bounds every TCP `connect` (both the fallback in
+    /// [`acquire`](ProxyPool::acquire) and the background refill loop).
+    /// `max_per_upstream` caps concurrent live connections per `(host, port)`;
+    /// `0` is clamped up to `1` (a zero-permit pool would brick every acquire).
     pub fn new(config: PoolConfig, connect_timeout: Duration, max_per_upstream: usize) -> Self {
         // Tokio's Semaphore requires at least one permit; treat `0`
         // configuration as "1" to avoid hard-bricking the pool.

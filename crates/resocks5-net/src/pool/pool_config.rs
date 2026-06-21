@@ -1,5 +1,8 @@
+//! Knobs for the pre-connect TCP pool ([`PoolConfig`]).
+
 use serde::{Deserialize, Serialize};
 
+/// Serialisable configuration for [`ProxyPool`](crate::pool::ProxyPool).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
     /// Master switch. When `false` the pool is a no-op — `checkout`

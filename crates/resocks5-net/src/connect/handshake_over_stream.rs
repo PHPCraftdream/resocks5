@@ -1,3 +1,5 @@
+//! SOCKS5 handshake driven over an arbitrary async stream.
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::anyhow;

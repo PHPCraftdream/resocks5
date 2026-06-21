@@ -1,3 +1,5 @@
+//! HTTP `CONNECT` upstream connector.
+
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -9,6 +11,10 @@ use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
 use crate::types::ProxyConfig;
 
+/// Establish a tunnel to `target_addr` through an HTTP CONNECT proxy.
+///
+/// `handshake_timeout` bounds the wait for the proxy's `200` response; a
+/// proxy that accepts the TCP but never answers CONNECT is treated as dead.
 pub async fn connect_http_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,

@@ -1,3 +1,5 @@
+//! SOCKS5 (RFC 1928) upstream connector with optional RFC 1929 auth.
+
 use std::time::Duration;
 
 use anyhow::anyhow;

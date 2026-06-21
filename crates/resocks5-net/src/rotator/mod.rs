@@ -1,3 +1,9 @@
+//! Weighted-random upstream rotator with a per-target sticky cache.
+//!
+//! Wraps [`Ratings`] with a round-robin fallback
+//! ([`ProxyRotator::get_next`]) and a `target → proxy` affinity cache
+//! ([`ProxyRotator::link_proxy`] / [`ProxyRotator::get_linked`]).
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -6,6 +12,14 @@ use dashmap::DashMap;
 use crate::rating::{RatingPolicy, Ratings};
 use crate::types::ProxyConfig;
 
+/// Weighted-random rotator over a fixed set of upstream proxies, with a
+/// per-target sticky cache.
+///
+/// Construct with [`ProxyRotator::new`] (default policy) or
+/// [`ProxyRotator::with_policy`] (custom [`RatingPolicy`]).
+/// [`pick_order`](ProxyRotator::pick_order) returns a weighted-random
+/// permutation; [`get_next`](ProxyRotator::get_next) is plain round-robin,
+/// used for the fallback and the sticky-cache-miss path.
 pub struct ProxyRotator {
     /// Pre-built `Arc<ProxyConfig>` per upstream. `get_next` returns a
     /// cheap refcount clone, so no full struct copy on rotation.
@@ -32,10 +46,12 @@ pub struct ProxyRotator {
 }
 
 impl ProxyRotator {
+    /// Construct a rotator with the default [`RatingPolicy`].
     pub fn new(proxies: Vec<ProxyConfig>) -> Self {
         Self::with_policy(proxies, RatingPolicy::default())
     }
 
+    /// Construct a rotator with a custom [`RatingPolicy`].
     pub fn with_policy(proxies: Vec<ProxyConfig>, policy: RatingPolicy) -> Self {
         let proxy_index = DashMap::new();
         for (i, p) in proxies.iter().enumerate() {
@@ -58,23 +74,30 @@ impl ProxyRotator {
         self.map.insert(addr, proxy);
     }
 
+    /// Drop the cached upstream for `addr` (e.g. after it failed).
     pub fn unlink_proxy(&self, addr: &str) {
         self.map.remove(addr);
     }
 
+    /// Read back the cached upstream for `addr`, if any.
     pub fn get_linked(&self, addr: &str) -> Option<Arc<ProxyConfig>> {
         self.map.get(addr).map(|r| r.value().clone())
     }
 
+    /// Round-robin next proxy (fetch-and-increment, modulo length).
+    ///
+    /// Returns a cheap refcount clone of the chosen [`ProxyConfig`].
     pub fn get_next(&self) -> Arc<ProxyConfig> {
         let i = self.index.fetch_add(1, Ordering::Relaxed) % self.proxies.len();
         self.proxies[i].clone()
     }
 
+    /// Number of upstreams in the rotator.
     pub fn len(&self) -> usize {
         self.proxies.len()
     }
 
+    /// `true` if there are no upstreams.
     pub fn is_empty(&self) -> bool {
         self.proxies.is_empty()
     }

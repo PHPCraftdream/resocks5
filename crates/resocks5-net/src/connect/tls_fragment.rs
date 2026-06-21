@@ -1,3 +1,7 @@
+//! TLS ClientHello fragmentation for per-segment SNI-based DPI evasion.
+//!
+//! See `docs/ARCHITECTURE.md` for the threat model and limits.
+
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;

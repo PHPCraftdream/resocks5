@@ -1,3 +1,5 @@
+//! Cross-platform TCP keepalive setter (idle interval only).
+
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};

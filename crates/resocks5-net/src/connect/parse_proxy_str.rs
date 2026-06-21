@@ -1,5 +1,13 @@
+//! Parser for the `[*]user:pass@host:port` upstream-list line format.
+
 use crate::types::{ProxyConfig, ProxyProtocol, IP};
 
+/// Parse a single proxy-list line into a [`ProxyConfig`].
+///
+/// Accepted forms: `host:port`, `user:pass@host:port`, and the same with a
+/// leading `*` marking a gate. Lines beginning with `#` and anything that
+/// fails to parse return `None`. `protocol` and `ip` are supplied by the
+/// caller because the line itself carries no protocol or address-family info.
 pub fn parse_proxy_str(conn_str: &str, protocol: ProxyProtocol, ip: IP) -> Option<ProxyConfig> {
     if conn_str.starts_with('#') {
         return None;
