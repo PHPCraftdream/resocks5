@@ -224,6 +224,7 @@ mod tests {
             "sand_max:",
             "sand_min_weight:",
             "sand_success_factor:",
+            "recover_host_from_payload:",
             // FileLogConfig
             "enabled:",
             "path:",

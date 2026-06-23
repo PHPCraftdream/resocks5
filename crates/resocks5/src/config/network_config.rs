@@ -110,6 +110,28 @@ pub struct NetworkConfig {
     /// Sand model: multiplicative factor applied to sand on success.
     #[serde(default = "default_sand_success_factor")]
     pub sand_success_factor: f64,
+
+    /// Recover the original hostname from the client's first payload
+    /// when the CONNECT target is a bare IP literal.
+    ///
+    /// Some SOCKS front-ends (e.g. Proxifier with local DNS) resolve
+    /// the destination on the client and send an IP in the CONNECT
+    /// request. Upstream proxies that refuse CONNECT to raw CDN IPs
+    /// then time out every request. When this is `true` and the target
+    /// is an IP, resocks5 sends the SOCKS5 success reply early, peeks
+    /// the first record, and recovers the intended host from the TLS
+    /// SNI (port 443) or the HTTP `Host` header (plain HTTP) — then
+    /// addresses the upstream by domain. Falls back to the IP if no
+    /// name can be recovered.
+    ///
+    /// Trade-off: enabling this means the SOCKS5 success reply is sent
+    /// before the upstream connection is actually established (so a
+    /// later upstream failure surfaces as a dropped tunnel rather than
+    /// a SOCKS error), and the first client record is inspected. Set
+    /// to `false` for strict RFC 1928 reply ordering and no payload
+    /// inspection.
+    #[serde(default = "default_recover_host_from_payload")]
+    pub recover_host_from_payload: bool,
 }
 
 fn default_connect_timeout() -> u64 {
@@ -157,6 +179,9 @@ fn default_sand_min_weight() -> f64 {
 fn default_sand_success_factor() -> f64 {
     0.5
 }
+fn default_recover_host_from_payload() -> bool {
+    true
+}
 
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -176,6 +201,7 @@ impl Default for NetworkConfig {
             sand_max: default_sand_max(),
             sand_min_weight: default_sand_min_weight(),
             sand_success_factor: default_sand_success_factor(),
+            recover_host_from_payload: default_recover_host_from_payload(),
         }
     }
 }
@@ -206,6 +232,7 @@ mod tests {
         assert_eq!(d.sand_max, 8.0);
         assert_eq!(d.sand_min_weight, 0.05);
         assert_eq!(d.sand_success_factor, 0.5);
+        assert!(d.recover_host_from_payload);
     }
 
     /// Every `#[serde(default = "...")]` attribute on a field must
@@ -233,6 +260,10 @@ mod tests {
         assert_eq!(default_sand_max(), d.sand_max);
         assert_eq!(default_sand_min_weight(), d.sand_min_weight);
         assert_eq!(default_sand_success_factor(), d.sand_success_factor);
+        assert_eq!(
+            default_recover_host_from_payload(),
+            d.recover_host_from_payload
+        );
     }
 
     /// Regression: serialized default must not contain any cb_ fields

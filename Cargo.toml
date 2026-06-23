@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/resocks5-net", "crates/resocks5"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Verified against the `msrv` job in .github/workflows/ci.yml (runs on
 # ubuntu + windows with `--locked`). Two constraints bind the floor:

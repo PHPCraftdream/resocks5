@@ -283,6 +283,25 @@ network: { ... }                (timeouts and TCP keepalive)
         server; lower it on shared hosts or raise it on a dedicated
         box with plenty of headroom.
 
+    network.recover_host_from_payload: bool (default true)
+        When the CONNECT target is a bare IP literal, recover the
+        original hostname from the client's first record — TLS SNI on
+        port 443, or the HTTP `Host` header for plain HTTP — and
+        address the upstream by that domain instead of the IP.
+
+        Why: some SOCKS front-ends (e.g. Proxifier with local DNS)
+        resolve the destination on the client and send an IP. Upstream
+        proxies that refuse CONNECT to raw CDN IPs then time out every
+        such request, while the same host succeeds by name. This
+        recovers the name the client already stated in its own payload.
+
+        Trade-off: the SOCKS5 success reply is sent BEFORE the upstream
+        is connected (a later upstream failure surfaces as a dropped
+        tunnel, not a SOCKS error), and the first client record is
+        inspected to read SNI/Host. Set to false for strict RFC 1928
+        reply ordering and zero payload inspection. Falls back to the
+        IP when no name can be recovered (non-TLS, no SNI, ESNI/ECH).
+
 resocks5.proxy_list.ktav  — upstream proxies
 --------------------------------------------
 

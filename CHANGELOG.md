@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-23
+
+### Added
+
+- **Host recovery from client payload** (`network.recover_host_from_payload`,
+  default `true`). When a SOCKS front-end resolves DNS locally and issues
+  `CONNECT` to a bare IP literal, upstream proxies that refuse `CONNECT` to
+  raw CDN IP ranges time out every request. resocks5 now recovers the
+  intended hostname from the client's first record — TLS **SNI** (port 443)
+  or the HTTP **`Host`** header (plain HTTP CONNECT) — and addresses the
+  upstream by that domain instead of the IP. Falls back to the IP when no
+  name can be recovered (non-TLS, no SNI, ESNI/ECH). Applies to pool-routed
+  (non-direct) clients whose target is a bare IPv4 literal. Trade-off: the
+  success reply is sent before the upstream is connected, and the first
+  client record is inspected; set the flag to `false` for strict RFC 1928 /
+  RFC 7231 reply ordering and zero payload inspection.
+- New `resocks5-net` API: `connect::parse_sni` and `connect::parse_http_host`
+  — strictly bounds-checked, allocation-light extractors that never panic on
+  malformed input.
+
 ## [0.1.0] - 2026-06-21
 
 Initial public release. Workspace with two crates: `resocks5-net` (the
@@ -75,5 +95,6 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/PHPCraftdream/resocks5/releases/tag/v0.1.0

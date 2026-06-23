@@ -15,9 +15,9 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use resocks5_net::connect::send_possibly_fragmented;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::tunnel::tunnel_with_timeouts;
+use resocks5_net::connect::{parse_http_host, parse_sni, send_possibly_fragmented};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -135,6 +135,34 @@ pub async fn handle_http_client(
         None
     };
 
+    // ── SNI/Host recovery ───────────────────────────────────────────
+    // Pool-routed clients only. When the CONNECT target is a bare IPv4
+    // literal and recovery is enabled, recover the intended hostname
+    // from the client's first record (pipelined ClientHello, or the
+    // first read) and address the upstream by that domain. See
+    // `recover_host_from_payload` in NetworkConfig.
+    if !is_direct && network.recover_host_from_payload {
+        if let Some(port) = ipv4_literal_port(&req.target) {
+            return recover_and_tunnel_http(
+                client_stream,
+                &req.target,
+                port,
+                req.pipelined,
+                gate_rotator,
+                v6_rotator,
+                v4_rotator,
+                logger,
+                banned,
+                pool,
+                frag,
+                network,
+                req.client_user.as_deref(),
+                tls_connector,
+            )
+            .await;
+        }
+    }
+
     let mut proxy_stream = if is_direct {
         let user_owned = req
             .client_user
@@ -238,6 +266,143 @@ fn idle_duration(secs: u64) -> Duration {
     } else {
         Duration::from_secs(secs)
     }
+}
+
+/// If `target` is `IPv4:port`, return the port substring; otherwise
+/// `None`. Recovery applies only to bare IPv4 literals (domains already
+/// carry the name; IPv6 literals stay on the standard path).
+fn ipv4_literal_port(target: &str) -> Option<&str> {
+    let (host, port) = target.rsplit_once(':')?;
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+/// HTTP CONNECT recovery path: target is a bare IPv4 and recovery is on.
+///
+/// Mirror of the SOCKS5 `recover_and_tunnel`: reply `200 Connection
+/// Established` early so the client emits its first record, recover the
+/// hostname from the pipelined ClientHello (or the first read) via TLS
+/// SNI / HTTP `Host`, open the upstream by that domain (falling back to
+/// the IP), forward the buffered record, then tunnel.
+#[allow(clippy::too_many_arguments)]
+async fn recover_and_tunnel_http(
+    mut client_stream: TcpStream,
+    target: &str,
+    port: &str,
+    pipelined: Vec<u8>,
+    gate_rotator: &Option<Arc<ProxyRotator>>,
+    v6_rotator: &Option<Arc<ProxyRotator>>,
+    v4_rotator: &Option<Arc<ProxyRotator>>,
+    logger: &Arc<Logger>,
+    banned: &Arc<RegexSet>,
+    pool: &Arc<ProxyPool>,
+    frag: &Arc<TlsFragmentConfig>,
+    network: &Arc<NetworkConfig>,
+    client_user: Option<&str>,
+    tls_connector: Option<&TlsConnector>,
+) -> Result<()> {
+    let ctag = match client_user {
+        Some(u) => format!(" [client={}]", u),
+        None => " [client=anon]".to_string(),
+    };
+
+    // Early 200 so the client sends its first application record.
+    client_stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+
+    // First record: prefer a pipelined ClientHello, else read one under
+    // the client-protocol deadline.
+    let buf: Vec<u8> = if !pipelined.is_empty() {
+        pipelined
+    } else {
+        let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
+        let mut b = vec![0u8; 16 * 1024];
+        let n = match timeout(protocol_dur, client_stream.read(&mut b)).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(anyhow!(
+                    "client sent no payload within {}s — recovery peek timeout{}",
+                    protocol_dur.as_secs(),
+                    ctag
+                ));
+            }
+        };
+        b.truncate(n);
+        b
+    };
+
+    let effective_target = match parse_sni(&buf).or_else(|| parse_http_host(&buf)) {
+        Some(host) => {
+            let t = format!("{}:{}", host, port);
+            logger.cache_write(|| {
+                format!(
+                    "Recovered host {} from payload for IP {}{}",
+                    t, target, ctag
+                )
+            });
+            t
+        }
+        None => {
+            logger.attempt(|| {
+                format!(
+                    "No host recoverable from payload for {} — using IP{}",
+                    target, ctag
+                )
+            });
+            target.to_string()
+        }
+    };
+
+    // We have already sent `200`, so an upstream failure here cannot be
+    // reported as an HTTP error — log and drop.
+    let mut proxy_stream = match server::establish_connection(
+        &effective_target,
+        gate_rotator,
+        v6_rotator,
+        v4_rotator,
+        logger,
+        banned,
+        pool,
+        network,
+        client_user,
+        tls_connector,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            logger.connection_error(|| {
+                format!(
+                    "Recovery upstream failed for {}: {}{}",
+                    effective_target, e, ctag
+                )
+            });
+            return Err(e);
+        }
+    };
+
+    let _ = set_keepalive(&client_stream, network.tcp_keepalive_sec);
+    if let Some(tcp) = proxy_stream.as_tcp() {
+        let _ = set_keepalive(tcp, network.tcp_keepalive_sec);
+    }
+
+    if frag.enabled {
+        proxy_stream.set_nodelay(true)?;
+        send_possibly_fragmented(&mut proxy_stream, &buf, &frag.to_spec()).await?;
+    } else {
+        proxy_stream.write_all(&buf).await?;
+    }
+
+    let idle = idle_duration(network.tunnel_idle_timeout_sec);
+    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
+    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
+    Ok(())
 }
 
 /// Read the HTTP CONNECT request line + headers until `\r\n\r\n`,

@@ -15,9 +15,9 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use resocks5_net::connect::send_possibly_fragmented;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::tunnel::tunnel_with_timeouts;
+use resocks5_net::connect::{parse_http_host, parse_sni, send_possibly_fragmented};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -92,6 +92,33 @@ pub async fn handle_socks5_client(
     } else {
         None
     };
+
+    // ── SNI/Host recovery ───────────────────────────────────────────
+    // Pool-routed clients only (never direct). When the CONNECT target
+    // is a bare IPv4 literal and recovery is enabled, we recover the
+    // intended hostname from the client's first record (TLS SNI / HTTP
+    // Host) and address the upstream by that domain. See
+    // `recover_host_from_payload` in NetworkConfig for the rationale.
+    if !is_direct && network.recover_host_from_payload {
+        if let Some(port) = ipv4_literal_port(&target_addr) {
+            return recover_and_tunnel(
+                client_stream,
+                &target_addr,
+                port,
+                gate_rotator,
+                v6_rotator,
+                v4_rotator,
+                logger,
+                banned,
+                pool,
+                frag,
+                network,
+                client_user.as_deref(),
+                tls_connector,
+            )
+            .await;
+        }
+    }
 
     let mut proxy_stream = if is_direct {
         let user_owned = client_user
@@ -175,6 +202,146 @@ pub async fn handle_socks5_client(
     // halves when no bytes flow either direction for
     // `tunnel_idle_timeout_sec`) and a hard lifetime cap. Replaces
     // `tokio::io::copy_bidirectional`, which had no activity tracking.
+    let idle = idle_duration(network.tunnel_idle_timeout_sec);
+    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
+    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
+    Ok(())
+}
+
+/// If `target` is `IPv4:port`, return the port substring; otherwise
+/// `None`. Recovery only applies to bare IPv4 literals — domains
+/// already carry the name we want, and IPv6 literals are left on the
+/// standard path (Proxifier-style front-ends emit IPv4 in practice).
+fn ipv4_literal_port(target: &str) -> Option<&str> {
+    let (host, port) = target.rsplit_once(':')?;
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+/// Recovery path: the client asked for a bare IPv4 and recovery is on.
+///
+/// We send the SOCKS5 success reply *early* so the client emits its
+/// first application record, peek it to recover the intended hostname
+/// (TLS SNI or HTTP `Host`), then open the upstream addressed by that
+/// domain — falling back to the original IP when nothing is recovered.
+/// The peeked record is forwarded (fragmented if configured) before the
+/// bidirectional tunnel starts, so no client bytes are lost.
+#[allow(clippy::too_many_arguments)]
+async fn recover_and_tunnel(
+    mut client_stream: TcpStream,
+    target_addr: &str,
+    port: &str,
+    gate_rotator: &Option<Arc<ProxyRotator>>,
+    v6_rotator: &Option<Arc<ProxyRotator>>,
+    v4_rotator: &Option<Arc<ProxyRotator>>,
+    logger: &Arc<Logger>,
+    banned: &Arc<RegexSet>,
+    pool: &Arc<ProxyPool>,
+    frag: &Arc<TlsFragmentConfig>,
+    network: &Arc<NetworkConfig>,
+    client_user: Option<&str>,
+    tls_connector: Option<&TlsConnector>,
+) -> anyhow::Result<()> {
+    let ctag = match client_user {
+        Some(u) => format!(" [client={}]", u),
+        None => " [client=anon]".to_string(),
+    };
+
+    // Early SOCKS5 success reply — required so the client sends its
+    // ClientHello / HTTP request, which carries the name we need.
+    client_stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+
+    // Read the first application record under the client-protocol
+    // deadline (slowloris guard: a client that completes CONNECT but
+    // never speaks must not pin the slot).
+    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = match timeout(protocol_dur, client_stream.read(&mut buf)).await {
+        Ok(Ok(0)) => return Ok(()), // client closed before sending
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            return Err(anyhow!(
+                "client sent no payload within {}s — recovery peek timeout{}",
+                protocol_dur.as_secs(),
+                ctag
+            ));
+        }
+    };
+    buf.truncate(n);
+
+    // Recover the intended host: TLS SNI first, then HTTP Host.
+    let effective_target = match parse_sni(&buf).or_else(|| parse_http_host(&buf)) {
+        Some(host) => {
+            let t = format!("{}:{}", host, port);
+            logger.cache_write(|| {
+                format!(
+                    "Recovered host {} from payload for IP {}{}",
+                    t, target_addr, ctag
+                )
+            });
+            t
+        }
+        None => {
+            logger.attempt(|| {
+                format!(
+                    "No host recoverable from payload for {} — using IP{}",
+                    target_addr, ctag
+                )
+            });
+            target_addr.to_string()
+        }
+    };
+
+    // Open the upstream by the recovered domain. We have already sent
+    // the SOCKS5 success reply, so a failure here cannot be reported as
+    // a SOCKS error — we log it and drop the tunnel (the client's TLS
+    // handshake / HTTP request simply fails and is retried).
+    let mut proxy_stream = match crate::server::establish_connection(
+        &effective_target,
+        gate_rotator,
+        v6_rotator,
+        v4_rotator,
+        logger,
+        banned,
+        pool,
+        network,
+        client_user,
+        tls_connector,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            logger.connection_error(|| {
+                format!(
+                    "Recovery upstream failed for {}: {}{}",
+                    effective_target, e, ctag
+                )
+            });
+            return Err(e);
+        }
+    };
+
+    let _ = set_keepalive(&client_stream, network.tcp_keepalive_sec);
+    if let Some(tcp) = proxy_stream.as_tcp() {
+        let _ = set_keepalive(tcp, network.tcp_keepalive_sec);
+    }
+
+    // Forward the peeked first record — fragmented if it is a TLS
+    // ClientHello and fragmentation is enabled.
+    if frag.enabled {
+        proxy_stream.set_nodelay(true)?;
+        send_possibly_fragmented(&mut proxy_stream, &buf, &frag.to_spec()).await?;
+    } else {
+        proxy_stream.write_all(&buf).await?;
+    }
+
     let idle = idle_duration(network.tunnel_idle_timeout_sec);
     let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
     let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
