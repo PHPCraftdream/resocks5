@@ -23,9 +23,12 @@ port serves both kinds of client.
 # 1. first run — creates the three .ktav config files in the CWD, then exits
 resocks5
 
-# 2. add one upstream and one client user
-printf 'socks5_v4: [ user:pass@198.51.100.7:1080 ]\n' >> resocks5.proxy_list.ktav
-resocks5 users add alice        # interactive, no-echo password prompt
+# 2. add one upstream: edit resocks5.proxy_list.ktav and put it in the
+#    socks5_v4 list (replace the empty `socks5_v4: []` line — don't add a
+#    second one; ktav rejects duplicate keys):
+#        socks5_v4: [ user:pass@198.51.100.7:1080 ]
+# then add one client user (interactive, no-echo password prompt):
+resocks5 users add alice
 
 # 3. start the proxy (listens on 127.0.0.1:20082 by default)
 resocks5
@@ -176,7 +179,9 @@ so there's no shell inside it.
 #    then exits telling you that no upstream proxies are configured yet.
 resocks5
 
-# 2. Add at least one upstream to resocks5.proxy_list.ktav, e.g.:
+# 2. Add at least one upstream to resocks5.proxy_list.ktav by editing the
+#    existing socks5_v4 line (replace `socks5_v4: []` in place — ktav rejects
+#    duplicate keys, so don't append a second socks5_v4):
 #       socks5_v4: [ user:pass@198.51.100.7:1080 ]
 
 # 3. (Optional) add a client user. With no users configured the proxy
