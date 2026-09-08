@@ -50,6 +50,8 @@ fn is_tls_client_hello(data: &[u8]) -> bool {
 ///
 /// If `cfg.enabled` is false, or the data is not a TLS ClientHello, the
 /// whole slice is written in one call — no overhead on the hot path.
+///
+/// cancel-safe: NO — a prefix may have been written; close the stream on timeout.
 pub async fn send_possibly_fragmented<W>(
     writer: &mut W,
     data: &[u8],

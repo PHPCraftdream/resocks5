@@ -21,3 +21,6 @@ rustls.workspace = true
 webpki-roots.workspace = true
 dashmap.workspace = true
 crossbeam-queue.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

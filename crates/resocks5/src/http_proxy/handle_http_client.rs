@@ -16,8 +16,7 @@ use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
-use resocks5_net::connect::tunnel::tunnel_with_timeouts;
-use resocks5_net::connect::{parse_http_host, parse_sni, send_possibly_fragmented};
+use resocks5_net::connect::{parse_http_host, parse_sni};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -163,7 +162,7 @@ pub async fn handle_http_client(
         }
     }
 
-    let mut proxy_stream = if is_direct {
+    let proxy_stream = if is_direct {
         let user_owned = req
             .client_user
             .as_deref()
@@ -226,46 +225,8 @@ pub async fn handle_http_client(
 
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
-        if !req.pipelined.is_empty() {
-            // Fast-open path: TLS ClientHello arrived pipelined with
-            // the CONNECT request — fragment it before bidir copy.
-            send_possibly_fragmented(&mut proxy_stream, &req.pipelined, &frag.to_spec()).await?;
-        } else {
-            // Normal path: read the first application chunk from the
-            // client (typically TLS ClientHello) and fragment it.
-            // 16 KiB buffer covers oversized ClientHello records with
-            // ECH / post-quantum extensions.
-            let mut buf = vec![0u8; 16 * 1024];
-            match client_stream.read(&mut buf).await? {
-                0 => return Ok(()),
-                n => {
-                    send_possibly_fragmented(&mut proxy_stream, &buf[..n], &frag.to_spec()).await?
-                }
-            }
-        }
-    } else if !req.pipelined.is_empty() {
-        proxy_stream.write_all(&req.pipelined).await?;
     }
-
-    // `tunnel_with_timeouts` is a half-close-aware bidirectional
-    // copy with two safety nets: an idle deadline (sends FIN on both
-    // halves when no bytes flow either direction for
-    // `tunnel_idle_timeout_sec`) and a hard lifetime cap.
-    let idle = idle_duration(network.tunnel_idle_timeout_sec);
-    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
-    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
-    Ok(())
-}
-
-/// `0` means "no idle check"; we still need a finite Duration to feed
-/// `tokio::time::sleep`. A century is well within Tokio's safe range
-/// and effectively never fires.
-fn idle_duration(secs: u64) -> Duration {
-    if secs == 0 {
-        Duration::from_secs(60 * 60 * 24 * 365 * 100)
-    } else {
-        Duration::from_secs(secs)
-    }
+    server::forward_tunnel(client_stream, proxy_stream, req.pipelined, frag, network).await
 }
 
 /// If `target` is `IPv4:port`, return the port substring; otherwise
@@ -361,7 +322,7 @@ async fn recover_and_tunnel_http(
 
     // We have already sent `200`, so an upstream failure here cannot be
     // reported as an HTTP error — log and drop.
-    let mut proxy_stream = match server::establish_connection(
+    let proxy_stream = match server::establish_connection(
         &effective_target,
         gate_rotator,
         v6_rotator,
@@ -394,15 +355,8 @@ async fn recover_and_tunnel_http(
 
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
-        send_possibly_fragmented(&mut proxy_stream, &buf, &frag.to_spec()).await?;
-    } else {
-        proxy_stream.write_all(&buf).await?;
     }
-
-    let idle = idle_duration(network.tunnel_idle_timeout_sec);
-    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
-    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
-    Ok(())
+    server::forward_tunnel(client_stream, proxy_stream, buf, frag, network).await
 }
 
 /// Read the HTTP CONNECT request line + headers until `\r\n\r\n`,
@@ -426,9 +380,15 @@ async fn parse_http_connect(
         if n == 0 {
             return Err(anyhow!("client closed before sending HTTP request line"));
         }
+        let scan_from = buf.len().saturating_sub(3);
         buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_double_crlf(&buf) {
-            break pos + 4;
+        if let Some(pos) = find_double_crlf(&buf[scan_from..]) {
+            let end = scan_from + pos + 4;
+            if end > MAX_HEADER_BYTES {
+                let _ = client_stream.write_all(RESP_413).await;
+                return Err(anyhow!("HTTP headers exceeded {} bytes", MAX_HEADER_BYTES));
+            }
+            break end;
         }
         if buf.len() > MAX_HEADER_BYTES {
             let _ = client_stream.write_all(RESP_413).await;
@@ -497,10 +457,7 @@ async fn parse_http_connect(
                 Some(s) => s,
                 None => {
                     let _ = client_stream.write_all(RESP_407).await;
-                    return Err(anyhow!(
-                        "unsupported Proxy-Authorization scheme: {:?}",
-                        value
-                    ));
+                    return Err(anyhow!("unsupported Proxy-Authorization scheme"));
                 }
             };
             let decoded = match general_purpose::STANDARD.decode(creds_b64) {
@@ -527,7 +484,7 @@ async fn parse_http_connect(
                     "client sent Proxy-Authorization but server has no users configured"
                 ));
             }
-            if !auth.verify(user, password) {
+            if !auth.verify_async(user, password).await {
                 let _ = client_stream.write_all(RESP_407).await;
                 return Err(anyhow!("HTTP auth failed for user {:?}", user));
             }
@@ -562,5 +519,65 @@ fn split_basic_token(value: &str) -> Option<&str> {
         Some(token)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn parse_request(request: &[u8]) -> (Result<ConnectRequest>, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let auth = Arc::new(
+                AuthState::build(
+                    &crate::config::AuthConfig {
+                        allow_anonymous: true,
+                    },
+                    &crate::config::UsersConfig { users: Vec::new() },
+                    "unused-users.ktav",
+                )
+                .unwrap(),
+            );
+            parse_http_connect(&mut stream, &auth).await
+        };
+        let client = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, client)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsupported_auth_does_not_expose_credentials() {
+        let (result, response) = parse_request(b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Bearer private-token\r\n\r\n").await;
+        let error = result
+            .err()
+            .expect("unsupported auth must fail")
+            .to_string();
+        assert!(!error.contains("private-token"));
+        assert!(response.starts_with(b"HTTP/1.1 407 "));
+    }
+
+    #[tokio::test]
+    async fn header_limit_includes_the_terminating_delimiter() {
+        let mut request = b"CONNECT example.com:443 HTTP/1.1\r\nX-Pad: ".to_vec();
+        request.resize(MAX_HEADER_BYTES - 4, b'a');
+        request.extend_from_slice(b"\r\n\r\n");
+        assert!(parse_request(&request).await.0.is_ok());
+        request.insert(MAX_HEADER_BYTES - 4, b'a');
+        let (result, response) = parse_request(&request).await;
+        assert!(result.is_err());
+        assert!(response.starts_with(b"HTTP/1.1 431 "));
     }
 }

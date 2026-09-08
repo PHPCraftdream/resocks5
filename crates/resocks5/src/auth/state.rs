@@ -1,4 +1,5 @@
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Result};
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
@@ -6,6 +7,7 @@ use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 use crate::auth::compute_hash::compute_hash;
 use crate::auth::params::argon2_instance;
@@ -16,6 +18,12 @@ use crate::config::{AuthConfig, User, UsersConfig};
 /// will set it. Anything else is treated as a real Argon2id PHC string.
 const INIT_HASH: &str = "init";
 
+struct UserEntry {
+    index: usize,
+    enabled: bool,
+    direct: bool,
+}
+
 /// Server-side auth bundle, built once at startup and shared with each
 /// connection-handling task via `Arc<AuthState>`. Holds the snapshot of
 /// the users list as loaded from disk, the policy flag, the
@@ -23,11 +31,8 @@ const INIT_HASH: &str = "init";
 ///
 /// ## Cache invalidation on password change
 ///
-/// The cache is keyed by username and the value is the HMAC of the
-/// *currently valid* password. If the password changes, the new HMAC
-/// mismatches the cached value and we fall back to Argon2 — on success
-/// the entry is overwritten. Old passwords therefore stop authenticating
-/// the moment a new one is recorded, even within a running process.
+/// Users are a startup snapshot. CLI password and policy changes require a
+/// server restart. Only init-claims update this process's hashes at runtime.
 ///
 /// ## Init-on-first-login
 ///
@@ -46,15 +51,14 @@ pub struct AuthState {
     /// the only writer and runs at most once per user (lifetime of the
     /// server process / persisted file).
     users: RwLock<Vec<User>>,
+    entries: HashMap<String, UserEntry>,
+    verify_slots: Arc<Semaphore>,
     /// Mirrors `auth.allow_anonymous` from `resocks5.main.ktav`. When
     /// `true`, the server advertises SOCKS5 method `0x00` to clients
     /// (and skips Proxy-Authorization on HTTP); when `false`, only
     /// authenticated clients are accepted.
     pub allow_anonymous: bool,
-    /// 32 random bytes generated at startup. Used as HMAC key for cache
-    /// entries so plaintext passwords never sit in process memory.
-    /// Never persisted — a fresh `server_secret` every run means a
-    /// captured memory image from one run cannot be replayed.
+    /// Process-local HMAC key. The cache stores no plaintext passwords.
     server_secret: [u8; 32],
     /// `name → HMAC(server_secret, name || 0x00 || password)` for the
     /// last successfully verified password. Hit = O(1) success;
@@ -75,8 +79,19 @@ impl AuthState {
         let mut server_secret = [0u8; 32];
         getrandom::getrandom(&mut server_secret)
             .map_err(|e| anyhow!("OS random source unavailable: {}", e))?;
+        let mut entries = HashMap::with_capacity(users.users.len());
+        for (index, user) in users.users.iter().enumerate() {
+            entries.entry(user.name.clone()).or_insert(UserEntry {
+                index,
+                enabled: user.is_enabled,
+                direct: user.direct,
+            });
+        }
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
         Ok(Self {
             users: RwLock::new(users.users.clone()),
+            entries,
+            verify_slots: Arc::new(Semaphore::new(workers)),
             allow_anonymous: auth_cfg.allow_anonymous,
             server_secret,
             cache: DashMap::new(),
@@ -86,25 +101,53 @@ impl AuthState {
 
     /// True when no users are configured.
     pub fn is_empty(&self) -> bool {
-        self.users.read().expect("users RwLock poisoned").is_empty()
+        self.entries.is_empty()
     }
 
     /// Current number of configured users (including any unclaimed
     /// `hash == "init"` placeholders).
     pub fn users_count(&self) -> usize {
-        self.users.read().expect("users RwLock poisoned").len()
+        self.entries.len()
     }
 
     /// Returns `true` when the named user exists, is enabled, and has
     /// `direct == true`. Returns `false` for missing, disabled, or
     /// pool-routed users.
     pub fn is_direct(&self, name: &str) -> bool {
-        let users = self.users.read().expect("users RwLock poisoned");
-        users
-            .iter()
-            .find(|u| u.name == name)
-            .map(|u| u.is_enabled && u.direct)
+        self.entries
+            .get(name)
+            .map(|u| u.enabled && u.direct)
             .unwrap_or(false)
+    }
+
+    /// cancel-safe: NO — admitted blocking work may finish an init-claim after
+    /// cancellation. Its permit stays with the work until hashing/persistence ends.
+    pub async fn verify_async(self: &Arc<Self>, name: &str, password: &str) -> bool {
+        if !self.entries.get(name).is_some_and(|u| u.enabled) {
+            return false;
+        }
+        let candidate = compute_cache_hmac(&self.server_secret, name, password);
+        if self.cache_matches(name, &candidate) {
+            return true;
+        }
+        let Ok(permit) = self.verify_slots.clone().acquire_owned().await else {
+            return false;
+        };
+        let state = self.clone();
+        let name = name.to_owned();
+        let password = password.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            state.verify(&name, &password)
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    fn cache_matches(&self, name: &str, candidate: &[u8; 32]) -> bool {
+        self.cache
+            .get(name)
+            .is_some_and(|cached| bool::from(cached.value().ct_eq(candidate)))
     }
 
     /// Verify a username + password pair. `false` on any failure —
@@ -114,30 +157,19 @@ impl AuthState {
     /// `"init"` placeholder, atomically claims the password for the
     /// account and persists it to disk.
     pub fn verify(&self, name: &str, password: &str) -> bool {
-        let hash_opt = {
-            let users = self.users.read().expect("users RwLock poisoned");
-            users
-                .iter()
-                .find(|u| u.name == name)
-                .filter(|u| u.is_enabled)
-                .map(|u| u.hash.clone())
-        };
-        let Some(hash) = hash_opt else {
+        let Some(entry) = self.entries.get(name).filter(|u| u.enabled) else {
             return false;
         };
-
         let candidate_hmac = compute_cache_hmac(&self.server_secret, name, password);
+        if self.cache_matches(name, &candidate_hmac) {
+            return true;
+        }
+        let hash = self.users.read().expect("users RwLock poisoned")[entry.index]
+            .hash
+            .clone();
 
         if hash == INIT_HASH {
             return self.try_claim_init(name, password, candidate_hmac);
-        }
-
-        if let Some(cached) = self.cache.get(name) {
-            if bool::from(cached.value().ct_eq(&candidate_hmac)) {
-                return true;
-            }
-            // Mismatch (likely password change since last cache write) —
-            // fall through to a real Argon2 verify.
         }
 
         if argon2_verify(&hash, password) {
@@ -162,9 +194,10 @@ impl AuthState {
         };
 
         let mut users = self.users.write().expect("users RwLock poisoned");
-        let Some(idx) = users.iter().position(|u| u.name == name) else {
+        let Some(entry) = self.entries.get(name) else {
             return false;
         };
+        let idx = entry.index;
         if users[idx].hash != INIT_HASH {
             // Someone else won the race between our read and write. Fall
             // back to verifying our password against the claimed hash:
@@ -324,6 +357,57 @@ mod tests {
         assert_eq!(state.cache.len(), 1);
         // Second call hits the cache — same answer.
         assert!(state.verify("alice", "s3cret"));
+    }
+
+    #[tokio::test]
+    async fn cached_async_verify_skips_hashing_slots() {
+        let state = Arc::new(build_state(vec![make_user("alice", "secret", true)], false));
+        assert!(state.verify("alice", "secret"));
+        let slots = u32::try_from(state.verify_slots.available_permits()).unwrap();
+        let _all_slots = state
+            .verify_slots
+            .clone()
+            .acquire_many_owned(slots)
+            .await
+            .unwrap();
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.verify_async("alice", "secret"),
+        )
+        .await
+        .unwrap();
+        assert!(accepted);
+        assert!(!state.verify_async("unknown", "secret").await);
+    }
+
+    #[tokio::test]
+    async fn uncached_async_verify_waits_for_hashing_slot() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let state = Arc::new(build_state(vec![make_user("alice", "secret", true)], false));
+        let slots = u32::try_from(state.verify_slots.available_permits()).unwrap();
+        let all_slots = state
+            .verify_slots
+            .clone()
+            .acquire_many_owned(slots)
+            .await
+            .unwrap();
+        let verification = state.verify_async("alice", "secret");
+        tokio::pin!(verification);
+        poll_fn(|cx| {
+            assert!(verification.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(state.cache.is_empty());
+        drop(all_slots);
+        assert!(verification.await);
+        assert!(!state.verify_async("alice", "wrong").await);
+        assert_eq!(
+            state.verify_slots.available_permits(),
+            usize::try_from(slots).unwrap()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use regex::RegexSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -47,43 +47,40 @@ async fn use_gate(
 ) -> anyhow::Result<AnyUpstream> {
     let proxy_addr = format!("{}:{}", proxy_config.host, proxy_config.port);
 
-    if let Ok(gate_stream) = pool.acquire(gate_config).await {
-        let gate_auth = get_auth(gate_config);
-
-        match handshake_with_timeout(gate_stream, &proxy_addr, gate_auth, handshake_timeout).await {
-            Ok(stream) => {
-                let proxy_auth = get_auth(proxy_config);
-
-                match handshake_with_timeout(stream, target_addr, proxy_auth, handshake_timeout)
-                    .await
-                {
-                    Ok(final_stream) => {
-                        return Ok(AnyUpstream::Plain(final_stream));
-                    }
-                    Err(_) => {
-                        return Err(anyhow!(format!(
-                            "Failed to connect to target: {} by proxy {} with gate {}",
-                            target_addr,
-                            print_cfg(proxy_config),
-                            print_cfg(gate_config),
-                        )));
-                    }
-                }
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "Failed to connect to proxy {} through the gate - {}",
-                    print_cfg(proxy_config),
-                    print_cfg(gate_config),
-                ));
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "Failed to connect to gate #1 - {}",
-        print_cfg(gate_config)
-    ))
+    let gate_stream = pool
+        .acquire(gate_config)
+        .await
+        .with_context(|| format!("Failed to connect to gate {}", print_cfg(gate_config)))?;
+    let stream = handshake_with_timeout(
+        gate_stream,
+        &proxy_addr,
+        get_auth(gate_config),
+        handshake_timeout,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to connect to proxy {} through gate {}",
+            print_cfg(proxy_config),
+            print_cfg(gate_config),
+        )
+    })?;
+    let stream = handshake_with_timeout(
+        stream,
+        target_addr,
+        get_auth(proxy_config),
+        handshake_timeout,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to connect to target {} by proxy {} with gate {}",
+            target_addr,
+            print_cfg(proxy_config),
+            print_cfg(gate_config),
+        )
+    })?;
+    Ok(AnyUpstream::Plain(stream))
 }
 
 async fn try_proxy(
@@ -305,9 +302,9 @@ pub async fn establish_connection(
                         format!(
                             "attempt target={} via={} path=direct outcome=fail dur={}ms err={}{}",
                             target_addr,
-                            e,
                             print_cfg(proxy_config),
                             ms,
+                            e,
                             ctag,
                         )
                     });
@@ -358,5 +355,37 @@ mod tests {
             should_record_failure(&err),
             "generic error SHOULD be recorded as failure"
         );
+    }
+
+    #[tokio::test]
+    async fn gate_capacity_error_retains_its_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = ProxyConfig {
+            protocol: resocks5_net::types::ProxyProtocol::Socks5,
+            ip: resocks5_net::types::IP::V4,
+            host: address.ip().to_string(),
+            port: address.port(),
+            user: None,
+            password: None,
+            is_gate: true,
+            gate: None,
+        };
+        let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 1);
+        let _busy = pool.acquire(&gate).await.unwrap();
+        let error = use_gate(
+            "example.com:443",
+            &gate,
+            &gate,
+            &pool,
+            Duration::from_secs(2),
+        )
+        .await
+        .err()
+        .expect("gate at capacity must reject the connection");
+        assert!(!should_record_failure(&error));
+        assert!(error
+            .downcast_ref::<resocks5_net::pool::AtCapacity>()
+            .is_some());
     }
 }

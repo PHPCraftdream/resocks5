@@ -1,30 +1,26 @@
-//! Idle- and lifetime-bounded bidirectional copy between two streams.
-//!
-//! Replaces `tokio::io::copy_bidirectional` because that one has no
-//! activity tracking — a misbehaving peer that holds the TCP open but
-//! never sends a byte would keep the per-upstream permit busy until
-//! `tunnel_max_lifetime_sec` (30 min). With explicit idle tracking we
-//! tear the tunnel down within `tunnel_idle_timeout_sec` (60 s) of
-//! silence, sending FIN to both peers so they can clean up too.
+//! Bidirectional copy with activity tracking and bounded teardown.
 
+use std::future::poll_fn;
 use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Instant;
 
-/// Forward bytes between `a` and `b` until either side closes, both
-/// timeouts fire, or an I/O error happens. Sends `shutdown()` on the
-/// opposite write half whenever one direction reaches EOF or a
-/// timeout fires, so peers see a clean FIN rather than a half-open
-/// zombie connection.
+/// Forward bytes until both directions reach EOF, a timeout fires, or I/O fails.
+/// Half-closes are propagated while the other direction continues to flow.
 ///
-/// `idle` is the per-iteration deadline: if `select!` doesn't make
-/// any read progress within this duration the tunnel is closed.
-/// `max_lifetime` is a hard cap independent of activity.
+/// `idle` measures time since the last successful read or write in either
+/// direction. `max_lifetime` also bounds stalled writes and shutdowns.
+/// A zero duration disables the corresponding deadline. On timeout, shutdown
+/// is attempted once on each stream before dropping both; teardown never waits
+/// indefinitely for a peer to accept buffered data.
 ///
-/// Both streams are consumed by value so that the function owns the
-/// drop-order and any wrapper resources (e.g. a per-upstream permit
-/// inside `UpstreamStream`) are released before this returns.
+/// cancel-safe: NO — cancellation can discard buffered bytes. Both owned
+/// streams and their permits are dropped; the transfer must not be resumed.
 pub async fn tunnel_with_timeouts<A, B>(
     a: A,
     b: B,
@@ -35,76 +31,156 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut a_r, mut a_w) = tokio::io::split(a);
-    let (mut b_r, mut b_w) = tokio::io::split(b);
-
-    let mut buf_ab = vec![0u8; 16 * 1024];
-    let mut buf_ba = vec![0u8; 16 * 1024];
-    let mut ab_open = true; // a → b direction still flowing
-    let mut ba_open = true; // b → a direction still flowing
-
-    // Hard lifetime deadline is a single sleep, pinned so we can poll
-    // it across multiple iterations of the select loop.
-    let lifetime = tokio::time::sleep(max_lifetime);
-    tokio::pin!(lifetime);
-
-    while ab_open || ba_open {
-        // Per-iteration idle sleep — freshly created each loop so its
-        // deadline is "now + idle". When this branch fires, neither
-        // read side has produced any data in the past `idle` window.
-        tokio::select! {
-            // ── a → b ────────────────────────────────────────────
-            res = a_r.read(&mut buf_ab), if ab_open => {
-                let n = res?;
-                if n == 0 {
-                    // EOF from a — tell b we won't send any more.
-                    let _ = b_w.shutdown().await;
-                    ab_open = false;
-                } else {
-                    // write_all is NOT cancel-safe; the surrounding
-                    // select has already picked this branch, so we
-                    // run write_all to completion here without risk
-                    // of an `idle` cancellation tearing it up mid-way.
-                    b_w.write_all(&buf_ab[..n]).await?;
+    let activity = Activity {
+        epoch: Instant::now(),
+        nanos: AtomicU64::new(0),
+    };
+    let mut a = Tracked {
+        inner: a,
+        activity: &activity,
+    };
+    let mut b = Tracked {
+        inner: b,
+        activity: &activity,
+    };
+    {
+        let transfer = copy_bidirectional_with_sizes(&mut a, &mut b, 16 * 1024, 16 * 1024);
+        let lifetime = tokio::time::sleep(max_lifetime);
+        let idle_timer = tokio::time::sleep(idle);
+        tokio::pin!(transfer, lifetime, idle_timer);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut lifetime, if !max_lifetime.is_zero() => break,
+                _ = &mut idle_timer, if !idle.is_zero() => {
+                    let last = activity.epoch + Duration::from_nanos(activity.nanos.load(Ordering::Relaxed));
+                    let deadline = last + idle;
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    idle_timer.as_mut().reset(deadline);
                 }
-            }
-
-            // ── b → a ────────────────────────────────────────────
-            res = b_r.read(&mut buf_ba), if ba_open => {
-                let n = res?;
-                if n == 0 {
-                    let _ = a_w.shutdown().await;
-                    ba_open = false;
-                } else {
-                    a_w.write_all(&buf_ba[..n]).await?;
-                }
-            }
-
-            // ── Idle watchdog ───────────────────────────────────
-            _ = tokio::time::sleep(idle) => {
-                // No read progress for `idle` seconds. Send FIN on
-                // both directions still open so the peers don't sit
-                // in CLOSE_WAIT.
-                let _ = a_w.shutdown().await;
-                let _ = b_w.shutdown().await;
-                return Ok(());
-            }
-
-            // ── Hard lifetime cap ───────────────────────────────
-            _ = &mut lifetime => {
-                let _ = a_w.shutdown().await;
-                let _ = b_w.shutdown().await;
-                return Ok(());
+                result = &mut transfer => return result.map(|_| ()),
             }
         }
     }
+    poll_fn(|cx| {
+        let _ = Pin::new(&mut a.inner).poll_shutdown(cx);
+        let _ = Pin::new(&mut b.inner).poll_shutdown(cx);
+        Poll::Ready(())
+    })
+    .await;
     Ok(())
+}
+
+struct Activity {
+    epoch: Instant,
+    nanos: AtomicU64,
+}
+
+impl Activity {
+    fn record(&self) {
+        let nanos = u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // Both wrappers are polled by one task; no other state is published.
+        self.nanos.store(nanos, Ordering::Relaxed);
+    }
+}
+
+struct Tracked<'a, S> {
+    inner: S,
+    activity: &'a Activity,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Tracked<'_, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.activity.record();
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.record();
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_write_still_allows_reverse_traffic() {
+        let (mut client, client_inner) = duplex(64);
+        let (mut proxy, proxy_inner) = duplex(1);
+        client.write_all(b"request").await.unwrap();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        ));
+        let mut byte = [0];
+        proxy.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte, *b"r");
+        proxy.write_all(b"R").await.unwrap();
+        let received =
+            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut byte)).await;
+        drop(client);
+        drop(proxy);
+        let _ = task.await.unwrap();
+        received
+            .expect("reverse traffic stalled behind a blocked write")
+            .unwrap();
+        assert_eq!(byte, *b"R");
+    }
+
+    async fn check_blocked_write_deadline(idle: Duration, lifetime: Duration) {
+        let (mut client, client_inner) = duplex(64);
+        let (_proxy, proxy_inner) = duplex(1);
+        client.write_all(b"request").await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            tunnel_with_timeouts(client_inner, proxy_inner, idle, lifetime),
+        )
+        .await
+        .expect("blocked write bypassed the tunnel deadline")
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_deadline_covers_blocked_writes() {
+        check_blocked_write_deadline(Duration::from_secs(5), Duration::from_secs(60)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifetime_deadline_covers_blocked_writes() {
+        check_blocked_write_deadline(Duration::from_secs(60), Duration::from_secs(5)).await;
+    }
 
     /// Helper: build two pairs of in-memory pipes representing the
     /// client side and the proxy side of the tunnel, plus the "outer"
@@ -154,10 +230,10 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_timeout_closes_silent_tunnel() {
         let (client_outer, client_inner, proxy_outer, proxy_inner) = pair();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let task = tokio::spawn(tunnel_with_timeouts(
             client_inner,
             proxy_inner,
@@ -184,7 +260,7 @@ mod tests {
         drop(proxy_outer);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_does_not_fire_while_data_flows() {
         let (mut client_outer, client_inner, mut proxy_outer, proxy_inner) = pair();
         let task = tokio::spawn(tunnel_with_timeouts(
@@ -196,13 +272,12 @@ mod tests {
 
         // Drip a byte every 50 ms — well under the idle threshold —
         // for 500 ms, then close.
+        let mut got = Vec::new();
         for i in 0u8..10 {
             client_outer.write_all(&[i]).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            got.push(proxy_outer.read_u8().await.unwrap());
+            tokio::time::advance(Duration::from_millis(50)).await;
         }
-        // Read what the proxy side received.
-        let mut got = vec![0u8; 10];
-        proxy_outer.read_exact(&mut got).await.unwrap();
         assert_eq!(got, (0..10u8).collect::<Vec<_>>());
 
         // Now close — tunnel must end gracefully, NOT via idle (we
@@ -215,10 +290,10 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn max_lifetime_caps_tunnel() {
         let (client_outer, client_inner, proxy_outer, proxy_inner) = pair();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let task = tokio::spawn(tunnel_with_timeouts(
             client_inner,
             proxy_inner,
@@ -242,6 +317,84 @@ mod tests {
 
         drop(client_outer);
         drop(proxy_outer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_deadlines_allow_a_long_lived_tunnel() {
+        let (mut client, client_inner, mut proxy, proxy_inner) = pair();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!task.is_finished());
+        client.write_all(b"x").await.unwrap();
+        assert_eq!(proxy.read_u8().await.unwrap(), b'x');
+        drop(client);
+        drop(proxy);
+        task.await.unwrap().unwrap();
+    }
+
+    struct PendingShutdown {
+        inner: tokio::io::DuplexStream,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PendingShutdown {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl AsyncRead for PendingShutdown {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PendingShutdown {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_drops_stream_even_when_shutdown_stalls() {
+        let (_client, client_inner, _proxy, proxy_inner) = pair();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = PendingShutdown {
+            inner: client_inner,
+            dropped: dropped.clone(),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tunnel_with_timeouts(
+                stream,
+                proxy_inner,
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("shutdown bypassed the deadline")
+        .unwrap();
+        assert!(dropped.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

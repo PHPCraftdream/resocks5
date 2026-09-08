@@ -16,8 +16,7 @@ use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
-use resocks5_net::connect::tunnel::tunnel_with_timeouts;
-use resocks5_net::connect::{parse_http_host, parse_sni, send_possibly_fragmented};
+use resocks5_net::connect::{parse_http_host, parse_sni};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -120,7 +119,7 @@ pub async fn handle_socks5_client(
         }
     }
 
-    let mut proxy_stream = if is_direct {
+    let proxy_stream = if is_direct {
         let user_owned = client_user
             .as_deref()
             .expect("is_direct implies a named user");
@@ -186,26 +185,8 @@ pub async fn handle_socks5_client(
 
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
-        // Read up to 16 KiB so the entire TLS ClientHello (including
-        // bulky extensions like ECH and post-quantum key shares) is in
-        // hand before we split. Fragmenting only the first 4 KiB
-        // would leak the SNI in the unfragmented remainder.
-        let mut buf = vec![0u8; 16 * 1024];
-        match client_stream.read(&mut buf).await? {
-            0 => return Ok(()),
-            n => send_possibly_fragmented(&mut proxy_stream, &buf[..n], &frag.to_spec()).await?,
-        }
     }
-
-    // `tunnel_with_timeouts` is a half-close-aware bidirectional
-    // copy with two safety nets: an idle deadline (sends FIN on both
-    // halves when no bytes flow either direction for
-    // `tunnel_idle_timeout_sec`) and a hard lifetime cap. Replaces
-    // `tokio::io::copy_bidirectional`, which had no activity tracking.
-    let idle = idle_duration(network.tunnel_idle_timeout_sec);
-    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
-    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
-    Ok(())
+    server::forward_tunnel(client_stream, proxy_stream, Vec::new(), frag, network).await
 }
 
 /// If `target` is `IPv4:port`, return the port substring; otherwise
@@ -302,7 +283,7 @@ async fn recover_and_tunnel(
     // the SOCKS5 success reply, so a failure here cannot be reported as
     // a SOCKS error — we log it and drop the tunnel (the client's TLS
     // handshake / HTTP request simply fails and is retried).
-    let mut proxy_stream = match crate::server::establish_connection(
+    let proxy_stream = match crate::server::establish_connection(
         &effective_target,
         gate_rotator,
         v6_rotator,
@@ -333,30 +314,10 @@ async fn recover_and_tunnel(
         let _ = set_keepalive(tcp, network.tcp_keepalive_sec);
     }
 
-    // Forward the peeked first record — fragmented if it is a TLS
-    // ClientHello and fragmentation is enabled.
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
-        send_possibly_fragmented(&mut proxy_stream, &buf, &frag.to_spec()).await?;
-    } else {
-        proxy_stream.write_all(&buf).await?;
     }
-
-    let idle = idle_duration(network.tunnel_idle_timeout_sec);
-    let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
-    let _ = tunnel_with_timeouts(client_stream, proxy_stream, idle, lifetime).await;
-    Ok(())
-}
-
-/// `0` means "no idle check"; we still need a finite Duration to feed
-/// `tokio::time::sleep`. A century is well within Tokio's safe range
-/// and effectively never fires.
-fn idle_duration(secs: u64) -> Duration {
-    if secs == 0 {
-        Duration::from_secs(60 * 60 * 24 * 365 * 100)
-    } else {
-        Duration::from_secs(secs)
-    }
+    server::forward_tunnel(client_stream, proxy_stream, buf, frag, network).await
 }
 
 /// Read greeting → method-selection → (optional) RFC 1929 auth →
@@ -448,7 +409,7 @@ async fn socks5_handshake(
             }
         };
 
-        if !auth.verify(uname_str, pword_str) {
+        if !auth.verify_async(uname_str, pword_str).await {
             // Generic "auth failed" reply — same code for unknown user,
             // disabled user, and bad password, so the client can't
             // distinguish causes.
