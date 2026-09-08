@@ -52,7 +52,7 @@ impl RatingPolicy {
     /// they silently produce `inf`/`NaN` weights downstream (e.g.
     /// `sand_max = 0` makes `k()` infinite, so a fresh upstream's
     /// weight is `exp(-inf * 0)` = `NaN`). Derived quantities are checked
-    /// too: `k()` and the boundary weights at sand level 0 (fresh) and
+    /// too: `tau()`, `k()` and the boundary weights at sand level 0 (fresh) and
     /// `sand_max` (fully saturated) must all be finite — e.g. a subnormal
     /// `min_weight` passes every per-field check yet overflows
     /// `1.0 / min_weight`.
@@ -74,6 +74,11 @@ impl RatingPolicy {
                  timescale (tau = half_life_sec / ln 2), and zero or negative values \
                  yield inf/NaN sand levels",
                 self.half_life_sec
+            ));
+        }
+        if !self.tau().is_finite() {
+            return Err(anyhow!(
+                "rating policy: half_life_sec / ln 2 must be finite"
             ));
         }
         if self.sand_max <= 0.0 {
@@ -158,6 +163,15 @@ impl RatingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_rejects_an_overflowing_decay_constant() {
+        let p = RatingPolicy {
+            half_life_sec: f64::MAX,
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
 
     #[test]
     fn default_values_match_spec() {

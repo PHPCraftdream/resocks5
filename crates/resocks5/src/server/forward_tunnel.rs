@@ -131,18 +131,8 @@ where
         match within_idle(idle, step).await? {
             Some(true) => return Ok(true),
             Some(false) => {}
-            None => {
-                // Idle mid-accumulation. A signature-confirmed hello
-                // degrades to forwarding what was accumulated (still
-                // fragmented) instead of dropping it; the undecided
-                // signature case keeps its existing behaviour.
-                if len != 0 && classify_client_hello(&first[..len]) == ClientHelloMatch::ClientHello
-                {
-                    send_possibly_fragmented(upstream, &first[..len], &frag.to_spec()).await?;
-                    return Ok(true);
-                }
-                return Ok(false);
-            }
+            // A cancelled write may have sent a prefix; never replay it.
+            None => return Ok(false),
         }
     }
 }
@@ -216,20 +206,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn partial_pipelined_signature_is_accumulated() {
-        let (mut client, mut reader) = duplex(64);
-        client.write_all(&[0x01]).await.unwrap();
+        let (mut client, mut reader) = duplex(256);
+        let hello = client_hello_with_sni("pipelined.example");
+        client.write_all(&hello[5..]).await.unwrap();
         let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut recorder = ChunkRecorder(chunks.clone());
         assert!(prepare_payload(
             &mut reader,
             &mut recorder,
-            vec![0x16, 0x03, 0x01, 0, 1],
+            hello[..5].to_vec(),
             &fragmentation_with_size(1),
             Duration::from_secs(1),
         )
         .await
         .unwrap());
-        assert_eq!(*chunks.lock().unwrap(), vec![1; 6]);
+        assert_eq!(*chunks.lock().unwrap(), vec![1; hello.len()]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -295,19 +286,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn split_client_hello_is_still_fragmented() {
-        // No start_paused: the two writes must be separated by REAL time so
-        // the tunnel's first read sees only the 5-byte record header — the
-        // R21 case where the old code forwarded without fragmentation.
-        let (mut client, client_inner) = duplex(64);
+        // Backpressure separates the record header from its payload.
+        let (mut client, mut client_inner) = duplex(5);
         let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_chunks = chunks.clone();
-        let network = NetworkConfig {
-            tunnel_idle_timeout_sec: 10,
-            tunnel_max_lifetime_sec: 0,
-            ..Default::default()
-        };
         // Well-formed ClientHello record: 20-byte payload = 4-byte
         // handshake header (type + 16-byte declared body) + 16 body
         // bytes. The accumulator now walks the record layer, so the
@@ -316,20 +300,19 @@ mod tests {
         hello.extend_from_slice(&[0xAA; 16]); // total 25 bytes
 
         let task = tokio::spawn(async move {
-            forward_tunnel(
-                client_inner,
-                ChunkRecorder(chunks),
+            prepare_payload(
+                &mut client_inner,
+                &mut ChunkRecorder(chunks),
                 Vec::new(),
                 &fragmentation_with_size(5),
-                &network,
+                Duration::from_secs(10),
             )
             .await
         });
 
         client.write_all(&hello[..5]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
         client.write_all(&hello[5..]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(task.await.unwrap().unwrap());
 
         let recorded = recorded_chunks.lock().unwrap().clone();
         // Every fragment respects fragment_size=5 — with the old single-read
@@ -337,12 +320,11 @@ mod tests {
         assert!(recorded.iter().all(|&n| n <= 5), "chunks: {recorded:?}");
         assert_eq!(recorded.iter().sum::<usize>(), hello.len());
         assert_eq!(recorded, vec![5, 5, 5, 5, 5]);
-        task.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn upstream_banner_interrupts_partial_prefix_accumulation() {
-        let (mut client, client_inner) = duplex(64);
+        let (mut client, client_inner) = duplex(1);
         let (mut upstream, upstream_inner) = duplex(64);
         let network = NetworkConfig {
             tunnel_idle_timeout_sec: 10,
@@ -365,7 +347,6 @@ mod tests {
 
         // Client starts a hello; the first read is Indeterminate (5 bytes).
         client.write_all(&hello[..5]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         // The server speaks while the prefix is mid-accumulation: its
         // banner must be relayed to the client immediately.
         upstream.write_all(b"SSH-2.0-test\r\n").await.unwrap();
@@ -386,7 +367,9 @@ mod tests {
         // read_exact may coalesce fragments; content and order
         // are what matter here (strict chunk boundaries are TEST 1's job).
         assert_eq!(seen, hello);
-        task.abort();
+        client.shutdown().await.unwrap();
+        upstream.shutdown().await.unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -410,6 +393,35 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_closes_a_partially_written_client_hello() {
+        let (mut client, client_inner) = duplex(256);
+        let (mut upstream, upstream_inner) = duplex(1);
+        let hello = client_hello_with_sni("blocked.example.org");
+        client.write_all(&hello[6..]).await.unwrap();
+        let network = NetworkConfig {
+            tunnel_idle_timeout_sec: 1,
+            tunnel_max_lifetime_sec: 0,
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_tunnel(
+                client_inner,
+                upstream_inner,
+                hello[..6].to_vec(),
+                &fragmentation_with_size(4),
+                &network,
+            ),
+        )
+        .await
+        .expect("idle timeout must close a partially written hello")
+        .unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, hello[..1]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -469,40 +481,34 @@ mod tests {
         rec
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn sni_bearing_tail_of_split_hello_is_also_fragmented() {
         // R2-17: the 6-byte signature confirms on the first read, but
         // the SNI-carrying bytes arrive only in a later one. The tail
         // must go out through the fragmenting path too, not the plain
         // post-accumulation copy.
-        let (mut client, client_inner) = duplex(64);
+        let (mut client, mut client_inner) = duplex(6);
         let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_chunks = chunks.clone();
-        let network = NetworkConfig {
-            tunnel_idle_timeout_sec: 10,
-            tunnel_max_lifetime_sec: 0,
-            ..Default::default()
-        };
         let hello = client_hello_with_sni("tail.example.org");
         assert_eq!(
             resocks5_net::connect::parse_sni(&hello).as_deref(),
             Some("tail.example.org")
         );
         let task = tokio::spawn(async move {
-            forward_tunnel(
-                client_inner,
-                ChunkRecorder(chunks),
+            prepare_payload(
+                &mut client_inner,
+                &mut ChunkRecorder(chunks),
                 Vec::new(),
                 &fragmentation_with_size(4),
-                &network,
+                Duration::from_secs(10),
             )
             .await
         });
 
         client.write_all(&hello[..6]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
         client.write_all(&hello[6..]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(task.await.unwrap().unwrap());
 
         let recorded = recorded_chunks.lock().unwrap().clone();
         // Every byte — including the late SNI-bearing tail — was sent
@@ -511,49 +517,32 @@ mod tests {
         // first 6 bytes fragmented and the 71-byte tail as ONE chunk.
         assert!(recorded.iter().all(|&n| n <= 4), "chunks: {recorded:?}");
         assert_eq!(recorded.iter().sum::<usize>(), hello.len());
-        task.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn oversized_hello_degrades_at_the_accumulator_cap() {
         // A hello whose handshake header declares far more than the
         // 16 KiB accumulator can never complete: the cap must forward
         // what was accumulated instead of hanging (graceful degrade).
-        let (mut client, client_inner) = duplex(64);
+        let (mut client, mut client_inner) = duplex(64);
         let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded_chunks = chunks.clone();
-        let network = NetworkConfig {
-            tunnel_idle_timeout_sec: 10,
-            tunnel_max_lifetime_sec: 0,
-            ..Default::default()
-        };
         let mut hello = vec![0x16, 0x03, 0x01, 0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0xFF];
         hello.resize(16 * 1024, 0xEE);
         let task = tokio::spawn(async move {
-            forward_tunnel(
-                client_inner,
-                ChunkRecorder(chunks),
+            prepare_payload(
+                &mut client_inner,
+                &mut ChunkRecorder(chunks),
                 Vec::new(),
                 &fragmentation(),
-                &network,
+                Duration::from_secs(10),
             )
             .await
         });
         client.write_all(&hello).await.unwrap();
         drop(client);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let sum: usize = recorded_chunks.lock().unwrap().iter().sum();
-            if sum == 16 * 1024 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cap degrade never fired; got {sum} of {} bytes",
-                16 * 1024
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        task.abort();
+        assert!(task.await.unwrap().unwrap());
+        let sum: usize = recorded_chunks.lock().unwrap().iter().sum();
+        assert_eq!(sum, hello.len());
     }
 }

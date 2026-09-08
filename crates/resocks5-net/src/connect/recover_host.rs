@@ -23,7 +23,7 @@
 //! Both parsers are strictly bounds-checked and allocation-light: they
 //! never panic on malformed input, returning `None` instead.
 
-use crate::connect::tls_records::assemble_handshake_message;
+use crate::connect::tls_records::{client_hello_might_continue, handshake_message};
 
 /// Extract the SNI host from the TLS ClientHello record stream `data`.
 ///
@@ -45,16 +45,13 @@ pub fn parse_sni(data: &[u8]) -> Option<String> {
     }
     // Reassemble the handshake byte stream across record boundaries: a
     // second record's 5-byte header is framing, not handshake content.
-    let assembled = assemble_handshake_message(data)?;
+    let message = handshake_message(data)?;
     // Handshake header: msg_type(1) length(3)
-    if assembled.message.len() < 4 || assembled.message[0] != 0x01 {
+    if message.len() < 4 || message[0] != 0x01 {
         return None;
     }
-    let hs_len = be_u24(&assembled.message[1..4]) as usize;
-    let hs = assembled
-        .message
-        .get(4..4 + hs_len)
-        .unwrap_or(&assembled.message[4..]);
+    let hs_len = be_u24(&message[1..4]) as usize;
+    let hs = message.get(4..4 + hs_len).unwrap_or(&message[4..]);
 
     // ClientHello body:
     //   client_version(2) random(32) session_id(<vec8>)
@@ -171,31 +168,7 @@ fn is_http1_request_line(line: &[u8]) -> bool {
 /// callers accumulate bytes while this returns `true`, re-running
 /// `parse_sni` after each read.
 pub fn sni_might_still_appear(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return true;
-    }
-    if data[0] != 0x16 {
-        return false; // not a Handshake record; byte 0 is final
-    }
-    if data.len() < 2 {
-        return true;
-    }
-    if data[1] != 0x03 {
-        return false; // wrong legacy record version; byte 1 is final
-    }
-    // Completeness is a record-layer question: each further record
-    // contributes payload minus its own 5-byte header, and the
-    // ClientHello may span records (RFC 8446 §5.1).
-    let Some(assembled) = assemble_handshake_message(data) else {
-        return true; // the first record header itself is still partial
-    };
-    if assembled.message.is_empty() {
-        return true; // handshake-type byte not seen yet
-    }
-    if assembled.message[0] != 0x01 {
-        return false; // handshake present but not a ClientHello
-    }
-    !assembled.complete // handshake body still short across records
+    client_hello_might_continue(data)
 }
 
 /// `true` if appending more bytes could still let [`parse_http_host`]
@@ -264,6 +237,20 @@ fn skip_vec(buf: &[u8], p: usize, len_bytes: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_handshake_cannot_gain_an_sni_by_appending_bytes() {
+        let interruption = [0x17, 0x03, 0x03, 0, 1, 0];
+        for end in 1..=interruption.len() {
+            let mut data = vec![0x16, 0x03, 0x01, 0, 4, 1, 0, 0, 100];
+            data.extend_from_slice(&interruption[..end]);
+            assert_eq!(parse_sni(&data), None);
+            assert!(!sni_might_still_appear(&data), "interruption prefix {end}");
+            data.extend_from_slice(&client_hello_with_sni("too-late.example"));
+            assert_eq!(parse_sni(&data), None);
+            assert!(!sni_might_still_appear(&data));
+        }
+    }
 
     #[test]
     fn incomplete_host_value_never_selects_a_partial_destination() {

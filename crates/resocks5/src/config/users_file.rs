@@ -410,22 +410,24 @@ pub(crate) fn write_atomic(path: &Path, config: &UsersConfig) -> Result<()> {
     let text = ktav::to_string(config).context("serialize users")?;
     let tmp = sibling_path(path, ".tmp");
 
-    let write_tmp = || -> Result<()> {
-        #[cfg(unix)]
-        let existing_mode = existing_target_mode(path)?;
+    #[cfg(unix)]
+    let existing_mode = existing_target_mode(path)?;
 
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Owner-only FROM CREATION: the credential-adjacent temp is
-            // never exposed at a looser mode, even briefly.
-            opts.mode(0o600);
-        }
-        let mut f = opts
-            .open(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    // Cleanup is allowed only after this call creates the file.
+    let mut f = opts.open(&tmp).with_context(|| {
+        format!(
+            "create {}; any existing recovery file was preserved",
+            tmp.display()
+        )
+    })?;
+    let write_result = (|| -> Result<()> {
         #[cfg(unix)]
         if let Some(mode) = existing_mode {
             use std::os::unix::fs::PermissionsExt;
@@ -441,8 +443,9 @@ pub(crate) fn write_atomic(path: &Path, config: &UsersConfig) -> Result<()> {
         f.sync_all()
             .with_context(|| format!("flush {}", tmp.display()))?;
         Ok(())
-    };
-    if let Err(e) = write_tmp() {
+    })();
+    drop(f);
+    if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -596,6 +599,27 @@ mod tests {
         // The temp file is gone after a successful write.
         assert!(!sibling_path(&path, ".tmp").exists());
         cleanup(&path);
+    }
+
+    #[test]
+    fn failed_write_preserves_an_existing_recovery_file() {
+        for target_exists in [false, true] {
+            let path = unique_path("preserve_recovery");
+            let config = UsersConfig {
+                users: vec![user("alice", "hash-1")],
+            };
+            if target_exists {
+                write_atomic(&path, &config).unwrap();
+            }
+            let tmp = sibling_path(&path, ".tmp");
+            let recovery = b"only surviving recovery copy";
+            fs::write(&tmp, recovery).unwrap();
+
+            assert!(write_atomic(&path, &config).is_err());
+            let preserved = fs::read(&tmp);
+            cleanup(&path);
+            assert_eq!(preserved.unwrap(), recovery);
+        }
     }
 
     #[test]

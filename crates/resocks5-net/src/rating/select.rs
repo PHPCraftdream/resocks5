@@ -2,9 +2,6 @@
 
 use crate::rating::rng::SmallRng;
 
-/// Small epsilon to avoid division by zero in `weighted_order`.
-const EPS: f64 = 1e-18;
-
 /// Return index `i` with probability `weights[i] / sum(weights)`.
 ///
 /// Defensive: if total weight is zero (or `weights` is empty), returns 0.
@@ -16,41 +13,77 @@ pub fn weighted_index(weights: &[f64], rng: &mut SmallRng) -> usize {
     let mut dart = rng.next_f64() * total;
     for (i, &w) in weights.iter().enumerate() {
         dart -= w;
-        if dart <= 0.0 {
+        if w > 0.0 && dart <= 0.0 {
             return i;
         }
     }
-    weights.len() - 1
+    weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
 }
 
 /// Return a permutation of `0..weights.len()` where higher-weight items
 /// tend to appear first (Efraimidis–Spirakis weighted reservoir sampling).
 ///
-/// The key is the textbook `u^(1/w)` computed in log space: since
-/// `u^(1/w) == exp(ln(u)/w)` and `exp` is strictly increasing, ordering by
-/// `ln(u)/w` descending is the identical ranking. The direct form must not
-/// be used: `u.powf(1/w)` underflows to exactly `0.0` for tiny weights
-/// (`0.25^1e6 == 0.0` for every `u < 1`), collapsing all small-weight
-/// entries to one key and letting the stable sort fall back to input
-/// order. `ln(u)/w` stays finite and distinct for any `w > 0`; a zero
-/// draw gives `-inf`, which still sorts last (a zero draw got key `0.0`
-/// under the old form too).
+/// Sorting `ln(-ln(u)) - ln(w)` ascending is equivalent to sorting
+/// `u^(1/w)` descending. The extra logarithm avoids underflow of the
+/// power and overflow of `ln(u)/w`, without clamping tiny positive weights.
+/// Zero draws and nonpositive or nonfinite weights sort last.
 pub fn weighted_order(weights: &[f64], rng: &mut SmallRng) -> Vec<usize> {
-    let mut keyed: Vec<(usize, f64)> = weights
-        .iter()
+    order_keys(weighted_keys(weights.iter().copied(), rng))
+}
+
+pub(super) fn weighted_keys(
+    weights: impl IntoIterator<Item = f64>,
+    rng: &mut SmallRng,
+) -> Vec<(usize, f64)> {
+    weights
+        .into_iter()
         .enumerate()
-        .map(|(i, &w)| {
-            let key = rng.next_f64().ln() / w.max(EPS);
+        .map(|(i, w)| {
+            let u = rng.next_f64();
+            let key = if w > 0.0 && w.is_finite() {
+                (-u.ln()).ln() - w.ln()
+            } else {
+                f64::INFINITY
+            };
             (i, key)
         })
-        .collect();
-    keyed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        .collect()
+}
+
+pub(super) fn order_keys(mut keyed: Vec<(usize, f64)>) -> Vec<usize> {
+    keyed.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     keyed.into_iter().map(|(i, _)| i).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weighted_order_is_invariant_under_a_common_weight_scale() {
+        let weights = [1.0, 2.0, 3.0, 4.0];
+        for seed in 0..16 {
+            let expected = weighted_order(&weights, &mut SmallRng::from_seed(seed));
+            for scale in [f64::MIN_POSITIVE, 1e-300, 1e-30, 1e30, 1e300] {
+                let scaled = weights.map(|weight| weight * scale);
+                assert_eq!(
+                    weighted_order(&scaled, &mut SmallRng::from_seed(seed)),
+                    expected,
+                    "seed {seed}, scale {scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_index_skips_zero_weight_when_the_random_draw_is_zero() {
+        let seed = 0u64.wrapping_sub(0x9E3779B97F4A7C15);
+        assert_eq!(SmallRng::from_seed(seed).next_f64(), 0.0);
+        assert_eq!(
+            weighted_index(&[0.0, 1.0], &mut SmallRng::from_seed(seed)),
+            1
+        );
+    }
 
     #[test]
     fn weighted_index_uniform_when_weights_equal() {
@@ -180,30 +213,22 @@ mod tests {
         );
     }
 
-    /// The log-space key is the same ranking as the textbook form:
-    /// `exp(ln(u)/w)` equals `u^(1/w)` within f64 rounding, and `exp` is
-    /// strictly increasing, so both induce identical orders.
     #[test]
     fn weighted_order_log_key_matches_powf_key_ranking() {
-        let us = [0.01_f64, 0.05, 0.25, 0.5, 0.75, 0.9, 0.99];
         let ws = [0.5_f64, 1.0, 2.0, 4.0, 10.0];
-        for &u in &us {
-            let powf_keys: Vec<f64> = ws.iter().map(|&w| u.powf(1.0 / w)).collect();
-            let log_keys: Vec<f64> = ws.iter().map(|&w| u.ln() / w).collect();
-            let rank = |keys: &[f64]| {
-                let mut v: Vec<usize> = (0..keys.len()).collect();
-                v.sort_by(|&a, &b| keys[b].partial_cmp(&keys[a]).unwrap());
-                v
-            };
-            assert_eq!(rank(&powf_keys), rank(&log_keys), "u={u}");
-            for (&w, &k) in ws.iter().zip(&log_keys) {
-                let back = k.exp();
-                let old = u.powf(1.0 / w);
-                assert!(
-                    (back - old).abs() <= 1e-9 * old,
-                    "u={u} w={w}: exp(ln(u)/w)={back} != u^(1/w)={old}"
-                );
-            }
+        for seed in 0..16 {
+            let mut reference_rng = SmallRng::from_seed(seed);
+            let keys: Vec<_> = ws
+                .iter()
+                .map(|&w| reference_rng.next_f64().powf(1.0 / w))
+                .collect();
+            let mut expected: Vec<_> = (0..ws.len()).collect();
+            expected.sort_by(|&a, &b| keys[b].total_cmp(&keys[a]));
+            assert_eq!(
+                weighted_order(&ws, &mut SmallRng::from_seed(seed)),
+                expected,
+                "seed {seed}"
+            );
         }
     }
 

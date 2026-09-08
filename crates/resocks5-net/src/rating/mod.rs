@@ -112,17 +112,14 @@ impl Ratings {
 
     /// Return a weighted permutation of all upstream indices.
     pub fn pick_order(&self) -> Vec<usize> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.cells.is_empty() {
-            return Vec::new();
-        }
-        let now = Instant::now();
-        let weights: Vec<f64> = inner
-            .cells
-            .iter()
-            .map(|s| s.weight(now, &self.policy))
-            .collect();
-        select::weighted_order(&weights, &mut inner.rng)
+        let keyed = {
+            let mut inner = self.inner.lock().unwrap();
+            let now = Instant::now();
+            let Inner { cells, rng } = &mut *inner;
+            select::weighted_keys(cells.iter().map(|s| s.weight(now, &self.policy)), rng)
+        };
+        // The O(n log n) sort does not hold the ratings lock.
+        select::order_keys(keyed)
     }
 }
 

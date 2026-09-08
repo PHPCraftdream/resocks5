@@ -25,10 +25,11 @@ impl Sand {
     }
 
     /// Effective sand level at `now`, after exponential decay.
+    /// Residuals below one millionth of `sand_max` are rounded to zero.
     pub fn level_at(&self, now: Instant, p: &RatingPolicy) -> f64 {
         let dt = now.saturating_duration_since(self.last).as_secs_f64();
         let decayed = self.level * (-dt / p.tau()).exp();
-        if decayed < 1e-6 {
+        if decayed < p.sand_max * 1e-6 {
             0.0
         } else {
             decayed
@@ -57,6 +58,31 @@ impl Sand {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn rescaling_sand_units_preserves_weights() {
+        let now = Instant::now();
+        let base = RatingPolicy::default();
+        let mut original = Sand::new(now);
+        original.observe_failure(now, &base);
+        for scale in [1e-300, 1e-8, 1e8] {
+            let scaled = RatingPolicy {
+                fail_penalty: base.fail_penalty * scale,
+                sand_max: base.sand_max * scale,
+                ..base
+            };
+            scaled.validate().unwrap();
+            let mut sand = Sand::new(now);
+            sand.observe_failure(now, &scaled);
+            for seconds in [0, 30, 120] {
+                let at = now + Duration::from_secs(seconds);
+                assert!(
+                    (sand.weight(at, &scaled) - original.weight(at, &base)).abs() < 1e-12,
+                    "scale {scale}, seconds {seconds}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn starts_at_zero_level_and_weight_one() {

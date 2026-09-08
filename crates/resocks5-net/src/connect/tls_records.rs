@@ -9,7 +9,7 @@
 //! content. Everything here is bounds-checked and never panics on
 //! malformed input.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 /// Content type of a TLS Handshake record.
 const HANDSHAKE: u8 = 0x16;
@@ -21,6 +21,7 @@ pub struct AssembledHandshake {
     /// Clipped to the bytes actually present when the stream is
     /// truncated, so callers parse the same prefix they would have
     /// before record-layer reassembly existed.
+    /// Bytes from later handshake messages are excluded.
     pub message: Vec<u8>,
     /// `true` when the message length declared in the handshake header
     /// is fully present — the whole message has arrived, across however
@@ -33,34 +34,14 @@ pub struct AssembledHandshake {
 ///
 /// Consecutive Handshake-type records are concatenated until the
 /// handshake header's declared length is satisfied; any other record
-/// type ends the handshake stream. Returns `None` only when `data`
-/// holds less than one complete record header.
+/// type ends the handshake stream. Returns `None` if the first record
+/// header is incomplete or its type is not Handshake.
 pub fn assemble_handshake_message(data: &[u8]) -> Option<AssembledHandshake> {
-    let records = walk_records(data);
-    match records.first() {
-        Some(first) if first.content_type == HANDSHAKE => {}
-        _ => return None,
-    }
-    let mut message = Vec::new();
-    let mut complete = false;
-    for record in records {
-        let TlsRecord {
-            content_type,
-            payload,
-        } = record;
-        if content_type != HANDSHAKE {
-            break; // the handshake stream is interrupted
-        }
-        message.extend_from_slice(&data[payload]);
-        if message.len() >= 4 {
-            let declared = 4 + be_u24(&message[1..4]) as usize;
-            if message.len() >= declared {
-                complete = true;
-                break;
-            }
-        }
-    }
-    Some(AssembledHandshake { message, complete })
+    let prefix = handshake_prefix(data)?;
+    Some(AssembledHandshake {
+        message: message_bytes(data, prefix.len).into_owned(),
+        complete: prefix.complete,
+    })
 }
 
 /// `true` when the ClientHello at the start of `data` is fully
@@ -69,10 +50,96 @@ pub fn assemble_handshake_message(data: &[u8]) -> Option<AssembledHandshake> {
 /// length. Callers are expected to have classified `data` as a
 /// ClientHello already; a non-ClientHello message is never complete.
 pub fn client_hello_is_complete(data: &[u8]) -> bool {
-    match assemble_handshake_message(data) {
-        Some(assembled) => assembled.complete && assembled.message.first() == Some(&0x01),
-        None => false,
+    handshake_prefix(data).is_some_and(|prefix| prefix.complete && prefix.kind == Some(0x01))
+}
+
+pub(super) fn client_hello_might_continue(data: &[u8]) -> bool {
+    if data.first().is_some_and(|&kind| kind != HANDSHAKE)
+        || data.get(1).is_some_and(|&major| major != 0x03)
+    {
+        return false;
     }
+    match handshake_prefix(data) {
+        Some(prefix) => {
+            prefix.kind.is_none_or(|kind| kind == 0x01) && !prefix.complete && prefix.extendable
+        }
+        None => data.len() < 5,
+    }
+}
+
+pub(super) fn handshake_message(data: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let prefix = handshake_prefix(data)?;
+    Some(message_bytes(data, prefix.len))
+}
+
+struct HandshakePrefix {
+    len: usize,
+    kind: Option<u8>,
+    complete: bool,
+    extendable: bool,
+}
+
+fn handshake_prefix(data: &[u8]) -> Option<HandshakePrefix> {
+    let mut records = walk_records(data);
+    let first = records.next()?;
+    if first.content_type != HANDSHAKE {
+        return None;
+    }
+    let mut prefix = HandshakePrefix {
+        len: 0,
+        kind: None,
+        complete: false,
+        extendable: true,
+    };
+    let mut header = [0; 4];
+    let mut header_len = 0;
+    let mut next_header = first.payload.end;
+    for record in std::iter::once(first).chain(records) {
+        if record.content_type != HANDSHAKE {
+            prefix.extendable = false;
+            break;
+        }
+        next_header = record.payload.end;
+        let payload = &data[record.payload];
+        let n = payload.len().min(header.len() - header_len);
+        header[header_len..header_len + n].copy_from_slice(&payload[..n]);
+        header_len += n;
+        prefix.len += payload.len();
+        if header_len != 0 {
+            prefix.kind = Some(header[0]);
+        }
+        if header_len == header.len() {
+            let declared = 4 + be_u24(&header[1..]) as usize;
+            if prefix.len >= declared {
+                prefix.len = declared;
+                prefix.complete = true;
+                break;
+            }
+        }
+    }
+    if data.get(next_header).is_some_and(|&kind| kind != HANDSHAKE) {
+        prefix.extendable = false;
+    }
+    Some(prefix)
+}
+
+fn message_bytes(data: &[u8], len: usize) -> Cow<'_, [u8]> {
+    let mut records = walk_records(data);
+    let first = records
+        .next()
+        .expect("handshake_prefix checked the first record");
+    if len <= first.payload.len() {
+        return Cow::Borrowed(&data[first.payload.start..first.payload.start + len]);
+    }
+    let mut message = Vec::with_capacity(len);
+    for record in std::iter::once(first).chain(records) {
+        let n = record.payload.len().min(len - message.len());
+        message.extend_from_slice(&data[record.payload.start..record.payload.start + n]);
+        if message.len() == len {
+            break;
+        }
+    }
+    Cow::Owned(message)
 }
 
 /// One record parsed from a TLS record-layer stream.
@@ -84,29 +151,20 @@ struct TlsRecord {
     payload: Range<usize>,
 }
 
-/// Parse consecutive TLS records from `data`, which must start at a
-/// record header. A trailing partial record — fewer than five header
-/// bytes left, or a declared length exceeding the bytes present — is
-/// included with its payload clipped to what is actually there.
-fn walk_records(data: &[u8]) -> Vec<TlsRecord> {
-    let mut records = Vec::new();
+/// Walk complete record headers lazily, clipping a truncated final payload.
+fn walk_records(data: &[u8]) -> impl Iterator<Item = TlsRecord> + '_ {
     let mut pos = 0usize;
-    while pos < data.len() {
-        let Some(header) = data.get(pos..pos + 5) else {
-            break; // partial record header at the tail
-        };
+    std::iter::from_fn(move || {
+        let payload_start = pos.checked_add(5)?;
+        let header = data.get(pos..payload_start)?;
         let len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        let Some(payload_end) = (pos + 5).checked_add(len) else {
-            break; // unreachable for in-memory buffers; refuse rather than wrap
-        };
-        let payload_end = payload_end.min(data.len());
-        records.push(TlsRecord {
-            content_type: header[0],
-            payload: pos + 5..payload_end,
-        });
+        let payload_end = payload_start.checked_add(len)?.min(data.len());
         pos = payload_end;
-    }
-    records
+        Some(TlsRecord {
+            content_type: header[0],
+            payload: payload_start..payload_end,
+        })
+    })
 }
 
 #[inline]
@@ -130,7 +188,7 @@ mod tests {
         let data = [
             0x16u8, 0x03, 0x01, 0x00, 0x02, 0xAA, 0xBB, 0x17, 0x03, 0x03, 0x00, 0x01, 0xCC,
         ];
-        let records = walk_records(&data);
+        let records: Vec<_> = walk_records(&data).collect();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].content_type, 0x16);
         assert_eq!(&data[records[0].payload.clone()], &[0xAA, 0xBB]);
@@ -141,7 +199,7 @@ mod tests {
     #[test]
     fn truncated_payload_is_clipped() {
         let data = [0x16u8, 0x03, 0x01, 0x00, 0x05, 0xAA, 0xBB];
-        let records = walk_records(&data);
+        let records: Vec<_> = walk_records(&data).collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].payload.len(), 2);
     }
@@ -156,6 +214,26 @@ mod tests {
             [0x01, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC]
         );
         assert!(assembled.complete);
+    }
+
+    #[test]
+    fn assembly_stops_at_the_first_message_boundary() {
+        let message = [0x01, 0, 0, 3, 0xAA, 0xBB, 0xCC];
+        for split in 1..=message.len() {
+            let mut data = one_record(HANDSHAKE, &message[..split]);
+            let mut tail = message[split..].to_vec();
+            tail.extend_from_slice(&[0x02, 0, 0, 1, 0xDD]);
+            data.extend_from_slice(&one_record(HANDSHAKE, &tail));
+            let assembled = assemble_handshake_message(&data).unwrap();
+            assert_eq!(assembled.message, message, "split at {split}");
+            assert!(assembled.complete);
+            assert!(client_hello_is_complete(&data));
+        }
+        let data = one_record(HANDSHAKE, &[0x01, 0, 0, 0, 0x02, 0, 0, 0]);
+        assert_eq!(
+            assemble_handshake_message(&data).unwrap().message,
+            [1, 0, 0, 0]
+        );
     }
 
     #[test]

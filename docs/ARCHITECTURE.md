@@ -113,6 +113,11 @@ upstreams with probability proportional to weight; in one client request it
 draws an entire weighted-random permutation (Efraimidis–Spirakis) so the
 fallback walk never revisits the same upstream.
 
+The permutation sorts `ln(-ln(U)) - ln(weight)` ascending. This preserves
+the ranking of `U^(1/weight)` without underflow or clamping small positive
+weights. Random keys are generated under the ratings mutex; sorting runs
+after that lock is released.
+
 ### Three desired properties — and how they fall out
 
 | Property | Why it holds |
@@ -127,8 +132,8 @@ Four predicates protect the model:
 
 1. **Hard clamp** at `SAND_MAX` after every failure — `level` cannot exceed
    the ceiling regardless of failure rate.
-2. **Floor at `1e-6`** — sub-microsecond residuals snap to zero, killing
-   float denormals and slow drift.
+2. **Floor at `SAND_MAX * 1e-6`** — negligible residuals snap to zero.
+   This relative threshold preserves behavior when sand units are rescaled.
 3. **Closed-form lazy decay** — `s · exp(−Δt / τ)` from a monotonic `Instant`.
    No accumulated discretization error; untouched cells decay to zero in
    bounded time.
