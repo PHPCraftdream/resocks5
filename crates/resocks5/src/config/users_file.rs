@@ -49,7 +49,7 @@ const LOCK_POLL: Duration = Duration::from_millis(10);
 
 #[cfg(unix)]
 mod platform {
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io;
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::raw::c_int;
@@ -453,6 +453,7 @@ pub(crate) fn write_atomic(path: &Path, config: &UsersConfig) -> Result<()> {
 /// Mode of the existing target file, if any (`None` = first write).
 #[cfg(unix)]
 fn existing_target_mode(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
     match fs::metadata(path) {
         Ok(md) => Ok(Some(md.permissions().mode())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
