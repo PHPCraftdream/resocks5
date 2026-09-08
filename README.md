@@ -60,8 +60,9 @@ demoting any that fail via the sand-rating model instead of dropping them.
 
 - **SOCKS5 + HTTP CONNECT** front end, auto-detected per connection.
 - **Upstream protocols:** SOCKS5, HTTP, and HTTPS (TLS-wrapped CONNECT) proxies.
-- **Rotation + stickiness:** round-robin across the pool, with a per-target
-  cache so a given destination keeps using the upstream that last worked.
+- **Rotation + stickiness:** weighted-random selection across the pool,
+  with a per-target cache so a given destination keeps using the upstream
+  that last worked.
 - **Gates (proxy chaining):** route through a gate proxy to a second proxy
   before reaching the target.
 - **Sand-rating soft-weight rotator:** each upstream has a per-failure
@@ -69,7 +70,7 @@ demoting any that fail via the sand-rating model instead of dropping them.
   is weighted-random with weight `exp(-k · sand)` — failing upstreams are
   picked less often but never excluded, and recover automatically as their
   sand drains. When every upstream is bad the weights equalise, so a
-  full outage degrades to uniform round-robin instead of locking out.
+  full outage degrades to uniform random selection instead of locking out.
 - **Per-upstream concurrency cap** to respect a provider's per-account/per-IP
   connection quota.
 - **Optional pre-warmed TCP pool** to cut connection latency.
@@ -95,7 +96,7 @@ pool.
 resocks5's **sand-rating** model takes the opposite stance. A failed upstream
 is *demoted*, never excluded: its selection weight decays toward (but never
 reaches) zero and recovers on its own as the sand drains. A full outage
-degrades to uniform round-robin instead of a lockout, and a recovering
+degrades to uniform random selection instead of a lockout, and a recovering
 upstream is probed for free because its weight never hits zero.
 
 ### How it compares
@@ -115,7 +116,9 @@ upstream is probed for free because its weight never hits zero.
 - **Rotation that never locks you out** — the sand-rating model's whole
   reason to exist.
 - **TLS fragmentation** for per-segment, SNI-based DPI, built in.
-- **Rust + rustls** — memory-safe, no `cmake` / C toolchain to build.
+- **Rust + rustls** — memory-safe; no `cmake` needed (`ring` compiles
+  bundled C sources, but the C compiler in any standard Rust build
+  environment — MSVC Build Tools, gcc, or clang — covers it).
 
 **Where the others still win**
 
@@ -138,7 +141,9 @@ to keep flowing when they misbehave," that's the case resocks5 is built for.
 Requires a recent stable Rust toolchain. The dependency tree (rustls 0.23,
 rpassword 7) sets the floor at **Rust 1.88+**, declared as `rust-version` in
 every crate and enforced by the `msrv` job in CI. The crate uses the `ring`
-crypto provider, so no C toolchain or `cmake` is needed to build.
+crypto provider, which compiles bundled C sources as part of the build, so
+a C compiler must be available — as it already is on any system set up to
+build Rust — but no `cmake` is needed.
 
 ```bash
 # Build from a checkout:

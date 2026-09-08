@@ -42,8 +42,15 @@ pub async fn connect_http_proxy(
     }
 }
 
+/// Perform the HTTP `CONNECT` handshake for one tunnel hop on an
+/// already-connected stream, leaving the stream usable for payload.
+///
+/// Public so that gate-tunnel callers in dependent crates can run the
+/// HTTP hop over any stream (plain, TLS, or TLS-in-TLS), not just
+/// [`UpstreamStream`].
+///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
-pub(crate) async fn http_connect_handshake<S>(
+pub async fn http_connect_handshake<S>(
     stream: &mut S,
     target_addr: &str,
     proxy: &ProxyConfig,

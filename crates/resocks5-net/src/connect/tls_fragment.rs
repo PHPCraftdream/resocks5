@@ -24,6 +24,53 @@ pub struct FragmentSpec {
     pub delay_ms: u64,
 }
 
+/// Outcome of matching a possibly-truncated byte prefix against the
+/// ClientHello signature.
+///
+/// A single TCP read may deliver fewer than the 6 bytes
+/// [`is_tls_client_hello`] needs, so deciding from one read misclassifies
+/// split ClientHellos as ordinary traffic. The third state lets a caller
+/// accumulate across reads until the signature is confirmed or ruled
+/// out (see [`classify_client_hello`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientHelloMatch {
+    /// `data` begins with a TLS ClientHello record.
+    ClientHello,
+    /// `data` is definitively not a ClientHello: a later read cannot
+    /// change bytes already inspected.
+    Other,
+    /// Fewer than 6 bytes, all consistent with a ClientHello prefix —
+    /// more bytes are needed to decide.
+    Indeterminate,
+}
+
+/// Match `data` against the ClientHello signature
+/// (`0x16 0x03 .. .. .. 0x01`), tolerating truncation. See
+/// [`is_tls_client_hello`] for the signature rationale and
+/// [`ClientHelloMatch`] for why the third state exists.
+pub fn classify_client_hello(data: &[u8]) -> ClientHelloMatch {
+    if data.is_empty() {
+        return ClientHelloMatch::Indeterminate;
+    }
+    if data[0] != 0x16 {
+        return ClientHelloMatch::Other;
+    }
+    if data.len() < 2 {
+        return ClientHelloMatch::Indeterminate;
+    }
+    if data[1] != 0x03 {
+        return ClientHelloMatch::Other;
+    }
+    if data.len() < 6 {
+        return ClientHelloMatch::Indeterminate;
+    }
+    if data[5] == 0x01 {
+        ClientHelloMatch::ClientHello
+    } else {
+        ClientHelloMatch::Other
+    }
+}
+
 /// Returns true if `data` begins with a TLS ClientHello record.
 /// Signature: 6 bytes — 5-byte record header + 1-byte handshake type:
 ///
@@ -36,7 +83,7 @@ pub struct FragmentSpec {
 /// binary stream won't start with these exact bytes by accident in any
 /// practical traffic.
 fn is_tls_client_hello(data: &[u8]) -> bool {
-    data.len() >= 6 && data[0] == 0x16 && data[1] == 0x03 && data[5] == 0x01
+    matches!(classify_client_hello(data), ClientHelloMatch::ClientHello)
 }
 
 /// Write `data` to `writer`.
@@ -155,6 +202,60 @@ mod tests {
         // miss unless byte 5 happens to also be 0x01.
         let data = [0x16, 0x03, 0x99, 0x99, 0x99, 0xFF];
         assert!(!is_tls_client_hello(&data));
+    }
+
+    #[test]
+    fn classify_agrees_with_is_tls_client_hello() {
+        let cases: Vec<Vec<u8>> = vec![
+            ch(0x01),
+            ch(0x02),
+            vec![],
+            vec![0x16],
+            vec![0x16, 0x03],
+            vec![0x16, 0x03, 0x01],
+            vec![0x16, 0x03, 0x01, 0x00],
+            vec![0x16, 0x03, 0x01, 0x00, 0x10],
+            vec![0x15, 0x03, 0x01, 0x00, 0x02, 0x01],
+            vec![0x17, 0x03, 0x03, 0x00, 0x10, 0x01],
+            vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01],
+            vec![0x16, 0x02, 0x01, 0x00, 0x10, 0x01],
+            vec![0x16, 0x03, 0x99, 0x99, 0x99, 0xFF],
+        ];
+        for data in &cases {
+            assert_eq!(
+                classify_client_hello(data) == ClientHelloMatch::ClientHello,
+                is_tls_client_hello(data),
+                "mismatch for {data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_reports_indeterminate_for_partial_signatures() {
+        // The exact R21 defect: a 5-byte first segment of a ClientHello.
+        assert_eq!(classify_client_hello(&[]), ClientHelloMatch::Indeterminate);
+        assert_eq!(
+            classify_client_hello(&[0x16]),
+            ClientHelloMatch::Indeterminate
+        );
+        assert_eq!(
+            classify_client_hello(&[0x16, 0x03]),
+            ClientHelloMatch::Indeterminate
+        );
+        assert_eq!(
+            classify_client_hello(&[0x16, 0x03, 0x01, 0x00, 0x10]),
+            ClientHelloMatch::Indeterminate
+        );
+    }
+
+    #[test]
+    fn classify_rules_out_non_hello_prefixes_before_six_bytes() {
+        assert_eq!(classify_client_hello(&[0x17]), ClientHelloMatch::Other);
+        assert_eq!(
+            classify_client_hello(&[0x16, 0x02]),
+            ClientHelloMatch::Other
+        );
+        assert_eq!(classify_client_hello(b"GET"), ClientHelloMatch::Other);
     }
 
     #[tokio::test]

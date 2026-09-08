@@ -24,6 +24,7 @@ pub mod proxy_list_path;
 pub mod tls_fragment_config;
 pub mod user;
 pub mod users_config;
+pub(crate) mod users_file;
 pub mod users_path;
 
 pub use auth_config::AuthConfig;

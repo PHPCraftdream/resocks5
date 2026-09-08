@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Result};
@@ -11,6 +12,7 @@ use tokio::sync::Semaphore;
 
 use crate::auth::compute_hash::compute_hash;
 use crate::auth::params::argon2_instance;
+use crate::config::users_file::{write_atomic, UsersFileLock};
 use crate::config::{AuthConfig, User, UsersConfig};
 
 /// Sentinel value placed in a `User.hash` to indicate that the password
@@ -183,8 +185,9 @@ impl AuthState {
     /// Implements the `hash == "init"` first-login claim flow. Returns
     /// `true` when the password was either just recorded for the user
     /// (we won the race), or matches the hash that was recorded by a
-    /// concurrent winner. Returns `false` on hash-compute failure, disk
-    /// persistence failure, or a real password mismatch.
+    /// concurrent winner — in-process or on disk. Returns `false` on
+    /// hash-compute failure, disk persistence failure, or a real
+    /// password mismatch.
     fn try_claim_init(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> bool {
         // Compute the new hash outside the write lock — Argon2id takes
         // ~15 ms and we don't want it blocking concurrent read-side
@@ -212,26 +215,108 @@ impl AuthState {
             return false;
         }
 
-        users[idx].hash = new_hash;
-        let snapshot = UsersConfig {
-            users: users.clone(),
-        };
+        users[idx].hash = new_hash.clone();
 
-        // Persist the entire users file under the write lock so on-disk
-        // and in-memory states stay consistent. On failure, revert the
-        // in-memory change so a retry can re-attempt the claim cleanly.
-        if let Err(e) = ktav::to_file(&snapshot, &self.users_path) {
-            users[idx].hash = INIT_HASH.to_string();
-            eprintln!(
-                "init-claim: failed to persist {} after first-login of '{}': {}",
-                self.users_path, name, e
-            );
-            return false;
+        // Persist this one claim on top of what is CURRENTLY on disk —
+        // not on top of our startup snapshot. A CLI process may have
+        // edited the file since we loaded it; writing our whole stale
+        // snapshot back would silently revert those edits. The write
+        // guard stays held across persistence: it serializes claims
+        // within this process, while the file lock serializes against
+        // other processes.
+        match persist_claim(Path::new(&self.users_path), name, &new_hash, &users) {
+            ClaimPersist::Written => {
+                drop(users);
+                self.cache.insert(name.to_string(), candidate_hmac);
+                true
+            }
+            ClaimPersist::DiskHashChanged(disk_hash) => {
+                // The file's hash for this user stopped being "init"
+                // while we worked — a real password landed on disk via a
+                // concurrent CLI edit. Disk wins: adopt its hash and
+                // treat our candidate as a normal login against it
+                // instead of clobbering it.
+                users[idx].hash = disk_hash.clone();
+                drop(users);
+                if argon2_verify(&disk_hash, password) {
+                    self.cache.insert(name.to_string(), candidate_hmac);
+                    true
+                } else {
+                    false
+                }
+            }
+            ClaimPersist::Failed(e) => {
+                users[idx].hash = INIT_HASH.to_string();
+                eprintln!(
+                    "init-claim: failed to persist {} after first-login of '{}': {}",
+                    self.users_path, name, e
+                );
+                false
+            }
         }
+    }
+}
 
-        drop(users);
-        self.cache.insert(name.to_string(), candidate_hmac);
-        true
+/// Outcome of the cross-process persist of an init-claim.
+enum ClaimPersist {
+    /// The claimed hash was merged into the on-disk file.
+    Written,
+    /// The on-disk hash for this user is no longer the `"init"`
+    /// sentinel; carries the current on-disk value. Nothing was written.
+    DiskHashChanged(String),
+    /// Nothing was written; carries the reason.
+    Failed(anyhow::Error),
+}
+
+/// Merge a single init-claim into the users file under the cross-process
+/// file lock, then atomically replace the file.
+///
+/// `fallback_users` (the caller's full in-memory list, with the claimed
+/// hash already applied) is only written wholesale when the file does
+/// not exist yet — there is nothing on disk to merge into, so this
+/// preserves the old "first claim creates the file" behavior.
+fn persist_claim(path: &Path, name: &str, new_hash: &str, fallback_users: &[User]) -> ClaimPersist {
+    let _lock = match UsersFileLock::acquire(path) {
+        Ok(lock) => lock,
+        Err(e) => return ClaimPersist::Failed(e.context("acquire users-file lock")),
+    };
+
+    if !path.exists() {
+        let cfg = UsersConfig {
+            users: fallback_users.to_vec(),
+        };
+        return match write_atomic(path, &cfg) {
+            Ok(()) => ClaimPersist::Written,
+            Err(e) => ClaimPersist::Failed(e),
+        };
+    }
+
+    let mut disk: UsersConfig = match ktav::from_file(path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return ClaimPersist::Failed(
+                anyhow::Error::new(e).context(format!("read {}", path.display())),
+            )
+        }
+    };
+
+    let Some(user) = disk.users.iter_mut().find(|u| u.name == name) else {
+        return ClaimPersist::Failed(anyhow!(
+            "user '{}' no longer exists in {} — removed by a concurrent CLI edit, \
+             not re-adding it",
+            name,
+            path.display()
+        ));
+    };
+
+    if user.hash != INIT_HASH {
+        return ClaimPersist::DiskHashChanged(user.hash.clone());
+    }
+
+    user.hash = new_hash.to_string();
+    match write_atomic(path, &disk) {
+        Ok(()) => ClaimPersist::Written,
+        Err(e) => ClaimPersist::Failed(e),
     }
 }
 
@@ -258,6 +343,7 @@ mod tests {
     use super::*;
     use crate::auth::compute_hash;
     use crate::config::User;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -314,6 +400,15 @@ mod tests {
             path.clone(),
         )
         .unwrap();
+        (state, path)
+    }
+
+    /// Like `build_state_persistent`, but also writes the users file to
+    /// disk first, so the state has an on-disk baseline that a simulated
+    /// CLI edit can diverge from.
+    fn build_state_with_disk_file(users: Vec<User>, allow_anonymous: bool) -> (AuthState, String) {
+        let (state, path) = build_state_persistent(users.clone(), allow_anonymous);
+        crate::config::users_file::write_atomic(Path::new(&path), &UsersConfig { users }).unwrap();
         (state, path)
     }
 
@@ -639,6 +734,162 @@ mod tests {
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
         assert!(r1 && r2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── cross-process safety: CLI edits vs init-claim (R13) ────────
+
+    #[test]
+    fn init_claim_preserves_concurrent_cli_edit_to_other_users() {
+        // Server snapshot is [alice enabled, bob init]; a CLI process
+        // then disables alice and adds carol ON DISK; finally bob
+        // claims. The claim must merge into the on-disk truth, not
+        // overwrite it with the stale snapshot.
+        let baseline = vec![
+            make_user("alice", "alice-pw", true),
+            make_init_user("bob", true),
+        ];
+        let (state, path) = build_state_with_disk_file(baseline.clone(), false);
+
+        // Simulated CLI edit (separate process writing the file).
+        let cli_edit = vec![
+            User {
+                is_enabled: false,
+                ..baseline[0].clone()
+            },
+            make_init_user("bob", true),
+            make_init_user("carol", true),
+        ];
+        ktav::to_file(&UsersConfig { users: cli_edit }, &path).unwrap();
+
+        assert!(state.verify("bob", "bob-pw"));
+
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(loaded.users.len(), 3, "CLI-added user must survive");
+        let alice = loaded.users.iter().find(|u| u.name == "alice").unwrap();
+        assert!(!alice.is_enabled, "CLI disable must survive the claim");
+        let carol = loaded.users.iter().find(|u| u.name == "carol").unwrap();
+        assert_eq!(carol.hash, INIT_HASH);
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, INIT_HASH);
+        assert!(bob.hash.starts_with("$argon2id$"));
+
+        // A server restarted on the merged file sees the CLI's edits too.
+        let fresh = AuthState::build(
+            &AuthConfig {
+                allow_anonymous: false,
+            },
+            &loaded,
+            path.clone(),
+        )
+        .unwrap();
+        assert!(fresh.verify("bob", "bob-pw"));
+        assert!(
+            !fresh.verify("alice", "alice-pw"),
+            "alice must still be disabled on disk"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_claim_yields_to_cli_password_change_for_same_user() {
+        // R13, same-user variant: the CLI set a real password for bob
+        // while the server still believed bob was unclaimed. The claim
+        // must adopt the on-disk hash, not overwrite it.
+        let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)], false);
+        let cli_hash = compute_hash("cli-pw").unwrap();
+        ktav::to_file(
+            &UsersConfig {
+                users: vec![User {
+                    name: "bob".into(),
+                    hash: cli_hash.clone(),
+                    is_enabled: true,
+                    direct: false,
+                }],
+            },
+            &path,
+        )
+        .unwrap();
+
+        // The client submits the password the CLI installed.
+        assert!(state.verify("bob", "cli-pw"));
+
+        // The CLI's hash is still on disk, byte-for-byte.
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(loaded.users[0].hash, cli_hash);
+
+        // In-memory state adopted it too — wrong passwords now take the
+        // normal rejection path and never rewrite the file.
+        assert!(!state.verify("bob", "wrong"));
+        let reloaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(reloaded.users[0].hash, cli_hash);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_claim_fails_when_user_removed_from_disk_by_cli() {
+        // R13, removal variant: CLI deleted bob from the file while the
+        // server's snapshot still had him. The claim must fail closed —
+        // not resurrect bob by writing the stale snapshot back.
+        let baseline = vec![
+            make_user("alice", "alice-pw", true),
+            make_init_user("bob", true),
+        ];
+        let (state, path) = build_state_with_disk_file(baseline.clone(), false);
+
+        let cli_edit = vec![baseline[0].clone()]; // bob removed
+        ktav::to_file(&UsersConfig { users: cli_edit }, &path).unwrap();
+
+        assert!(!state.verify("bob", "anything"));
+
+        // In-memory hash reverted to the sentinel so state stays
+        // consistent with disk.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH);
+        }
+
+        // On-disk file untouched: still exactly the CLI's version.
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(loaded.users.len(), 1);
+        assert_eq!(loaded.users[0].name, "alice");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_claim_write_failure_leaves_previous_disk_file_intact() {
+        // R12 through the claim path: the persist starts but fails
+        // mid-way (the temp-file slot is sabotaged with a directory).
+        // The previous on-disk file must survive byte-for-byte and the
+        // in-memory sentinel must be restored for a retry.
+        let baseline = vec![
+            make_user("alice", "alice-pw", true),
+            make_init_user("bob", true),
+        ];
+        let (state, path) = build_state_with_disk_file(baseline, false);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let tmp = PathBuf::from(format!("{}.tmp", path));
+        std::fs::create_dir(&tmp).unwrap();
+
+        assert!(!state.verify("bob", "pw"));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "failed persist must leave the previous file intact"
+        );
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH, "sentinel must be restored on failure");
+        }
+
+        std::fs::remove_dir(&tmp).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }

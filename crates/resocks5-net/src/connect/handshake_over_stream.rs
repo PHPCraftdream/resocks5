@@ -59,15 +59,10 @@ where
         }
     }
 
-    let parts: Vec<&str> = target_addr.rsplitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err(anyhow!(
-            "[SOCKS5] Invalid target address format: {}",
-            target_addr
-        ));
-    }
-    let port: u16 = parts[0].parse()?;
-    let host = parts[1];
+    let parsed = super::HostPort::parse(target_addr)
+        .ok_or_else(|| anyhow!("[SOCKS5] Invalid target address format: {}", target_addr))?;
+    let host = parsed.host;
+    let port = parsed.port;
     let (atyp, addr_bytes) = if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
         (0x01, ipv4.octets().to_vec())
     } else if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
@@ -113,4 +108,135 @@ where
         _ => return Err(anyhow!("[SOCKS5] Unknown address type in response")),
     }
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv6Addr;
+    use std::time::Duration;
+
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    use super::handshake_over_stream;
+
+    /// Minimal no-auth SOCKS5 server stub over a duplex half: completes the
+    /// greeting, captures the CONNECT request (head + address + port), then
+    /// replies with success and the payload `ok`.
+    async fn stub_server(mut upstream: tokio::io::DuplexStream) -> ([u8; 4], Vec<u8>) {
+        let mut greeting = [0u8; 3];
+        upstream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x00]);
+        upstream.write_all(&[0x05, 0x00]).await.unwrap();
+
+        let mut head = [0u8; 4];
+        upstream.read_exact(&mut head).await.unwrap();
+        let mut addr = match head[3] {
+            0x01 => {
+                let mut b = [0u8; 6];
+                upstream.read_exact(&mut b).await.unwrap();
+                b.to_vec()
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                upstream.read_exact(&mut len).await.unwrap();
+                let mut b = vec![0u8; len[0] as usize + 2];
+                upstream.read_exact(&mut b).await.unwrap();
+                b
+            }
+            0x04 => {
+                let mut b = [0u8; 18];
+                upstream.read_exact(&mut b).await.unwrap();
+                b.to_vec()
+            }
+            other => panic!("unexpected ATYP {other:02x}"),
+        };
+        addr.insert(0, head[3]);
+        upstream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        upstream.write_all(b"ok").await.unwrap();
+        (head, addr)
+    }
+
+    /// Drive the client side and return the captured request head and
+    /// ATYP-prefixed address bytes, asserting the returned stream still
+    /// carries the stub's `ok` payload.
+    async fn exchange(target: &str) -> anyhow::Result<([u8; 4], Vec<u8>)> {
+        let (mut client, upstream) = duplex(4096);
+        let server = tokio::spawn(stub_server(upstream));
+        let stream = handshake_over_stream(&mut client, target, None).await?;
+        let mut payload = Vec::new();
+        tokio::pin!(stream);
+        stream.read_to_end(&mut payload).await?;
+        assert_eq!(payload, b"ok");
+        Ok(server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_uses_atyp4() {
+        let (head, addr) = tokio::time::timeout(Duration::from_secs(5), exchange("[::1]:443"))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(head, [0x05, 0x01, 0x00, 0x04]);
+        assert_eq!(addr[0], 0x04);
+        assert_eq!(&addr[1..17], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(&addr[17..], &[0x01, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn bare_ipv6_uses_atyp4() {
+        let (head, addr) = tokio::time::timeout(Duration::from_secs(5), exchange("::1:443"))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(head, [0x05, 0x01, 0x00, 0x04]);
+        assert_eq!(&addr[1..17], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(&addr[17..], &[0x01, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn ipv4_uses_atyp1() {
+        let (head, addr) = tokio::time::timeout(Duration::from_secs(5), exchange("1.2.3.4:443"))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(head, [0x05, 0x01, 0x00, 0x01]);
+        assert_eq!(addr, vec![0x01, 1, 2, 3, 4, 0x01, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn domain_uses_atyp3() {
+        let (head, addr) =
+            tokio::time::timeout(Duration::from_secs(5), exchange("example.com:443"))
+                .await
+                .expect("timed out")
+                .unwrap();
+        assert_eq!(head, [0x05, 0x01, 0x00, 0x03]);
+        assert_eq!(addr[0], 0x03);
+        assert_eq!(&addr[1..12], b"example.com");
+        assert_eq!(&addr[12..], &[0x01, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn missing_port_is_rejected() {
+        let result = tokio::time::timeout(Duration::from_secs(5), exchange("no-port-target"))
+            .await
+            .expect("timed out");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn full_ipv6_bracketed() {
+        let (head, addr) =
+            tokio::time::timeout(Duration::from_secs(5), exchange("[2001:db8::1]:443"))
+                .await
+                .expect("timed out")
+                .unwrap();
+        assert_eq!(head, [0x05, 0x01, 0x00, 0x04]);
+        let expected: [u8; 16] = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
+        assert_eq!(&addr[1..17], &expected);
+        assert_eq!(&addr[17..], &[0x01, 0xBB]);
+    }
 }

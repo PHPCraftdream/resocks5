@@ -96,7 +96,9 @@ pub async fn run_server(
         // so it doesn't grow unboundedly with completed handlers. (The
         // permit-via-Semaphore enforces the live cap, but this keeps
         // memory tight.)
-        while tasks.try_join_next().is_some() {}
+        while let Some(res) = tasks.try_join_next() {
+            report_finished_task(logger, res);
+        }
 
         tokio::select! {
             // Bias accept toward listening rather than to the shutdown
@@ -202,8 +204,123 @@ pub async fn run_server(
     // Drain active handlers with a deadline. After it expires whatever
     // is still running gets aborted by the runtime when this function
     // returns (the JoinSet drops, all its tasks are cancelled).
-    let drain = async { while tasks.join_next().await.is_some() {} };
+    let drain = async {
+        while let Some(res) = tasks.join_next().await {
+            report_finished_task(logger, res);
+        }
+    };
     let _ = tokio::time::timeout(Duration::from_secs(SHUTDOWN_DRAIN_SEC), drain).await;
     logger.lifecycle(|| "Shutdown complete.".to_string());
     Ok(())
+}
+
+/// Inspect one finished connection-handler task instead of discarding
+/// its `Result`. A panic in `handle_client` unwinds past the handler's
+/// own `connection_error` logging, so this `JoinError` is the only
+/// trace it leaves. Cancellation is deliberately silent: it is the
+/// expected outcome of the drain-timeout path dropping the `JoinSet`,
+/// and nothing aborts individual tasks before that point.
+fn report_finished_task(logger: &Logger, res: Result<(), tokio::task::JoinError>) {
+    match res {
+        Ok(()) => {}
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => logger.connection_error(|| format!("connection handler task panicked: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logger::{ELog, LogConfig};
+    use tokio::sync::mpsc;
+
+    fn panic_reporting_logger() -> (Arc<Logger>, mpsc::Receiver<ELog>) {
+        let (tx, rx) = mpsc::channel::<ELog>(4);
+        let cfg = LogConfig {
+            connection_errors: true,
+            ..Default::default()
+        };
+        (Arc::new(Logger::new(tx, cfg)), rx)
+    }
+
+    /// A panicked handler must be observable as `Some(Err(e))` with
+    /// `is_panic() == true` and produce a visible log line — it used to
+    /// vanish because the accept-loop cleanup discarded every result
+    /// (review R25).
+    #[tokio::test]
+    async fn panicking_task_surfaces_as_join_error_and_log_line() {
+        let (logger, mut rx) = panic_reporting_logger();
+
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        tasks.spawn(async {
+            panic!("simulated handler panic");
+        });
+
+        // Accept-loop shape: poll without blocking until the task is
+        // joinable. Bounded so a regression can't spin forever.
+        let mut finished = None;
+        for _ in 0..100 {
+            match tasks.try_join_next() {
+                Some(res) => {
+                    finished = Some(res);
+                    break;
+                }
+                None => tokio::task::yield_now().await,
+            }
+        }
+        let res = finished.expect("panicked task must become joinable");
+        assert!(res.is_err());
+        assert!(
+            res.as_ref().unwrap_err().is_panic(),
+            "JoinError must be reported as a panic"
+        );
+
+        report_finished_task(&logger, res);
+        let msg = match rx.recv().await {
+            Some(ELog::Error(m)) => m,
+            _ => panic!("expected a connection_error for the panicked handler"),
+        };
+        assert!(
+            msg.contains("panicked") && msg.contains("simulated handler panic"),
+            "panic report must name the panic, got: {msg}"
+        );
+    }
+
+    /// Drain-loop shape: `join_next().await` resolves with the panic and
+    /// the fixed loop routes it to the logger. Cancellation — the
+    /// expected drain-timeout abort outcome — must stay unlogged.
+    #[tokio::test]
+    async fn drain_loop_reports_panic_but_stays_silent_on_cancellation() {
+        let (logger, mut rx) = panic_reporting_logger();
+
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        tasks.spawn(async {
+            panic!("drain-side panic");
+        });
+        while let Some(res) = tasks.join_next().await {
+            report_finished_task(&logger, res);
+        }
+        let msg = match rx.recv().await {
+            Some(ELog::Error(m)) => m,
+            _ => panic!("expected a connection_error for the panicked handler"),
+        };
+        assert!(msg.contains("drain-side panic"), "got: {msg}");
+
+        // A real cancelled JoinError: abort a sleeping task mid-flight.
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        let handle = tasks.spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        handle.abort();
+        let res = tasks
+            .join_next()
+            .await
+            .expect("aborted task must yield a result");
+        assert!(res.as_ref().unwrap_err().is_cancelled());
+        report_finished_task(&logger, res);
+        assert!(
+            rx.try_recv().is_err(),
+            "cancellation must not be logged (expected on drain-timeout abort)"
+        );
+    }
 }

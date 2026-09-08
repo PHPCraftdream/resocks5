@@ -11,7 +11,9 @@ impl SmallRng {
         Self { state: seed }
     }
 
-    /// Create from OS entropy.
+    /// Create from process-local entropy (wall-clock time XORed with the
+    /// current thread ID) — not an OS-backed or cryptographic entropy
+    /// source, but sufficient to seed weighted selection.
     pub fn from_os() -> Self {
         // Use std::time + std::thread::current().id() as entropy sources.
         // This is not cryptographic quality, but sufficient for weighted

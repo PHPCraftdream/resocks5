@@ -21,6 +21,6 @@ pub mod any_upstream;
 pub mod pool_config;
 pub mod proxy_pool;
 
-pub use any_upstream::AnyUpstream;
+pub use any_upstream::{AnyUpstream, BoxedUpstream};
 pub use pool_config::PoolConfig;
 pub use proxy_pool::{AtCapacity, ProxyPool, UpstreamStream};

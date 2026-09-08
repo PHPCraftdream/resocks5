@@ -15,9 +15,10 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
+use resocks5_net::connect::recover_host::{http_host_might_still_appear, sni_might_still_appear};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
-use resocks5_net::pool::ProxyPool;
+use resocks5_net::pool::{AnyUpstream, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
 
 /// Maximum size of the request line + headers section. 16 KiB matches
@@ -241,13 +242,80 @@ fn ipv4_literal_port(target: &str) -> Option<&str> {
     }
 }
 
+/// Mirror of the SOCKS5 handler's grace window: how long a client-first
+/// protocol (TLS, HTTP) typically needs to produce its first
+/// application bytes after the early 200 reply. Only when this expires
+/// with a STILL silent client do we consider the upstream a
+/// server-speaks-first protocol and give it a chance to greet first.
+const CLIENT_FIRST_GRACE: Duration = Duration::from_millis(1000);
+
+/// Outcome of the recovery peek (mirror of the SOCKS5 variant).
+enum RecoveryPeek {
+    /// The client spoke first: its accumulated prefix (possibly
+    /// truncated mid-record if the client EOF'd — recovery proceeds
+    /// with whatever is there, falling back to the IP).
+    Client(Vec<u8>),
+    /// The client closed without sending anything.
+    ClientClosed,
+    /// The upstream greeted first — a server-speaks-first protocol.
+    /// The upstream is already connected (by the original IP, nothing
+    /// having been recovered) and carries the first banner bytes,
+    /// which must be relayed to the client before forwarding starts.
+    ServerFirst(AnyUpstream, Vec<u8>),
+}
+
+/// Accumulate the client's first application record across TCP segment
+/// boundaries until recovery can decide: SNI/Host found, definitively
+/// absent (both probes say no more bytes can help), or the 16 KiB cap
+/// hit (proceed with what we have, same fallback-to-IP as before).
+/// `seed` is bytes already read — the CONNECT request's pipelined
+/// payload, if any (possibly empty). Returns `None` only for a clean
+/// EOF before ANY byte.
+///
+/// Bounded by the caller's `timeout` — individual reads here carry no
+/// deadline of their own.
+/// cancel-safe: NO — bytes already consumed before cancellation are
+/// lost; callers close the stream on timeout.
+async fn read_recovery_prefix(
+    client: &mut TcpStream,
+    mut buf: Vec<u8>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    const PEEK_MAX: usize = 16 * 1024;
+    let mut tmp = [0u8; 4096];
+    loop {
+        if parse_sni(&buf).is_some()
+            || parse_http_host(&buf).is_some()
+            || (!sni_might_still_appear(&buf) && !http_host_might_still_appear(&buf))
+            || buf.len() >= PEEK_MAX
+        {
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        let n = client.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        let take = n.min(PEEK_MAX - buf.len());
+        buf.extend_from_slice(&tmp[..take]);
+    }
+}
+
 /// HTTP CONNECT recovery path: target is a bare IPv4 and recovery is on.
 ///
 /// Mirror of the SOCKS5 `recover_and_tunnel`: reply `200 Connection
-/// Established` early so the client emits its first record, recover the
-/// hostname from the pipelined ClientHello (or the first read) via TLS
-/// SNI / HTTP `Host`, open the upstream by that domain (falling back to
-/// the IP), forward the buffered record, then tunnel.
+/// Established` early so the client emits its first record, then
+/// accumulate that record across reads (TCP segmentation routinely
+/// splits a ClientHello, and a pipelined fast-open hello can itself be
+/// truncated) until TLS SNI / HTTP `Host` recovery can decide, the
+/// probes rule the record out, or the 16 KiB cap is hit — all under the
+/// existing client-protocol deadline. Open the upstream by that domain
+/// (falling back to the IP), forward the buffered record, then tunnel.
+///
+/// A client still silent after the ~1 s grace (`CLIENT_FIRST_GRACE`) is
+/// unlikely to be TLS/HTTP (those speak within an RTT): the upstream —
+/// dialed by the original IP, nothing recovered yet — then gets one
+/// chance to greet first. A server-speaks-first protocol (SSH, SMTP,
+/// FTP) does, and we fall back to plain forwarding by IP; otherwise we
+/// keep waiting for the client as before.
 #[allow(clippy::too_many_arguments)]
 async fn recover_and_tunnel_http(
     mut client_stream: TcpStream,
@@ -275,16 +343,19 @@ async fn recover_and_tunnel_http(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    // First record: prefer a pipelined ClientHello, else read one under
-    // the client-protocol deadline.
-    let buf: Vec<u8> = if !pipelined.is_empty() {
-        pipelined
-    } else {
-        let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
-        let mut b = vec![0u8; 16 * 1024];
-        let n = match timeout(protocol_dur, client_stream.read(&mut b)).await {
-            Ok(Ok(0)) => return Ok(()),
-            Ok(Ok(n)) => n,
+    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
+    let peeked = if !pipelined.is_empty() {
+        // The client already spoke (CONNECT + pipelined payload), so
+        // there is no server-first ambiguity: complete the prefix under
+        // the client-protocol deadline. For an already-decidable
+        // pipelined record this reads nothing — same as before.
+        match timeout(
+            protocol_dur,
+            read_recovery_prefix(&mut client_stream, pipelined),
+        )
+        .await
+        {
+            Ok(Ok(prefix)) => prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client),
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
                 return Err(anyhow!(
@@ -293,9 +364,120 @@ async fn recover_and_tunnel_http(
                     ctag
                 ));
             }
-        };
-        b.truncate(n);
-        b
+        }
+    } else {
+        match timeout(protocol_dur, async {
+            let mut tmp = [0u8; 4096];
+            let mut up_tmp = [0u8; 4096];
+            Ok(match timeout(CLIENT_FIRST_GRACE, client_stream.read(&mut tmp)).await {
+                // The client spoke within the grace window: recovery proceeds.
+                Ok(Ok(0)) => RecoveryPeek::ClientClosed,
+                Ok(Ok(n)) => {
+                    let seed = tmp[..n].to_vec();
+                    read_recovery_prefix(&mut client_stream, seed)
+                        .await
+                        .map(|p| p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client))?
+                }
+                Ok(Err(e)) => return Err(e),
+                // Client silent through the grace window: give the
+                // upstream — addressed by the original IP, nothing
+                // recovered yet — one chance to greet first
+                // (server-speaks-first protocols, e.g. SSH over an
+                // IPv4 CONNECT).
+                Err(_) => match server::establish_connection(
+                    target,
+                    gate_rotator,
+                    v6_rotator,
+                    v4_rotator,
+                    logger,
+                    banned,
+                    pool,
+                    network,
+                    client_user,
+                    tls_connector,
+                )
+                .await
+                {
+                    Ok(mut upstream) => {
+                        tokio::select! {
+                            r = client_stream.read(&mut tmp) => match r {
+                                Ok(0) => RecoveryPeek::ClientClosed,
+                                Ok(n) => {
+                                    let seed = tmp[..n].to_vec();
+                                    read_recovery_prefix(&mut client_stream, seed)
+                                        .await
+                                        .map(|p| {
+                                            p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
+                                        })?
+                                }
+                                Err(e) => return Err(e),
+                            },
+                            r = upstream.read(&mut up_tmp) => match r {
+                                Ok(n) if n > 0 => {
+                                    RecoveryPeek::ServerFirst(upstream, up_tmp[..n].to_vec())
+                                }
+                                // Upstream closed or errored without a
+                                // greeting: not server-first after
+                                // all. Keep waiting for the client;
+                                // the established connection is
+                                // dropped — recovery opens a fresh one
+                                // by host, and no queued upstream byte
+                                // was ever relayed, so dropping is
+                                // invisible to the client.
+                                _ => {
+                                    let prefix = read_recovery_prefix(&mut client_stream, Vec::new()).await?;
+                                    prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
+                                }
+                            },
+                        }
+                    }
+                    // Upstream by IP unavailable (why recovery exists
+                    // for some CDN ranges): keep waiting for the
+                    // client under the outer deadline, as before.
+                    Err(_) => {
+                        let prefix = read_recovery_prefix(&mut client_stream, Vec::new()).await?;
+                        prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
+                    }
+                },
+            })
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "client sent no payload within {}s — recovery peek timeout{}",
+                    protocol_dur.as_secs(),
+                    ctag
+                ));
+            }
+        }
+    };
+
+    let buf = match peeked {
+        RecoveryPeek::ClientClosed => return Ok(()), // client closed before sending
+        RecoveryPeek::ServerFirst(upstream, banner) => {
+            // Server-speaks-first protocol: skip recovery entirely (an
+            // empty client read carries no host to recover), relay the
+            // greeting and tunnel by IP.
+            logger.attempt(|| {
+                format!(
+                    "Client silent; upstream {} greeted first — forwarding by IP without recovery{}",
+                    target, ctag
+                )
+            });
+            client_stream.write_all(&banner).await?;
+            let _ = set_keepalive(&client_stream, network.tcp_keepalive_sec);
+            if let Some(tcp) = upstream.as_tcp() {
+                let _ = set_keepalive(tcp, network.tcp_keepalive_sec);
+            }
+            if frag.enabled {
+                upstream.set_nodelay(true)?;
+            }
+            return server::forward_tunnel(client_stream, upstream, Vec::new(), frag, network)
+                .await;
+        }
+        RecoveryPeek::Client(prefix) => prefix,
     };
 
     let effective_target = match parse_sni(&buf).or_else(|| parse_http_host(&buf)) {
@@ -579,5 +761,455 @@ mod tests {
         let (result, response) = parse_request(&request).await;
         assert!(result.is_err());
         assert!(response.starts_with(b"HTTP/1.1 431 "));
+    }
+
+    // ── Recovery-path tests ─────────────────────────────────────────
+    //
+    // Mirror of the SOCKS5 recovery tests: exercise
+    // `recover_and_tunnel_http` end-to-end against a minimal no-auth
+    // SOCKS5 stub upstream, observing which target the upstream was
+    // asked for (recovered host vs. bare IP) and what bytes flowed.
+
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    use tokio::net::TcpListener;
+
+    fn test_logger() -> Arc<crate::logger::Logger> {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
+        Arc::new(crate::logger::Logger::new(
+            tx,
+            crate::logger::LogConfig::default(),
+        ))
+    }
+
+    /// Minimal no-auth SOCKS5 stub. After CONNECT succeeds it writes
+    /// `banner` to the tunnel (if non-empty), then records everything the
+    /// client sends. The log starts with the requested target ("host:port").
+    async fn spawn_socks5_stub(banner: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let log = log2.clone();
+                tokio::spawn(async move {
+                    let _ = serve_stub_client(sock, log, banner).await;
+                });
+            }
+        });
+        (addr, log)
+    }
+
+    async fn serve_stub_client(
+        mut sock: tokio::net::TcpStream,
+        log: Arc<Mutex<Vec<String>>>,
+        banner: &'static [u8],
+    ) -> Option<()> {
+        let mut greet = [0u8; 2];
+        sock.read_exact(&mut greet).await.ok()?;
+        let mut methods = vec![0u8; greet[1] as usize];
+        sock.read_exact(&mut methods).await.ok()?;
+        sock.write_all(&[0x05, 0x00]).await.ok()?;
+        let mut head = [0u8; 4];
+        sock.read_exact(&mut head).await.ok()?;
+        let host = match head[3] {
+            0x01 => {
+                let mut o = [0u8; 4];
+                sock.read_exact(&mut o).await.ok()?;
+                std::net::Ipv4Addr::from(o).to_string()
+            }
+            0x03 => {
+                let mut l = [0u8; 1];
+                sock.read_exact(&mut l).await.ok()?;
+                let mut d = vec![0u8; l[0] as usize];
+                sock.read_exact(&mut d).await.ok()?;
+                String::from_utf8(d).ok()?
+            }
+            _ => return None,
+        };
+        let mut pt = [0u8; 2];
+        sock.read_exact(&mut pt).await.ok()?;
+        log.lock()
+            .unwrap()
+            .push(format!("{}:{}", host, u16::from_be_bytes(pt)));
+        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .ok()?;
+        if !banner.is_empty() {
+            sock.write_all(banner).await.ok()?;
+        }
+        let mut b = [0u8; 512];
+        loop {
+            match sock.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => log
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&b[..n]).into_owned()),
+            }
+        }
+        Some(())
+    }
+
+    fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
+        resocks5_net::types::ProxyConfig {
+            protocol: resocks5_net::types::ProxyProtocol::Socks5,
+            ip: resocks5_net::types::IP::V4,
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            user: None,
+            password: None,
+            is_gate: false,
+            gate: None,
+        }
+    }
+
+    /// Build a minimal but well-formed TLS ClientHello carrying a single
+    /// SNI host_name extension. (Duplicated from the private helper in
+    /// `resocks5-net/src/connect/recover_host.rs` — it is not exported.)
+    fn client_hello_with_sni(host: &str) -> Vec<u8> {
+        let host_bytes = host.as_bytes();
+        let mut sni_ext = Vec::new();
+        let entry_len = 1 + 2 + host_bytes.len();
+        sni_ext.extend_from_slice(&(entry_len as u16).to_be_bytes());
+        sni_ext.push(0x00); // name_type = host_name
+        sni_ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(host_bytes);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&sni_ext);
+
+        let mut ch = Vec::new();
+        ch.extend_from_slice(&[0x03, 0x03]); // client_version TLS1.2
+        ch.extend_from_slice(&[0xAB; 32]); // random
+        ch.push(0x00); // session_id length 0
+        ch.extend_from_slice(&0x0002u16.to_be_bytes()); // cipher_suites len
+        ch.extend_from_slice(&[0x13, 0x01]); // one cipher suite
+        ch.push(0x01); // compression_methods len
+        ch.push(0x00); // null compression
+        ch.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        ch.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let l = ch.len();
+        hs.push((l >> 16) as u8);
+        hs.push((l >> 8) as u8);
+        hs.push(l as u8);
+        hs.extend_from_slice(&ch);
+
+        let mut rec = Vec::new();
+        rec.push(0x16);
+        rec.extend_from_slice(&[0x03, 0x01]);
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[tokio::test]
+    async fn recovery_recovers_sni_from_truncated_pipelined_hello() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        // First 5 bytes of the hello ride along pipelined; the 200 reply
+        // is sent first, then the rest arrives in a separate segment.
+        let hello = client_hello_with_sni("recovered.example");
+        let rest = hello[5..].to_vec();
+        let task = tokio::spawn(async move {
+            recover_and_tunnel_http(
+                server,
+                "203.0.113.9:443",
+                "443",
+                hello[..5].to_vec(), // truncated pipelined prefix
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let mut reply = [0u8; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        client.read_exact(&mut reply).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200 "));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.write_all(&rest).await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("recovery must not stall")
+            .unwrap()
+            .expect("recovery succeeds");
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.iter().any(|t| t == "recovered.example:443"),
+            "SNI must be recovered from the truncated pipelined hello, targets: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t == "203.0.113.9:443"),
+            "the IP must not be dialed when SNI was recovered, targets: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_recovers_http_host_across_segmented_reads() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        let task = tokio::spawn(async move {
+            recover_and_tunnel_http(
+                server,
+                "203.0.113.9:80",
+                "80",
+                Vec::new(),
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let mut reply = [0u8; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        client.read_exact(&mut reply).await.unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 200 "));
+
+        // The request line + Host header split across two writes, with
+        // real time in between so one read cannot see both.
+        client.write_all(b"POST / HTTP/1.1\r\nHo").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client
+            .write_all(b"st: recovered.example\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("recovery must not stall")
+            .unwrap()
+            .expect("recovery succeeds");
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.iter().any(|t| t == "recovered.example:80"),
+            "HTTP Host must be recovered across segmented reads, targets: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t == "203.0.113.9:80"),
+            "the IP must not be dialed when the Host was recovered, targets: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_first_upstream_banner_is_relayed_without_recovery() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"SSH-2.0-stub\r\n").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        let task = tokio::spawn(async move {
+            recover_and_tunnel_http(
+                server,
+                "203.0.113.9:22",
+                "22",
+                Vec::new(),
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+            )
+            .await
+        });
+
+        // Read the early 200 reply, then stay silent — the client of an
+        // SSH server waits for the banner.
+        let mut reply = [0u8; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        client.read_exact(&mut reply).await.unwrap();
+
+        let mut banner = [0u8; 14];
+        tokio::time::timeout(Duration::from_secs(4), client.read_exact(&mut banner))
+            .await
+            .expect("banner must arrive without the full protocol timeout")
+            .unwrap();
+        assert_eq!(&banner, b"SSH-2.0-stub\r\n");
+
+        client.write_all(b"CLIENT-RESP").await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("server-first path must not stall")
+            .unwrap()
+            .expect("server-first tunnel succeeds");
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.iter().any(|t| t == "203.0.113.9:22"),
+            "the upstream must be dialed by the original IP, targets: {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t == "CLIENT-RESP"),
+            "client traffic must flow after the banner, targets: {targets:?}"
+        );
+        assert_eq!(
+            targets.first().map(String::as_str),
+            Some("203.0.113.9:22"),
+            "no recovery may happen for a server-speaks-first protocol, targets: {targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn undecidable_pipelined_payload_falls_back_to_ip_promptly() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        let task = tokio::spawn(async move {
+            recover_and_tunnel_http(
+                server,
+                "203.0.113.9:443",
+                "443",
+                b"\x00\x01\x02".to_vec(),
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let mut reply = [0u8; b"HTTP/1.1 200 Connection Established\r\n\r\n".len()];
+        client.read_exact(&mut reply).await.unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("undecidable payload must not stall recovery")
+            .unwrap()
+            .expect("fallback-to-IP tunnel succeeds");
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.iter().any(|t| t == "203.0.113.9:443"),
+            "the IP must be dialed when no host is recoverable, targets: {targets:?}"
+        );
+        assert_eq!(
+            targets.first().map(String::as_str),
+            Some("203.0.113.9:443"),
+            "the CONNECT target must be the only dialed host, targets: {targets:?}"
+        );
     }
 }

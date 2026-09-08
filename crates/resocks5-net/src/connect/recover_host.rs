@@ -138,6 +138,88 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
     None
 }
 
+/// `true` if appending more bytes could still let [`parse_sni`] find an
+/// SNI host in `data` — i.e. the prefix is consistent with the start of
+/// a TLS ClientHello record that has not fully arrived yet. `false`
+/// means further bytes cannot change the outcome: bytes already present
+/// rule out a ClientHello record, or the handshake body announced by
+/// the record headers is complete, so a `parse_sni` result of `None`
+/// on such input is final.
+///
+/// This is the "keep reading?" counterpart of `parse_sni`, whose `None`
+/// collapses *malformed* and *merely truncated* input. A single TCP
+/// read frequently delivers only part of a ClientHello (modern hellos
+/// with many extensions are routinely split across segments), so
+/// callers accumulate bytes while this returns `true`, re-running
+/// `parse_sni` after each read.
+pub fn sni_might_still_appear(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    if data[0] != 0x16 {
+        return false; // not a Handshake record; byte 0 is final
+    }
+    if data.len() < 2 {
+        return true;
+    }
+    if data[1] != 0x03 {
+        return false; // wrong legacy record version; byte 1 is final
+    }
+    if data.len() < 6 {
+        return true; // handshake-type byte not seen yet
+    }
+    if data[5] != 0x01 {
+        return false; // handshake present but not a ClientHello
+    }
+    if data.len() < 5 + 4 {
+        return true; // handshake header (type + 3-byte length) incomplete
+    }
+    let hs_len = be_u24(&data[6..9]) as usize;
+    data.len() < 5 + 4 + hs_len // handshake body still short
+}
+
+/// `true` if appending more bytes could still let [`parse_http_host`]
+/// find a `Host:` header in `data` — the header section has not been
+/// terminated yet, so a `Host:` line could still arrive. `false` means
+/// further bytes are irrelevant: `data` cannot be the start of an
+/// HTTP/1.x request (request-line methods begin with an alphabetic
+/// byte; header bytes are ASCII), the request line is already
+/// terminated and carries no HTTP version, or the header section is
+/// terminated in a form `parse_http_host` cannot parse (bare LF), in
+/// which case waiting would only stall until the caller's deadline.
+pub fn http_host_might_still_appear(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    // Request-line methods start with an ALPHA token; a TLS record,
+    // binary protocol payload, etc. can never grow a Host header.
+    if !data[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(data) else {
+        // HTTP header bytes are ASCII; non-UTF-8 is never a Host carrier.
+        return false;
+    };
+    let request_line = text.split("\r\n").next().unwrap_or("");
+    if request_line.contains('\n') {
+        // Bare LF terminates the request line: parse_http_host splits
+        // on CRLF only, so this can never yield a Host header.
+        return false;
+    }
+    if request_line.len() + 2 <= text.len() {
+        // The request line is CRLF-terminated in `data`; an HTTP/1.x
+        // request line always carries the protocol version, and a
+        // Host: line can only follow a versioned request line.
+        if !request_line.contains(" HTTP/") {
+            return false;
+        }
+    }
+    // Header section still open: a complete or partial `Host:` line
+    // could still arrive. Once the section is terminated — CRLF CRLF,
+    // or bare LF — no further header line can parse.
+    !(text.contains("\r\n\r\n") || text.contains("\n\n"))
+}
+
 #[inline]
 fn be_u16(b: &[u8]) -> u16 {
     ((b[0] as u16) << 8) | b[1] as u16
@@ -224,6 +306,34 @@ mod tests {
         rec
     }
 
+    /// Build the same ClientHello as `client_hello_with_sni` but with an
+    /// empty extensions list — no SNI.
+    fn client_hello_without_sni() -> Vec<u8> {
+        // ClientHello with empty extensions.
+        let mut ch = Vec::new();
+        ch.extend_from_slice(&[0x03, 0x03]);
+        ch.extend_from_slice(&[0xAB; 32]);
+        ch.push(0x00);
+        ch.extend_from_slice(&0x0002u16.to_be_bytes());
+        ch.extend_from_slice(&[0x13, 0x01]);
+        ch.push(0x01);
+        ch.push(0x00);
+        ch.extend_from_slice(&0x0000u16.to_be_bytes()); // extensions len = 0
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let l = ch.len();
+        hs.push((l >> 16) as u8);
+        hs.push((l >> 8) as u8);
+        hs.push(l as u8);
+        hs.extend_from_slice(&ch);
+        let mut rec = Vec::new();
+        rec.push(0x16);
+        rec.extend_from_slice(&[0x03, 0x01]);
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
     #[test]
     fn extracts_sni_from_well_formed_hello() {
         let rec = client_hello_with_sni("registry.npmjs.org");
@@ -252,28 +362,7 @@ mod tests {
 
     #[test]
     fn returns_none_when_no_sni_extension() {
-        // ClientHello with empty extensions.
-        let mut ch = Vec::new();
-        ch.extend_from_slice(&[0x03, 0x03]);
-        ch.extend_from_slice(&[0xAB; 32]);
-        ch.push(0x00);
-        ch.extend_from_slice(&0x0002u16.to_be_bytes());
-        ch.extend_from_slice(&[0x13, 0x01]);
-        ch.push(0x01);
-        ch.push(0x00);
-        ch.extend_from_slice(&0x0000u16.to_be_bytes()); // extensions len = 0
-        let mut hs = Vec::new();
-        hs.push(0x01);
-        let l = ch.len();
-        hs.push((l >> 16) as u8);
-        hs.push((l >> 8) as u8);
-        hs.push(l as u8);
-        hs.extend_from_slice(&ch);
-        let mut rec = Vec::new();
-        rec.push(0x16);
-        rec.extend_from_slice(&[0x03, 0x01]);
-        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
-        rec.extend_from_slice(&hs);
+        let rec = client_hello_without_sni();
         assert_eq!(parse_sni(&rec), None);
     }
 
@@ -321,5 +410,154 @@ mod tests {
         // Documented behaviour: a partial final line is still parsed.
         // For our use the first read always contains the full header.
         assert_eq!(parse_http_host(req).as_deref(), Some("registry.npmjs.or"));
+    }
+
+    #[test]
+    fn sni_five_byte_prefix_is_incomplete_not_absent() {
+        // R21: a 5-byte first read — record header only, handshake-type
+        // byte not yet arrived — is the case the single-read flow got
+        // wrong: parse_sni must give up on it, but the caller must be told
+        // to keep reading rather than fall back.
+        let rec = client_hello_with_sni("example.com");
+        let prefix = &rec[..5];
+        assert_eq!(parse_sni(prefix), None);
+        assert!(sni_might_still_appear(prefix));
+    }
+
+    #[test]
+    fn sni_truncated_hello_is_incomplete() {
+        let rec = client_hello_with_sni("example.com");
+        let cut = &rec[..rec.len() - 5];
+        assert_eq!(parse_sni(cut), None);
+        assert!(sni_might_still_appear(cut));
+    }
+
+    #[test]
+    fn sni_empty_prefix_is_incomplete() {
+        assert!(sni_might_still_appear(&[]));
+    }
+
+    #[test]
+    fn sni_complete_hello_is_decided() {
+        let rec = client_hello_with_sni("example.com");
+        assert!(!sni_might_still_appear(&rec));
+        // A complete hello WITHOUT an SNI extension must also read as
+        // decided — otherwise recovery stalls on SNI-less clients.
+        let no_sni = client_hello_without_sni();
+        assert!(!sni_might_still_appear(&no_sni));
+    }
+
+    #[test]
+    fn sni_non_hello_prefixes_are_never_incomplete() {
+        // ApplicationData record.
+        assert!(!sni_might_still_appear(&[
+            0x17, 0x03, 0x03, 0x00, 0x05, 1, 2, 3, 4, 5
+        ]));
+        // Wrong legacy record version.
+        assert!(!sni_might_still_appear(&[
+            0x16, 0x02, 0x01, 0x00, 0x10, 0x01
+        ]));
+        // Handshake present, but not a ClientHello type.
+        assert!(!sni_might_still_appear(&[
+            0x16, 0x03, 0x99, 0x99, 0x99, 0xFF
+        ]));
+        // Plain HTTP request.
+        assert!(!sni_might_still_appear(
+            b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn sni_probe_accumulation_finds_sni_under_any_segmentation() {
+        // Model of the production accumulate loop: parse after every chunk;
+        // whenever the probe says "decided" the parse must have found the
+        // SNI (no decided-but-missed state may exist for a valid hello).
+        let rec = client_hello_with_sni("sni.example");
+        let mut accumulated: Vec<u8> = Vec::new();
+        let mut found = false;
+        for chunk in rec.chunks(3) {
+            accumulated.extend_from_slice(chunk);
+            if let Some(host) = parse_sni(&accumulated) {
+                assert_eq!(host, "sni.example");
+                found = true;
+                break;
+            }
+            assert!(
+                sni_might_still_appear(&accumulated),
+                "probe gave up at {} of {} bytes",
+                accumulated.len(),
+                rec.len()
+            );
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn http_host_partial_request_is_incomplete() {
+        let req = b"GET / HTTP/1.1\r\nHost: registry.npmjs.or";
+        assert!(http_host_might_still_appear(req));
+    }
+
+    #[test]
+    fn http_host_request_line_split_is_incomplete() {
+        // Version suffix not yet arrived: the request line is open, so the
+        // probe must not decide from a missing " HTTP/".
+        assert!(http_host_might_still_appear(b"GET / HT"));
+    }
+
+    #[test]
+    fn http_host_complete_header_is_decided() {
+        assert!(!http_host_might_still_appear(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        ));
+        // Complete header section with no Host line at all — decided, so
+        // recovery falls back to the IP instead of waiting for the deadline.
+        assert!(!http_host_might_still_appear(
+            b"GET / HTTP/1.1\r\nAccept: */*\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn http_host_non_http_prefixes_are_never_incomplete() {
+        // TLS record prefix.
+        assert!(!http_host_might_still_appear(&[
+            0x16, 0x03, 0x01, 0x00, 0x10, 0x01
+        ]));
+        // A server-greeting-style line: request line terminated without an
+        // HTTP version — waiting for it would stall to the deadline.
+        assert!(!http_host_might_still_appear(b"SSH-2.0-OpenSSH_9\r\n"));
+        // Bare-LF request: parse_http_host reads CRLF lines only.
+        assert!(!http_host_might_still_appear(b"GET /\nHost: a.example\n\n"));
+        // Empty value on a terminated Host line.
+        assert!(!http_host_might_still_appear(
+            b"GET / HTTP/1.1\r\nHost:\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn http_host_probe_accumulation_finds_host_under_any_segmentation() {
+        let req: &[u8] = b"POST / HTTP/1.1\r\nHost: split.example\r\n\r\n";
+        let mut accumulated: Vec<u8> = Vec::new();
+        let mut found = false;
+        for chunk in req.chunks(7) {
+            accumulated.extend_from_slice(chunk);
+            if let Some(host) = parse_http_host(&accumulated) {
+                // parse_http_host accepts a partial final Host line
+                // (see http_host_incomplete_line_returns_none), so a
+                // mid-accumulation hit may be a prefix of the full host.
+                assert!(host.starts_with("split"), "got {host:?}");
+                found = true;
+                break;
+            }
+            assert!(
+                http_host_might_still_appear(&accumulated),
+                "probe gave up at {} of {} bytes",
+                accumulated.len(),
+                req.len()
+            );
+        }
+        assert!(found);
+        // Once the request is complete the parsed host must be exact.
+        assert_eq!(parse_http_host(req).as_deref(), Some("split.example"));
     }
 }

@@ -3,17 +3,132 @@
 //! Wraps [`Ratings`] with a round-robin fallback
 //! ([`ProxyRotator::get_next`]) and a `target → proxy` affinity cache
 //! ([`ProxyRotator::link_proxy`] / [`ProxyRotator::get_linked`]).
+//!
+//! The sticky cache is bounded: it holds at most
+//! [`DEFAULT_STICKY_CACHE_MAX_ENTRIES`] entries, each living at most
+//! [`DEFAULT_STICKY_CACHE_TTL`], with LRU + TTL eviction by default.
+//! Use [`ProxyRotator::with_cache_limits`] to configure both limits.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
 use crate::rating::{RatingPolicy, Ratings};
-use crate::types::ProxyConfig;
+use crate::types::{ProxyConfig, ProxyProtocol};
+
+/// Stable identity of an upstream rating slot: everything that
+/// identifies WHICH real-world upstream a [`ProxyConfig`] refers to —
+/// endpoint, protocol, and account. `gate` is deliberately excluded:
+/// it records how the upstream is reached on this attempt (it is set
+/// on the gate-composite configs written to the sticky cache), not
+/// what the upstream is.
+type ProxyIdentity = (String, u16, u8, Option<String>, Option<String>, bool);
+
+/// Compute the stable identity of a proxy config. Must agree with the
+/// doc comment on [`ProxyIdentity`].
+fn proxy_identity(p: &ProxyConfig) -> ProxyIdentity {
+    (
+        p.host.clone(),
+        p.port,
+        match p.protocol {
+            ProxyProtocol::Socks5 => 0u8,
+            ProxyProtocol::Http => 1,
+            ProxyProtocol::Https => 2,
+        },
+        p.user.clone(),
+        p.password.clone(),
+        p.is_gate,
+    )
+}
+
+/// Default hard cap on sticky-cache entries.
+pub const DEFAULT_STICKY_CACHE_MAX_ENTRIES: usize = 4096;
+/// Default sticky-cache entry lifetime.
+pub const DEFAULT_STICKY_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// A sticky-cache entry: the linked proxy plus LRU recency and TTL stamps.
+struct StickyEntry {
+    proxy: Arc<ProxyConfig>,
+    /// LRU recency stamp.
+    last_used: Instant,
+    /// TTL deadline.
+    expires_at: Instant,
+}
+
+/// Bounded sticky cache with LRU + TTL eviction.
+struct StickyCache {
+    max_entries: usize,
+    ttl: Duration,
+    map: HashMap<String, StickyEntry>,
+}
+
+impl StickyCache {
+    /// Look up `addr`; expired entries are removed and reported as a miss.
+    fn get(&mut self, addr: &str, now: Instant) -> Option<Arc<ProxyConfig>> {
+        if self.map.get(addr).is_some_and(|e| now >= e.expires_at) {
+            self.map.remove(addr);
+            return None;
+        }
+        let entry = self.map.get_mut(addr)?;
+        entry.last_used = now;
+        Some(entry.proxy.clone())
+    }
+
+    /// Insert (or replace) the entry for `addr`, evicting as needed.
+    fn insert(&mut self, addr: String, proxy: Arc<ProxyConfig>, now: Instant) {
+        if self.max_entries == 0 {
+            return; // cache disabled
+        }
+        let expires_at = now.checked_add(self.ttl).unwrap_or(now);
+        if let Some(entry) = self.map.get_mut(&addr) {
+            entry.proxy = proxy;
+            entry.last_used = now;
+            entry.expires_at = expires_at;
+            return;
+        }
+        if self.map.len() >= self.max_entries {
+            // Purge expired entries first, then evict LRU victims.
+            self.map.retain(|_, e| now < e.expires_at);
+            while self.map.len() >= self.max_entries {
+                let victim = self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_used)
+                    .map(|(k, _)| k.clone());
+                match victim {
+                    Some(k) => {
+                        self.map.remove(&k);
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.map.insert(
+            addr,
+            StickyEntry {
+                proxy,
+                last_used: now,
+                expires_at,
+            },
+        );
+    }
+
+    /// Plain remove (used by `unlink_proxy`).
+    fn remove(&mut self, addr: &str) {
+        self.map.remove(addr);
+    }
+}
 
 /// Weighted-random rotator over a fixed set of upstream proxies, with a
 /// per-target sticky cache.
+///
+/// The sticky cache is bounded: by default at most
+/// [`DEFAULT_STICKY_CACHE_MAX_ENTRIES`] entries, each living at most
+/// [`DEFAULT_STICKY_CACHE_TTL`], with LRU + TTL eviction. Use
+/// [`ProxyRotator::with_cache_limits`] to configure both limits.
 ///
 /// Construct with [`ProxyRotator::new`] (default policy) or
 /// [`ProxyRotator::with_policy`] (custom [`RatingPolicy`]).
@@ -32,17 +147,17 @@ pub struct ProxyRotator {
     /// depends on the order of these increments, only on each one
     /// being atomic.
     index: AtomicUsize,
-    /// Cache of `target_addr → Arc<ProxyConfig>` learned during
-    /// connection attempts. `DashMap` is a sharded concurrent map —
-    /// uncontended reads & writes don't serialise on one lock, so
-    /// many simultaneous connections hitting different shards make
-    /// progress in parallel. `RwLock<HashMap>`-style reader/writer
-    /// contention is gone.
-    map: DashMap<String, Arc<ProxyConfig>>,
+    /// Bounded `target_addr → Arc<ProxyConfig>` sticky cache learned
+    /// during connection attempts. Holds at most `max_entries` entries,
+    /// each expiring after `ttl`; LRU eviction makes room when full.
+    sticky: Mutex<StickyCache>,
     /// Sand-model ratings for weighted-random proxy selection.
     ratings: Ratings,
-    /// Reverse lookup from `(host, port)` to index in `proxies`.
-    proxy_index: DashMap<(String, u16), usize>,
+    /// Reverse lookup from a config's stable [`ProxyIdentity`] to its
+    /// index in `proxies`, so ratings survive gate-composition of a
+    /// config and distinct accounts/protocols on one `(host, port)`
+    /// get independent rating slots.
+    proxy_index: DashMap<ProxyIdentity, usize>,
 }
 
 impl ProxyRotator {
@@ -53,15 +168,40 @@ impl ProxyRotator {
 
     /// Construct a rotator with a custom [`RatingPolicy`].
     pub fn with_policy(proxies: Vec<ProxyConfig>, policy: RatingPolicy) -> Self {
+        Self::with_cache_limits(
+            proxies,
+            policy,
+            DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+            DEFAULT_STICKY_CACHE_TTL,
+        )
+    }
+
+    /// Construct a rotator with a custom [`RatingPolicy`] and explicit
+    /// sticky-cache limits.
+    ///
+    /// `max_entries` is the hard cap on cached target entries — `0`
+    /// disables the sticky cache entirely. `ttl` is the entry lifetime —
+    /// `0` expires entries immediately. When the cache is full, the
+    /// least-recently-used entry is evicted to make room (LRU eviction).
+    pub fn with_cache_limits(
+        proxies: Vec<ProxyConfig>,
+        policy: RatingPolicy,
+        max_entries: usize,
+        ttl: Duration,
+    ) -> Self {
         let proxy_index = DashMap::new();
         for (i, p) in proxies.iter().enumerate() {
-            proxy_index.insert((p.host.clone(), p.port), i);
+            proxy_index.insert(proxy_identity(p), i);
         }
         let n = proxies.len();
         Self {
             proxies: proxies.into_iter().map(Arc::new).collect(),
             index: AtomicUsize::new(0),
-            map: DashMap::new(),
+            sticky: Mutex::new(StickyCache {
+                max_entries,
+                ttl,
+                map: HashMap::new(),
+            }),
             ratings: Ratings::new(n, policy),
             proxy_index,
         }
@@ -70,18 +210,27 @@ impl ProxyRotator {
     /// Insert (or replace) the cache entry for `addr`. Takes ownership
     /// of `Arc<ProxyConfig>` so the caller can hand off the only clone
     /// it had — refcount stays the same.
+    ///
+    /// The entry is subject to the cache's LRU + TTL eviction: if the
+    /// cache is full, the least-recently-used entry is evicted.
     pub fn link_proxy(&self, addr: String, proxy: Arc<ProxyConfig>) {
-        self.map.insert(addr, proxy);
+        self.sticky
+            .lock()
+            .unwrap()
+            .insert(addr, proxy, Instant::now());
     }
 
     /// Drop the cached upstream for `addr` (e.g. after it failed).
     pub fn unlink_proxy(&self, addr: &str) {
-        self.map.remove(addr);
+        self.sticky.lock().unwrap().remove(addr);
     }
 
     /// Read back the cached upstream for `addr`, if any.
+    ///
+    /// Expired entries are removed and reported as `None` — a normal
+    /// cache miss.
     pub fn get_linked(&self, addr: &str) -> Option<Arc<ProxyConfig>> {
-        self.map.get(addr).map(|r| r.value().clone())
+        self.sticky.lock().unwrap().get(addr, Instant::now())
     }
 
     /// Round-robin next proxy (fetch-and-increment, modulo length).
@@ -110,7 +259,7 @@ impl ProxyRotator {
 
     /// Look up the internal index for the given proxy config.
     fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
-        self.proxy_index.get(&(p.host.clone(), p.port)).map(|v| *v)
+        self.proxy_index.get(&proxy_identity(p)).map(|v| *v)
     }
 
     /// Record a failure for the given proxy in the sand model.
@@ -251,5 +400,243 @@ mod tests {
         let mut ports: Vec<u16> = order.iter().map(|p| p.port).collect();
         ports.sort();
         assert_eq!(ports, vec![1000, 1001, 1002, 1003, 1004]);
+    }
+
+    #[test]
+    fn sticky_link_get_roundtrip() {
+        let proxies = vec![make_proxy("h", 1000), make_proxy("h", 1001)];
+        let r = ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            8,
+            Duration::from_secs(600),
+        );
+        let a = Arc::new(make_proxy("h", 1000));
+        r.link_proxy("target".to_string(), a.clone());
+        assert_eq!(r.get_linked("target").map(|p| p.port), Some(1000));
+        assert!(Arc::ptr_eq(&r.get_linked("target").unwrap(), &a));
+        r.unlink_proxy("target");
+        assert!(r.get_linked("target").is_none());
+    }
+
+    #[test]
+    fn sticky_relink_replaces_entry() {
+        let proxies = vec![make_proxy("h", 1000), make_proxy("h", 1001)];
+        let r = ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            8,
+            Duration::from_secs(600),
+        );
+        r.link_proxy("target".to_string(), Arc::new(make_proxy("h", 1000)));
+        r.link_proxy("target".to_string(), Arc::new(make_proxy("h", 1001)));
+        assert_eq!(r.get_linked("target").map(|p| p.port), Some(1001));
+    }
+
+    #[test]
+    fn bounded_sequential_unique_targets() {
+        let proxies = vec![make_proxy("h", 1000), make_proxy("h", 1001)];
+        let r = ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            8,
+            Duration::from_secs(600),
+        );
+        let total = 2000;
+        for i in 0..total {
+            r.link_proxy(format!("t{i}"), Arc::new(make_proxy("h", 1000)));
+            assert!(r.sticky.lock().unwrap().map.len() <= 8);
+        }
+        // Insertion order == recency order: the last 8 linked addresses
+        // must be present, the 9th-most-recent must be gone.
+        for i in (total - 8)..total {
+            assert!(
+                r.get_linked(&format!("t{i}")).is_some(),
+                "recent target t{i} missing"
+            );
+        }
+        assert!(r.get_linked(&format!("t{}", total - 9)).is_none());
+    }
+
+    #[test]
+    fn bounded_concurrent_hammer_stays_within_cap() {
+        let proxies = vec![make_proxy("h", 1000), make_proxy("h", 1001)];
+        let r = Arc::new(ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            8,
+            Duration::from_secs(6000),
+        ));
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let r = &r;
+                s.spawn(move || {
+                    for i in 0u32..250 {
+                        let addr = format!("t{t}-{i}");
+                        r.link_proxy(addr.clone(), Arc::new(make_proxy("h", 1000)));
+                        assert!(r.sticky.lock().unwrap().map.len() <= 8);
+                        if i % 10 == 0 {
+                            let probe = format!("t{t}-{}", i / 2);
+                            let _ = r.get_linked(&probe);
+                            r.unlink_proxy(&format!("t{t}-{}", i.saturating_sub(1)));
+                        }
+                    }
+                });
+            }
+        });
+        assert!(r.sticky.lock().unwrap().map.len() <= 8);
+        r.link_proxy("sentinel".to_string(), Arc::new(make_proxy("h", 1001)));
+        assert_eq!(r.get_linked("sentinel").map(|p| p.port), Some(1001));
+    }
+
+    #[test]
+    fn lru_touch_prevents_eviction() {
+        let proxies = vec![make_proxy("h", 1000)];
+        let r = ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            2,
+            Duration::from_secs(600),
+        );
+        r.link_proxy("A".to_string(), Arc::new(make_proxy("h", 1000)));
+        r.link_proxy("B".to_string(), Arc::new(make_proxy("h", 1001)));
+        assert_eq!(r.get_linked("A").map(|p| p.port), Some(1000)); // touch
+        r.link_proxy("C".to_string(), Arc::new(make_proxy("h", 1002)));
+        assert!(r.get_linked("B").is_none(), "B should be LRU-evicted");
+        assert!(r.get_linked("A").is_some());
+        assert_eq!(r.get_linked("C").map(|p| p.port), Some(1002));
+    }
+
+    #[test]
+    fn ttl_expires_entries() {
+        let mut cache = StickyCache {
+            max_entries: 8,
+            ttl: Duration::from_secs(10),
+            map: HashMap::new(),
+        };
+        let t0 = Instant::now();
+        cache.insert("a".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+        assert!(cache.get("a", t0 + Duration::from_secs(5)).is_some());
+        assert!(cache.get("a", t0 + Duration::from_secs(10)).is_none());
+        assert!(cache.map.is_empty());
+    }
+
+    #[test]
+    fn ttl_purge_frees_room_without_evicting_live_entries() {
+        let mut cache = StickyCache {
+            max_entries: 2,
+            ttl: Duration::from_secs(10),
+            map: HashMap::new(),
+        };
+        let t0 = Instant::now();
+        cache.insert("A".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+        cache.insert("B".to_string(), Arc::new(make_proxy("h", 1001)), t0);
+        let t1 = t0 + Duration::from_secs(11);
+        cache.insert("C".to_string(), Arc::new(make_proxy("h", 1002)), t1);
+        cache.insert("D".to_string(), Arc::new(make_proxy("h", 1003)), t1);
+        assert_eq!(cache.get("C", t1).map(|p| p.port), Some(1002));
+        assert_eq!(cache.get("D", t1).map(|p| p.port), Some(1003));
+        assert_eq!(cache.map.len(), 2);
+    }
+
+    #[test]
+    fn cap_zero_disables_cache() {
+        let proxies = vec![make_proxy("h", 1000)];
+        let r = ProxyRotator::with_cache_limits(
+            proxies,
+            RatingPolicy::default(),
+            0,
+            Duration::from_secs(600),
+        );
+        r.link_proxy("a".to_string(), Arc::new(make_proxy("h", 1000)));
+        assert!(r.get_linked("a").is_none());
+        assert_eq!(r.sticky.lock().unwrap().map.len(), 0);
+    }
+
+    #[test]
+    fn same_endpoint_different_accounts_rate_independently() {
+        let mut alice = make_proxy("host", 1000);
+        alice.user = Some("alice".to_string());
+        alice.password = Some("pw-a".to_string());
+        let mut bob = make_proxy("host", 1000);
+        bob.user = Some("bob".to_string());
+        bob.password = Some("pw-b".to_string());
+        let policy = RatingPolicy {
+            fail_penalty: 2.0,
+            sand_max: 8.0,
+            min_weight: 0.01,
+            ..Default::default()
+        };
+        let r = ProxyRotator::with_policy(vec![alice.clone(), bob.clone()], policy);
+
+        for _ in 0..10 {
+            r.record_failure(&alice);
+        }
+        let w = r.ratings.weights();
+        assert!(w[0] < 1.0, "alice's slot must be penalized, got {}", w[0]);
+        assert!(
+            (w[1] - 1.0).abs() < 1e-9,
+            "bob's slot must be untouched by alice's failures, got {}",
+            w[1]
+        );
+    }
+
+    #[test]
+    fn same_endpoint_different_protocols_rate_independently() {
+        let socks = make_proxy("host", 1000);
+        let mut http = make_proxy("host", 1000);
+        http.protocol = ProxyProtocol::Http;
+        let policy = RatingPolicy {
+            fail_penalty: 2.0,
+            sand_max: 8.0,
+            min_weight: 0.01,
+            ..Default::default()
+        };
+        let r = ProxyRotator::with_policy(vec![socks.clone(), http.clone()], policy);
+
+        for _ in 0..10 {
+            r.record_failure(&http);
+        }
+        let w = r.ratings.weights();
+        assert!(w[1] < 1.0, "http slot must be penalized, got {}", w[1]);
+        assert!(
+            (w[0] - 1.0).abs() < 1e-9,
+            "socks slot must be untouched by http failures, got {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn gate_composite_maps_to_original_rating_slot() {
+        let inner = make_proxy("host", 1000);
+        let other = make_proxy("host", 1001);
+        let mut gate = make_proxy("gatehost", 999);
+        gate.is_gate = true;
+        let mut composite = inner.clone();
+        composite.gate = Some(Arc::new(gate));
+        let policy = RatingPolicy {
+            fail_penalty: 2.0,
+            sand_max: 8.0,
+            min_weight: 0.01,
+            ..Default::default()
+        };
+        let r = ProxyRotator::with_policy(vec![inner.clone(), other.clone()], policy);
+
+        // The composite is a fresh allocation with `.gate` set; rating
+        // it must still land on the original inner entry's slot.
+        for _ in 0..10 {
+            r.record_failure(&composite);
+        }
+        let w = r.ratings.weights();
+        assert!(
+            w[0] < 1.0,
+            "composite failure must penalize the original inner slot, got {}",
+            w[0]
+        );
+        assert!(
+            (w[1] - 1.0).abs() < 1e-9,
+            "unrelated upstream must be untouched, got {}",
+            w[1]
+        );
     }
 }

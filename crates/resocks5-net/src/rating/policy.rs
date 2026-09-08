@@ -1,5 +1,7 @@
 //! Tuning knobs for the sand-rating model ([`RatingPolicy`]).
 
+use anyhow::anyhow;
+
 /// Tunable knobs that control the exponential-decay sand model.
 #[derive(Debug, Clone, Copy)]
 pub struct RatingPolicy {
@@ -43,6 +45,66 @@ impl RatingPolicy {
     pub fn k(&self) -> f64 {
         (1.0 / self.min_weight).ln() / self.sand_max
     }
+
+    /// Validate the knobs are finite and inside the ranges the sand
+    /// model's maths requires. Call this before building any rating
+    /// consumer from config: invalid values do not fail immediately —
+    /// they silently produce `inf`/`NaN` weights downstream (e.g.
+    /// `sand_max = 0` makes `k()` infinite, so a fresh upstream's
+    /// weight is `exp(-inf * 0)` = `NaN`).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("half_life_sec", self.half_life_sec),
+            ("fail_penalty", self.fail_penalty),
+            ("sand_max", self.sand_max),
+            ("min_weight", self.min_weight),
+            ("success_factor", self.success_factor),
+        ] {
+            if !value.is_finite() {
+                return Err(anyhow!("rating policy: {name} must be finite, got {value}"));
+            }
+        }
+        if self.half_life_sec <= 0.0 {
+            return Err(anyhow!(
+                "rating policy: half_life_sec must be > 0, got {}; it is the decay \
+                 timescale (tau = half_life_sec / ln 2), and zero or negative values \
+                 yield inf/NaN sand levels",
+                self.half_life_sec
+            ));
+        }
+        if self.sand_max <= 0.0 {
+            return Err(anyhow!(
+                "rating policy: sand_max must be > 0, got {}; it is the denominator of \
+                 k() = ln(1/min_weight) / sand_max, so 0 makes k() infinite and the \
+                 weight of every fresh upstream undefined",
+                self.sand_max
+            ));
+        }
+        if self.min_weight <= 0.0 || self.min_weight > 1.0 {
+            return Err(anyhow!(
+                "rating policy: min_weight must be in (0, 1], got {}; k() takes \
+                 ln(1/min_weight), so values <= 0 give NaN, and values > 1 make k() \
+                 negative so a fully-saturated upstream would be boosted above weight 1",
+                self.min_weight
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.success_factor) {
+            return Err(anyhow!(
+                "rating policy: success_factor must be in [0, 1], got {}; success \
+                 multiplies the remaining sand by it, so < 0 produces negative sand and \
+                 weight > 1, and > 1 makes success increase sand",
+                self.success_factor
+            ));
+        }
+        if self.fail_penalty < 0.0 {
+            return Err(anyhow!(
+                "rating policy: fail_penalty must be >= 0, got {}; it is the sand added \
+                 per failure, and a negative value produces negative sand and weight > 1",
+                self.fail_penalty
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -85,5 +147,160 @@ mod tests {
             "exp(-k*sand_max) = {w}, expected {}",
             p.min_weight
         );
+    }
+
+    #[test]
+    fn validate_accepts_default_and_boundaries() {
+        assert!(RatingPolicy::default().validate().is_ok());
+        let p = RatingPolicy {
+            min_weight: 1.0,
+            ..Default::default()
+        };
+        assert!(
+            p.validate().is_ok(),
+            "min_weight=1 is degenerate (k=0, weight always 1) but defined"
+        );
+        for success_factor in [0.0, 0.5, 1.0] {
+            let p = RatingPolicy {
+                success_factor,
+                ..Default::default()
+            };
+            assert!(p.validate().is_ok(), "success_factor={success_factor}");
+        }
+        let p = RatingPolicy {
+            fail_penalty: 0.0,
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok(), "fail_penalty=0 disables the model");
+    }
+
+    #[test]
+    fn validate_rejects_each_invalid_field() {
+        let cases: Vec<(&str, RatingPolicy)> = vec![
+            (
+                "half_life_sec",
+                RatingPolicy {
+                    half_life_sec: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "half_life_sec",
+                RatingPolicy {
+                    half_life_sec: -1.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "half_life_sec",
+                RatingPolicy {
+                    half_life_sec: f64::NAN,
+                    ..Default::default()
+                },
+            ),
+            (
+                "half_life_sec",
+                RatingPolicy {
+                    half_life_sec: f64::INFINITY,
+                    ..Default::default()
+                },
+            ),
+            (
+                "sand_max",
+                RatingPolicy {
+                    sand_max: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "sand_max",
+                RatingPolicy {
+                    sand_max: -2.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_weight",
+                RatingPolicy {
+                    min_weight: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_weight",
+                RatingPolicy {
+                    min_weight: -0.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_weight",
+                RatingPolicy {
+                    min_weight: 1.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_weight",
+                RatingPolicy {
+                    min_weight: f64::NAN,
+                    ..Default::default()
+                },
+            ),
+            (
+                "success_factor",
+                RatingPolicy {
+                    success_factor: -0.1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "success_factor",
+                RatingPolicy {
+                    success_factor: 1.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "success_factor",
+                RatingPolicy {
+                    success_factor: f64::NAN,
+                    ..Default::default()
+                },
+            ),
+            (
+                "fail_penalty",
+                RatingPolicy {
+                    fail_penalty: -1.0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, policy) in cases {
+            let err = policy.validate().expect_err(field);
+            assert!(
+                err.to_string().contains(field),
+                "error for {field} must name the field, got: {err}"
+            );
+        }
+    }
+
+    /// Premise for validating sand_max: with sand_max = 0 the weight
+    /// mapping constant k() is not finite, so a fresh cell's weight is
+    /// undefined exactly as the review describes.
+    #[test]
+    fn zero_sand_max_makes_k_non_finite() {
+        let p = RatingPolicy {
+            sand_max: 0.0,
+            ..Default::default()
+        };
+        assert!(!p.k().is_finite());
+        assert!(p.validate().is_err());
+        let p = RatingPolicy {
+            sand_max: 0.0,
+            min_weight: 1.0,
+            ..Default::default()
+        };
+        assert!(p.k().is_nan(), "0/0 must be NaN");
     }
 }
