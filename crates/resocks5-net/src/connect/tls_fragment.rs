@@ -27,8 +27,8 @@ pub struct FragmentSpec {
 /// Outcome of matching a possibly-truncated byte prefix against the
 /// ClientHello signature.
 ///
-/// A single TCP read may deliver fewer than the 6 bytes
-/// `is_tls_client_hello` needs, so deciding from one read misclassifies
+/// A single TCP read may deliver fewer than the 6 bytes the private
+/// ClientHello matcher needs, so deciding from one read misclassifies
 /// split ClientHellos as ordinary traffic. The third state lets a caller
 /// accumulate across reads until the signature is confirmed or ruled
 /// out (see [`classify_client_hello`]).
@@ -45,8 +45,8 @@ pub enum ClientHelloMatch {
 }
 
 /// Match `data` against the ClientHello signature
-/// (`0x16 0x03 .. .. .. 0x01`), tolerating truncation. See
-/// `is_tls_client_hello` for the signature rationale and
+/// (`0x16 0x03 .. .. .. 0x01`), tolerating truncation. See the private
+/// signature matcher below for the signature rationale and
 /// [`ClientHelloMatch`] for why the third state exists.
 pub fn classify_client_hello(data: &[u8]) -> ClientHelloMatch {
     if data.is_empty() {
