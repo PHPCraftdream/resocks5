@@ -14,34 +14,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
-
 use crate::rating::{RatingPolicy, Ratings};
-use crate::types::{ProxyConfig, ProxyProtocol};
+use crate::types::ProxyConfig;
 
-/// Stable identity of an upstream rating slot: everything that
-/// identifies WHICH real-world upstream a [`ProxyConfig`] refers to —
-/// endpoint, protocol, and account. `gate` is deliberately excluded:
-/// it records how the upstream is reached on this attempt (it is set
-/// on the gate-composite configs written to the sticky cache), not
-/// what the upstream is.
-type ProxyIdentity = (String, u16, u8, Option<String>, Option<String>, bool);
-
-/// Compute the stable identity of a proxy config. Must agree with the
-/// doc comment on [`ProxyIdentity`].
-fn proxy_identity(p: &ProxyConfig) -> ProxyIdentity {
-    (
-        p.host.clone(),
-        p.port,
-        match p.protocol {
-            ProxyProtocol::Socks5 => 0u8,
-            ProxyProtocol::Http => 1,
-            ProxyProtocol::Https => 2,
-        },
-        p.user.clone(),
-        p.password.clone(),
-        p.is_gate,
-    )
+/// True when `a` and `b` refer to the same real-world upstream rating
+/// slot: endpoint, protocol, and account all match. `gate` is
+/// deliberately excluded — it records how the upstream is reached on
+/// this attempt (it is set on the gate-composite configs written to
+/// the sticky cache), not what the upstream is — so rating a
+/// gate-composite still lands on the plain upstream's slot. Compares
+/// borrowed fields only: no `host`/`user`/`password` clones on the
+/// per-event `record_failure`/`record_success` path. Cheap scalars
+/// are compared first so mismatching candidates exit early.
+fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
+    a.port == b.port
+        && a.protocol == b.protocol
+        && a.is_gate == b.is_gate
+        && a.host == b.host
+        && a.user == b.user
+        && a.password == b.password
 }
 
 /// Default hard cap on sticky-cache entries.
@@ -153,11 +144,6 @@ pub struct ProxyRotator {
     sticky: Mutex<StickyCache>,
     /// Sand-model ratings for weighted-random proxy selection.
     ratings: Ratings,
-    /// Reverse lookup from a config's stable [`ProxyIdentity`] to its
-    /// index in `proxies`, so ratings survive gate-composition of a
-    /// config and distinct accounts/protocols on one `(host, port)`
-    /// get independent rating slots.
-    proxy_index: DashMap<ProxyIdentity, usize>,
 }
 
 impl ProxyRotator {
@@ -189,10 +175,6 @@ impl ProxyRotator {
         max_entries: usize,
         ttl: Duration,
     ) -> Self {
-        let proxy_index = DashMap::new();
-        for (i, p) in proxies.iter().enumerate() {
-            proxy_index.insert(proxy_identity(p), i);
-        }
         let n = proxies.len();
         Self {
             proxies: proxies.into_iter().map(Arc::new).collect(),
@@ -203,7 +185,6 @@ impl ProxyRotator {
                 map: HashMap::new(),
             }),
             ratings: Ratings::new(n, policy),
-            proxy_index,
         }
     }
 
@@ -258,8 +239,14 @@ impl ProxyRotator {
     }
 
     /// Look up the internal index for the given proxy config.
+    ///
+    /// The proxy list is immutable after construction, so a borrowed
+    /// linear scan needs no lock and no allocation; it is called once
+    /// per attempt outcome, not per byte of traffic. `rposition`
+    /// returns the LAST matching entry, matching the old reverse
+    /// index, where a duplicate identity overwrote the earlier slot.
     fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
-        self.proxy_index.get(&proxy_identity(p)).map(|v| *v)
+        self.proxies.iter().rposition(|q| same_upstream(p, q))
     }
 
     /// Record a failure for the given proxy in the sand model.

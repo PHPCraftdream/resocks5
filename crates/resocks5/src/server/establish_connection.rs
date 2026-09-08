@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -79,11 +78,11 @@ fn gate_stage_of(err: &anyhow::Error) -> Option<GateStage> {
 fn apply_gate_failure(
     err: &anyhow::Error,
     proxy_rotator: &ProxyRotator,
-    proxy_config: &ProxyConfig,
-    gate_config: Option<&ProxyConfig>,
+    proxy_config: &Arc<ProxyConfig>,
+    gate_config: Option<&Arc<ProxyConfig>>,
     gate_rotator: Option<&ProxyRotator>,
-    dead_gates: &mut HashSet<UpstreamId>,
-    dead_proxies: &mut HashSet<UpstreamId>,
+    dead_gates: &mut Vec<Arc<ProxyConfig>>,
+    dead_proxies: &mut Vec<Arc<ProxyConfig>>,
 ) -> bool {
     if !should_record_failure(err) {
         return false;
@@ -99,7 +98,7 @@ fn apply_gate_failure(
             if let Some(gate_rotator) = gate_rotator {
                 gate_rotator.record_failure(gate_config);
             }
-            dead_gates.insert(upstream_id(gate_config));
+            dead_gates.push(gate_config.clone());
             true
         }
         Some(GateStage::GateToProxy) => {
@@ -118,7 +117,7 @@ fn apply_gate_failure(
             // Stage 3: the gate worked; the inner proxy failed to
             // reach the target.
             proxy_rotator.record_failure(proxy_config);
-            dead_proxies.insert(upstream_id(proxy_config));
+            dead_proxies.push(proxy_config.clone());
             false
         }
         None => {
@@ -133,32 +132,42 @@ fn apply_gate_failure(
     }
 }
 
-/// Stable identity of one real upstream within this call: everything
-/// that distinguishes genuinely different upstreams (endpoint,
-/// protocol, account, gate flag), deliberately excluding `gate` —
-/// that field records only how the upstream is reached on this
-/// attempt. Mirrors the rating identity `ProxyRotator` uses, so a
-/// sticky-cache composite (an inner config with `.gate` set) and the
-/// plain inner config from `pick_order()` compare equal here.
-type UpstreamId = (String, u16, u8, Option<String>, Option<String>, bool);
+/// True when `a` and `b` are the same real upstream within this
+/// call: everything that distinguishes genuinely different
+/// upstreams (endpoint, protocol, account, gate flag) matches,
+/// deliberately excluding `gate` — that field records only how the
+/// upstream is reached on this attempt. Mirrors the rating identity
+/// `ProxyRotator` uses, so a sticky-cache composite (an inner
+/// config with `.gate` set) and the plain inner config from
+/// `pick_order()` compare equal here. Compares borrowed fields
+/// only; cheap scalars first so mismatching candidates exit early.
+fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
+    a.port == b.port
+        && a.protocol == b.protocol
+        && a.is_gate == b.is_gate
+        && a.host == b.host
+        && a.user == b.user
+        && a.password == b.password
+}
 
-/// One access route tried this call: `Some(gate) + inner`, or
-/// `None + inner` for the direct path.
-type Route = (Option<UpstreamId>, UpstreamId);
+/// One access route tried this call: `Some(gate)` + inner, or
+/// `None` + inner for the direct path. Entries share the rotators'
+/// `Arc`s (refcount bumps only); membership is compared by value
+/// with `same_upstream`, never by pointer.
+type Route = (Option<Arc<ProxyConfig>>, Arc<ProxyConfig>);
 
-fn upstream_id(p: &ProxyConfig) -> UpstreamId {
-    (
-        p.host.clone(),
-        p.port,
-        match p.protocol {
-            ProxyProtocol::Socks5 => 0u8,
-            ProxyProtocol::Http => 1,
-            ProxyProtocol::Https => 2,
-        },
-        p.user.clone(),
-        p.password.clone(),
-        p.is_gate,
-    )
+/// `true` if the `(gate, inner)` route was already attempted this
+/// call. Compared by value, so a composite cached config and the
+/// plain rotator entry it was built from are the same route.
+fn route_tried(tried: &[Route], gate: Option<&ProxyConfig>, proxy: &ProxyConfig) -> bool {
+    tried.iter().any(|(g, p)| {
+        same_upstream(p, proxy)
+            && match (g.as_deref(), gate) {
+                (None, None) => true,
+                (Some(a), Some(b)) => same_upstream(a, b),
+                _ => false,
+            }
+    })
 }
 
 /// One hop of a gate tunnel: speak `hop`'s protocol over the incoming
@@ -355,11 +364,12 @@ pub async fn establish_connection(
     // already-tried route must not consume another budget slot — the
     // cache composite and the gates phase can independently select the
     // same underlying route once the cache entry fails and is unlinked.
-    let mut tried_routes: HashSet<Route> = HashSet::new();
+    let mut tried_routes: Vec<Route> = Vec::new();
     // Nodes proven unusable THIS call by a classified single-node
     // fault; excluded from later combinations within the same call.
-    let mut dead_gates: HashSet<UpstreamId> = HashSet::new();
-    let mut dead_proxies: HashSet<UpstreamId> = HashSet::new();
+    // Shared `Arc`s compared by value — no per-event String clones.
+    let mut dead_gates: Vec<Arc<ProxyConfig>> = Vec::new();
+    let mut dead_proxies: Vec<Arc<ProxyConfig>> = Vec::new();
     // The gates cartesian product must not consume the whole budget
     // before the direct fallback is tried: reserve it one attempt when
     // any direct candidate exists.
@@ -383,11 +393,7 @@ pub async fn establish_connection(
     // Check cached proxies
     for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         if let Some(cached_proxy) = rotator.get_linked(target_addr) {
-            let route: Route = (
-                cached_proxy.gate.as_ref().map(|g| upstream_id(g)),
-                upstream_id(&cached_proxy),
-            );
-            if tried_routes.contains(&route) {
+            if route_tried(&tried_routes, cached_proxy.gate.as_deref(), &cached_proxy) {
                 continue;
             }
             if attempts >= max_attempts {
@@ -397,7 +403,7 @@ pub async fn establish_connection(
                     target_addr
                 ));
             }
-            tried_routes.insert(route);
+            tried_routes.push((cached_proxy.gate.clone(), cached_proxy.clone()));
             attempts += 1;
             logger.cache_attempt(|| {
                 format!("Attempting to use cached proxy for {}{}", target_addr, ctag)
@@ -451,7 +457,7 @@ pub async fn establish_connection(
                         &e,
                         rotator,
                         &cached_proxy,
-                        cached_proxy.gate.as_deref(),
+                        cached_proxy.gate.as_ref(),
                         gate_rotator.as_deref(),
                         &mut dead_gates,
                         &mut dead_proxies,
@@ -466,23 +472,21 @@ pub async fn establish_connection(
     if let Some(gate_rotator) = gate_rotator {
         let gate_order = gate_rotator.pick_order();
         'gates: for gate_config in &gate_order {
-            let gate_id = upstream_id(gate_config);
-            if dead_gates.contains(&gate_id) {
+            if dead_gates.iter().any(|g| same_upstream(g, gate_config)) {
                 continue;
             }
             for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
                 let order = rotator.pick_order();
                 for proxy_config in &order {
-                    let proxy_id = upstream_id(proxy_config);
-                    if dead_proxies.contains(&proxy_id)
-                        || tried_routes.contains(&(Some(gate_id.clone()), proxy_id.clone()))
+                    if dead_proxies.iter().any(|p| same_upstream(p, proxy_config))
+                        || route_tried(&tried_routes, Some(&**gate_config), proxy_config)
                     {
                         continue;
                     }
                     if attempts + direct_reserve >= max_attempts {
                         break 'gates;
                     }
-                    tried_routes.insert((Some(gate_id.clone()), proxy_id.clone()));
+                    tried_routes.push((Some(gate_config.clone()), proxy_config.clone()));
                     attempts += 1;
                     let t0 = Instant::now();
                     match use_gate(
@@ -552,15 +556,15 @@ pub async fn establish_connection(
     'direct: for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         let order = rotator.pick_order();
         for proxy_config in &order {
-            let proxy_id = upstream_id(proxy_config);
-            if dead_proxies.contains(&proxy_id) || tried_routes.contains(&(None, proxy_id.clone()))
+            if dead_proxies.iter().any(|p| same_upstream(p, proxy_config))
+                || route_tried(&tried_routes, None, proxy_config)
             {
                 continue;
             }
             if attempts >= max_attempts {
                 break 'direct;
             }
-            tried_routes.insert((None, proxy_id.clone()));
+            tried_routes.push((None, proxy_config.clone()));
             attempts += 1;
             let t0 = Instant::now();
             match connect_proxy(
