@@ -86,13 +86,21 @@ fn load_or_init_proxy_list() -> Result<ProxyListConfig> {
 }
 
 fn load_or_init_users() -> Result<UsersConfig> {
-    if Path::new(USERS_PATH).exists() {
-        return ktav::from_file(USERS_PATH).with_context(|| format!("read {}", USERS_PATH));
+    load_or_init_users_at(Path::new(USERS_PATH))
+}
+
+fn load_or_init_users_at(path: &Path) -> Result<UsersConfig> {
+    if path.exists() {
+        return ktav::from_file(path).with_context(|| format!("read {}", path.display()));
     }
 
-    eprintln!("Creating empty {}", USERS_PATH);
+    let _lock = crate::config::users_file::UsersFileLock::acquire(path)?;
+    if path.exists() {
+        return ktav::from_file(path).with_context(|| format!("read {}", path.display()));
+    }
+    eprintln!("Creating empty {}", path.display());
     let cfg = UsersConfig::default();
-    ktav::to_file(&cfg, USERS_PATH).with_context(|| format!("write {}", USERS_PATH))?;
+    crate::config::users_file::write_atomic(path, &cfg)?;
     Ok(cfg)
 }
 
@@ -131,6 +139,57 @@ fn read_proxy_lines(path: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_users_path(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "resocks5_init_{}_{}_{}.ktav",
+            std::process::id(),
+            tag,
+            nonce
+        ))
+    }
+
+    #[test]
+    fn initialization_cannot_write_while_another_writer_holds_the_lock() {
+        let path = unique_users_path("locked");
+        let lock = crate::config::users_file::UsersFileLock::acquire(&path).unwrap();
+        let result = load_or_init_users_at(&path);
+        let created = path.exists();
+        if created {
+            std::fs::remove_file(&path).unwrap();
+        }
+        drop(lock);
+        assert!(
+            result.is_err(),
+            "initializer bypassed the existing writer lock"
+        );
+        assert!(!created);
+    }
+
+    #[test]
+    fn existing_users_load_without_waiting_for_the_writer_lock() {
+        let path = unique_users_path("existing");
+        let users = UsersConfig {
+            users: vec![crate::config::User {
+                name: "existing".into(),
+                hash: "init".into(),
+                is_enabled: true,
+                direct: false,
+            }],
+        };
+        crate::config::users_file::write_atomic(&path, &users).unwrap();
+        let lock = crate::config::users_file::UsersFileLock::acquire(&path).unwrap();
+        let result = load_or_init_users_at(&path);
+        drop(lock);
+        std::fs::remove_file(&path).unwrap();
+        let loaded = result.unwrap();
+        assert_eq!(loaded.users.len(), 1);
+        assert_eq!(loaded.users[0].name, "existing");
+    }
 
     /// The serializer must not emit ktav type-tags (`:i` for integers,
     /// `:b` for booleans, etc.) on field names. ktav ≥ 0.6 dropped

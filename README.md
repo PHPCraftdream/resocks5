@@ -189,8 +189,8 @@ resocks5
 #    duplicate keys, so don't append a second socks5_v4):
 #       socks5_v4: [ user:pass@198.51.100.7:1080 ]
 
-# 3. (Optional) add a client user. With no users configured the proxy
-#    accepts anyone who can reach the listen address — see step 5.
+# 3. (Optional) add a client user. Anonymous access is enabled by default;
+#    see below for requiring credentials before exposing the listener.
 resocks5 users add alice
 
 # 4. Start the proxy. It listens on 127.0.0.1:20082 by default.
@@ -199,17 +199,24 @@ resocks5
 # 5. Point your SOCKS5 / HTTP-proxy client at 127.0.0.1:20082.
 ```
 
-To expose it beyond localhost, change `listen_host` in `resocks5.main.ktav`
-— and configure users first, since a `0.0.0.0` listener with no auth is an
-open proxy.
+Before exposing the listener beyond localhost, configure users and edit the
+existing `auth` block in `resocks5.main.ktav`:
+
+```text
+auth: { allow_anonymous: false }
+```
+
+Restart the server after applying these settings. Adding users alone leaves
+anonymous access enabled when `allow_anonymous` is `true`. Apply both settings
+before changing `listen_host` to a public interface.
 
 ## How it works
 
 For each accepted connection:
 
 1. **Protocol detect** — the first bytes decide SOCKS5 vs HTTP CONNECT.
-2. **Authenticate** — the client is checked against the user table (Argon2id);
-   skipped when no users are configured.
+2. **Authenticate** — credentials are checked against the user table (Argon2id).
+   Anonymous clients are accepted only when `auth.allow_anonymous` is `true`.
 3. **Pick an upstream** — if this target was reached before, reuse the sticky
    upstream that last worked; otherwise draw one with sand-rating's
    weighted-random order. IPv6 targets prefer the IPv6 upstream set.
@@ -340,7 +347,9 @@ resocks5 users disable <name>
 resocks5 users remove  <name> [--yes]
 ```
 
-The server runs **without authentication** when no users are configured.
+Anonymous access defaults to `auth.allow_anonymous: true`, including when users
+are configured. Set it to `false` to require credentials. Restart the server
+after changing users or authentication settings to apply the new snapshot.
 Passwords are only ever read from an interactive, no-echo prompt — never from
 a command-line flag — so they don't leak into shell history.
 

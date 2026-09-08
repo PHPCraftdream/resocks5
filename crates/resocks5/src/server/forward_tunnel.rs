@@ -49,7 +49,9 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    if !initial.is_empty() {
+    let partial_signature =
+        frag.enabled && classify_client_hello(&initial) == ClientHelloMatch::Indeterminate;
+    if !initial.is_empty() && !partial_signature {
         return within_idle(
             idle,
             send_possibly_fragmented(upstream, &initial, &frag.to_spec()),
@@ -64,8 +66,9 @@ where
     // ClientHello signature is decidable — a single TCP segment often
     // carries only part of a ClientHello, and deciding too early would
     // forward the rest unfragmented (R21).
-    let mut first = vec![0; 16 * 1024];
-    let mut len = 0usize;
+    let mut first = initial;
+    let mut len = first.len();
+    first.resize(16 * 1024, 0);
     let mut reply = [0; 1024];
     loop {
         let step = async {
@@ -94,6 +97,9 @@ where
                 n = upstream.read(&mut reply) => {
                     let n = n?;
                     if n == 0 {
+                        if len != 0 {
+                            send_possibly_fragmented(upstream, &first[..len], &frag.to_spec()).await?;
+                        }
                         return Ok(true);
                     }
                     client.write_all(&reply[..n]).await?;
@@ -150,6 +156,49 @@ mod tests {
     /// client branch is deterministic.
     #[derive(Clone)]
     struct ChunkRecorder(Arc<std::sync::Mutex<Vec<usize>>>);
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_prefix_survives_upstream_half_close() {
+        let (mut client, client_inner) = duplex(1);
+        let (mut upstream, upstream_inner) = duplex(64);
+        let task = tokio::spawn(async move {
+            forward_tunnel(
+                client_inner,
+                upstream_inner,
+                Vec::new(),
+                &fragmentation(),
+                &NetworkConfig::default(),
+            )
+            .await
+        });
+        client.write_all(b"\x16\x03").await.unwrap();
+        upstream.shutdown().await.unwrap();
+        assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+        client.write_all(b"payload").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).await.unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(received, b"\x16\x03payload");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_pipelined_signature_is_accumulated() {
+        let (mut client, mut reader) = duplex(64);
+        client.write_all(&[0x01]).await.unwrap();
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut recorder = ChunkRecorder(chunks.clone());
+        assert!(prepare_payload(
+            &mut reader,
+            &mut recorder,
+            vec![0x16, 0x03, 0x01, 0, 1],
+            &fragmentation_with_size(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap());
+        assert_eq!(*chunks.lock().unwrap(), vec![1; 6]);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn fragmentation_allows_server_to_speak_first() {

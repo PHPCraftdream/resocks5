@@ -15,10 +15,10 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use resocks5_net::connect::recover_host::{http_host_might_still_appear, sni_might_still_appear};
+use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
-use resocks5_net::pool::{AnyUpstream, ProxyPool};
+use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
 /// Maximum size of the request line + headers section. 16 KiB matches
@@ -242,63 +242,6 @@ fn ipv4_literal_port(target: &str) -> Option<&str> {
     }
 }
 
-/// Mirror of the SOCKS5 handler's grace window: how long a client-first
-/// protocol (TLS, HTTP) typically needs to produce its first
-/// application bytes after the early 200 reply. Only when this expires
-/// with a STILL silent client do we consider the upstream a
-/// server-speaks-first protocol and give it a chance to greet first.
-const CLIENT_FIRST_GRACE: Duration = Duration::from_millis(1000);
-
-/// Outcome of the recovery peek (mirror of the SOCKS5 variant).
-enum RecoveryPeek {
-    /// The client spoke first: its accumulated prefix (possibly
-    /// truncated mid-record if the client EOF'd — recovery proceeds
-    /// with whatever is there, falling back to the IP).
-    Client(Vec<u8>),
-    /// The client closed without sending anything.
-    ClientClosed,
-    /// The upstream greeted first — a server-speaks-first protocol.
-    /// The upstream is already connected (by the original IP, nothing
-    /// having been recovered) and carries the first banner bytes,
-    /// which must be relayed to the client before forwarding starts.
-    ServerFirst(AnyUpstream, Vec<u8>),
-}
-
-/// Accumulate the client's first application record across TCP segment
-/// boundaries until recovery can decide: SNI/Host found, definitively
-/// absent (both probes say no more bytes can help), or the 16 KiB cap
-/// hit (proceed with what we have, same fallback-to-IP as before).
-/// `seed` is bytes already read — the CONNECT request's pipelined
-/// payload, if any (possibly empty). Returns `None` only for a clean
-/// EOF before ANY byte.
-///
-/// Bounded by the caller's `timeout` — individual reads here carry no
-/// deadline of their own.
-/// cancel-safe: NO — bytes already consumed before cancellation are
-/// lost; callers close the stream on timeout.
-async fn read_recovery_prefix(
-    client: &mut TcpStream,
-    mut buf: Vec<u8>,
-) -> std::io::Result<Option<Vec<u8>>> {
-    const PEEK_MAX: usize = 16 * 1024;
-    let mut tmp = [0u8; 4096];
-    loop {
-        if parse_sni(&buf).is_some()
-            || parse_http_host(&buf).is_some()
-            || (!sni_might_still_appear(&buf) && !http_host_might_still_appear(&buf))
-            || buf.len() >= PEEK_MAX
-        {
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        let n = client.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        let take = n.min(PEEK_MAX - buf.len());
-        buf.extend_from_slice(&tmp[..take]);
-    }
-}
-
 /// HTTP CONNECT recovery path: target is a bare IPv4 and recovery is on.
 ///
 /// Mirror of the SOCKS5 `recover_and_tunnel`: reply `200 Connection
@@ -344,113 +287,34 @@ async fn recover_and_tunnel_http(
         .await?;
 
     let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
-    let peeked = if !pipelined.is_empty() {
-        // The client already spoke (CONNECT + pipelined payload), so
-        // there is no server-first ambiguity: complete the prefix under
-        // the client-protocol deadline. For an already-decidable
-        // pipelined record this reads nothing — same as before.
-        match timeout(
-            protocol_dur,
-            read_recovery_prefix(&mut client_stream, pipelined),
-        )
-        .await
-        {
-            Ok(Ok(prefix)) => prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Err(anyhow!(
-                    "client sent no payload within {}s — recovery peek timeout{}",
-                    protocol_dur.as_secs(),
-                    ctag
-                ));
-            }
-        }
-    } else {
-        match timeout(protocol_dur, async {
-            let mut tmp = [0u8; 4096];
-            let mut up_tmp = [0u8; 4096];
-            Ok(match timeout(CLIENT_FIRST_GRACE, client_stream.read(&mut tmp)).await {
-                // The client spoke within the grace window: recovery proceeds.
-                Ok(Ok(0)) => RecoveryPeek::ClientClosed,
-                Ok(Ok(n)) => {
-                    let seed = tmp[..n].to_vec();
-                    read_recovery_prefix(&mut client_stream, seed)
-                        .await
-                        .map(|p| p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client))?
-                }
-                Ok(Err(e)) => return Err(e),
-                // Client silent through the grace window: give the
-                // upstream — addressed by the original IP, nothing
-                // recovered yet — one chance to greet first
-                // (server-speaks-first protocols, e.g. SSH over an
-                // IPv4 CONNECT).
-                Err(_) => match server::establish_connection(
-                    target,
-                    gate_rotator,
-                    v6_rotator,
-                    v4_rotator,
-                    logger,
-                    banned,
-                    pool,
-                    network,
-                    client_user,
-                    tls_connector,
-                )
-                .await
-                {
-                    Ok(mut upstream) => {
-                        tokio::select! {
-                            r = client_stream.read(&mut tmp) => match r {
-                                Ok(0) => RecoveryPeek::ClientClosed,
-                                Ok(n) => {
-                                    let seed = tmp[..n].to_vec();
-                                    read_recovery_prefix(&mut client_stream, seed)
-                                        .await
-                                        .map(|p| {
-                                            p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                                        })?
-                                }
-                                Err(e) => return Err(e),
-                            },
-                            r = upstream.read(&mut up_tmp) => match r {
-                                Ok(n) if n > 0 => {
-                                    RecoveryPeek::ServerFirst(upstream, up_tmp[..n].to_vec())
-                                }
-                                // Upstream closed or errored without a
-                                // greeting: not server-first after
-                                // all. Keep waiting for the client;
-                                // the established connection is
-                                // dropped — recovery opens a fresh one
-                                // by host, and no queued upstream byte
-                                // was ever relayed, so dropping is
-                                // invisible to the client.
-                                _ => {
-                                    let prefix = read_recovery_prefix(&mut client_stream, Vec::new()).await?;
-                                    prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                                }
-                            },
-                        }
-                    }
-                    // Upstream by IP unavailable (why recovery exists
-                    // for some CDN ranges): keep waiting for the
-                    // client under the outer deadline, as before.
-                    Err(_) => {
-                        let prefix = read_recovery_prefix(&mut client_stream, Vec::new()).await?;
-                        prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                    }
-                },
-            })
-        })
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(anyhow!(
-                    "client sent no payload within {}s — recovery peek timeout{}",
-                    protocol_dur.as_secs(),
-                    ctag
-                ));
-            }
+    let peeked = match timeout(
+        protocol_dur,
+        peek_recovery(
+            &mut client_stream,
+            pipelined,
+            server::establish_connection(
+                target,
+                gate_rotator,
+                v6_rotator,
+                v4_rotator,
+                logger,
+                banned,
+                pool,
+                network,
+                client_user,
+                tls_connector,
+            ),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(anyhow!(
+                "client sent no payload within {}s ? recovery peek timeout{}",
+                protocol_dur.as_secs(),
+                ctag,
+            ))
         }
     };
 

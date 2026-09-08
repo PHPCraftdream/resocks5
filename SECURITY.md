@@ -85,8 +85,11 @@ Advisory unless you ask to remain anonymous.
 
 These aren't vulnerabilities, they're defaults worth knowing about:
 
-- A listener bound to `0.0.0.0` **with no users configured is an open proxy.**
-  Add users (`resocks5 users add …`) before exposing the port.
+- A publicly reachable listener with `auth.allow_anonymous: true` is an open
+  proxy, even when users are configured. Before exposing the port, add users
+  (`resocks5 users add …`), set `allow_anonymous: false` inside the main config's
+  existing `auth` block, and restart the server. User and authentication changes
+  require a restart.
 - `direct: true` users leak the **server's real IP** and the server's DNS
   resolver to every target they contact. Reserve it for trusted internal use.
 - `resocks5.*.ktav` files contain the auth salt, upstream credentials, and

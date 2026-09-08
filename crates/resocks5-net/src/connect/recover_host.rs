@@ -112,15 +112,20 @@ fn parse_server_name_ext(data: &[u8]) -> Option<String> {
 ///
 /// Returns `None` if no complete `Host:` line is found in `data`.
 pub fn parse_http_host(data: &[u8]) -> Option<String> {
-    // Only look at the header region; cap the scan so a body full of
-    // "Host:" never gets mistaken for a header.
-    let text = std::str::from_utf8(data).ok()?;
-    let head = text.split("\r\n\r\n").next().unwrap_or(text);
-    for line in head.split("\r\n") {
-        let mut parts = line.splitn(2, ':');
-        let key = parts.next()?.trim();
-        if key.eq_ignore_ascii_case("host") {
-            let val = parts.next()?.trim();
+    let (request, mut headers) = crlf_line(data)?;
+    if !is_http1_request_line(request) {
+        return None;
+    }
+    while let Some((line, rest)) = crlf_line(headers) {
+        if line.is_empty() {
+            break;
+        }
+        headers = rest;
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        if line[..colon].trim_ascii().eq_ignore_ascii_case(b"host") {
+            let val = std::str::from_utf8(&line[colon + 1..]).ok()?.trim();
             if val.is_empty() {
                 return None;
             }
@@ -136,6 +141,15 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+fn crlf_line(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = data.windows(2).position(|bytes| bytes == b"\r\n")?;
+    Some((&data[..end], &data[end + 2..]))
+}
+
+fn is_http1_request_line(line: &[u8]) -> bool {
+    line.ends_with(b" HTTP/1.0") || line.ends_with(b" HTTP/1.1")
 }
 
 /// `true` if appending more bytes could still let [`parse_sni`] find an
@@ -183,7 +197,7 @@ pub fn sni_might_still_appear(data: &[u8]) -> bool {
 /// terminated yet, so a `Host:` line could still arrive. `false` means
 /// further bytes are irrelevant: `data` cannot be the start of an
 /// HTTP/1.x request (request-line methods begin with an alphabetic
-/// byte; header bytes are ASCII), the request line is already
+/// byte), the request line is already
 /// terminated and carries no HTTP version, or the header section is
 /// terminated in a form `parse_http_host` cannot parse (bare LF), in
 /// which case waiting would only stall until the caller's deadline.
@@ -196,28 +210,16 @@ pub fn http_host_might_still_appear(data: &[u8]) -> bool {
     if !data[0].is_ascii_alphabetic() {
         return false;
     }
-    let Ok(text) = std::str::from_utf8(data) else {
-        // HTTP header bytes are ASCII; non-UTF-8 is never a Host carrier.
+    if data.iter().position(|&b| b == b'\n').is_some_and(|end| {
+        end == 0 || data[end - 1] != b'\r' || !is_http1_request_line(&data[..end - 1])
+    }) {
         return false;
-    };
-    let request_line = text.split("\r\n").next().unwrap_or("");
-    if request_line.contains('\n') {
-        // Bare LF terminates the request line: parse_http_host splits
-        // on CRLF only, so this can never yield a Host header.
-        return false;
-    }
-    if request_line.len() + 2 <= text.len() {
-        // The request line is CRLF-terminated in `data`; an HTTP/1.x
-        // request line always carries the protocol version, and a
-        // Host: line can only follow a versioned request line.
-        if !request_line.contains(" HTTP/") {
-            return false;
-        }
     }
     // Header section still open: a complete or partial `Host:` line
     // could still arrive. Once the section is terminated — CRLF CRLF,
     // or bare LF — no further header line can parse.
-    !(text.contains("\r\n\r\n") || text.contains("\n\n"))
+    !(data.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+        || data.windows(2).any(|bytes| bytes == b"\n\n"))
 }
 
 #[inline]
@@ -256,6 +258,33 @@ fn skip_vec(buf: &[u8], p: usize, len_bytes: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_host_value_never_selects_a_partial_destination() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let start = b"GET / HTTP/1.1\r\nHost: ".len();
+        for end in start + 1..request.len() - 2 {
+            assert_eq!(parse_http_host(&request[..end]), None, "cut at {end}");
+        }
+        assert_eq!(parse_http_host(request).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn binary_body_does_not_hide_a_complete_host_header() {
+        assert_eq!(
+            parse_http_host(b"POST / HTTP/1.1\r\nHost: example.com\r\n\r\n\xff\xfe").as_deref(),
+            Some("example.com")
+        );
+    }
+
+    #[test]
+    fn opaque_header_bytes_do_not_rule_out_a_later_host() {
+        let partial = b"GET / HTTP/1.1\r\nX-Opaque: \xff\r\nHo";
+        assert!(http_host_might_still_appear(partial));
+        let mut complete = partial.to_vec();
+        complete.extend_from_slice(b"st: example.com\r\n\r\n");
+        assert_eq!(parse_http_host(&complete).as_deref(), Some("example.com"));
+    }
 
     /// Build a minimal but well-formed TLS ClientHello carrying a single
     /// SNI host_name extension.
@@ -405,11 +434,7 @@ mod tests {
     fn http_host_incomplete_line_returns_none() {
         // Host line not yet terminated — we only act on complete lines.
         let req = b"GET / HTTP/1.1\r\nHost: registry.npmjs.or";
-        // split("\r\n") yields "Host: registry.npmjs.or" as a line, which
-        // we *would* accept; guard against that by requiring CRLF after.
-        // Documented behaviour: a partial final line is still parsed.
-        // For our use the first read always contains the full header.
-        assert_eq!(parse_http_host(req).as_deref(), Some("registry.npmjs.or"));
+        assert_eq!(parse_http_host(req), None);
     }
 
     #[test]
@@ -537,26 +562,18 @@ mod tests {
     #[test]
     fn http_host_probe_accumulation_finds_host_under_any_segmentation() {
         let req: &[u8] = b"POST / HTTP/1.1\r\nHost: split.example\r\n\r\n";
-        let mut accumulated: Vec<u8> = Vec::new();
-        let mut found = false;
-        for chunk in req.chunks(7) {
-            accumulated.extend_from_slice(chunk);
-            if let Some(host) = parse_http_host(&accumulated) {
-                // parse_http_host accepts a partial final Host line
-                // (see http_host_incomplete_line_returns_none), so a
-                // mid-accumulation hit may be a prefix of the full host.
-                assert!(host.starts_with("split"), "got {host:?}");
-                found = true;
-                break;
+        // Every segmentation visits a sequence of these prefixes.
+        for end in 0..=req.len() {
+            let prefix = &req[..end];
+            if let Some(host) = parse_http_host(prefix) {
+                assert_eq!(host, "split.example", "cut at {end}");
+            } else {
+                assert!(
+                    http_host_might_still_appear(prefix),
+                    "probe gave up at {end}"
+                );
             }
-            assert!(
-                http_host_might_still_appear(&accumulated),
-                "probe gave up at {} of {} bytes",
-                accumulated.len(),
-                req.len()
-            );
         }
-        assert!(found);
         // Once the request is complete the parsed host must be exact.
         assert_eq!(parse_http_host(req).as_deref(), Some("split.example"));
     }

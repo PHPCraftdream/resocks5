@@ -5,6 +5,7 @@ pub mod get_auth;
 pub mod handle_client;
 pub mod handle_socks5_client;
 pub mod print_cfg;
+pub(crate) mod recovery;
 pub mod run_server;
 
 pub use establish_connection::establish_connection;

@@ -15,10 +15,10 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use resocks5_net::connect::recover_host::{http_host_might_still_appear, sni_might_still_appear};
+use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
-use resocks5_net::pool::{AnyUpstream, ProxyPool};
+use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
 #[allow(clippy::too_many_arguments)]
@@ -203,66 +203,6 @@ fn ipv4_literal_port(target: &str) -> Option<&str> {
     }
 }
 
-/// How long a client-first protocol (TLS, HTTP) typically needs to
-/// produce its first application bytes after the early success reply —
-/// roughly an RTT plus scheduler slack. Only when this grace expires
-/// with a STILL silent client do we consider the upstream to be a
-/// server-speaks-first protocol (SSH, SMTP, FTP) and give it a chance
-/// to greet first. Deliberately far below `client_protocol_timeout_sec`
-/// (the slowloris guard), which remains the hard bound for everything.
-const CLIENT_FIRST_GRACE: Duration = Duration::from_millis(1000);
-
-/// Outcome of the recovery peek.
-enum RecoveryPeek {
-    /// The client spoke first: its accumulated prefix (possibly
-    /// truncated mid-record if the client EOF'd — recovery proceeds
-    /// with whatever is there, falling back to the IP).
-    Client(Vec<u8>),
-    /// The client closed without sending anything.
-    ClientClosed,
-    /// The upstream greeted first — a server-speaks-first protocol.
-    /// The upstream is already connected (by the original IP, nothing
-    /// having been recovered) and carries the first banner bytes,
-    /// which must be relayed to the client before forwarding starts.
-    ServerFirst(AnyUpstream, Vec<u8>),
-}
-
-/// Accumulate the client's first application record across TCP segment
-/// boundaries until recovery can decide: SNI/Host found, definitively
-/// absent (both probes say no more bytes can help), or the 16 KiB cap
-/// hit (proceed with what we have, same fallback-to-IP as before).
-/// `seed` is bytes already read (possibly empty). Returns `None` only
-/// for a clean EOF before ANY byte.
-///
-/// Bounded by the caller's `timeout` — individual reads here carry no
-/// deadline of their own.
-/// cancel-safe: NO — bytes already consumed before cancellation are
-/// lost; callers close the stream on timeout.
-async fn read_recovery_prefix(
-    client: &mut TcpStream,
-    mut buf: Vec<u8>,
-) -> std::io::Result<Option<Vec<u8>>> {
-    const PEEK_MAX: usize = 16 * 1024;
-    let mut tmp = [0u8; 4096];
-    loop {
-        if parse_sni(&buf).is_some()
-            || parse_http_host(&buf).is_some()
-            || (!sni_might_still_appear(&buf) && !http_host_might_still_appear(&buf))
-            || buf.len() >= PEEK_MAX
-        {
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        let n = client.read(&mut tmp).await?;
-        if n == 0 {
-            // EOF mid-record: the rest never arrives, so the truncated
-            // prefix is final. EOF before any byte is "client closed".
-            return Ok(if buf.is_empty() { None } else { Some(buf) });
-        }
-        let take = n.min(PEEK_MAX - buf.len());
-        buf.extend_from_slice(&tmp[..take]);
-    }
-}
-
 /// Recovery path: the client asked for a bare IPv4 and recovery is on.
 ///
 /// We send the SOCKS5 success reply *early* so the client emits its
@@ -315,25 +255,12 @@ async fn recover_and_tunnel(
     // slot). The grace window inside distinguishes a slow client-first
     // protocol from a server-speaks-first one.
     let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
-    let peeked = match timeout(protocol_dur, async {
-        let mut tmp = [0u8; 4096];
-        let mut up_tmp = [0u8; 4096];
-        Ok(match timeout(CLIENT_FIRST_GRACE, client_stream.read(&mut tmp)).await {
-            // The client spoke within the grace window: recovery proceeds.
-            Ok(Ok(0)) => RecoveryPeek::ClientClosed,
-            Ok(Ok(n)) => {
-                let seed = tmp[..n].to_vec();
-                read_recovery_prefix(&mut client_stream, seed)
-                    .await
-                    .map(|p| p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client))?
-            }
-            Ok(Err(e)) => return Err(e),
-            // Client silent through the grace window. A client-first
-            // protocol (TLS, HTTP) answers within ~an RTT, so a silent
-            // client suggests a server-speaks-first protocol: give the
-            // upstream — addressed by the original IP, nothing recovered
-            // yet — one chance to greet first.
-            Err(_) => match crate::server::establish_connection(
+    let peeked = match timeout(
+        protocol_dur,
+        peek_recovery(
+            &mut client_stream,
+            Vec::new(),
+            server::establish_connection(
                 target_addr,
                 gate_rotator,
                 v6_rotator,
@@ -344,62 +271,18 @@ async fn recover_and_tunnel(
                 network,
                 client_user,
                 tls_connector,
-            )
-            .await
-            {
-                Ok(mut upstream) => {
-                    tokio::select! {
-                        r = client_stream.read(&mut tmp) => match r {
-                            Ok(0) => RecoveryPeek::ClientClosed,
-                            Ok(n) => {
-                                let seed = tmp[..n].to_vec();
-                                read_recovery_prefix(&mut client_stream, seed)
-                                    .await
-                                    .map(|p| {
-                                        p.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                                    })?
-                            }
-                            Err(e) => return Err(e),
-                        },
-                        r = upstream.read(&mut up_tmp) => match r {
-                            Ok(n) if n > 0 => {
-                                RecoveryPeek::ServerFirst(upstream, up_tmp[..n].to_vec())
-                            }
-                            // Upstream closed or errored without a
-                            // greeting: not server-first after all.
-                            // Keep waiting for the client; the
-                            // established connection is dropped (any
-                            // bytes it queued were never relayed, so
-                            // dropping it is invisible to the client —
-                            // recovery opens a fresh one by host).
-                            _ => {
-                                let prefix =
-                                    read_recovery_prefix(&mut client_stream, Vec::new()).await?;
-                                prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                            }
-                        },
-                    }
-                }
-                // Upstream by IP unavailable (this is precisely why
-                // recovery exists for some CDN ranges): degrade to the
-                // pre-grace behaviour — keep waiting for the client
-                // under the outer deadline.
-                Err(_) => {
-                    let prefix = read_recovery_prefix(&mut client_stream, Vec::new()).await?;
-                    prefix.map_or(RecoveryPeek::ClientClosed, RecoveryPeek::Client)
-                }
-            },
-        })
-    })
+            ),
+        ),
+    )
     .await
     {
         Ok(result) => result?,
         Err(_) => {
             return Err(anyhow!(
-                "client sent no payload within {}s — recovery peek timeout{}",
+                "client sent no payload within {}s ? recovery peek timeout{}",
                 protocol_dur.as_secs(),
-                ctag
-            ));
+                ctag,
+            ))
         }
     };
 
@@ -654,6 +537,26 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::socks5_handshake;
+
+    #[tokio::test]
+    async fn recovery_limit_preserves_the_unread_tail() {
+        let mut seed = b"GET / HTTP/1.1\r\nX-Pad: ".to_vec();
+        seed.resize(16 * 1024 - 1, b'a');
+        let (mut client, mut reader) = tokio::io::duplex(128);
+        client
+            .write_all(b"a\r\nHost: example.com\r\n\r\nbody")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let prefix = crate::server::recovery::read_recovery_prefix(&mut reader, seed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.len(), 16 * 1024);
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"\r\nHost: example.com\r\n\r\nbody");
+    }
 
     fn test_auth() -> Arc<crate::auth::AuthState> {
         Arc::new(

@@ -93,7 +93,8 @@ pub struct UpstreamStream {
     stream: TcpStream,
     /// Kept private so callers can't shuffle permits between tunnels;
     /// `attach_permit` is the only way to add one.
-    _permits: Vec<OwnedSemaphorePermit>,
+    _permit: OwnedSemaphorePermit,
+    extra_permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl UpstreamStream {
@@ -119,7 +120,7 @@ impl UpstreamStream {
     /// when the tunnel ends, alongside the socket and the gate's own
     /// permit.
     pub fn attach_permit(&mut self, permit: OwnedSemaphorePermit) {
-        self._permits.push(permit);
+        self.extra_permits.push(permit);
     }
 }
 
@@ -286,8 +287,9 @@ impl ProxyPool {
     }
 
     /// Take one slot from `(host, port)`'s concurrency-cap semaphore
-    /// WITHOUT opening a TCP connection or checking out a pooled
-    /// socket. The single choke point through which every path
+    /// without opening a TCP connection. If idle spares hold every slot,
+    /// discard one spare and transfer its permit to the active tunnel.
+    /// The single choke point through which every path
     /// accounts a node of a tunnel against `max_per_upstream`:
     /// `acquire` calls it for the socket it opens, and the gate path
     /// (`establish_connection::use_gate`) calls it for the inner proxy
@@ -302,6 +304,18 @@ impl ProxyPool {
     /// tunneled hops.
     pub fn reserve_permit(&self, proxy: &ProxyConfig) -> anyhow::Result<OwnedSemaphorePermit> {
         let sem = self.upstream_semaphore(&proxy.host, proxy.port);
+        if let Ok(permit) = sem.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        if let Some(spares) = self.pools.get(&(proxy.host.clone(), proxy.port)) {
+            if let Some(spare) = spares.queue.pop() {
+                let PreWarmed { stream, permit, .. } = spare;
+                drop(stream);
+                spares.notify.notify_one();
+                return Ok(permit);
+            }
+        }
+        // A concurrent checkout may have released an expired spare's slot.
         sem.try_acquire_owned().map_err(|_| {
             anyhow::Error::new(AtCapacity {
                 host: proxy.host.clone(),
@@ -333,7 +347,8 @@ impl ProxyPool {
         if let Some(pw) = self.checkout_prewarmed(proxy) {
             return Ok(UpstreamStream {
                 stream: pw.stream,
-                _permits: vec![pw.permit],
+                _permit: pw.permit,
+                extra_permits: Vec::new(),
             });
         }
 
@@ -359,7 +374,8 @@ impl ProxyPool {
         };
         Ok(UpstreamStream {
             stream,
-            _permits: vec![permit],
+            _permit: permit,
+            extra_permits: Vec::new(),
         })
     }
 
@@ -414,7 +430,11 @@ impl ProxyPool {
             return;
         }
         let key = (proxy.host.clone(), proxy.port);
-        let target = self.config.spare_per_proxy.max(1);
+        let target = self
+            .config
+            .spare_per_proxy
+            .max(1)
+            .min(self.max_per_upstream);
         let max_age = Duration::from_secs(self.config.max_session_age_sec);
         // Race-safe get-or-create: DashMap serialises the entry, so
         // whichever caller lands first constructs the ProxySpares and
@@ -529,6 +549,57 @@ impl Drop for ProxyPool {
 mod tests {
     use super::*;
     use crate::types::{ProxyProtocol, IP as IPV};
+
+    #[tokio::test]
+    async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = make_proxy("127.0.0.1", port);
+        let pool = ProxyPool::new(
+            PoolConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            Duration::from_secs(2),
+            1,
+        );
+        let permit = pool.reserve_permit(&proxy).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let spares = Arc::new(ProxySpares {
+            queue: ArrayQueue::new(1),
+            notify: Notify::new(),
+        });
+        assert!(spares
+            .queue
+            .push(PreWarmed {
+                stream,
+                permit,
+                created_at: Instant::now()
+            })
+            .is_ok());
+        pool.pools
+            .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+        let reservation = pool
+            .reserve_permit(&proxy)
+            .expect("an idle spare must not exclude a tunneled hop");
+        assert!(spares.queue.is_empty());
+        assert!(pool.reserve_permit(&proxy).is_err());
+        assert_eq!(
+            timeout(Duration::from_secs(2), peer.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(reservation);
+        assert!(pool.reserve_permit(&proxy).is_ok());
+    }
 
     fn make_proxy(host: &str, port: u16) -> ProxyConfig {
         ProxyConfig {

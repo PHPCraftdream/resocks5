@@ -8,7 +8,7 @@ use crate::logger::LogConfig;
 /// `Arc<Logger>` from `run_server` into each connection task.
 ///
 /// The channel is bounded — under sudden load spikes the producer side
-/// uses `try_send`, dropping the log line if the consumer can't keep up
+/// uses `try_reserve`, dropping the log line if the consumer can't keep up
 /// rather than blocking the proxy task. Lost logs are the right
 /// trade-off here: tunnels must not stall because the terminal is slow.
 pub struct Logger {
@@ -21,63 +21,72 @@ impl Logger {
         Self { sender, cfg }
     }
 
-    fn send_info(&self, msg: String) {
-        // `try_send` returns Err on Full or Closed — we silently drop
-        // either way. A backed-up consumer means logs are lost (better
-        // than blocking the hot path); a closed receiver means the
-        // logger task is gone (server shutdown), nothing to do.
-        let _ = self.sender.try_send(ELog::Log(msg));
-    }
-
-    fn send_error(&self, msg: String) {
-        let _ = self.sender.try_send(ELog::Error(msg));
+    fn send(&self, msg: impl FnOnce() -> String, wrap: fn(String) -> ELog) {
+        let Ok(permit) = self.sender.try_reserve() else {
+            return;
+        };
+        let message = msg();
+        let message = if message.chars().any(char::is_control) {
+            let mut escaped = String::with_capacity(message.len());
+            for c in message.chars() {
+                if c.is_control() {
+                    escaped.extend(c.escape_default());
+                } else {
+                    escaped.push(c);
+                }
+            }
+            escaped
+        } else {
+            message
+        };
+        permit.send(wrap(message));
     }
 
     pub fn lifecycle(&self, msg: impl FnOnce() -> String) {
         if self.cfg.lifecycle {
-            self.send_info(msg());
+            self.send(msg, ELog::Log);
         }
     }
 
     pub fn cache_attempt(&self, msg: impl FnOnce() -> String) {
         if self.cfg.cache_attempts {
-            self.send_info(msg());
+            self.send(msg, ELog::Log);
         }
     }
 
     pub fn cache_hit(&self, msg: impl FnOnce() -> String) {
         if self.cfg.cache_hits {
-            self.send_info(msg());
+            self.send(msg, ELog::Log);
         }
     }
 
     pub fn cache_write(&self, msg: impl FnOnce() -> String) {
         if self.cfg.cache_writes {
-            self.send_info(msg());
+            self.send(msg, ELog::Log);
         }
     }
 
     pub fn proxy_failure(&self, msg: impl FnOnce() -> String) {
         if self.cfg.proxy_failures {
-            self.send_error(msg());
+            self.send(msg, ELog::Error);
         }
     }
 
     pub fn banned_target(&self, msg: impl FnOnce() -> String) {
         if self.cfg.banned_targets {
-            self.send_error(msg());
+            self.send(msg, ELog::Error);
         }
     }
 
     pub fn connection_error(&self, msg: impl FnOnce() -> String) {
         if self.cfg.connection_errors {
-            self.send_error(msg());
+            self.send(msg, ELog::Error);
         }
     }
 
     pub fn attempt(&self, msg: impl FnOnce() -> String) {
         if self.cfg.attempts {
-            self.send_info(msg());
+            self.send(msg, ELog::Log);
         }
     }
 }
@@ -115,6 +124,31 @@ mod tests {
             connection_errors: true,
             attempts: true,
         }
+    }
+
+    #[test]
+    fn full_queue_does_not_format_dropped_entries() {
+        let (tx, _rx) = mpsc::channel(1);
+        let log = Logger::new(tx, all_on());
+        log.lifecycle(|| "first".to_owned());
+        let formatted = Cell::new(false);
+        log.connection_error(|| {
+            formatted.set(true);
+            "discarded".to_owned()
+        });
+        assert!(!formatted.get());
+    }
+
+    #[tokio::test]
+    async fn control_characters_cannot_forge_log_records() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let log = Logger::new(tx, all_on());
+        log.connection_error(|| "данные\nforged\r\u{1b}[2J".to_owned());
+        let Some(ELog::Error(message)) = rx.recv().await else {
+            panic!("expected an error record");
+        };
+        assert!(!message.chars().any(char::is_control));
+        assert!(message.starts_with("данные\\nforged\\r"));
     }
 
     #[test]
