@@ -12,10 +12,11 @@
 //!   via [`platform::commit`]. On unix the commit is `fs::rename`; on
 //!   Windows it is `ReplaceFileW` (which preserves the replaced file's
 //!   DACL and attributes) with a plain rename fallback for a first
-//!   write. The temp file is created `0600` on unix from the very
-//!   start, and a replacement inherits the replaced file's mode (unix)
-//!   or DACL (windows) — see [`write_atomic`] for the exact durability
-//!   model.
+//!   write. The temp file is private from the very start — mode `0600`
+//!   on unix, a protected owner-only DACL on windows — before any
+//!   content is written, and a replacement inherits the replaced file's
+//!   mode (unix) or DACL (windows) — see [`write_atomic`] for the exact
+//!   durability model.
 //!
 //! - **No lost updates across processes:** the in-process `RwLock` in
 //!   `AuthState` cannot coordinate the server with a separate CLI
@@ -137,7 +138,7 @@ mod platform {
     use std::io;
     use std::os::raw::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
 
     use anyhow::{Context, Result};
@@ -159,11 +160,29 @@ mod platform {
         h_event: usize,
     }
 
+    /// Rust mirror of the full Win32 `SECURITY_ATTRIBUTES`
+    /// (wtypesbase.h): `DWORD nLength; LPVOID lpSecurityDescriptor;
+    /// BOOL bInheritHandle;` — `usize`-sized pointer fields use
+    /// `*mut c_void`, `BOOL` is `i32`.
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        security_descriptor: *mut c_void,
+        inherit_handle: i32,
+    }
+
     const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
     const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
     const ERROR_LOCK_VIOLATION: i32 = 33;
     const ERROR_UNABLE_TO_MOVE_REPLACEMENT: i32 = 1176;
     const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: i32 = 1177;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const SDDL_REVISION_1: u32 = 1;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -190,6 +209,26 @@ mod platform {
             exclude: *mut c_void,
             reserved: *mut c_void,
         ) -> i32;
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *mut SecurityAttributes,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: *mut c_void,
+        ) -> *mut c_void;
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
     }
 
     fn wide(p: &Path) -> Vec<u16> {
@@ -197,6 +236,93 @@ mod platform {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
+    }
+
+    /// Creates `path` as a brand-new file with a protected, owner-only
+    /// DACL — the Windows analogue of unix `OpenOptionsExt::mode(0o600)`
+    /// — and wraps the raw `HANDLE` into a `File`. Everything else
+    /// matches `OpenOptions::new().write(true).create_new(true)` (share
+    /// mode, attributes, and error mapping: `ERROR_FILE_EXISTS` from
+    /// `CREATE_NEW` maps to `AlreadyExists` exactly like `create_new`),
+    /// so callers see identical behavior except for the security
+    /// descriptor.
+    pub(super) fn create_private_tmp(path: &Path) -> io::Result<File> {
+        // SDDL "D:P(A;;FA;;;OW)" (Security Descriptor String Format,
+        // learn.microsoft.com): DACL with `P` = SE_DACL_PROTECTED — the
+        // DACL is protected, NOTHING is inherited from the containing
+        // directory — and one ACE: `A` allow, `FA` file-all access
+        // (FILE_GENERIC_ALL = 0x1F01FF), `OW` = Owner-Rights SID
+        // (S-1-3-4: the current owner of the file). No other principal
+        // is granted anything. Note: deliberately NOT "AI"
+        // (SE_DACL_AUTO_INHERITED is a status flag meaning the DACL was
+        // auto-inherited — the opposite of the intent here).
+        let sddl: Vec<u16> = "D:P(A;;FA;;;OW)"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `sddl` is a NUL-terminated wide string valid for the
+        // synchronous call. On success the function returns a
+        // self-relative security descriptor allocated with `LocalAlloc`
+        // that we own and must free with `LocalFree` (its documented
+        // contract), and it writes exactly one pointer through `&mut sd`.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(), // size out-param is optional
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        debug_assert!(!sd.is_null());
+
+        let mut sa = SecurityAttributes {
+            length: std::mem::size_of::<SecurityAttributes>() as u32,
+            security_descriptor: sd,
+            inherit_handle: 0, // FALSE: handle is not inheritable
+        };
+
+        let path_w = wide(path);
+        // SAFETY: `path_w` is NUL-terminated and outlives the call; `sa`
+        // (and the descriptor it points to) is valid for the duration of
+        // the synchronous call. `dwShareMode`/`dwFlagsAndAttributes`
+        // mirror what std uses for `OpenOptions::create_new` without
+        // custom flags (share read+write+delete, FILE_ATTRIBUTE_NORMAL).
+        let handle = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &mut sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        // INVALID_HANDLE_VALUE (all bits set), not NULL, signals failure.
+        if handle as usize == usize::MAX {
+            // Capture the error BEFORE LocalFree: another FFI call can
+            // clobber the thread's last-error value.
+            let err = io::Error::last_os_error();
+            // SAFETY: `sd` came from
+            // ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            // whose documented deallocator is LocalFree.
+            unsafe { LocalFree(sd) };
+            return Err(err);
+        }
+        // SAFETY: same ownership contract as above — we own `sd` and
+        // LocalFree is its documented deallocator.
+        unsafe { LocalFree(sd) };
+
+        // SAFETY: `handle` is a valid, exclusively owned file HANDLE
+        // from a successful CreateFileW; `File::from_raw_handle` takes
+        // sole ownership so `File`'s Drop closes it. No other wrapper
+        // owns this handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     pub(super) fn try_exclusive_lock(file: &File) -> io::Result<()> {
@@ -294,8 +420,10 @@ mod platform {
         match replace_file(path, tmp) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // First write: the target does not exist yet. A fresh file
-                // inherits the directory's DACL.
+                // First write: the target does not exist yet. The renamed temp
+                // KEEPS its own DACL — the protected owner-only descriptor it was
+                // created with (see `create_private_tmp`) — instead of inheriting
+                // the directory's.
                 fs::rename(tmp, path)
                     .with_context(|| format!("create {} from {}", path.display(), tmp.display()))
             }
@@ -404,8 +532,13 @@ mod platform {
 ///   Owner/group are not transferred — that would require privileges.
 ///   The temp is created `0600` and chmod'ed to the target's mode while
 ///   still private. On windows `ReplaceFileW` preserves the replaced
-///   file's DACL/attributes; a brand-new file inherits the directory's
-///   DACL.
+///   file's DACL/attributes, and the temp file is created with a
+///   protected owner-only DACL (SDDL `D:P(A;;FA;;;OW)` — the analogue
+///   of unix `0600`) so credential hashes never sit under the
+///   directory's (possibly wider) inherited DACL — not in the temp, not
+///   in a leftover crash-recovery copy, and not in a brand-new users
+///   file (a first write renames the already-protected temp into
+///   place).
 pub(crate) fn write_atomic(path: &Path, config: &UsersConfig) -> Result<()> {
     let text = ktav::to_string(config).context("serialize users")?;
     let tmp = sibling_path(path, ".tmp");
@@ -413,20 +546,30 @@ pub(crate) fn write_atomic(path: &Path, config: &UsersConfig) -> Result<()> {
     #[cfg(unix)]
     let existing_mode = existing_target_mode(path)?;
 
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
     // Cleanup is allowed only after this call creates the file.
-    let mut f = opts.open(&tmp).with_context(|| {
+    #[cfg(windows)]
+    let mut f = platform::create_private_tmp(&tmp).with_context(|| {
         format!(
             "create {}; any existing recovery file was preserved",
             tmp.display()
         )
     })?;
+    #[cfg(not(windows))]
+    let mut f = {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp).with_context(|| {
+            format!(
+                "create {}; any existing recovery file was preserved",
+                tmp.display()
+            )
+        })?
+    };
     let write_result = (|| -> Result<()> {
         #[cfg(unix)]
         if let Some(mode) = existing_mode {
@@ -694,6 +837,195 @@ mod tests {
             !sibling_path(&path, ".tmp").exists(),
             "failed commit must clean up the temp file"
         );
+        cleanup(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_temp_file_is_created_with_protected_owner_only_dacl() {
+        use std::os::raw::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        const SE_FILE_OBJECT: u32 = 1;
+        const OWNER_SECURITY_INFORMATION: u32 = 0x1;
+        const DACL_SECURITY_INFORMATION: u32 = 0x4;
+        const SE_DACL_PRESENT: u16 = 0x0004;
+        const SE_DACL_PROTECTED: u16 = 0x1000;
+        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+        const INHERITED_ACE: u8 = 0x10;
+        // FILE_ALL_ACCESS == FILE_GENERIC_ALL == STANDARD_RIGHTS_REQUIRED
+        // | SYNCHRONIZE | 0x1FF
+        const FILE_ALL_ACCESS_MASK: u32 = 0x001F_01FF;
+
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetNamedSecurityInfoW(
+                object_name: *const u16,
+                object_type: u32,
+                security_info: u32,
+                owner: *mut *mut c_void,
+                group: *mut *mut c_void,
+                dacl: *mut *mut c_void,
+                sacl: *mut *mut c_void,
+                security_descriptor: *mut *mut c_void,
+            ) -> u32;
+            fn GetSecurityDescriptorControl(
+                sd: *mut c_void,
+                control: *mut u16,
+                revision: *mut u32,
+            ) -> i32;
+            fn GetSecurityDescriptorDacl(
+                sd: *mut c_void,
+                present: *mut i32,
+                dacl: *mut *mut c_void,
+                defaulted: *mut i32,
+            ) -> i32;
+            fn GetSecurityDescriptorOwner(
+                sd: *mut c_void,
+                owner: *mut *mut c_void,
+                defaulted: *mut i32,
+            ) -> i32;
+            fn GetAce(acl: *mut c_void, index: u32, ace: *mut *mut c_void) -> i32;
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+        }
+
+        let path = unique_path("dacltmp");
+        let tmp = sibling_path(&path, ".tmp");
+        // Create the temp exactly as write_atomic would, and hold it open.
+        let f = platform::create_private_tmp(&tmp)
+            .expect("create_private_tmp must create the owner-only temp");
+
+        let tmp_w: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut c_void = std::ptr::null_mut();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        // SAFETY: tmp_w is NUL-terminated and outlives the call; every
+        // out-pointer is valid. The returned sd is freed with LocalFree
+        // below (documented contract of GetNamedSecurityInfoW).
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                tmp_w.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(rc, 0, "GetNamedSecurityInfoW failed");
+
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        let ok = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
+        assert_ne!(ok, 0, "GetSecurityDescriptorControl failed");
+        assert_ne!(control & SE_DACL_PRESENT, 0, "DACL must be present");
+        assert_ne!(
+            control & SE_DACL_PROTECTED,
+            0,
+            "DACL must be protected — no inheritance from the directory"
+        );
+
+        let mut dacl_present: i32 = 0;
+        let mut defaulted: i32 = 0;
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut defaulted) };
+        assert_ne!(ok, 0, "GetSecurityDescriptorDacl failed");
+        assert_ne!(dacl_present, 0, "DACL must be present");
+        assert!(!dacl.is_null());
+
+        // GetAclInformation proved unreliable here (it returned
+        // AclRevisionInformation-shaped data on this system), so read
+        // the ACL header directly — ACL layout (winnt.h):
+        // {AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, Sbz2 u16}.
+        let acl_bytes = dacl as *const u8;
+        let acl_revision = unsafe { *acl_bytes };
+        let ace_count = unsafe {
+            ((*acl_bytes.add(4) as u16) as u32) | (((*acl_bytes.add(5) as u16) as u32) << 8)
+        };
+        assert_eq!(
+            acl_revision, 2,
+            "ACL_REVISION expected for the temp file's DACL"
+        );
+        assert_eq!(
+            ace_count, 1,
+            "protected DACL must contain exactly our one ACE — no inherited ACEs"
+        );
+
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe { GetAce(dacl, 0, &mut ace) };
+        assert_ne!(ok, 0, "GetAce failed");
+        // ACCESS_ALLOWED_ACE layout (winnt.h): ACE_HEADER {AceType u8,
+        // AceFlags u8, AceSize u16} then ACCESS_MASK Mask u32 then
+        // SidStart (the SID begins here, at byte offset 8).
+        let ace_bytes = ace as *const u8;
+        let ace_type = unsafe { *ace_bytes };
+        let ace_flags = unsafe { *ace_bytes.add(1) };
+        let ace_mask = unsafe { std::ptr::read_unaligned(ace_bytes.add(4) as *const u32) };
+        let ace_sid = unsafe { ace_bytes.add(8) } as *mut c_void;
+        assert_eq!(ace_type, ACCESS_ALLOWED_ACE_TYPE);
+        assert_eq!(
+            ace_flags & INHERITED_ACE,
+            0,
+            "our ACE must not be flagged as inherited"
+        );
+        assert_eq!(ace_flags & 0x0F, 0, "no inheritance flags on a file ACE");
+        assert_eq!(
+            ace_mask, FILE_ALL_ACCESS_MASK,
+            "the single ACE must grant file-all access"
+        );
+
+        let mut owner_defaulted: i32 = 0;
+        let ok = unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut owner_defaulted) };
+        assert_ne!(ok, 0, "GetSecurityDescriptorOwner failed");
+        assert!(!owner.is_null(), "SD must have an owner");
+        // The ACE's SID must be the well-known Owner-Rights SID
+        // S-1-3-4 (SECURITY_CREATOR_SID_AUTHORITY = 3, one
+        // subauthority = 4) — the ACE grants to whoever owns the file,
+        // not to any named principal. SID layout (winnt.h):
+        // {Revision u8, SubAuthorityCount u8,
+        //  IdentifierAuthority [u8; 6] (big-endian),
+        //  SubAuthority [u32; count]}.
+        let sid_bytes = ace_sid as *const u8;
+        let sid_revision = unsafe { *sid_bytes };
+        let sid_sub_count = unsafe { *sid_bytes.add(1) };
+        let sid_authority = unsafe {
+            u64::from_be_bytes([
+                0,
+                0,
+                *sid_bytes.add(2),
+                *sid_bytes.add(3),
+                *sid_bytes.add(4),
+                *sid_bytes.add(5),
+                *sid_bytes.add(6),
+                *sid_bytes.add(7),
+            ])
+        };
+        let sid_first_sub = unsafe { std::ptr::read_unaligned(sid_bytes.add(8) as *const u32) };
+        assert_eq!(sid_revision, 1, "SID revision must be 1");
+        assert_eq!(sid_sub_count, 1, "Owner-Rights SID has one subauthority");
+        assert_eq!(
+            sid_authority, 3,
+            "ACE SID must use the Creator SID authority (S-1-3)"
+        );
+        assert_eq!(
+            sid_first_sub, 4,
+            "ACE SID must be the Owner-Rights SID (S-1-3-4)"
+        );
+
+        drop(f);
+        // SAFETY: sd was allocated by GetNamedSecurityInfoW; LocalFree is
+        // its documented deallocator. Same for the test-only declaration.
+        unsafe { LocalFree(sd) };
         cleanup(&path);
     }
 

@@ -33,3 +33,6 @@ Thumbs.db
 # Per-session checkpoints written by /checkpoint — internal notes,
 # never published.
 /docs/checkpoints/
+
+# /wrush task worktrees — always created here, in-tree
+/worktrees/
