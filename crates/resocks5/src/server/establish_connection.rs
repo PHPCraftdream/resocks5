@@ -62,6 +62,77 @@ fn gate_stage_of(err: &anyhow::Error) -> Option<GateStage> {
     err.downcast_ref::<GateStage>().copied()
 }
 
+/// Feed one failed route attempt into this call's bookkeeping. Shared
+/// by the cached-route retry path and the gates cartesian product so
+/// their outcome handling cannot drift apart. Cap-hit errors are our
+/// own load and feed nothing. Otherwise the failing [`GateStage`]
+/// decides who pays: `GateConnect` penalizes only the gate and
+/// dead-lists it, `ProxyToTarget` only the inner proxy (also
+/// dead-listed), while `GateToProxy` and untagged errors stay the
+/// documented ambiguous double penalty. A non-gate route
+/// (`gate_config` is `None` — the error came from `connect_proxy`,
+/// which never tags a stage) lands its single failure on the proxy
+/// alone. Returns `true` when the attempt proved the gate itself
+/// unreachable: the caller can stop pairing this gate with further
+/// proxies right away, because `pool.acquire(gate)` does not involve
+/// the inner proxy.
+fn apply_gate_failure(
+    err: &anyhow::Error,
+    proxy_rotator: &ProxyRotator,
+    proxy_config: &ProxyConfig,
+    gate_config: Option<&ProxyConfig>,
+    gate_rotator: Option<&ProxyRotator>,
+    dead_gates: &mut HashSet<UpstreamId>,
+    dead_proxies: &mut HashSet<UpstreamId>,
+) -> bool {
+    if !should_record_failure(err) {
+        return false;
+    }
+    let Some(gate_config) = gate_config else {
+        proxy_rotator.record_failure(proxy_config);
+        return false;
+    };
+    match gate_stage_of(err) {
+        Some(GateStage::GateConnect) => {
+            // Stage 1: the gate was never usable; the inner proxy was
+            // not touched.
+            if let Some(gate_rotator) = gate_rotator {
+                gate_rotator.record_failure(gate_config);
+            }
+            dead_gates.insert(upstream_id(gate_config));
+            true
+        }
+        Some(GateStage::GateToProxy) => {
+            // Stage 2 is ambiguous by construction: gate refusal to
+            // forward vs. a down inner proxy is indistinguishable
+            // here, so both stay penalized. The one clear attribution
+            // (inner-proxy AtCapacity) is already excluded by
+            // `should_record_failure` above.
+            proxy_rotator.record_failure(proxy_config);
+            if let Some(gate_rotator) = gate_rotator {
+                gate_rotator.record_failure(gate_config);
+            }
+            false
+        }
+        Some(GateStage::ProxyToTarget) => {
+            // Stage 3: the gate worked; the inner proxy failed to
+            // reach the target.
+            proxy_rotator.record_failure(proxy_config);
+            dead_proxies.insert(upstream_id(proxy_config));
+            false
+        }
+        None => {
+            // `use_gate` tags every fallible stage; keep the blanket
+            // double penalty for anything untagged.
+            proxy_rotator.record_failure(proxy_config);
+            if let Some(gate_rotator) = gate_rotator {
+                gate_rotator.record_failure(gate_config);
+            }
+            false
+        }
+    }
+}
+
 /// Stable identity of one real upstream within this call: everything
 /// that distinguishes genuinely different upstreams (endpoint,
 /// protocol, account, gate flag), deliberately excluding `gate` —
@@ -376,9 +447,15 @@ pub async fn establish_connection(
                             ctag
                         )
                     });
-                    if should_record_failure(&e) {
-                        rotator.record_failure(&cached_proxy);
-                    }
+                    apply_gate_failure(
+                        &e,
+                        rotator,
+                        &cached_proxy,
+                        cached_proxy.gate.as_deref(),
+                        gate_rotator.as_deref(),
+                        &mut dead_gates,
+                        &mut dead_proxies,
+                    );
                     rotator.unlink_proxy(target_addr);
                 }
             }
@@ -447,42 +524,22 @@ pub async fn establish_connection(
                             logger.proxy_failure(|| {
                                 format!("Failed: {} - {}{}", target_addr, e, ctag)
                             });
-                            if should_record_failure(&e) {
-                                match gate_stage_of(&e) {
-                                    Some(GateStage::GateConnect) => {
-                                        // Stage 1: the gate was never
-                                        // usable; the inner proxy was
-                                        // not touched.
-                                        gate_rotator.record_failure(gate_config);
-                                        dead_gates.insert(gate_id.clone());
-                                    }
-                                    Some(GateStage::GateToProxy) => {
-                                        // Stage 2 is ambiguous by
-                                        // construction: gate refusal to
-                                        // forward vs. a down inner proxy
-                                        // is indistinguishable here, so
-                                        // both stay penalized. The one
-                                        // clear attribution (inner-proxy
-                                        // AtCapacity) is already excluded
-                                        // by `should_record_failure`.
-                                        rotator.record_failure(proxy_config);
-                                        gate_rotator.record_failure(gate_config);
-                                    }
-                                    Some(GateStage::ProxyToTarget) => {
-                                        // Stage 3: the gate worked; the
-                                        // inner proxy failed to reach the
-                                        // target.
-                                        rotator.record_failure(proxy_config);
-                                        dead_proxies.insert(proxy_id.clone());
-                                    }
-                                    None => {
-                                        // `use_gate` tags every fallible
-                                        // stage; keep the old blanket
-                                        // behavior for anything untagged.
-                                        rotator.record_failure(proxy_config);
-                                        gate_rotator.record_failure(gate_config);
-                                    }
-                                }
+                            if apply_gate_failure(
+                                &e,
+                                rotator,
+                                proxy_config,
+                                Some(gate_config),
+                                Some(gate_rotator.as_ref()),
+                                &mut dead_gates,
+                                &mut dead_proxies,
+                            ) {
+                                // The gate itself is proven dead for the
+                                // rest of this call — no proxy pairing
+                                // can succeed against it — so stop
+                                // burning attempt budget on this gate
+                                // now instead of at the next
+                                // outer-loop entry (R2-19).
+                                continue 'gates;
                             }
                         }
                     }
@@ -1538,5 +1595,195 @@ m5U+IaJs7A0H816xsAViQQj2XJybA8npNgjnI4qzpH9iQXWDHvN+oCnb
         let joined = chain.join("\n");
         assert!(!joined.contains("alice"), "username leaked: {}", joined);
         assert!(!joined.contains("s3cret"), "password leaked: {}", joined);
+    }
+
+    /// Rating policy where ONE failure saturates the sand completely
+    /// (`fail_penalty == sand_max`) and decay is negligible over a test
+    /// run: a penalized upstream weighs exactly `min_weight` = 0.01 vs
+    /// 1.0 for a pristine one, so sampling `pick_order` separates the
+    /// two within a few thousand draws (same technique as the
+    /// rotator's own `record_failure_lowers_pick_probability`).
+    fn sharp_policy() -> resocks5_net::rating::RatingPolicy {
+        resocks5_net::rating::RatingPolicy {
+            half_life_sec: 3600.0,
+            fail_penalty: 8.0,
+            sand_max: 8.0,
+            min_weight: 0.01,
+            success_factor: 0.5,
+        }
+    }
+
+    /// Fraction of `n` weighted-random picks that put `proxy` first.
+    fn first_pick_fraction(rotator: &ProxyRotator, proxy: &ProxyConfig, n: u32) -> f64 {
+        let mut hits = 0u32;
+        for _ in 0..n {
+            if rotator.pick_order()[0].port == proxy.port {
+                hits += 1;
+            }
+        }
+        f64::from(hits) / f64::from(n)
+    }
+
+    #[tokio::test]
+    async fn cached_gate_connect_failure_penalizes_gate_not_inner_proxy() {
+        // R2-19: the cached-route retry of a gate composite must apply
+        // the same per-stage classification as the gates phase. The
+        // gate is unreachable (GateConnect): the inner proxy — never
+        // touched — keeps its rating, while the gate itself takes the
+        // penalty (and is excluded from the later gates phase).
+        let target = "example.com:443";
+        let logger = test_logger();
+        let banned = Arc::new(RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            handshake_timeout_sec: 2,
+            // One cache attempt, then the gates phase must bail before
+            // any pairing: budget 2 minus the direct reserve of 1. So
+            // the witness gate below is never attempted and its rating
+            // stays pristine as the control.
+            max_upstream_attempts: 2,
+            ..Default::default()
+        });
+        let dead_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
+        let witness_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 2)), true);
+        let inner_a = socks5_config(spawn_socks5_stub().await, false);
+        let inner_b = socks5_config(spawn_socks5_stub().await, false);
+        let mut composite = inner_a.clone();
+        composite.gate = Some(Arc::new(dead_gate.clone()));
+
+        let policy = sharp_policy();
+        let v4 = Arc::new(ProxyRotator::with_policy(
+            vec![inner_a.clone(), inner_b.clone()],
+            policy,
+        ));
+        v4.link_proxy(target.to_string(), Arc::new(composite));
+        let gates = Arc::new(ProxyRotator::with_policy(
+            vec![dead_gate, witness_gate.clone()],
+            policy,
+        ));
+
+        let result = establish_connection(
+            target,
+            &Some(gates.clone()),
+            &None,
+            &Some(v4.clone()),
+            &logger,
+            &banned,
+            &pool,
+            &network,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "direct fallback must serve the target: {:?}",
+            result.as_ref().err()
+        );
+
+        // The inner proxy was spared: both inners still weigh ~1.0, so
+        // either may be picked first about half the time. Before the
+        // fix the cached failure landed on the composite's inner
+        // identity (~1% first-pick).
+        let frac_a = first_pick_fraction(&v4, &inner_a, 2000);
+        assert!(
+            frac_a > 0.3,
+            "untouched inner proxy picked first only {:.1}%, expected ~50%",
+            frac_a * 100.0
+        );
+
+        // The gate took the penalty: the never-attempted witness gate
+        // must now dominate the gate rotator's picks. Before the fix
+        // both gates stayed pristine (~50%).
+        let frac_witness = first_pick_fraction(&gates, &witness_gate, 2000);
+        assert!(
+            frac_witness > 0.7,
+            "spared witness gate picked first only {:.1}%, expected ~99%",
+            frac_witness * 100.0
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_gate_not_retried_against_second_proxy_within_one_call() {
+        // R2-19: once a gate fails at GateConnect against the FIRST
+        // proxy, the same call must not burn another attempt pairing
+        // it with the NEXT proxy — the dead-gate short-circuit takes
+        // effect immediately, not at the next outer-loop entry. The
+        // budget is deliberately generous so only the short-circuit
+        // (not the budget) can stop the gates phase.
+        let target = "example.com:443";
+        let banned = Arc::new(RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            handshake_timeout_sec: 2,
+            max_upstream_attempts: 10,
+            ..Default::default()
+        });
+        let dead_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
+        let inner_a = socks5_config(spawn_socks5_stub().await, false);
+        let inner_b = socks5_config(spawn_socks5_stub().await, false);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
+        let logger = Arc::new(Logger::new(
+            tx,
+            crate::logger::LogConfig {
+                attempts: true,
+                ..Default::default()
+            },
+        ));
+
+        let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
+        let v4 = Arc::new(ProxyRotator::new(vec![inner_a, inner_b]));
+
+        let result = establish_connection(
+            target,
+            &Some(gates),
+            &None,
+            &Some(v4.clone()),
+            &logger,
+            &banned,
+            &pool,
+            &network,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "direct fallback must serve the target: {:?}",
+            result.as_ref().err()
+        );
+
+        // Each `use_gate` attempt logs exactly one `attempt ... path=gate`
+        // line; the direct fallback logs `path=direct`.
+        let mut gate_attempts = 0u32;
+        let mut direct_attempts = 0u32;
+        while let Ok(entry) = rx.try_recv() {
+            let crate::logger::ELog::Log(msg) = entry else {
+                continue;
+            };
+            if msg.contains("path=gate") {
+                gate_attempts += 1;
+            } else if msg.contains("path=direct") {
+                direct_attempts += 1;
+            }
+        }
+        assert_eq!(
+            gate_attempts, 1,
+            "a gate proven dead against the first proxy must not be \
+             re-tried against the second within the same call"
+        );
+        assert_eq!(
+            direct_attempts, 1,
+            "the direct fallback must still run exactly once"
+        );
     }
 }

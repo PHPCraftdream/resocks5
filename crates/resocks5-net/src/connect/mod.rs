@@ -16,6 +16,7 @@ pub mod parse_proxy_str;
 pub mod recover_host;
 pub mod tcp_keepalive;
 pub mod tls_fragment;
+pub mod tls_records;
 pub mod tunnel;
 pub mod upstream_tls;
 

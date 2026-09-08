@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use resocks5_net::connect::tls_fragment::{classify_client_hello, ClientHelloMatch};
+use resocks5_net::connect::tls_records::client_hello_is_complete;
 use resocks5_net::connect::{send_possibly_fragmented, tunnel::tunnel_with_timeouts};
 
 /// cancel-safe: NO — partial forwarding is terminal; both owned streams close.
@@ -49,9 +50,16 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let partial_signature =
-        frag.enabled && classify_client_hello(&initial) == ClientHelloMatch::Indeterminate;
-    if !initial.is_empty() && !partial_signature {
+    let unfinished_hello = frag.enabled
+        && match classify_client_hello(&initial) {
+            ClientHelloMatch::Indeterminate => true,
+            // R2-17: a confirmed signature does not mean the whole
+            // ClientHello has arrived — the SNI usually sits well past
+            // byte 6 and may arrive in a later read or record.
+            ClientHelloMatch::ClientHello => !client_hello_is_complete(&initial),
+            ClientHelloMatch::Other => false,
+        };
+    if !initial.is_empty() && !unfinished_hello {
         return within_idle(
             idle,
             send_possibly_fragmented(upstream, &initial, &frag.to_spec()),
@@ -63,9 +71,11 @@ where
         return Ok(true);
     }
     // The client prefix accumulates across multiple reads until the
-    // ClientHello signature is decidable — a single TCP segment often
-    // carries only part of a ClientHello, and deciding too early would
-    // forward the rest unfragmented (R21).
+    // whole ClientHello handshake message is assembled — a single TCP
+    // segment often carries only part of a ClientHello (R2-06), and the
+    // message itself may span several TLS records (R2-17). Deciding at
+    // the 6-byte signature would send every later SNI-bearing byte
+    // unfragmented.
     let mut first = initial;
     let mut len = first.len();
     first.resize(16 * 1024, 0);
@@ -76,22 +86,33 @@ where
                 n = client.read(&mut first[len..]) => {
                     let n = n?;
                     len += n;
-                    // n == 0: client EOF — nothing more will ever arrive, so decide
-                    // from what we have.
-                    let decided = n == 0
-                        || classify_client_hello(&first[..len]) != ClientHelloMatch::Indeterminate;
+                    // n == 0: client EOF — nothing more will ever arrive,
+                    // so decide from what we have. len == cap: the bounded
+                    // accumulator cannot take more either; degrade rather
+                    // than hang on a pathological oversized hello.
+                    let exhausted = n == 0 || len == first.len();
+                    let decided = match classify_client_hello(&first[..len]) {
+                        ClientHelloMatch::Other => true,
+                        // Still inside the 6-byte signature window.
+                        ClientHelloMatch::Indeterminate => exhausted,
+                        // Signature confirmed: hold until the whole
+                        // handshake message is assembled so no later-read
+                        // SNI bytes escape unfragmented.
+                        ClientHelloMatch::ClientHello => {
+                            exhausted || client_hello_is_complete(&first[..len])
+                        }
+                    };
                     if decided {
-                        // Forward the whole accumulated prefix in one fragmented (or
-                        // plain) write. An Indeterminate tail implies len < 6, and
-                        // send_possibly_fragmented forwards that as-is.
+                        // Forward the whole accumulated prefix in one
+                        // fragmented (or plain) write.
                         if len != 0 {
-                            send_possibly_fragmented(upstream, &first[..len], &frag.to_spec()).await?;
+                            send_possibly_fragmented(upstream, &first[..len], &frag.to_spec())
+                                .await?;
                         }
                         return Ok(true);
                     }
-                    // Still inside the 6-byte signature window: keep accumulating.
-                    // Safe against an empty read slice: Indeterminate implies
-                    // len < 6 << first.len(), so first[len..] is never empty here.
+                    // Keep accumulating. Safe against an empty read slice:
+                    // both undecided states imply len < first.len().
                     Ok(false)
                 }
                 n = upstream.read(&mut reply) => {
@@ -110,7 +131,18 @@ where
         match within_idle(idle, step).await? {
             Some(true) => return Ok(true),
             Some(false) => {}
-            None => return Ok(false),
+            None => {
+                // Idle mid-accumulation. A signature-confirmed hello
+                // degrades to forwarding what was accumulated (still
+                // fragmented) instead of dropping it; the undecided
+                // signature case keeps its existing behaviour.
+                if len != 0 && classify_client_hello(&first[..len]) == ClientHelloMatch::ClientHello
+                {
+                    send_possibly_fragmented(upstream, &first[..len], &frag.to_spec()).await?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
         }
     }
 }
@@ -276,15 +308,19 @@ mod tests {
             tunnel_max_lifetime_sec: 0,
             ..Default::default()
         };
-        let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x14, 0x01]; // record hdr + ClientHello type
-        hello.extend_from_slice(&[0xAA; 14]); // total 20 bytes
+        // Well-formed ClientHello record: 20-byte payload = 4-byte
+        // handshake header (type + 16-byte declared body) + 16 body
+        // bytes. The accumulator now walks the record layer, so the
+        // headers must agree with the payload.
+        let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x14, 0x01, 0x00, 0x00, 0x10];
+        hello.extend_from_slice(&[0xAA; 16]); // total 25 bytes
 
         let task = tokio::spawn(async move {
             forward_tunnel(
                 client_inner,
                 ChunkRecorder(chunks),
                 Vec::new(),
-                &fragmentation_with_size(4),
+                &fragmentation_with_size(5),
                 &network,
             )
             .await
@@ -296,11 +332,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let recorded = recorded_chunks.lock().unwrap().clone();
-        // Every fragment respects fragment_size=4 — with the old single-read
+        // Every fragment respects fragment_size=5 — with the old single-read
         // detection the first 5 bytes went out as ONE 5-byte chunk.
-        assert!(recorded.iter().all(|&n| n <= 4), "chunks: {recorded:?}");
+        assert!(recorded.iter().all(|&n| n <= 5), "chunks: {recorded:?}");
         assert_eq!(recorded.iter().sum::<usize>(), hello.len());
-        assert_eq!(recorded, vec![4, 4, 4, 4, 4]);
+        assert_eq!(recorded, vec![5, 5, 5, 5, 5]);
         task.abort();
     }
 
@@ -313,8 +349,8 @@ mod tests {
             tunnel_max_lifetime_sec: 0,
             ..Default::default()
         };
-        let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x14, 0x01];
-        hello.extend_from_slice(&[0xAA; 14]);
+        let mut hello = vec![0x16, 0x03, 0x01, 0x00, 0x14, 0x01, 0x00, 0x00, 0x10];
+        hello.extend_from_slice(&[0xAA; 16]);
 
         let task = tokio::spawn(async move {
             forward_tunnel(
@@ -398,5 +434,126 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    /// A complete, well-formed single-record ClientHello carrying one
+    /// SNI host_name extension (same shape as recover_host's builder).
+    fn client_hello_with_sni(host: &str) -> Vec<u8> {
+        let host = host.as_bytes();
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0xAB; 32]);
+        body.push(0x00); // empty session_id
+        body.extend_from_slice(&0x0002u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        let entry_len = 1 + 2 + host.len();
+        let sni_body_len = 2 + entry_len;
+        let ext_len = 4 + sni_body_len;
+        body.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&(sni_body_len as u16).to_be_bytes());
+        body.extend_from_slice(&(entry_len as u16).to_be_bytes());
+        body.push(0x00);
+        body.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        body.extend_from_slice(host);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+        rec.push(0x01);
+        rec.extend_from_slice(&[
+            (body.len() >> 16) as u8,
+            (body.len() >> 8) as u8,
+            body.len() as u8,
+        ]);
+        rec.extend_from_slice(&body);
+        rec
+    }
+
+    #[tokio::test]
+    async fn sni_bearing_tail_of_split_hello_is_also_fragmented() {
+        // R2-17: the 6-byte signature confirms on the first read, but
+        // the SNI-carrying bytes arrive only in a later one. The tail
+        // must go out through the fragmenting path too, not the plain
+        // post-accumulation copy.
+        let (mut client, client_inner) = duplex(64);
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_chunks = chunks.clone();
+        let network = NetworkConfig {
+            tunnel_idle_timeout_sec: 10,
+            tunnel_max_lifetime_sec: 0,
+            ..Default::default()
+        };
+        let hello = client_hello_with_sni("tail.example.org");
+        assert_eq!(
+            resocks5_net::connect::parse_sni(&hello).as_deref(),
+            Some("tail.example.org")
+        );
+        let task = tokio::spawn(async move {
+            forward_tunnel(
+                client_inner,
+                ChunkRecorder(chunks),
+                Vec::new(),
+                &fragmentation_with_size(4),
+                &network,
+            )
+            .await
+        });
+
+        client.write_all(&hello[..6]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.write_all(&hello[6..]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let recorded = recorded_chunks.lock().unwrap().clone();
+        // Every byte — including the late SNI-bearing tail — was sent
+        // through the fragmenting path: all chunks respect
+        // fragment_size=4. The old signature-only decision sent the
+        // first 6 bytes fragmented and the 71-byte tail as ONE chunk.
+        assert!(recorded.iter().all(|&n| n <= 4), "chunks: {recorded:?}");
+        assert_eq!(recorded.iter().sum::<usize>(), hello.len());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_hello_degrades_at_the_accumulator_cap() {
+        // A hello whose handshake header declares far more than the
+        // 16 KiB accumulator can never complete: the cap must forward
+        // what was accumulated instead of hanging (graceful degrade).
+        let (mut client, client_inner) = duplex(64);
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_chunks = chunks.clone();
+        let network = NetworkConfig {
+            tunnel_idle_timeout_sec: 10,
+            tunnel_max_lifetime_sec: 0,
+            ..Default::default()
+        };
+        let mut hello = vec![0x16, 0x03, 0x01, 0xFF, 0xFF, 0x01, 0xFF, 0xFF, 0xFF];
+        hello.resize(16 * 1024, 0xEE);
+        let task = tokio::spawn(async move {
+            forward_tunnel(
+                client_inner,
+                ChunkRecorder(chunks),
+                Vec::new(),
+                &fragmentation(),
+                &network,
+            )
+            .await
+        });
+        client.write_all(&hello).await.unwrap();
+        drop(client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let sum: usize = recorded_chunks.lock().unwrap().iter().sum();
+            if sum == 16 * 1024 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cap degrade never fired; got {sum} of {} bytes",
+                16 * 1024
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
     }
 }

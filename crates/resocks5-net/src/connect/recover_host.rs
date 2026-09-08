@@ -23,34 +23,38 @@
 //! Both parsers are strictly bounds-checked and allocation-light: they
 //! never panic on malformed input, returning `None` instead.
 
-/// Extract the SNI host from a TLS ClientHello record.
+use crate::connect::tls_records::assemble_handshake_message;
+
+/// Extract the SNI host from the TLS ClientHello record stream `data`.
 ///
 /// `data` must start at the TLS record header (content-type byte). The
-/// whole ClientHello is expected to fit within `data`; if it is
-/// truncated mid-field the parser gives up and returns `None` rather
-/// than guessing. Only the first `server_name` of type `host_name`
-/// (RFC 6066) is returned, lowercased.
+/// ClientHello may be split across several consecutive Handshake
+/// records (RFC 8446 §5.1), so the handshake message is reassembled
+/// across record boundaries before its fields are walked; a truncated
+/// stream is parsed as far as the bytes present, and the parser gives
+/// up mid-field (`None`) rather than guessing. Only the first
+/// `server_name` of type `host_name` (RFC 6066) is returned, lowercased.
 ///
 /// Returns `None` for: non-handshake records, non-ClientHello
 /// handshakes, absent SNI extension, or any malformed/truncated field.
 pub fn parse_sni(data: &[u8]) -> Option<String> {
-    // TLS record header: type(1) version(2) length(2)
-    // We require a Handshake record (0x16) and a major version of 0x03.
+    // TLS record header: type(1) version(2) length(2). We require a
+    // Handshake record (0x16) and a legacy major version of 0x03.
     if data.len() < 5 || data[0] != 0x16 || data[1] != 0x03 {
         return None;
     }
-    // Handshake body starts at offset 5. We parse against the record
-    // payload but tolerate the body extending across what would be
-    // multiple records in pathological cases — in practice a ClientHello
-    // fits one record. Clamp our view to the buffer we actually have.
-    let body = &data[5..];
-
+    // Reassemble the handshake byte stream across record boundaries: a
+    // second record's 5-byte header is framing, not handshake content.
+    let assembled = assemble_handshake_message(data)?;
     // Handshake header: msg_type(1) length(3)
-    if body.len() < 4 || body[0] != 0x01 {
+    if assembled.message.len() < 4 || assembled.message[0] != 0x01 {
         return None;
     }
-    let hs_len = be_u24(&body[1..4]) as usize;
-    let hs = body.get(4..4 + hs_len).unwrap_or(&body[4..]);
+    let hs_len = be_u24(&assembled.message[1..4]) as usize;
+    let hs = assembled
+        .message
+        .get(4..4 + hs_len)
+        .unwrap_or(&assembled.message[4..]);
 
     // ClientHello body:
     //   client_version(2) random(32) session_id(<vec8>)
@@ -156,8 +160,8 @@ fn is_http1_request_line(line: &[u8]) -> bool {
 /// SNI host in `data` — i.e. the prefix is consistent with the start of
 /// a TLS ClientHello record that has not fully arrived yet. `false`
 /// means further bytes cannot change the outcome: bytes already present
-/// rule out a ClientHello record, or the handshake body announced by
-/// the record headers is complete, so a `parse_sni` result of `None`
+/// rule out a ClientHello record, or the handshake message announced
+/// across the record headers is complete, so a `parse_sni` result of `None`
 /// on such input is final.
 ///
 /// This is the "keep reading?" counterpart of `parse_sni`, whose `None`
@@ -179,17 +183,19 @@ pub fn sni_might_still_appear(data: &[u8]) -> bool {
     if data[1] != 0x03 {
         return false; // wrong legacy record version; byte 1 is final
     }
-    if data.len() < 6 {
+    // Completeness is a record-layer question: each further record
+    // contributes payload minus its own 5-byte header, and the
+    // ClientHello may span records (RFC 8446 §5.1).
+    let Some(assembled) = assemble_handshake_message(data) else {
+        return true; // the first record header itself is still partial
+    };
+    if assembled.message.is_empty() {
         return true; // handshake-type byte not seen yet
     }
-    if data[5] != 0x01 {
+    if assembled.message[0] != 0x01 {
         return false; // handshake present but not a ClientHello
     }
-    if data.len() < 5 + 4 {
-        return true; // handshake header (type + 3-byte length) incomplete
-    }
-    let hs_len = be_u24(&data[6..9]) as usize;
-    data.len() < 5 + 4 + hs_len // handshake body still short
+    !assembled.complete // handshake body still short across records
 }
 
 /// `true` if appending more bytes could still let [`parse_http_host`]
@@ -576,5 +582,106 @@ mod tests {
         }
         // Once the request is complete the parsed host must be exact.
         assert_eq!(parse_http_host(req).as_deref(), Some("split.example"));
+    }
+
+    /// ClientHello handshake stream (msg_type + length + body) with a
+    /// 32-byte session_id and an SNI host, plus byte ranges — inside the
+    /// stream — of the session_id, the extensions block content, and the
+    /// server_name value, so tests can drop a TLS record boundary
+    /// strictly INSIDE a field rather than between fields.
+    #[allow(clippy::type_complexity)] // (stream, session_id, ext_block, name) ranges
+    fn hello_field_map(host: &str) -> (Vec<u8>, (usize, usize), (usize, usize), (usize, usize)) {
+        let host = host.as_bytes();
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // client_version
+        body.extend_from_slice(&[0xAB; 32]); // random
+        body.push(32); // session_id length
+        let sid = (body.len(), body.len() + 32);
+        body.resize(body.len() + 32, 0xAA);
+        body.extend_from_slice(&0x0002u16.to_be_bytes()); // cipher_suites length
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]); // compression_methods
+                                               // extensions block content:
+                                               //   [ext_type 2][ext_len 2][list_len 2][name_type 1][name_len 2][name]
+        let ext_body_len: u16 = (5 + host.len()) as u16; // list_len..name
+        let ext_total: u16 = (4 + ext_body_len as usize) as u16;
+        body.extend_from_slice(&ext_total.to_be_bytes()); // extensions total length
+        let ext_block = (body.len(), body.len() + ext_total as usize);
+        body.extend_from_slice(&0x0000u16.to_be_bytes()); // server_name ext type
+        body.extend_from_slice(&ext_body_len.to_be_bytes());
+        body.extend_from_slice(&((3 + host.len()) as u16).to_be_bytes()); // list_len
+        body.push(0x00); // name_type = host_name
+        body.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        let name = (body.len(), body.len() + host.len());
+        body.extend_from_slice(host);
+        let mut stream = vec![0x01]; // msg_type = ClientHello
+        let l = body.len();
+        stream.extend_from_slice(&[(l >> 16) as u8, (l >> 8) as u8, l as u8]);
+        stream.extend_from_slice(&body);
+        (stream, sid, ext_block, name)
+    }
+
+    /// Wrap one handshake message into TWO consecutive Handshake TLS
+    /// records whose boundary sits at `split` — a mid-field offset of
+    /// the caller's choosing.
+    fn two_record_hello(stream: &[u8], split: usize) -> Vec<u8> {
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(split as u16).to_be_bytes());
+        rec.extend_from_slice(&stream[..split]);
+        rec.extend_from_slice(&[0x16, 0x03, 0x01]);
+        rec.extend_from_slice(&((stream.len() - split) as u16).to_be_bytes());
+        rec.extend_from_slice(&stream[split..]);
+        rec
+    }
+
+    #[test]
+    fn parse_sni_reassembles_hello_split_inside_session_id() {
+        let (stream, sid, _, _) = hello_field_map("split.example");
+        let split = (sid.0 + sid.1) / 2;
+        assert!(split > sid.0 && split < sid.1);
+        assert_eq!(
+            parse_sni(&two_record_hello(&stream, split)).as_deref(),
+            Some("split.example")
+        );
+    }
+
+    #[test]
+    fn parse_sni_reassembles_hello_split_inside_extensions() {
+        let (stream, _, exts, name) = hello_field_map("split.example");
+        // Strictly inside the server_name_list length field: not on any
+        // field boundary, not inside the host name itself.
+        let split = exts.0 + 5;
+        assert!(split > exts.0 && split < exts.1 && split < name.0);
+        assert_eq!(
+            parse_sni(&two_record_hello(&stream, split)).as_deref(),
+            Some("split.example")
+        );
+    }
+
+    #[test]
+    fn parse_sni_reassembles_hello_split_inside_server_name_value() {
+        let (stream, _, _, name) = hello_field_map("fragmented.example.net");
+        let split = (name.0 + name.1) / 2;
+        assert!(split > name.0 && split < name.1);
+        assert_eq!(
+            parse_sni(&two_record_hello(&stream, split)).as_deref(),
+            Some("fragmented.example.net")
+        );
+    }
+
+    #[test]
+    fn sni_probe_accounts_for_record_boundaries() {
+        // One byte short of the declared message length — but the
+        // missing byte sits behind the second record's header. The
+        // probe must still say "keep reading": the shortfall is
+        // payload, not framing.
+        let (stream, _, _, _) = hello_field_map("split.example");
+        let split = stream.len() - 1;
+        let full = two_record_hello(&stream, split);
+        let header_plus = &full[..5 + split + 5];
+        assert_eq!(parse_sni(header_plus), None);
+        assert!(sni_might_still_appear(header_plus));
+        assert!(!sni_might_still_appear(&full));
+        assert_eq!(parse_sni(&full).as_deref(), Some("split.example"));
     }
 }
