@@ -231,22 +231,55 @@ mod platform {
         ) -> i32;
     }
 
-    fn wide(p: &Path) -> Vec<u16> {
-        p.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+    fn wide(p: &Path) -> io::Result<Vec<u16>> {
+        const SEP: u16 = b'\\' as u16;
+        const QUERY: u16 = b'?' as u16;
+        let mut encoded: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"));
+        }
+        // Normalize before adding a verbatim prefix: it disables slash/dot processing.
+        if !encoded.is_empty()
+            && !encoded.starts_with(&[SEP, SEP, QUERY, SEP])
+            && !encoded.starts_with(&[SEP, QUERY, QUERY, SEP])
+        {
+            let absolute = std::path::absolute(p)?;
+            encoded = absolute.as_os_str().encode_wide().collect();
+            if encoded.len() >= 248 {
+                use std::path::{Component, Prefix};
+                if let Some(Component::Prefix(prefix)) = absolute.components().next() {
+                    match prefix.kind() {
+                        Prefix::Disk(_) => {
+                            encoded.splice(..0, r"\\?\".encode_utf16());
+                        }
+                        Prefix::UNC(_, _) => {
+                            encoded.splice(..2, r"\\?\UNC\".encode_utf16());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    #[test]
+    fn wide_normalizes_long_unc_and_preserves_verbatim_paths() {
+        let tail = "x".repeat(250);
+        let unc = format!(r"\\server\share\folder\..\{tail}");
+        let verbatim = format!(r"\\?\UNC\server\share\{tail}");
+        let expected: Vec<u16> = verbatim.encode_utf16().chain([0]).collect();
+        assert_eq!(wide(Path::new(&unc)).unwrap(), expected);
+        assert_eq!(wide(Path::new(&verbatim)).unwrap(), expected);
     }
 
     /// Creates `path` as a brand-new file with a protected, owner-only
     /// DACL — the Windows analogue of unix `OpenOptionsExt::mode(0o600)`
-    /// — and wraps the raw `HANDLE` into a `File`. Everything else
-    /// matches `OpenOptions::new().write(true).create_new(true)` (share
-    /// mode, attributes, and error mapping: `ERROR_FILE_EXISTS` from
-    /// `CREATE_NEW` maps to `AlreadyExists` exactly like `create_new`),
-    /// so callers see identical behavior except for the security
-    /// descriptor.
+    /// — and wraps the owned `HANDLE` into a `File`. Existing paths
+    /// fail with `AlreadyExists`, like `OpenOptions::create_new`.
     pub(super) fn create_private_tmp(path: &Path) -> io::Result<File> {
+        let path_w = wide(path)?;
         // SDDL "D:P(A;;FA;;;OW)" (Security Descriptor String Format,
         // learn.microsoft.com): DACL with `P` = SE_DACL_PROTECTED — the
         // DACL is protected, NOTHING is inherited from the containing
@@ -286,7 +319,6 @@ mod platform {
             inherit_handle: 0, // FALSE: handle is not inheritable
         };
 
-        let path_w = wide(path);
         // SAFETY: `path_w` is NUL-terminated and outlives the call; `sa`
         // (and the descriptor it points to) is valid for the duration of
         // the synchronous call. `dwShareMode`/`dwFlagsAndAttributes`
@@ -387,8 +419,8 @@ mod platform {
     }
 
     fn replace_file(replaced: &Path, replacement: &Path) -> io::Result<()> {
-        let replaced_w = wide(replaced);
-        let replacement_w = wide(replacement);
+        let replaced_w = wide(replaced)?;
+        let replacement_w = wide(replacement)?;
         // SAFETY: both wide strings are NUL-terminated and outlive the
         // call. lpBackupFileName is NULL so Windows creates no backup
         // file and no backup artifact can be orphaned. Flags = 0: the
@@ -842,6 +874,72 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_private_temp_rejects_nul_without_creating_a_prefix_file() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let prefix = unique_path("nulpath");
+        let mut encoded: Vec<u16> = prefix.as_os_str().encode_wide().collect();
+        encoded.extend([0, u16::from(b'x')]);
+        let invalid = PathBuf::from(OsString::from_wide(&encoded));
+        let expected = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&invalid)
+            .unwrap_err()
+            .kind();
+        let result = platform::create_private_tmp(&invalid);
+        let actual = result.as_ref().err().map(std::io::Error::kind);
+        let prefix_created = prefix.exists();
+        drop(result);
+        cleanup(&prefix);
+        assert_eq!(actual, Some(expected));
+        assert!(!prefix_created, "NUL must not truncate the requested path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_temp_supports_long_paths() {
+        let root = unique_path("longpath");
+        fs::create_dir(&root).unwrap();
+        let dir = root
+            .join("a".repeat(80))
+            .join("b".repeat(80))
+            .join("c".repeat(80));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("users.tmp");
+        let standard = OpenOptions::new().write(true).create_new(true).open(&path);
+        assert!(
+            standard.is_ok(),
+            "std must support this fixture: {standard:?}"
+        );
+        drop(standard);
+        fs::remove_file(&path).unwrap();
+        let result = (|| -> Result<UsersConfig> {
+            drop(platform::create_private_tmp(&path)?);
+            fs::remove_file(&path)?;
+            write_atomic(
+                &path,
+                &UsersConfig {
+                    users: vec![user("alice", "one")],
+                },
+            )?;
+            write_atomic(
+                &path,
+                &UsersConfig {
+                    users: vec![user("bob", "two")],
+                },
+            )?;
+            Ok(ktav::from_file(&path)?)
+        })();
+        fs::remove_dir_all(&root).unwrap();
+        let loaded = result.expect("long-path creation and replacement must succeed");
+        assert_eq!(loaded.users.len(), 1);
+        assert_eq!(loaded.users[0].name, "bob");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_temp_file_is_created_with_protected_owner_only_dacl() {
         use std::os::raw::c_void;
         use std::os::windows::ffi::OsStrExt;
@@ -851,11 +949,15 @@ mod tests {
         const DACL_SECURITY_INFORMATION: u32 = 0x4;
         const SE_DACL_PRESENT: u16 = 0x0004;
         const SE_DACL_PROTECTED: u16 = 0x1000;
-        const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
-        const INHERITED_ACE: u8 = 0x10;
-        // FILE_ALL_ACCESS == FILE_GENERIC_ALL == STANDARD_RIGHTS_REQUIRED
-        // | SYNCHRONIZE | 0x1FF
-        const FILE_ALL_ACCESS_MASK: u32 = 0x001F_01FF;
+        const ACL_SIZE_INFORMATION_CLASS: u32 = 2;
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct AclSizeInformation {
+            ace_count: u32,
+            bytes_in_use: u32,
+            bytes_free: u32,
+        }
 
         #[link(name = "advapi32")]
         extern "system" {
@@ -874,16 +976,11 @@ mod tests {
                 control: *mut u16,
                 revision: *mut u32,
             ) -> i32;
-            fn GetSecurityDescriptorDacl(
-                sd: *mut c_void,
-                present: *mut i32,
-                dacl: *mut *mut c_void,
-                defaulted: *mut i32,
-            ) -> i32;
-            fn GetSecurityDescriptorOwner(
-                sd: *mut c_void,
-                owner: *mut *mut c_void,
-                defaulted: *mut i32,
+            fn GetAclInformation(
+                acl: *mut c_void,
+                information: *mut c_void,
+                length: u32,
+                class: u32,
             ) -> i32;
             fn GetAce(acl: *mut c_void, index: u32, ace: *mut *mut c_void) -> i32;
         }
@@ -893,23 +990,27 @@ mod tests {
             fn LocalFree(hmem: *mut c_void) -> *mut c_void;
         }
 
+        struct LocalDescriptor(*mut c_void);
+        impl Drop for LocalDescriptor {
+            fn drop(&mut self) {
+                // SAFETY: this descriptor is owned and allocated by GetNamedSecurityInfoW.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+
         let path = unique_path("dacltmp");
         let tmp = sibling_path(&path, ".tmp");
-        // Create the temp exactly as write_atomic would, and hold it open.
-        let f = platform::create_private_tmp(&tmp)
-            .expect("create_private_tmp must create the owner-only temp");
-
+        let file = platform::create_private_tmp(&tmp).unwrap();
         let tmp_w: Vec<u16> = tmp
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let mut owner: *mut c_void = std::ptr::null_mut();
-        let mut dacl: *mut c_void = std::ptr::null_mut();
-        let mut sd: *mut c_void = std::ptr::null_mut();
-        // SAFETY: tmp_w is NUL-terminated and outlives the call; every
-        // out-pointer is valid. The returned sd is freed with LocalFree
-        // below (documented contract of GetNamedSecurityInfoW).
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: tmp_w is terminated and all output pointers are valid.
+        // On success, sd owns the allocation containing owner and dacl.
         let rc = unsafe {
             GetNamedSecurityInfoW(
                 tmp_w.as_ptr(),
@@ -922,111 +1023,55 @@ mod tests {
                 &mut sd,
             )
         };
+        drop(file);
+        cleanup(&path);
         assert_eq!(rc, 0, "GetNamedSecurityInfoW failed");
+        let sd = LocalDescriptor(sd);
+        assert!(!sd.0.is_null());
+        assert!(!owner.is_null(), "SD must have an owner");
+        assert!(!dacl.is_null(), "DACL must not grant unrestricted access");
 
-        let mut control: u16 = 0;
-        let mut revision: u32 = 0;
-        let ok = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) };
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: sd is live and valid; both output slots match the Win32 ABI.
+        let ok = unsafe { GetSecurityDescriptorControl(sd.0, &mut control, &mut revision) };
         assert_ne!(ok, 0, "GetSecurityDescriptorControl failed");
-        assert_ne!(control & SE_DACL_PRESENT, 0, "DACL must be present");
-        assert_ne!(
-            control & SE_DACL_PROTECTED,
-            0,
-            "DACL must be protected — no inheritance from the directory"
-        );
+        assert_ne!(control & SE_DACL_PRESENT, 0);
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
 
-        let mut dacl_present: i32 = 0;
-        let mut defaulted: i32 = 0;
-        let ok =
-            unsafe { GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut dacl, &mut defaulted) };
-        assert_ne!(ok, 0, "GetSecurityDescriptorDacl failed");
-        assert_ne!(dacl_present, 0, "DACL must be present");
-        assert!(!dacl.is_null());
-
-        // GetAclInformation proved unreliable here (it returned
-        // AclRevisionInformation-shaped data on this system), so read
-        // the ACL header directly — ACL layout (winnt.h):
-        // {AclRevision u8, Sbz1 u8, AclSize u16, AceCount u16, Sbz2 u16}.
-        let acl_bytes = dacl as *const u8;
-        let acl_revision = unsafe { *acl_bytes };
-        let ace_count = unsafe {
-            ((*acl_bytes.add(4) as u16) as u32) | (((*acl_bytes.add(5) as u16) as u32) << 8)
+        let mut info = AclSizeInformation::default();
+        // SAFETY: dacl is inside the live sd; class 2 writes this repr(C) layout.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<AclSizeInformation>() as u32,
+                ACL_SIZE_INFORMATION_CLASS,
+            )
         };
-        assert_eq!(
-            acl_revision, 2,
-            "ACL_REVISION expected for the temp file's DACL"
-        );
-        assert_eq!(
-            ace_count, 1,
-            "protected DACL must contain exactly our one ACE — no inherited ACEs"
-        );
+        assert_ne!(ok, 0, "GetAclInformation failed");
+        assert_eq!(info.ace_count, 1, "only the owner-rights ACE is allowed");
 
-        let mut ace: *mut c_void = std::ptr::null_mut();
+        let mut ace = std::ptr::null_mut();
+        // SAFETY: dacl is live and contains one ACE; ace is a valid output slot.
         let ok = unsafe { GetAce(dacl, 0, &mut ace) };
         assert_ne!(ok, 0, "GetAce failed");
-        // ACCESS_ALLOWED_ACE layout (winnt.h): ACE_HEADER {AceType u8,
-        // AceFlags u8, AceSize u16} then ACCESS_MASK Mask u32 then
-        // SidStart (the SID begins here, at byte offset 8).
-        let ace_bytes = ace as *const u8;
-        let ace_type = unsafe { *ace_bytes };
-        let ace_flags = unsafe { *ace_bytes.add(1) };
-        let ace_mask = unsafe { std::ptr::read_unaligned(ace_bytes.add(4) as *const u32) };
-        let ace_sid = unsafe { ace_bytes.add(8) } as *mut c_void;
-        assert_eq!(ace_type, ACCESS_ALLOWED_ACE_TYPE);
+        assert!(!ace.is_null());
+        // SAFETY: every valid ACE begins with the four-byte ACE_HEADER.
+        let header = unsafe { std::ptr::read_unaligned(ace.cast::<[u8; 4]>()) };
+        assert_eq!(header[0], 0, "ACCESS_ALLOWED_ACE expected");
+        assert_eq!(header[1], 0, "no inherited or inheritable flags");
+        let ace_size = u16::from_le_bytes([header[2], header[3]]);
+        assert_eq!(ace_size, 20, "owner-rights ACE has a twelve-byte SID");
+        // SAFETY: GetAce returned a valid ACE; its checked size covers these bytes.
+        let body = unsafe { std::ptr::read_unaligned(ace.cast::<u8>().add(4).cast::<[u8; 16]>()) };
+        let mask = u32::from_le_bytes(body[..4].try_into().unwrap());
+        assert_eq!(mask, 0x001F_01FF, "FILE_ALL_ACCESS expected");
         assert_eq!(
-            ace_flags & INHERITED_ACE,
-            0,
-            "our ACE must not be flagged as inherited"
+            &body[4..],
+            &[1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0],
+            "S-1-3-4 expected"
         );
-        assert_eq!(ace_flags & 0x0F, 0, "no inheritance flags on a file ACE");
-        assert_eq!(
-            ace_mask, FILE_ALL_ACCESS_MASK,
-            "the single ACE must grant file-all access"
-        );
-
-        let mut owner_defaulted: i32 = 0;
-        let ok = unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut owner_defaulted) };
-        assert_ne!(ok, 0, "GetSecurityDescriptorOwner failed");
-        assert!(!owner.is_null(), "SD must have an owner");
-        // The ACE's SID must be the well-known Owner-Rights SID
-        // S-1-3-4 (SECURITY_CREATOR_SID_AUTHORITY = 3, one
-        // subauthority = 4) — the ACE grants to whoever owns the file,
-        // not to any named principal. SID layout (winnt.h):
-        // {Revision u8, SubAuthorityCount u8,
-        //  IdentifierAuthority [u8; 6] (big-endian),
-        //  SubAuthority [u32; count]}.
-        let sid_bytes = ace_sid as *const u8;
-        let sid_revision = unsafe { *sid_bytes };
-        let sid_sub_count = unsafe { *sid_bytes.add(1) };
-        let sid_authority = unsafe {
-            u64::from_be_bytes([
-                0,
-                0,
-                *sid_bytes.add(2),
-                *sid_bytes.add(3),
-                *sid_bytes.add(4),
-                *sid_bytes.add(5),
-                *sid_bytes.add(6),
-                *sid_bytes.add(7),
-            ])
-        };
-        let sid_first_sub = unsafe { std::ptr::read_unaligned(sid_bytes.add(8) as *const u32) };
-        assert_eq!(sid_revision, 1, "SID revision must be 1");
-        assert_eq!(sid_sub_count, 1, "Owner-Rights SID has one subauthority");
-        assert_eq!(
-            sid_authority, 3,
-            "ACE SID must use the Creator SID authority (S-1-3)"
-        );
-        assert_eq!(
-            sid_first_sub, 4,
-            "ACE SID must be the Owner-Rights SID (S-1-3-4)"
-        );
-
-        drop(f);
-        // SAFETY: sd was allocated by GetNamedSecurityInfoW; LocalFree is
-        // its documented deallocator. Same for the test-only declaration.
-        unsafe { LocalFree(sd) };
-        cleanup(&path);
     }
 
     #[test]

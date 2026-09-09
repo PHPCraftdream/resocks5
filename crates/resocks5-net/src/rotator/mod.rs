@@ -9,8 +9,8 @@
 //! [`DEFAULT_STICKY_CACHE_TTL`], with LRU + TTL eviction by default.
 //! Use [`ProxyRotator::with_cache_limits`] to configure both limits.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{hash_map::RandomState, BTreeSet, HashMap};
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,197 +36,110 @@ fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
         && a.password == b.password
 }
 
+fn upstream_hash(state: &RandomState, proxy: &ProxyConfig) -> u64 {
+    state.hash_one((
+        proxy.host.as_str(),
+        proxy.port,
+        std::mem::discriminant(&proxy.protocol),
+        proxy.user.as_deref(),
+        proxy.password.as_deref(),
+        proxy.is_gate,
+    ))
+}
+
 /// Default hard cap on sticky-cache entries.
 pub const DEFAULT_STICKY_CACHE_MAX_ENTRIES: usize = 4096;
 /// Default sticky-cache entry lifetime.
 pub const DEFAULT_STICKY_CACHE_TTL: Duration = Duration::from_secs(600);
 
-/// A sticky-cache entry: the linked proxy plus LRU recency and TTL stamps.
 struct StickyEntry {
     proxy: Arc<ProxyConfig>,
-    /// LRU recency stamp.
     last_used: Instant,
-    /// TTL deadline.
     expires_at: Instant,
-    /// The entry's address, as an `Arc<str>` created once per insert so
-    /// per-touch pushes into the [`LruBook`] are refcount-only — no
-    /// `String` allocation on the hot `get` path.
-    key: Arc<str>,
-    /// Generation of `last_used`/`key`: the [`LruBook`] generation this
-    /// entry's current recency item was minted under. Older heap items
-    /// with mismatching generations are stale and discarded lazily.
-    gen: u64,
-    /// The shared LRU order book. Every entry of one cache carries a
-    /// clone of the same handle: the [`StickyCache`] field set is frozen
-    /// by struct literals elsewhere, so the book rides in the entries.
-    book: Arc<Mutex<LruBook>>,
+    generation: u64,
 }
 
-/// Min-heap on `(last_used, gen, key)` holding one item per recent
-/// touch/insert, ordered by recency then push order. `gen` is a
-/// book-wide monotonic counter minted on every push so each item is
-/// unique; a touch or re-insert mints a new item and bumps the entry's
-/// generation, leaving the old items stale (generation/recency
-/// mismatch), discarded when they surface — never scanned for eagerly.
-/// The inner `Mutex` never contends in practice because the book is
-/// only locked while the cache's own `Mutex<StickyCache>` is held (all
-/// `StickyCache` methods take `&mut self`); it exists because the book
-/// is shared through `Arc` clones inside the entries.
-#[derive(Default)]
-struct LruBook {
-    heap: BinaryHeap<Reverse<(Instant, u64, Arc<str>)>>,
-    next_gen: u64,
-}
-
-impl LruBook {
-    /// Mint the next generation and record `key`'s recency stamp.
-    fn push(&mut self, key: &Arc<str>, now: Instant) -> u64 {
-        let gen = self.next_gen;
-        // One mint per cache operation cannot exhaust u64; wrapping_add
-        // keeps the astronomically unlikely overflow defined instead of
-        // a debug-only panic. A wrapped reuse would at worst mis-order
-        // one eviction tie.
-        self.next_gen = gen.wrapping_add(1);
-        self.heap.push(Reverse((now, gen, Arc::clone(key))));
-        gen
-    }
-
-    /// Pop items until one live entry's current item surfaces, then
-    /// evict that entry from `map` — the LRU victim, or an expired
-    /// entry the old full-scan purge would have removed — and report
-    /// success. Items for entries since re-touched or removed are
-    /// stale and discarded. Returns `false` only when the heap ran
-    /// dry: under the book invariant (every live entry's current
-    /// `(last_used, gen, key)` item is in the heap) that implies `map`
-    /// is empty.
-    fn pop_into(&mut self, map: &mut HashMap<String, StickyEntry>) -> bool {
-        while let Some(Reverse((stamp, gen, key))) = self.heap.pop() {
-            let current = map
-                .get(key.as_ref())
-                .is_some_and(|entry| entry.gen == gen && entry.last_used == stamp);
-            if current {
-                map.remove(key.as_ref());
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Discard stale items that have surfaced at the top of the heap so
-    /// it stays proportional to the live entries between evictions;
-    /// stops at the first current item.
-    fn shed_stale(&mut self, map: &HashMap<String, StickyEntry>) {
-        while let Some(Reverse((stamp, gen, key))) = self.heap.peek() {
-            match map.get(key.as_ref()) {
-                Some(entry) if entry.gen == *gen && entry.last_used == *stamp => break,
-                _ => {
-                    self.heap.pop();
-                }
-            }
-        }
-    }
-}
-
-/// Bounded sticky cache with LRU + TTL eviction.
-///
-/// The LRU order lives in an [`LruBook`] shared by the entries instead
-/// of a field here, because this struct is constructed wholesale (by
-/// `ProxyRotator::with_cache_limits` and the unit tests) with a struct
-/// literal naming exactly `max_entries`, `ttl`, and `map`, so the field
-/// set is fixed and the eviction order rides in the entries as shared
-/// `Arc` handles.
+/// Each entry owns exactly one recency record and one expiry record.
 struct StickyCache {
     max_entries: usize,
     ttl: Duration,
-    map: HashMap<String, StickyEntry>,
+    map: HashMap<Arc<str>, StickyEntry>,
+    recency: BTreeSet<(Instant, u64, Arc<str>)>,
+    expiry: BTreeSet<(Instant, Arc<str>)>,
+    next_generation: u64,
 }
 
 impl StickyCache {
-    /// The cache-wide [`LruBook`] handle: cloned from any live entry,
-    /// or freshly created when the map is empty (the previous book died
-    /// with the last entry, together with its stale heap items).
-    fn book(&self) -> Arc<Mutex<LruBook>> {
-        match self.map.values().next() {
-            Some(entry) => Arc::clone(&entry.book),
-            None => Arc::default(),
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            max_entries,
+            ttl,
+            map: HashMap::new(),
+            recency: BTreeSet::new(),
+            expiry: BTreeSet::new(),
+            next_generation: 0,
         }
     }
 
-    /// Look up `addr`; expired entries are removed and reported as a miss.
     fn get(&mut self, addr: &str, now: Instant) -> Option<Arc<ProxyConfig>> {
-        if self.map.get(addr).is_some_and(|e| now >= e.expires_at) {
-            self.map.remove(addr);
+        let (key, entry) = self.map.get_key_value(addr)?;
+        if now >= entry.expires_at {
+            self.remove(addr);
             return None;
         }
+        let key = Arc::clone(key);
         let entry = self.map.get_mut(addr)?;
+        self.recency
+            .remove(&(entry.last_used, entry.generation, key.clone()));
         entry.last_used = now;
-        let book = Arc::clone(&entry.book);
-        let mut order = book.lock().unwrap();
-        let gen = order.push(&entry.key, now);
-        entry.gen = gen;
-        let proxy = entry.proxy.clone(); // last use of `entry`'s borrow
-        order.shed_stale(&self.map);
-        drop(order);
-        Some(proxy)
+        entry.generation = self.next_generation;
+        // Break ties between touches sharing an Instant.
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.recency.insert((now, entry.generation, key));
+        Some(entry.proxy.clone())
     }
 
-    /// Insert (or replace) the entry for `addr`, evicting as needed.
     fn insert(&mut self, addr: String, proxy: Arc<ProxyConfig>, now: Instant) {
         if self.max_entries == 0 {
-            return; // cache disabled
-        }
-        let expires_at = now.checked_add(self.ttl).unwrap_or(now);
-        if let Some(entry) = self.map.get_mut(&addr) {
-            // Replace in place: not a new insert, no eviction needed.
-            entry.proxy = proxy;
-            entry.last_used = now;
-            entry.expires_at = expires_at;
-            let book = Arc::clone(&entry.book);
-            let mut order = book.lock().unwrap();
-            let gen = order.push(&entry.key, now);
-            entry.gen = gen;
-            order.shed_stale(&self.map);
             return;
         }
-        let key: Arc<str> = Arc::from(addr.as_str());
-        let book = self.book();
-        let mut order = book.lock().unwrap();
+        let key = self.remove(&addr);
         if self.map.len() >= self.max_entries {
-            // Purge expired entries and evict LRU victims from the heap
-            // until there is room. Each pop either discards a stale item
-            // or removes one entry, so the loop makes progress; the
-            // `break` arm is unreachable while the book invariant holds
-            // and only guards a non-empty map with a spent heap.
-            while self.map.len() >= self.max_entries {
-                if !order.pop_into(&mut self.map) {
-                    break;
-                }
+            // Reclaim one expired entry before evicting any live entry.
+            let victim = self
+                .expiry
+                .first()
+                .filter(|(deadline, _)| *deadline <= now)
+                .map(|(_, key)| key)
+                .or_else(|| self.recency.first().map(|(_, _, key)| key))
+                .cloned();
+            if let Some(victim) = victim {
+                self.remove(&victim);
             }
         }
-        // Shed stale items before pushing: the new item is not yet in
-        // `map`, so shedding after the push would discard it as stale.
-        order.shed_stale(&self.map);
-        let gen = order.push(&key, now);
-        drop(order);
+        let key = key.unwrap_or_else(|| Arc::from(addr));
+        let expires_at = now.checked_add(self.ttl).unwrap_or(now);
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.recency.insert((now, generation, key.clone()));
+        self.expiry.insert((expires_at, key.clone()));
         self.map.insert(
-            addr,
+            key,
             StickyEntry {
                 proxy,
-                key,
                 last_used: now,
                 expires_at,
-                gen,
-                book,
+                generation,
             },
         );
     }
 
-    /// Plain remove (used by `unlink_proxy`).
-    fn remove(&mut self, addr: &str) {
-        self.map.remove(addr);
-        // The removed entry's heap items go stale; the book drops them
-        // lazily when they surface. If this was the last entry, the
-        // book dies with it and the next insert starts a fresh one.
+    fn remove(&mut self, addr: &str) -> Option<Arc<str>> {
+        let (key, entry) = self.map.remove_entry(addr)?;
+        self.recency
+            .remove(&(entry.last_used, entry.generation, key.clone()));
+        self.expiry.remove(&(entry.expires_at, key.clone()));
+        Some(key)
     }
 }
 
@@ -247,6 +160,9 @@ pub struct ProxyRotator {
     /// Pre-built `Arc<ProxyConfig>` per upstream. `get_next` returns a
     /// cheap refcount clone, so no full struct copy on rotation.
     proxies: Vec<Arc<ProxyConfig>>,
+    identity_hasher: RandomState,
+    /// Hash collisions are resolved by comparing the borrowed identity fields.
+    by_identity: HashMap<u64, Vec<usize>>,
     /// Round-robin counter, fetched-and-incremented atomically. Wrap
     /// at `usize::MAX` (decades away) is harmless: the `% len()` mod
     /// happens after every fetch.
@@ -284,8 +200,8 @@ impl ProxyRotator {
     ///
     /// `max_entries` is the hard cap on cached target entries — `0`
     /// disables the sticky cache entirely. `ttl` is the entry lifetime —
-    /// `0` expires entries immediately. When the cache is full, the
-    /// least-recently-used entry is evicted to make room (LRU eviction).
+    /// `0` expires entries immediately. A full cache reclaims an expired
+    /// entry first, otherwise evicting the least-recently-used entry.
     pub fn with_cache_limits(
         proxies: Vec<ProxyConfig>,
         policy: RatingPolicy,
@@ -293,14 +209,27 @@ impl ProxyRotator {
         ttl: Duration,
     ) -> Self {
         let n = proxies.len();
+        let identity_hasher = RandomState::new();
+        let mut by_identity = HashMap::<_, Vec<usize>>::with_capacity(n);
+        for (index, proxy) in proxies.iter().enumerate() {
+            let bucket = by_identity
+                .entry(upstream_hash(&identity_hasher, proxy))
+                .or_default();
+            if let Some(slot) = bucket
+                .iter_mut()
+                .find(|slot| same_upstream(proxy, &proxies[**slot]))
+            {
+                *slot = index;
+            } else {
+                bucket.push(index);
+            }
+        }
         Self {
             proxies: proxies.into_iter().map(Arc::new).collect(),
+            identity_hasher,
+            by_identity,
             index: AtomicUsize::new(0),
-            sticky: Mutex::new(StickyCache {
-                max_entries,
-                ttl,
-                map: HashMap::new(),
-            }),
+            sticky: Mutex::new(StickyCache::new(max_entries, ttl)),
             ratings: Ratings::new(n, policy),
         }
     }
@@ -309,8 +238,8 @@ impl ProxyRotator {
     /// of `Arc<ProxyConfig>` so the caller can hand off the only clone
     /// it had — refcount stays the same.
     ///
-    /// The entry is subject to the cache's LRU + TTL eviction: if the
-    /// cache is full, the least-recently-used entry is evicted.
+    /// A full cache reclaims an expired entry first, otherwise evicting
+    /// the least-recently-used entry.
     pub fn link_proxy(&self, addr: String, proxy: Arc<ProxyConfig>) {
         self.sticky
             .lock()
@@ -357,13 +286,14 @@ impl ProxyRotator {
 
     /// Look up the internal index for the given proxy config.
     ///
-    /// The proxy list is immutable after construction, so a borrowed
-    /// linear scan needs no lock and no allocation; it is called once
-    /// per attempt outcome, not per byte of traffic. `rposition`
-    /// returns the LAST matching entry, matching the old reverse
-    /// index, where a duplicate identity overwrote the earlier slot.
+    /// Expected O(1), with no lock or allocation. Duplicate identities
+    /// resolve to the last configured slot.
     fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
-        self.proxies.iter().rposition(|q| same_upstream(p, q))
+        self.by_identity
+            .get(&upstream_hash(&self.identity_hasher, p))?
+            .iter()
+            .copied()
+            .find(|index| same_upstream(p, &self.proxies[*index]))
     }
 
     /// Record a failure for the given proxy in the sand model.
@@ -406,6 +336,27 @@ mod tests {
             is_gate: false,
             gate: None,
         }
+    }
+
+    #[test]
+    fn rating_index_checks_identity_on_hash_collision() {
+        let first = make_proxy("one", 1000);
+        let second = make_proxy("two", 1001);
+        let mut rotator = ProxyRotator::new(vec![first.clone(), second.clone()]);
+        let hash = upstream_hash(&rotator.identity_hasher, &first);
+        rotator.by_identity.insert(hash, vec![1, 0]);
+        assert_eq!(rotator.index_of(&first), Some(0));
+        rotator.by_identity.insert(hash, vec![1]);
+        assert_eq!(rotator.index_of(&first), None);
+    }
+
+    #[test]
+    fn rating_index_preserves_last_duplicate_slot() {
+        let proxy = make_proxy("one", 1000);
+        let rotator = ProxyRotator::new(vec![proxy.clone(), proxy.clone(), proxy.clone()]);
+        assert_eq!(rotator.index_of(&proxy), Some(2));
+        let hash = upstream_hash(&rotator.identity_hasher, &proxy);
+        assert_eq!(rotator.by_identity[&hash].len(), 1);
     }
 
     #[test]
@@ -613,11 +564,7 @@ mod tests {
 
     #[test]
     fn ttl_expires_entries() {
-        let mut cache = StickyCache {
-            max_entries: 8,
-            ttl: Duration::from_secs(10),
-            map: HashMap::new(),
-        };
+        let mut cache = StickyCache::new(8, Duration::from_secs(10));
         let t0 = Instant::now();
         cache.insert("a".to_string(), Arc::new(make_proxy("h", 1000)), t0);
         assert!(cache.get("a", t0 + Duration::from_secs(5)).is_some());
@@ -626,12 +573,84 @@ mod tests {
     }
 
     #[test]
+    fn sticky_metadata_stays_bounded_behind_a_cold_entry() {
+        let mut cache = StickyCache::new(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let proxy = Arc::new(make_proxy("h", 1000));
+        cache.insert("cold".to_string(), proxy.clone(), t0);
+        cache.insert("hot".to_string(), proxy, t0);
+        for second in 1..=8 {
+            assert!(cache.get("hot", t0 + Duration::from_secs(second)).is_some());
+        }
+        let metadata_entries = cache.recency.len() + cache.expiry.len();
+        assert!(
+            metadata_entries <= 2 * cache.max_entries,
+            "two cached targets retained {metadata_entries} eviction records"
+        );
+    }
+
+    #[test]
+    fn sticky_expiry_takes_precedence_over_recency() {
+        let mut cache = StickyCache::new(2, Duration::from_secs(10));
+        let t0 = Instant::now();
+        cache.insert("expired".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+        cache.insert(
+            "live".to_string(),
+            Arc::new(make_proxy("h", 1001)),
+            t0 + Duration::from_secs(5),
+        );
+        assert!(cache.get("expired", t0 + Duration::from_secs(9)).is_some());
+        let now = t0 + Duration::from_secs(11);
+        cache.insert("new".to_string(), Arc::new(make_proxy("h", 1002)), now);
+        assert_eq!(cache.get("live", now).map(|p| p.port), Some(1001));
+        assert_eq!(cache.get("new", now).map(|p| p.port), Some(1002));
+        assert!(cache.get("expired", now).is_none());
+    }
+
+    #[test]
+    fn sticky_replacement_refreshes_expiry_and_removal_releases_metadata() {
+        let mut cache = StickyCache::new(2, Duration::from_secs(10));
+        let t0 = Instant::now();
+        cache.insert("A".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+        cache.insert(
+            "B".to_string(),
+            Arc::new(make_proxy("h", 1001)),
+            t0 + Duration::from_secs(1),
+        );
+        cache.insert(
+            "A".to_string(),
+            Arc::new(make_proxy("h", 1002)),
+            t0 + Duration::from_secs(8),
+        );
+        assert!(cache.get("B", t0 + Duration::from_secs(9)).is_some());
+        let now = t0 + Duration::from_secs(11);
+        cache.insert("C".to_string(), Arc::new(make_proxy("h", 1003)), now);
+        assert_eq!(cache.get("A", now).map(|p| p.port), Some(1002));
+        assert!(cache.get("B", now).is_none());
+        cache.remove("A");
+        cache.remove("C");
+        assert!(cache.map.is_empty());
+        assert!(cache.recency.is_empty());
+        assert!(cache.expiry.is_empty());
+    }
+
+    #[test]
+    fn sticky_recency_orders_operations_with_equal_timestamps() {
+        let mut cache = StickyCache::new(2, Duration::from_secs(10));
+        let now = Instant::now();
+        let proxy = Arc::new(make_proxy("h", 1000));
+        cache.insert("A".to_string(), proxy.clone(), now);
+        cache.insert("B".to_string(), proxy.clone(), now);
+        assert!(cache.get("A", now).is_some());
+        cache.insert("C".to_string(), proxy, now);
+        assert!(cache.get("A", now).is_some());
+        assert!(cache.get("C", now).is_some());
+        assert!(cache.get("B", now).is_none());
+    }
+
+    #[test]
     fn ttl_purge_frees_room_without_evicting_live_entries() {
-        let mut cache = StickyCache {
-            max_entries: 2,
-            ttl: Duration::from_secs(10),
-            map: HashMap::new(),
-        };
+        let mut cache = StickyCache::new(2, Duration::from_secs(10));
         let t0 = Instant::now();
         cache.insert("A".to_string(), Arc::new(make_proxy("h", 1000)), t0);
         cache.insert("B".to_string(), Arc::new(make_proxy("h", 1001)), t0);
