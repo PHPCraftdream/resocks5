@@ -17,7 +17,7 @@ use crate::logger::Logger;
 use crate::server;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
-use resocks5_net::connect::{parse_http_host, parse_sni};
+use resocks5_net::connect::{parse_http_host, parse_sni, HostPort};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -442,11 +442,26 @@ async fn parse_http_connect(
         }
     };
     let pipelined = buf.split_off(header_end);
-    let header_section = std::str::from_utf8(&buf[..header_end - 4])
-        .map_err(|_| anyhow!("non-UTF-8 bytes in HTTP request line/headers"))?;
+    // Byte-wise header parsing: obs-text bytes (0x80..=0xFF) are legal
+    // in field values (RFC 9110 §5.5) and this proxy ignores fields it
+    // doesn't use, so the block as a whole must NOT be required to be
+    // UTF-8. Only the request line and the fields actually read below
+    // are validated.
+    let mut lines: Vec<&[u8]> = Vec::new();
+    let mut rest = &buf[..header_end - 4];
+    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+        lines.push(&rest[..pos]);
+        rest = &rest[pos + 2..];
+    }
+    lines.push(rest);
 
-    let mut lines = header_section.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
+    let request_line = match std::str::from_utf8(lines[0]) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = client_stream.write_all(RESP_400).await;
+            return Err(anyhow!("non-UTF-8 bytes in HTTP request line"));
+        }
+    };
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -463,24 +478,43 @@ async fn parse_http_connect(
             method
         ));
     }
-    if !target.contains(':') {
+    // Validate the authority with the same grammar the upstream applies
+    // (HostPort::parse) BEFORE any pool acquire / dial: a bad port is a
+    // client error (RFC 9110 §9.3.6) and must cost a 400 here — never a
+    // wasted upstream attempt or a rotator rating penalty.
+    if HostPort::parse(target).is_none() {
         let _ = client_stream.write_all(RESP_400).await;
-        return Err(anyhow!("CONNECT target lacks :port — {:?}", target));
+        return Err(anyhow!(
+            "CONNECT target is not a valid host:port authority — {:?}",
+            target
+        ));
     }
 
-    // Find Proxy-Authorization (case-insensitive header name).
+    // Find Proxy-Authorization (case-insensitive header name). The scan
+    // works on raw bytes; only THIS field's value must be UTF-8 (it is
+    // decoded further below) — opaque bytes in any other header are
+    // skipped without affecting the parse.
     let mut proxy_auth_value: Option<&str> = None;
-    for line in lines {
+    for &line in lines.iter().skip(1) {
         if line.is_empty() {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("proxy-authorization") {
-            proxy_auth_value = Some(value.trim());
-            break;
+        let (name, value) = (&line[..colon], &line[colon + 1..]);
+        if !name
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"proxy-authorization")
+        {
+            continue;
         }
+        let Ok(value) = std::str::from_utf8(value.trim_ascii()) else {
+            let _ = client_stream.write_all(RESP_407).await;
+            return Err(anyhow!("Proxy-Authorization header is not valid UTF-8"));
+        };
+        proxy_auth_value = Some(value);
+        break;
     }
 
     // Auth policy mirrors the SOCKS5 dispatcher in
@@ -625,6 +659,85 @@ mod tests {
         let (result, response) = parse_request(&request).await;
         assert!(result.is_err());
         assert!(response.starts_with(b"HTTP/1.1 431 "));
+    }
+
+    #[tokio::test]
+    async fn invalid_connect_port_is_rejected_with_400_without_dialing() {
+        // parse_http_connect is called directly — no pool, rotator, or
+        // upstream exists in this test, so a 400 here provably happens
+        // before any upstream attempt or rating change.
+        for target in [
+            "example.com:notaport",
+            "example.com:",
+            "example.com:99999",
+            "example.com:65536",
+            "example.com:-1",
+            ":443",
+            "[::1]",
+        ] {
+            let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let (result, response) = parse_request(request.as_bytes()).await;
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("target {target:?} must be rejected"));
+            assert!(
+                !error.to_string().contains("upstream"),
+                "target {target:?} must not be classified as an upstream failure: {error}"
+            );
+            assert!(
+                response.starts_with(b"HTTP/1.1 400 "),
+                "target {target:?} must get 400, got {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_connect_authorities_still_parse() {
+        for target in [
+            "example.com:443",
+            "1.2.3.4:443",
+            "[2001:db8::1]:443",
+            "2001:db8::1:443",
+        ] {
+            let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let (result, _) = parse_request(request.as_bytes()).await;
+            assert!(result.is_ok(), "target {target:?} must still parse");
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_byte_in_unused_header_does_not_break_connect() {
+        // obs-text 0xE9 inside a header the proxy never reads (RFC 9110
+        // §5.5) must not fail the parse of an otherwise-valid CONNECT.
+        let request =
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nX-Opaque: \xE9\r\n\r\n"
+                .to_vec();
+        let (result, response) = parse_request(&request).await;
+        let req = result.expect("obs-text in an unused header must not fail the parse");
+        assert_eq!(req.target, "example.com:443");
+        assert!(
+            response.is_empty(),
+            "no error response expected on success, got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_utf8_proxy_authorization_value_is_rejected_with_407() {
+        let (result, response) = parse_request(
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic \xE9\r\n\r\n",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(response.starts_with(b"HTTP/1.1 407 "));
+    }
+
+    #[tokio::test]
+    async fn non_utf8_request_line_is_rejected_with_400() {
+        let (result, response) =
+            parse_request(b"CONNECT ex\xE9ample.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await;
+        assert!(result.is_err());
+        assert!(response.starts_with(b"HTTP/1.1 400 "));
     }
 
     // ── Recovery-path tests ─────────────────────────────────────────
