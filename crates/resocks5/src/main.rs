@@ -142,8 +142,56 @@ fn main() -> Result<()> {
     }
 }
 
-#[tokio::main]
-async fn run_server() -> Result<()> {
+/// Ceiling on runtime teardown after the async body returns.
+///
+/// The `#[tokio::main]` this replaces dropped the `Runtime` implicitly
+/// at the end of `main`, and `Runtime::drop` waits WITHOUT any timeout
+/// for every outstanding blocking-pool operation (tokio 1.43.1
+/// `BlockingPool::drop` → `shutdown(None)`). The log-drain task's
+/// `tokio::io::stdout/stderr/fs` writes dispatch to that pool
+/// (`io/blocking.rs::poll_write`), so a sink that stopped accepting
+/// bytes — a stalled pipe reader, a hung filesystem write — would hang
+/// process exit forever (review R5-06). `shutdown_timeout` waits at
+/// most this long for blocking work, then abandons it.
+///
+/// Loss policy: log lines still parked in a wedged write when this
+/// budget elapses are LOST, by design — a deliberate, bounded exit
+/// beats an indefinite hang. Five seconds mirrors the drain budget's
+/// intent (short grace, ample for a full backlog flush); drain join +
+/// diagnostic + teardown together stay far below the 30 s tunnel drain
+/// (`SHUTDOWN_DRAIN_SEC`).
+const SHUTDOWN_TEARDOWN_TIMEOUT_SEC: u64 = 5;
+
+/// Ceiling on one shutdown-time stderr diagnostic (see
+/// [`emit_shutdown_diagnostic`]). One line should never need more.
+const SHUTDOWN_DIAGNOSTIC_TIMEOUT_SEC: u64 = 1;
+
+/// Sync entry point: owns the runtime so its teardown is bounded. The
+/// async work lives in [`run_server_inner`]; this wrapper makes the
+/// `Runtime` an explicit local so it ends in `shutdown_timeout` instead
+/// of an unbounded implicit `Drop`, even if the body panics.
+fn run_server() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // catch_unwind so a panic can't unwind past the bounded teardown:
+    // unwinding would drop the `Runtime`, blocking without limit on
+    // stuck blocking-pool I/O. The panic hook has already printed the
+    // message; `resume_unwind` preserves the original unwind.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(run_server_inner())
+    }));
+    runtime.shutdown_timeout(Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC));
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Previous `#[tokio::main]` body, unchanged apart from the name: all
+/// runtime-dependent work stays here so `run_server` alone owns
+/// runtime creation and the bounded teardown.
+async fn run_server_inner() -> Result<()> {
     let configs = config::load_or_init()?;
     let cfg_main = &configs.main;
 
@@ -399,12 +447,17 @@ async fn run_server() -> Result<()> {
 /// `BufWriter`, while keeping the worst case far below the 30 s tunnel
 /// drain (`SHUTDOWN_DRAIN_SEC`) — a log flush must never dominate
 /// shutdown.
+/// On expiry the drain task is detached and un-flushed lines are lost
+/// by design; the bounded runtime teardown guarantees the detached
+/// task's wedged write cannot extend process exit.
 const LOG_DRAIN_TIMEOUT_SEC: u64 = 5;
 
-/// Body of the async log-drain task, spawned by `run_server`. Returns
-/// the `JoinHandle` so shutdown can wait for the queue to flush instead
-/// of letting `#[tokio::main]`'s runtime teardown silently cancel the
-/// task mid-`recv()`.
+/// Body of the async log-drain task, spawned by `run_server_inner`.
+/// Returns the `JoinHandle` so shutdown can wait for the queue to flush
+/// instead of letting runtime teardown silently cancel the task
+/// mid-`recv()` (a timeout instead detaches it; the bounded teardown
+/// then abandons any wedged write — see
+/// [`SHUTDOWN_TEARDOWN_TIMEOUT_SEC`]).
 ///
 /// A file write/flush failure is NOT swallowed: the first failure is
 /// reported on stderr and the task falls back to console-only for the
@@ -476,17 +529,43 @@ fn spawn_log_drain(
 /// `server::run_server`'s own shutdown sequence. Bounded so a channel
 /// that somehow never closes can't hang the process; on timeout we
 /// complain on stderr because the file logger itself may be what's
-/// stuck.
+/// stuck — via a diagnostic that is itself bounded (see
+/// [`emit_shutdown_diagnostic`]), and the runtime teardown that follows
+/// is bounded too (`SHUTDOWN_TEARDOWN_TIMEOUT_SEC`), so a wedged sink
+/// costs at most its grace periods, never an indefinite hang. Lines
+/// still un-flushed when a budget elapses are lost by design.
 async fn shutdown_log_drain(logger: Arc<logger::Logger>, drain: tokio::task::JoinHandle<()>) {
     drop(logger);
     match tokio::time::timeout(Duration::from_secs(LOG_DRAIN_TIMEOUT_SEC), drain).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("log drain task failed: {e}"),
-        Err(_) => eprintln!(
-            "warning: log drain did not finish within {LOG_DRAIN_TIMEOUT_SEC}s — \
-             recently queued log lines may have been lost"
-        ),
+        Ok(Err(e)) => {
+            emit_shutdown_diagnostic(format!("log drain task failed: {e}\n")).await;
+        }
+        Err(_) => {
+            emit_shutdown_diagnostic(format!(
+                "warning: log drain did not finish within {LOG_DRAIN_TIMEOUT_SEC}s — \
+                 recently queued log lines may have been lost\n"
+            ))
+            .await;
+        }
     }
+}
+
+/// Shutdown-time stderr diagnostic that cannot itself wedge the exit
+/// path. A synchronous `eprintln!` does a blocking `write()` — when the
+/// drain already timed out because a sink stopped accepting bytes, the
+/// same sink may be stderr, and the warning would hang forever. The
+/// write goes through `tokio::io::stderr()` (blocking pool, yields to
+/// the runtime) with its own budget; on expiry the message is dropped
+/// silently — nothing further can be done, and bounded exit is the
+/// point of this code path.
+async fn emit_shutdown_diagnostic(message: String) {
+    let mut err = tokio::io::stderr();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_DIAGNOSTIC_TIMEOUT_SEC),
+        err.write_all(message.as_bytes()),
+    )
+    .await;
 }
 
 /// One write+flush of a formatted log line. Flushed per line (existing
@@ -671,6 +750,60 @@ mod tests {
         assert!(
             msg.contains("console-only"),
             "must tell the operator the fallback: {msg}"
+        );
+    }
+
+    /// The R5-06 root cause as a test: a blocking-pool operation that
+    /// never finishes (exactly what a `tokio::io::stdout` write to a
+    /// stopped pipe becomes — `Blocking::poll_write` parks it in this
+    /// pool) must not extend process exit. The old `#[tokio::main]` path
+    /// ended with an implicit `Runtime::drop`, which waits unbounded for
+    /// exactly this; the explicit `shutdown_timeout` must return within
+    /// its budget instead.
+    #[test]
+    fn runtime_teardown_is_bounded_with_a_stuck_blocking_write() {
+        let start = std::time::Instant::now();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime must build");
+        runtime.block_on(async {
+            // Stuck sink stand-in: a blocking-pool op that never returns.
+            tokio::task::spawn_blocking(|| loop {
+                std::thread::park();
+            });
+        });
+        runtime.shutdown_timeout(Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "teardown must abandon the stuck blocking op within its budget, took {elapsed:?}"
+        );
+    }
+
+    /// A drain task that never completes (sink wedged mid-write) must be
+    /// given up on after the budget, not awaited forever; the timeout
+    /// diagnostic must not hang either (it is itself a bounded write).
+    /// Paused time lets the 5 s budget and the 1 s diagnostic budget
+    /// elapse via auto-advance, proving the give-up structure returns
+    /// without real wall-clock cost.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drain_gives_up_on_never_completing_drain() {
+        let start = std::time::Instant::now();
+        let (tx, _rx) = mpsc::channel::<ELog>(4);
+        let logger = Arc::new(crate::logger::Logger::new(
+            tx,
+            crate::logger::LogConfig {
+                lifecycle: true,
+                ..Default::default()
+            },
+        ));
+        let drain = spawn(std::future::pending::<()>());
+        shutdown_log_drain(logger, drain).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "give-up path must not wait in real time, took {:?}",
+            start.elapsed()
         );
     }
 }
