@@ -452,11 +452,25 @@ async fn socks5_handshake(
             ));
         }
         let ulen = auth_hdr[1] as usize;
+        // RFC 1929 §2: ULEN and PLEN are 1..=255 — a zero length is a
+        // malformed frame, rejected before any credential processing.
+        if ulen == 0 {
+            let _ = client_stream.write_all(&[0x01, 0x01]).await;
+            return Err(anyhow!(
+                "Zero-length username in auth subnegotiation (RFC 1929 requires 1-255 bytes)"
+            ));
+        }
         let mut uname = vec![0u8; ulen];
         client_stream.read_exact(&mut uname).await?;
         let mut plen_buf = [0u8; 1];
         client_stream.read_exact(&mut plen_buf).await?;
         let plen = plen_buf[0] as usize;
+        if plen == 0 {
+            let _ = client_stream.write_all(&[0x01, 0x01]).await;
+            return Err(anyhow!(
+                "Zero-length password in auth subnegotiation (RFC 1929 requires 1-255 bytes)"
+            ));
+        }
         let mut pword = vec![0u8; plen];
         client_stream.read_exact(&mut pword).await?;
 
@@ -670,6 +684,190 @@ mod tests {
         .expect("timed out")
         .0;
         assert_eq!(target_addr, "example.com:443");
+    }
+
+    // ── RFC 1929 zero-length-field tests (R5-07) ────────────────────
+
+    fn init_user(name: &str) -> crate::config::User {
+        crate::config::User {
+            name: name.to_string(),
+            // Mirrors state.rs's INIT_HASH ("init") first-login sentinel.
+            hash: "init".to_string(),
+            is_enabled: true,
+            direct: false,
+        }
+    }
+
+    fn unique_users_path() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let i = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "resocks5_test_socks5_users_{}_{}.ktav",
+                std::process::id(),
+                i,
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn auth_state_with_users(
+        users: Vec<crate::config::User>,
+        path: &str,
+    ) -> Arc<crate::auth::AuthState> {
+        Arc::new(
+            crate::auth::AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: false,
+                },
+                &crate::config::UsersConfig { users },
+                path,
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn zero_length_field_rejected_then_valid_claim(auth_frame: &[u8]) {
+        let path = unique_users_path();
+        let auth = auth_state_with_users(vec![init_user("bob")], &path);
+
+        // First connection: the malformed auth frame must fail the
+        // handshake without touching the claim machinery.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one(listener, auth.clone()));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x02]);
+        client.write_all(auth_frame).await.unwrap();
+
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x01, 0x01]);
+        drop(client);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "malformed frame must fail the handshake: {result:?}"
+        );
+        assert!(!std::path::Path::new(&path).exists());
+
+        // Second connection: a valid claim still succeeds and persists.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one(listener, auth));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x02]);
+
+        let mut frame = vec![0x01, 0x03, b'b', b'o', b'b', 0x07];
+        frame.extend_from_slice(b"real-pw");
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x01, 0x00]);
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
+            .await
+            .unwrap();
+        let (target_addr, authed_user) = tokio::time::timeout(Duration::from_secs(5), async {
+            server.await.unwrap().unwrap()
+        })
+        .await
+        .expect("timed out");
+        assert_eq!(target_addr, "1.2.3.4:443");
+        assert_eq!(authed_user.as_deref(), Some("bob"));
+
+        let loaded: crate::config::UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, "init");
+        assert!(bob.hash.starts_with("$argon2id$"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn zero_length_username_frame_rejected_and_init_stays_unclaimed() {
+        zero_length_field_rejected_then_valid_claim(&[0x01, 0x00]).await;
+    }
+
+    #[tokio::test]
+    async fn zero_length_password_frame_rejected_and_init_stays_unclaimed() {
+        zero_length_field_rejected_then_valid_claim(&[0x01, 0x03, b'b', b'o', b'b', 0x00]).await;
+    }
+
+    async fn short_password_claims_via_socks5(password: &[u8]) {
+        let path = unique_users_path();
+        let auth = auth_state_with_users(vec![init_user("bob")], &path);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one(listener, auth));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x02]);
+
+        let mut frame = vec![0x01, 0x03, b'b', b'o', b'b', password.len() as u8];
+        frame.extend_from_slice(password);
+        client.write_all(&frame).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x01, 0x00]);
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
+            .await
+            .unwrap();
+        let (target_addr, authed_user) = tokio::time::timeout(Duration::from_secs(5), async {
+            server.await.unwrap().unwrap()
+        })
+        .await
+        .expect("timed out");
+        assert_eq!(target_addr, "1.2.3.4:443");
+        assert_eq!(authed_user.as_deref(), Some("bob"));
+
+        let loaded: crate::config::UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, "init");
+        assert!(bob.hash.starts_with("$argon2id$"));
+
+        let fresh = crate::auth::AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous: false,
+            },
+            &loaded,
+            path.clone(),
+        )
+        .unwrap();
+        assert!(fresh.verify("bob", std::str::from_utf8(password).unwrap()));
+        assert!(!fresh.verify("bob", "y"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn one_byte_password_claims_via_socks5_and_persists() {
+        short_password_claims_via_socks5(b"x").await;
+    }
+
+    #[tokio::test]
+    async fn password_255_bytes_claims_via_socks5_and_persists() {
+        short_password_claims_via_socks5(&vec![b'a'; 255]).await;
     }
 
     // ── Recovery-path tests ─────────────────────────────────────────

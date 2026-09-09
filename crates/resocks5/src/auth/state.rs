@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, Result};
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
@@ -43,16 +43,28 @@ struct UserEntry {
 /// account by submitting a password that is then hashed (Argon2id),
 /// written into both the in-memory state and `resocks5.users.ktav`, and
 /// from that point on behaves as a normal account. Concurrent claims
-/// are serialised through the `users` write lock; the loser of the race
+/// are serialised through the dedicated `claim_lock` mutex (which is
+/// held across the cross-process persist); the `users` write lock is
+/// taken only for short publish/rollback updates. The loser of the race
 /// either authenticates against the winner's hash (same password →
 /// success) or fails (different password → standard rejection).
 pub struct AuthState {
     /// `RwLock` because `verify` may mutate the list (init-claim path)
     /// while other connections are doing read-only lookups in parallel.
-    /// Normal verify takes the read lock only briefly; init-claim is
-    /// the only writer and runs at most once per user (lifetime of the
-    /// server process / persisted file).
+    /// Guards are held only briefly: hashing and the cross-process
+    /// persist run OUTSIDE the lock (see `claim_lock`), so normal
+    /// cache-miss verifies never block behind claim file I/O. Init-claim
+    /// is the only writer and runs at most once per user (lifetime of
+    /// the server process / persisted file).
     users: RwLock<Vec<User>>,
+    claim_lock: Mutex<()>,
+    /// Serialises init-claims within this process. Held across the
+    /// whole claim critical section (re-check + persist + publish), so
+    /// only one thread at a time can claim a given (or any) user. The
+    /// cross-process `UsersFileLock` inside `persist_claim` still
+    /// serialises against other processes. A std Mutex is correct:
+    /// claim work runs synchronously inside `spawn_blocking` threads
+    /// and nothing `.await`s while the guard is held.
     entries: HashMap<String, UserEntry>,
     verify_slots: Arc<Semaphore>,
     /// Mirrors `auth.allow_anonymous` from `resocks5.main.ktav`. When
@@ -92,6 +104,7 @@ impl AuthState {
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
         Ok(Self {
             users: RwLock::new(users.users.clone()),
+            claim_lock: Mutex::new(()),
             entries,
             verify_slots: Arc::new(Semaphore::new(workers)),
             allow_anonymous: auth_cfg.allow_anonymous,
@@ -189,6 +202,15 @@ impl AuthState {
     /// hash-compute failure, disk persistence failure, or a real
     /// password mismatch.
     fn try_claim_init(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> bool {
+        // An empty password must never be claimable. The CLI rejects
+        // empty passwords (run_user_command::read_new_password); this
+        // claim path is reachable from any input protocol, so it
+        // enforces the same invariant independently of the SOCKS5
+        // framing layer (R5-07).
+        if password.is_empty() {
+            return false;
+        }
+
         // Compute the new hash outside the write lock — Argon2id takes
         // ~15 ms and we don't want it blocking concurrent read-side
         // verify calls during that window.
@@ -196,37 +218,61 @@ impl AuthState {
             return false;
         };
 
-        let mut users = self.users.write().expect("users RwLock poisoned");
+        // Re-check the race winner under a SHORT read guard: another
+        // in-process thread may have completed its claim while we were
+        // hashing or waiting on the claim mutex.
         let Some(entry) = self.entries.get(name) else {
             return false;
         };
         let idx = entry.index;
-        if users[idx].hash != INIT_HASH {
-            // Someone else won the race between our read and write. Fall
-            // back to verifying our password against the claimed hash:
-            // if we're the same legitimate user we'll match, otherwise
-            // we get the usual rejection.
-            let claimed_hash = users[idx].hash.clone();
-            drop(users);
-            if argon2_verify(&claimed_hash, password) {
-                self.cache.insert(name.to_string(), candidate_hmac);
-                return true;
+        {
+            let users = self.users.read().expect("users RwLock poisoned");
+            if users[idx].hash != INIT_HASH {
+                // Someone else won the race. Fall back to verifying our
+                // password against the claimed hash: if we're the same
+                // legitimate user we'll match, otherwise we get the
+                // usual rejection.
+                let claimed_hash = users[idx].hash.clone();
+                drop(users);
+                if argon2_verify(&claimed_hash, password) {
+                    self.cache.insert(name.to_string(), candidate_hmac);
+                    return true;
+                }
+                return false;
             }
-            return false;
         }
 
-        users[idx].hash = new_hash.clone();
+        // Snapshot the fallback (file-does-not-exist-yet) list under a
+        // SHORT read guard, then drop it before any file I/O.
+        let fallback_users = {
+            let mut snapshot = self.users.read().expect("users RwLock poisoned").clone();
+            snapshot[idx].hash = new_hash.clone();
+            snapshot
+        };
+
+        // Serialise the persist+publish critical section on the claim
+        // mutex (NOT the users RwLock): claims serialize in-process
+        // here, the file lock inside persist_claim serializes across
+        // processes, and normal cache-miss verifies for unrelated users
+        // proceed unblocked while we wait on cross-process file I/O.
+        let _claim_guard = self.claim_lock.lock().expect("claim mutex poisoned");
 
         // Persist this one claim on top of what is CURRENTLY on disk —
         // not on top of our startup snapshot. A CLI process may have
         // edited the file since we loaded it; writing our whole stale
-        // snapshot back would silently revert those edits. The write
-        // guard stays held across persistence: it serializes claims
-        // within this process, while the file lock serializes against
-        // other processes.
-        match persist_claim(Path::new(&self.users_path), name, &new_hash, &users) {
+        // snapshot back would silently revert those edits.
+        // No users guard is held here.
+        match persist_claim(
+            Path::new(&self.users_path),
+            name,
+            &new_hash,
+            &fallback_users,
+        ) {
             ClaimPersist::Written => {
-                drop(users);
+                // Only claim threads write users[idx] and they serialize
+                // on claim_lock (which we hold across persist+publish),
+                // so a brief write guard is sufficient to publish.
+                self.users.write().expect("users RwLock poisoned")[idx].hash = new_hash.clone();
                 self.cache.insert(name.to_string(), candidate_hmac);
                 true
             }
@@ -236,8 +282,7 @@ impl AuthState {
                 // concurrent CLI edit. Disk wins: adopt its hash and
                 // treat our candidate as a normal login against it
                 // instead of clobbering it.
-                users[idx].hash = disk_hash.clone();
-                drop(users);
+                self.users.write().expect("users RwLock poisoned")[idx].hash = disk_hash.clone();
                 if argon2_verify(&disk_hash, password) {
                     self.cache.insert(name.to_string(), candidate_hmac);
                     true
@@ -246,7 +291,9 @@ impl AuthState {
                 }
             }
             ClaimPersist::Failed(e) => {
-                users[idx].hash = INIT_HASH.to_string();
+                // Roll back to the sentinel so a retry is possible.
+                self.users.write().expect("users RwLock poisoned")[idx].hash =
+                    INIT_HASH.to_string();
                 eprintln!(
                     "init-claim: failed to persist {} after first-login of '{}': {}",
                     self.users_path, name, e
@@ -681,6 +728,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn empty_password_cannot_claim_init() {
+        let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+        assert!(!state.verify("bob", ""));
+        // Rejected before any claim machinery: sentinel intact, no cache
+        // entry, no disk write.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH);
+        }
+        assert!(state.cache.is_empty());
+        assert!(!Path::new(&path).exists());
+        // Same rejection directly through the claim fn, independent of
+        // verify()'s framing.
+        let hmac = compute_cache_hmac(&state.server_secret, "bob", "");
+        assert!(!state.try_claim_init("bob", "", hmac));
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH);
+        }
+        // The claim path itself still works.
+        assert!(state.verify("bob", "real-pw"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_password_claim_leaves_existing_disk_file_intact() {
+        let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)], false);
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(!state.verify("bob", ""));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+        let users = state.users.read().unwrap();
+        let bob = users.iter().find(|u| u.name == "bob").unwrap();
+        assert_eq!(bob.hash, INIT_HASH);
+        drop(users);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn password_length_1_and_255_can_claim_init() {
+        for pw in ["x", &"a".repeat(255)] {
+            let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+            assert!(state.verify("bob", pw));
+            {
+                let users = state.users.read().unwrap();
+                let bob = users.iter().find(|u| u.name == "bob").unwrap();
+                assert!(bob.hash.starts_with("$argon2id$"));
+            }
+            let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+            let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+            assert_ne!(bob.hash, INIT_HASH);
+            assert!(bob.hash.starts_with("$argon2id$"));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     // ─── is_direct tests ─────────────────────────────────────────────
 
     #[test]
@@ -891,5 +997,100 @@ mod tests {
 
         std::fs::remove_dir(&tmp).unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn users_lock_held_externally_does_not_block_cache_miss_verify_for_other_user() {
+        // R5-10: while one thread is parked inside the init-claim persist
+        // (waiting on the cross-process users-file lock), a plain
+        // cache-miss verify for an unrelated, fully-configured user must
+        // NOT block on the `users` RwLock.
+        //
+        // The busy lock is held by an in-process helper thread instead of
+        // a child process: byte-range locks (LockFileEx / flock) conflict
+        // across OPEN FILE HANDLES even within one process, which
+        // users_file.rs's `lock_is_exclusive_and_released_on_drop` proves
+        // (l1 held, second acquire times out). So a second UsersFileLock
+        // from a helper thread exercises the identical busy-lock path in
+        // persist_claim that a foreign process would, with zero
+        // subprocess overhead. Actual cross-process release-on-owner-death
+        // is separately covered by users_file.rs's crash test
+        // `lock_is_released_when_owner_process_dies_without_cleanup`.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (state, path) = build_state_with_disk_file(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("bob", true),
+            ],
+            false,
+        );
+
+        // Holder thread: acquire the users-file lock and hold it for 3
+        // seconds, signalling the parent only once it is ACTUALLY held.
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            let _ = &lock;
+            locked_tx.send(()).expect("signal lock held");
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        locked_rx.recv().expect("lock-holder signalled");
+
+        // T1: init-claim for bob — parks inside persist_claim on the
+        // file lock the holder thread holds.
+        let state = Arc::new(state);
+        let t1 = std::thread::spawn({
+            let state = state.clone();
+            move || state.verify("bob", "bob-pw")
+        });
+        std::thread::sleep(Duration::from_millis(300)); // let T1 reach the persist
+
+        // T2: a fresh cache-miss verify for alice (Argon2 only, no
+        // claim machinery) must complete in milliseconds, not wait
+        // behind the ~3s file-lock hold. Margin note: the old
+        // (write-guard-held-across-persist) implementation blocks this
+        // read until the holder releases (~2.7s remaining at this
+        // point), so the 1500ms bound discriminates with a >=2x margin;
+        // the fixed implementation returns in milliseconds.
+        let started = std::time::Instant::now();
+        let ok = state.verify("alice", "alice-pw");
+        let elapsed = started.elapsed();
+        assert!(ok);
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "cache-miss verify for an unrelated user blocked {:?} behind the claim persist",
+            elapsed
+        );
+
+        // Deterministic: T1 cannot publish until the holder releases the
+        // lock, so bob must still be the sentinel here.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH, "T1 must still be parked in persist");
+        }
+
+        holder.join().expect("join lock-holder thread");
+        assert!(t1.join().unwrap());
+
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert!(bob.hash.starts_with("$argon2id$"));
+        }
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, INIT_HASH);
+        assert!(bob.hash.starts_with("$argon2id$"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
     }
 }
