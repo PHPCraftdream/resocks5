@@ -91,6 +91,20 @@ pub async fn run_server(
     // task finishes.
     let mut tasks: JoinSet<()> = JoinSet::new();
 
+    // SIGTERM — what `docker stop` and Linux service managers send
+    // before SIGKILL — must trigger the same graceful drain as Ctrl+C.
+    // Registered once, OUTSIDE the accept loop: tokio restores a
+    // signal's default disposition once its last stream drops, so a
+    // per-iteration stream would leave windows where an arriving
+    // SIGTERM hard-kills the process instead of draining. `recv()` is
+    // cancel-safe, so re-polling the single stream from the select!
+    // below every iteration is the documented pattern. On non-unix the
+    // placeholder keeps the select! arm shape identical everywhere.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(not(unix))]
+    let mut sigterm = ();
+
     loop {
         // Drop already-finished tasks from the set every loop iteration
         // so it doesn't grow unboundedly with completed handlers. (The
@@ -185,14 +199,16 @@ pub async fn run_server(
             }
 
             _ = tokio::signal::ctrl_c() => {
-                logger.lifecycle(|| {
-                    format!(
-                        "Received Ctrl+C — closing listener, draining \
-                         {} active tunnel(s) (up to {} s)…",
-                        tasks.len(),
-                        SHUTDOWN_DRAIN_SEC
-                    )
-                });
+                log_shutdown_trigger(logger, tasks.len(), "Ctrl+C");
+                break;
+            }
+
+            // SIGTERM (unix only — `sigterm_fired` never resolves
+            // elsewhere) takes exactly the same path: this arm just
+            // falls through to the shared listener-close + bounded-drain
+            // sequence after the loop.
+            _ = sigterm_fired(&mut sigterm) => {
+                log_shutdown_trigger(logger, tasks.len(), "SIGTERM");
                 break;
             }
         }
@@ -226,6 +242,37 @@ fn report_finished_task(logger: &Logger, res: Result<(), tokio::task::JoinError>
         Err(e) if e.is_cancelled() => {}
         Err(e) => logger.connection_error(|| format!("connection handler task panicked: {e}")),
     }
+}
+
+/// One log line naming the signal that started the shared shutdown
+/// sequence (Ctrl+C everywhere, SIGTERM on unix). Both select! arms
+/// call this so the wording cannot drift between the two triggers;
+/// everything after their `break` — listener close, the bounded tunnel
+/// drain, the final lifecycle lines — is shared, unchanged code.
+fn log_shutdown_trigger(logger: &Logger, active_tunnels: usize, signal: &str) {
+    logger.lifecycle(|| {
+        format!(
+            "Received {signal} — closing listener, draining \
+             {active_tunnels} active tunnel(s) (up to {} s)…",
+            SHUTDOWN_DRAIN_SEC
+        )
+    });
+}
+
+/// Shutdown future for the SIGTERM select! arm. On unix this resolves
+/// when SIGTERM is delivered; elsewhere it never resolves (Windows has
+/// no SIGTERM-equivalent console event, and Ctrl+C already has its own
+/// arm), so the arm is dead weight there but keeps the select! shape
+/// identical on every platform — tokio's select! cannot cfg-gate a
+/// branch itself. `Signal::recv` is cancel-safe; `pending` trivially so.
+#[cfg(unix)]
+async fn sigterm_fired(sigterm: &mut tokio::signal::unix::Signal) {
+    sigterm.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn sigterm_fired(_: &mut ()) {
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
