@@ -35,10 +35,23 @@ pub struct NetworkConfig {
     #[serde(default = "default_tcp_keepalive")]
     pub tcp_keepalive_sec: u64,
 
-    /// Time budget for the client-side protocol phase: from the moment
-    /// the client connects until SOCKS5/CONNECT setup is done and
-    /// forwarding starts. Defends against slowloris-style clients that
-    /// open TCP but never finish (or never start) the handshake.
+    /// Time budget for the client-side protocol phase as ONE absolute
+    /// deadline, anchored the moment a client connection is accepted and
+    /// shared by every client-facing stage: the dispatcher's
+    /// protocol-detection peek, the SOCKS5/HTTP CONNECT handshake, and the
+    /// SNI/Host recovery peek. Each stage spends only the time still left
+    /// on that deadline, so time consumed by an earlier phase shrinks the
+    /// budget of later ones and no stage can start a fresh full-length
+    /// timer; a stage entered after the deadline has passed fails
+    /// immediately as a timeout. Defends against slowloris-style clients
+    /// that open TCP but never finish (or never start) the handshake.
+    ///
+    /// Out of scope: connecting to the upstream. Each upstream attempt in
+    /// `establish_connection` / `establish_direct` is bounded by
+    /// `connect_timeout_sec` + `handshake_timeout_sec` independently of
+    /// this setting. (The recovery peek, which races a speculative
+    /// upstream dial against the client's first record, is still capped by
+    /// what remains of this deadline.)
     #[serde(default = "default_client_protocol_timeout")]
     pub client_protocol_timeout_sec: u64,
 

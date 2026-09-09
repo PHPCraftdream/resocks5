@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
@@ -7,7 +6,7 @@ use regex::RegexSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use tokio_rustls::TlsConnector;
 
@@ -15,6 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
+use crate::server::handle_client::remaining_client_budget;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni, HostPort};
@@ -84,19 +84,27 @@ pub async fn handle_http_client(
     network: &Arc<NetworkConfig>,
     tls_connector: Option<&TlsConnector>,
     direct_limiter: &Arc<Semaphore>,
+    client_deadline: Instant,
 ) -> Result<()> {
-    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
-
     // ── Phase 1: HTTP CONNECT request + auth ────────────────────────
-    // Bounded by the client-protocol deadline so a slow drip of header
+    // Bounded by the remainder of the accept-anchored client-protocol
+    // deadline handed down by the dispatcher, so a slow drip of header
     // bytes can't pin the handler indefinitely.
-    let req = match timeout(protocol_dur, parse_http_connect(&mut client_stream, auth)).await {
+    // The dispatcher already spent part of the accept-anchored budget
+    // on protocol detection; only the remainder is ours to spend.
+    let handshake_budget = remaining_client_budget(client_deadline);
+    let req = match timeout(
+        handshake_budget,
+        parse_http_connect(&mut client_stream, auth),
+    )
+    .await
+    {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
             return Err(anyhow!(
-                "client HTTP CONNECT timed out after {}s",
-                protocol_dur.as_secs()
+                "client HTTP CONNECT timed out with only {}s left of the client-protocol budget",
+                handshake_budget.as_secs()
             ));
         }
     };
@@ -158,6 +166,7 @@ pub async fn handle_http_client(
                 network,
                 req.client_user.as_deref(),
                 tls_connector,
+                client_deadline,
             )
             .await;
         }
@@ -249,8 +258,9 @@ fn ipv4_literal_port(target: &str) -> Option<&str> {
 /// accumulate that record across reads (TCP segmentation routinely
 /// splits a ClientHello, and a pipelined fast-open hello can itself be
 /// truncated) until TLS SNI / HTTP `Host` recovery can decide, the
-/// probes rule the record out, or the 16 KiB cap is hit — all under the
-/// existing client-protocol deadline. Open the upstream by that domain
+/// probes rule the record out, or the 16 KiB cap is hit — all under
+/// the remainder of the accept-anchored client-protocol deadline
+/// threaded down from the dispatcher. Open the upstream by that domain
 /// (falling back to the IP), forward the buffered record, then tunnel.
 ///
 /// A client still silent after the ~1 s grace (`CLIENT_FIRST_GRACE`) is
@@ -275,6 +285,7 @@ async fn recover_and_tunnel_http(
     network: &Arc<NetworkConfig>,
     client_user: Option<&str>,
     tls_connector: Option<&TlsConnector>,
+    client_deadline: Instant,
 ) -> Result<()> {
     let ctag = match client_user {
         Some(u) => format!(" [client={}]", u),
@@ -286,9 +297,9 @@ async fn recover_and_tunnel_http(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
-    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
+    let recovery_budget = remaining_client_budget(client_deadline);
     let peeked = match timeout(
-        protocol_dur,
+        recovery_budget,
         peek_recovery(
             &mut client_stream,
             pipelined,
@@ -311,8 +322,8 @@ async fn recover_and_tunnel_http(
         Ok(result) => result?,
         Err(_) => {
             return Err(anyhow!(
-                "client sent no payload within {}s ? recovery peek timeout{}",
-                protocol_dur.as_secs(),
+                "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
+                recovery_budget.as_secs(),
                 ctag,
             ))
         }
@@ -605,6 +616,7 @@ fn split_basic_token(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     async fn parse_request(request: &[u8]) -> (Result<ConnectRequest>, Vec<u8>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -905,6 +917,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -934,6 +948,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -980,6 +995,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -1005,6 +1022,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -1057,6 +1075,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -1082,6 +1102,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -1140,6 +1161,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -1165,6 +1188,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });

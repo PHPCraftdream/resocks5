@@ -1,13 +1,12 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use regex::RegexSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use tokio_rustls::TlsConnector;
 
@@ -15,6 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
+use crate::server::handle_client::remaining_client_budget;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
@@ -35,25 +35,32 @@ pub async fn handle_socks5_client(
     network: &Arc<NetworkConfig>,
     tls_connector: Option<&TlsConnector>,
     direct_limiter: &Arc<Semaphore>,
+    client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
-
     // ── Phase 1: client-side SOCKS5 handshake ───────────────────────
     // Greeting + method selection + (optional) RFC 1929 auth + CONNECT
-    // request, all under a single deadline. Slowloris-style clients
+    // request, all under a single deadline — the accept-anchored one
+    // handed down by the dispatcher. Slowloris-style clients
     // that hold the TCP open but never finish the protocol exit here
     // instead of pinning the task indefinitely.
-    let (target_addr, client_user) =
-        match timeout(protocol_dur, socks5_handshake(&mut client_stream, auth)).await {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(anyhow!(
-                    "client SOCKS5 handshake timed out after {}s",
-                    protocol_dur.as_secs()
+    // The dispatcher already spent part of the accept-anchored budget
+    // on protocol detection; only the remainder is ours to spend.
+    let handshake_budget = remaining_client_budget(client_deadline);
+    let (target_addr, client_user) = match timeout(
+        handshake_budget,
+        socks5_handshake(&mut client_stream, auth),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(anyhow!(
+                    "client SOCKS5 handshake timed out with only {}s left of the client-protocol budget",
+                    handshake_budget.as_secs()
                 ));
-            }
-        };
+        }
+    };
 
     // ── Phase 2: upstream connect (no client-protocol timeout) ──────
     // If the authenticated user has direct=true, bypass the pool and
@@ -115,6 +122,7 @@ pub async fn handle_socks5_client(
                 network,
                 client_user.as_deref(),
                 tls_connector,
+                client_deadline,
             )
             .await;
         }
@@ -212,8 +220,9 @@ fn ipv4_literal_port(target: &str) -> Option<&str> {
 /// The prefix is *accumulated* across reads (TCP segmentation routinely
 /// splits a ClientHello, and a single read would see only a truncated
 /// prefix) until the parsers decide, the probes rule the record out, or
-/// the 16 KiB cap is hit — all under the existing client-protocol
-/// deadline, so the peeked record is forwarded (fragmented if
+/// the 16 KiB cap is hit — all under the remainder of the
+/// accept-anchored client-protocol deadline threaded down from the
+/// dispatcher, so the peeked record is forwarded (fragmented if
 /// configured) before the bidirectional tunnel starts and no client
 /// bytes are lost.
 ///
@@ -238,6 +247,7 @@ async fn recover_and_tunnel(
     network: &Arc<NetworkConfig>,
     client_user: Option<&str>,
     tls_connector: Option<&TlsConnector>,
+    client_deadline: Instant,
 ) -> anyhow::Result<()> {
     let ctag = match client_user {
         Some(u) => format!(" [client={}]", u),
@@ -254,9 +264,9 @@ async fn recover_and_tunnel(
     // client that completes CONNECT but never speaks must not pin the
     // slot). The grace window inside distinguishes a slow client-first
     // protocol from a server-speaks-first one.
-    let protocol_dur = Duration::from_secs(network.client_protocol_timeout_sec);
+    let recovery_budget = remaining_client_budget(client_deadline);
     let peeked = match timeout(
-        protocol_dur,
+        recovery_budget,
         peek_recovery(
             &mut client_stream,
             Vec::new(),
@@ -279,8 +289,8 @@ async fn recover_and_tunnel(
         Ok(result) => result?,
         Err(_) => {
             return Err(anyhow!(
-                "client sent no payload within {}s ? recovery peek timeout{}",
-                protocol_dur.as_secs(),
+                "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
+                recovery_budget.as_secs(),
                 ctag,
             ))
         }
@@ -829,6 +839,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -854,6 +866,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -908,6 +921,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -932,6 +947,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -993,6 +1009,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -1017,6 +1035,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
@@ -1063,6 +1082,8 @@ mod tests {
             handshake_timeout_sec: 2,
             ..Default::default()
         });
+        let client_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let frag = Arc::new(TlsFragmentConfig::default());
         let gate: Option<Arc<ProxyRotator>> = None;
         let v6: Option<Arc<ProxyRotator>> = None;
@@ -1087,6 +1108,7 @@ mod tests {
                 &network,
                 None,
                 None,
+                client_deadline,
             )
             .await
         });
