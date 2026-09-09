@@ -485,12 +485,27 @@ pub async fn establish_connection(
 
     // Check new connections through gates
     if let Some(gate_rotator) = gate_rotator {
-        let gate_order = gate_rotator.pick_order();
+        // R5-09: a gated attempt needs headroom for the direct reserve,
+        // so once `attempts + direct_reserve` reaches the cap the
+        // per-proxy check below breaks out of the gates loop at its
+        // first eligible route — don't build the full gate order at all.
+        let gate_order = if attempts + direct_reserve < max_attempts {
+            gate_rotator.pick_order()
+        } else {
+            Vec::new()
+        };
         'gates: for gate_config in &gate_order {
             if dead_gates.contains(&UpstreamKey(gate_config.clone())) {
                 continue;
             }
             for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
+                // R5-09: same budget condition as the per-proxy check
+                // below, hoisted above the build — a budget exhausted by
+                // earlier gates must not trigger another full build+sort
+                // for this gate.
+                if attempts + direct_reserve >= max_attempts {
+                    break 'gates;
+                }
                 let order = rotator.pick_order();
                 for proxy_config in &order {
                     let route = route_key(Some(gate_config), proxy_config);
@@ -570,6 +585,11 @@ pub async fn establish_connection(
 
     // Check direct connections
     'direct: for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
+        // R5-09: hoist the per-proxy budget check above the build —
+        // an exhausted budget must not build another full order.
+        if attempts >= max_attempts {
+            break 'direct;
+        }
         let order = rotator.pick_order();
         for proxy_config in &order {
             let route = route_key(None, proxy_config);
@@ -1229,6 +1249,65 @@ mod tests {
         );
         let linked = v4.get_linked(target).expect("success must link the cache");
         assert!(linked.gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
+        // R5-09: once the cache phase has consumed the budget, the gates
+        // and direct phases must not even build their pick orders — and
+        // must not make another connection attempt. The healthy direct
+        // proxy below therefore has to stay untried: the call fails with
+        // exactly the one cache attempt. (A successful extra attempt
+        // would turn the result Ok; a failed one would raise the count
+        // in the error past 1.)
+        let target = "example.com:443";
+        let logger = test_logger();
+        let banned = Arc::new(RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            handshake_timeout_sec: 2,
+            max_upstream_attempts: 1,
+            ..Default::default()
+        });
+        let dead_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
+        let inner = socks5_config(spawn_socks5_stub().await, false);
+        let mut composite = inner.clone();
+        composite.gate = Some(Arc::new(dead_gate.clone()));
+
+        let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
+        v4.link_proxy(target.to_string(), Arc::new(composite));
+        let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
+
+        let result = establish_connection(
+            target,
+            &Some(gates),
+            &None,
+            &Some(v4.clone()),
+            &logger,
+            &banned,
+            &pool,
+            &network,
+            None,
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("budget is exhausted after the cache failure"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("All 1 upstream attempts"),
+            "expected the exhaustion error, got: {err}"
+        );
+        assert!(
+            v4.get_linked(target).is_none(),
+            "no phase may attempt (and succeed) after the budget is gone"
+        );
     }
 
     use base64::engine::general_purpose::STANDARD as B64;

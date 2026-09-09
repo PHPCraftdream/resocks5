@@ -4,20 +4,43 @@ use crate::rating::rng::SmallRng;
 
 /// Return index `i` with probability `weights[i] / sum(weights)`.
 ///
-/// Defensive: if total weight is zero (or `weights` is empty), returns 0.
+/// Weights are normalized by their maximum before summing: raw sums of
+/// finite positive weights (e.g. `[f64::MAX, f64::MAX]`) overflow to
+/// +inf, which made the old fallback deterministically return the last
+/// index instead of a uniform draw.
+///
+/// Only finite positive weights are selectable; zero, negative, NaN and
+/// infinite weights act as ineligible. Returns 0 when nothing is
+/// eligible.
 pub fn weighted_index(weights: &[f64], rng: &mut SmallRng) -> usize {
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 || weights.is_empty() {
+    let max = weights.iter().fold(0.0_f64, |m, &w| {
+        if w.is_finite() && w > 0.0 {
+            m.max(w)
+        } else {
+            m
+        }
+    });
+    if max <= 0.0 {
         return 0;
     }
+    let total: f64 = weights
+        .iter()
+        .filter(|&&w| w.is_finite() && w > 0.0)
+        .map(|&w| w / max)
+        .sum();
     let mut dart = rng.next_f64() * total;
     for (i, &w) in weights.iter().enumerate() {
-        dart -= w;
-        if w > 0.0 && dart <= 0.0 {
-            return i;
+        if w.is_finite() && w > 0.0 {
+            dart -= w / max;
+            if dart <= 0.0 {
+                return i;
+            }
         }
     }
-    weights.iter().rposition(|&w| w > 0.0).unwrap_or(0)
+    weights
+        .iter()
+        .rposition(|&w| w.is_finite() && w > 0.0)
+        .unwrap_or(0)
 }
 
 /// Return a permutation of `0..weights.len()` where higher-weight items
@@ -243,5 +266,64 @@ mod tests {
         assert!(k1.is_finite() && k2.is_finite() && k1 < k2);
         // next_f64 can yield exactly 0.0: ln(0) = -inf sorts last, no NaN.
         assert_eq!(0.0_f64.ln() / 1e-6, f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn weighted_index_uniform_between_two_max_f64_weights() {
+        let mut rng = SmallRng::from_seed(42);
+        let weights = [f64::MAX, f64::MAX];
+        let n = 100_000;
+        let mut counts = [0u32; 2];
+        for _ in 0..n {
+            counts[weighted_index(&weights, &mut rng)] += 1;
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            let frac = c as f64 / n as f64;
+            assert!(
+                (frac - 0.5).abs() < 0.01,
+                "bucket {i}: {frac}, expected ~0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_index_scale_invariance_even_when_the_raw_sum_overflows() {
+        let base = [1.0, 2.0, 3.0, 4.0];
+        let expected = [0.1, 0.2, 0.3, 0.4];
+        let n = 100_000;
+        // At scale 2e307 every weight is still finite (largest 8e307 <
+        // f64::MAX ≈ 1.798e308) but the RAW sum is 2e308 which overflows
+        // to +inf — the pre-fix code was broken for exactly this input.
+        for scale in [1.0, 1e-300, 2e307] {
+            let weights = base.map(|w| w * scale);
+            let mut rng = SmallRng::from_seed(42);
+            let mut counts = [0u32; 4];
+            for _ in 0..n {
+                counts[weighted_index(&weights, &mut rng)] += 1;
+            }
+            for (i, (&c, &p)) in counts.iter().zip(expected.iter()).enumerate() {
+                let frac = c as f64 / n as f64;
+                assert!(
+                    (frac - p).abs() < 0.01,
+                    "scale {scale}, bucket {i}: {frac}, expected ~{p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_index_ignores_nonfinite_and_nonpositive_weights() {
+        let mut rng = SmallRng::from_seed(42);
+        let weights = [f64::NAN, -1.0, f64::INFINITY, 2.0, 0.0];
+        for _ in 0..1_000 {
+            assert_eq!(
+                weighted_index(&weights, &mut rng),
+                3,
+                "picked an ineligible index"
+            );
+        }
+        assert_eq!(weighted_index(&[f64::NAN], &mut rng), 0);
+        assert_eq!(weighted_index(&[0.0, f64::NEG_INFINITY], &mut rng), 0);
+        assert_eq!(weighted_index(&[], &mut rng), 0);
     }
 }
