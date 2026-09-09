@@ -159,6 +159,26 @@ mod tests {
         ))
     }
 
+    /// Give a freshly spawned task's first poll every real-scheduler
+    /// opportunity to happen before the paused virtual clock is
+    /// advanced. A single `sleep(1ms).await` can resolve via the
+    /// paused-clock auto-advance before the executor actually gets
+    /// around to polling the new task, under heavy real scheduler
+    /// pressure (observed in practice under simultaneous multi-crate
+    /// compilation/linking) — the freshly spawned task would then
+    /// anchor its deadline against an already-advanced virtual time,
+    /// silently invalidating this test's tight elapsed-time bounds.
+    /// Repeated real yields + a real sleep make that overwhelmingly
+    /// unlikely; same defensive pattern as `quiesce()` in
+    /// `proxy_pool.rs`'s tests for the same class of paused-clock /
+    /// real-scheduler interaction.
+    async fn anchor_first_poll() {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// R5-02 regression: a first byte that arrives just before the end of
     /// the client-protocol budget must not buy the SOCKS5 handshake a
     /// fresh full-length budget. The dispatcher's peek consumes the first
@@ -211,7 +231,7 @@ mod tests {
         // accept-anchored deadline is really anchored at accept time;
         // tokio auto-advance does not poll newly spawned tasks during
         // `advance`.
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        anchor_first_poll().await;
 
         let t0 = tokio::time::Instant::now();
         // Eat 90% of the budget in protocol detection: the first byte only
@@ -294,7 +314,7 @@ mod tests {
         // accept-anchored deadline is really anchored at accept time;
         // tokio auto-advance does not poll newly spawned tasks during
         // `advance`.
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        anchor_first_poll().await;
 
         let t0 = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_millis(1500)).await;
