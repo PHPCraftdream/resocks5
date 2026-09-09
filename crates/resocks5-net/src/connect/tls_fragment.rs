@@ -44,6 +44,18 @@ pub enum ClientHelloMatch {
     Indeterminate,
 }
 
+/// Outcome of a send whose individual writes are bounded by an idle
+/// window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendProgress {
+    /// Every byte of the payload was written and flushed.
+    Completed,
+    /// A chunk write did not complete within the idle window. A partial
+    /// prefix may already be on the wire — the writer must be closed,
+    /// never driven again with the same payload.
+    Stalled,
+}
+
 /// Match `data` against the ClientHello signature
 /// (`0x16 0x03 .. .. .. 0x01`), tolerating truncation. See the private
 /// signature matcher below for the signature rationale and
@@ -98,33 +110,80 @@ fn is_tls_client_hello(data: &[u8]) -> bool {
 /// If `cfg.enabled` is false, or the data is not a TLS ClientHello, the
 /// whole slice is written in one call — no overhead on the hot path.
 ///
-/// cancel-safe: NO — a prefix may have been written; close the stream on timeout.
+/// `idle` bounds each individual chunk write: a write_all+flush that
+/// does not complete within `idle` ends the send with
+/// [`SendProgress::Stalled`]. The bound is per write, not per send — a
+/// paced send whose chunks keep landing stays alive no matter how long
+/// the whole send takes, and the inter-fragment pause is deliberate
+/// pacing that never counts against `idle`. `Duration::ZERO` disables
+/// the bound entirely.
+///
+/// cancel-safe: NO — cancellation (or a [`SendProgress::Stalled`]
+/// outcome) can leave a prefix of `data` on the wire; close the writer,
+/// never re-send from the start of `data`.
 pub async fn send_possibly_fragmented<W>(
     writer: &mut W,
     data: &[u8],
     cfg: &FragmentSpec,
-) -> anyhow::Result<()>
+    idle: Duration,
+) -> anyhow::Result<SendProgress>
 where
     W: AsyncWriteExt + Unpin,
 {
     if !cfg.enabled || !is_tls_client_hello(data) {
-        writer.write_all(data).await?;
-        return Ok(());
+        return write_progress_bounded(writer, data, idle).await;
     }
     let chunk_size = cfg.fragment_size.max(1);
     for chunk in data.chunks(chunk_size) {
-        writer.write_all(chunk).await?;
-        writer.flush().await?;
+        if write_progress_bounded(writer, chunk, idle).await? == SendProgress::Stalled {
+            return Ok(SendProgress::Stalled);
+        }
         if cfg.delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(cfg.delay_ms)).await;
         }
     }
-    Ok(())
+    Ok(SendProgress::Completed)
+}
+
+/// Write `buf` in full and flush it, bounded by `idle`.
+///
+/// The bound covers one write attempt — write_all plus flush — measured
+/// from its start, not the time elapsed since the previous chunk. When
+/// the bound fires, the write future is dropped mid-flight: whatever
+/// prefix was accepted stays on the wire and the caller must treat the
+/// writer as terminal.
+async fn write_progress_bounded<W>(
+    writer: &mut W,
+    buf: &[u8],
+    idle: Duration,
+) -> anyhow::Result<SendProgress>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if idle.is_zero() {
+        writer.write_all(buf).await?;
+        writer.flush().await?;
+        return Ok(SendProgress::Completed);
+    }
+    let write = async {
+        writer.write_all(buf).await?;
+        writer.flush().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(idle, write).await {
+        Ok(status) => {
+            status?;
+            Ok(SendProgress::Completed)
+        }
+        Err(_) => Ok(SendProgress::Stalled),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::AsyncReadExt;
 
     fn ch(hs_type: u8) -> Vec<u8> {
         // Synthesises a 6-byte TLS Handshake-record prefix:
@@ -304,7 +363,7 @@ mod tests {
             buf: Vec::new(),
             flushes: 0,
         };
-        send_possibly_fragmented(&mut w, &hello, &cfg)
+        send_possibly_fragmented(&mut w, &hello, &cfg, Duration::ZERO)
             .await
             .unwrap();
 
@@ -327,7 +386,7 @@ mod tests {
         hello.extend_from_slice(&[0xCD; 10]);
 
         let mut buf: Vec<u8> = Vec::new();
-        send_possibly_fragmented(&mut buf, &hello, &cfg)
+        send_possibly_fragmented(&mut buf, &hello, &cfg, Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(buf, hello);
@@ -343,9 +402,87 @@ mod tests {
         // Application data — fragmentation skipped, single write.
         let data = [0x17, 0x03, 0x03, 0x00, 0x10, 0x99, 0xAA, 0xBB];
         let mut buf: Vec<u8> = Vec::new();
-        send_possibly_fragmented(&mut buf, &data, &cfg)
+        send_possibly_fragmented(&mut buf, &data, &cfg, Duration::ZERO)
             .await
             .unwrap();
         assert_eq!(buf, data);
+    }
+
+    /// R5-03: twenty 1-byte chunks paced 100 ms apart take ~2 s in
+    /// total — far past the 150 ms idle bound — yet every individual
+    /// write completes instantly. The send must complete: the bound is
+    /// per write, and the pacing pause is not inactivity.
+    #[tokio::test(start_paused = true)]
+    async fn steady_fragment_progress_never_trips_the_per_write_idle() {
+        let cfg = FragmentSpec {
+            enabled: true,
+            fragment_size: 1,
+            delay_ms: 100,
+        };
+        let mut data = ch(0x01);
+        data.extend_from_slice(&[0xDD; 14]); // 20 chunks in total
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let start = tokio::time::Instant::now();
+        let outcome =
+            send_possibly_fragmented(&mut writer, &data, &cfg, Duration::from_millis(150))
+                .await
+                .unwrap();
+        assert_eq!(outcome, SendProgress::Completed);
+        assert!(
+            start.elapsed() >= Duration::from_millis(100 * data.len() as u64),
+            "pacing pauses must actually elapse: {:?}",
+            start.elapsed()
+        );
+        drop(writer);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// A write that genuinely stops (peer never drains the 1-byte
+    /// duplex) must end with `Stalled` — not an error, not a hang —
+    /// after roughly the idle window.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_fragment_write_reports_stalled() {
+        let cfg = FragmentSpec {
+            enabled: true,
+            fragment_size: 2,
+            delay_ms: 0,
+        };
+        let hello = ch(0x01);
+        // Keep the read half alive: dropping it would surface as a
+        // broken-pipe error instead of a stalled write.
+        let (_keep_alive, mut writer) = tokio::io::duplex(1);
+
+        let start = tokio::time::Instant::now();
+        let outcome =
+            send_possibly_fragmented(&mut writer, &hello, &cfg, Duration::from_millis(100))
+                .await
+                .unwrap();
+        assert_eq!(outcome, SendProgress::Stalled);
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "stall must be bounded, not instant: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The pass-through single write (not a ClientHello) is bounded by
+    /// the same idle window as fragmented chunks.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_passthrough_write_is_also_bounded() {
+        let cfg = FragmentSpec {
+            enabled: true,
+            fragment_size: 3,
+            delay_ms: 0,
+        };
+        let data = b"GET /index HTTP/1.1"; // not a ClientHello
+        let (_keep_alive, mut writer) = tokio::io::duplex(1);
+
+        let outcome = send_possibly_fragmented(&mut writer, data, &cfg, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Stalled);
     }
 }

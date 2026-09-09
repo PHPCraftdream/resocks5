@@ -4,9 +4,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{NetworkConfig, TlsFragmentConfig};
-use resocks5_net::connect::tls_fragment::{classify_client_hello, ClientHelloMatch};
+use resocks5_net::connect::tls_fragment::{
+    classify_client_hello, send_possibly_fragmented, ClientHelloMatch, SendProgress,
+};
 use resocks5_net::connect::tls_records::client_hello_is_complete;
-use resocks5_net::connect::{send_possibly_fragmented, tunnel::tunnel_with_timeouts};
+use resocks5_net::connect::tunnel::tunnel_with_timeouts;
 
 /// cancel-safe: NO — partial forwarding is terminal; both owned streams close.
 pub(crate) async fn forward_tunnel<A, B>(
@@ -60,12 +62,16 @@ where
             ClientHelloMatch::Other => false,
         };
     if !initial.is_empty() && !unfinished_hello {
-        return within_idle(
-            idle,
-            send_possibly_fragmented(upstream, &initial, &frag.to_spec()),
-        )
-        .await
-        .map(|sent| sent.is_some());
+        // R5-03: the send tracks its own write progress — every chunk
+        // write renews the idle budget, so a long-paced but steadily
+        // advancing ClientHello is not measured as one whole-operation
+        // duration.
+        return match send_possibly_fragmented(upstream, &initial, &frag.to_spec(), idle).await? {
+            SendProgress::Completed => Ok(true),
+            // Idle elapsed on a stalled write; a prefix may be on the
+            // wire. Terminal: close both streams, never replay (R3-02).
+            SendProgress::Stalled => Ok(false),
+        };
     }
     if !frag.enabled {
         return Ok(true);
@@ -102,38 +108,39 @@ where
                             exhausted || client_hello_is_complete(&first[..len])
                         }
                     };
-                    if decided {
-                        // Forward the whole accumulated prefix in one
-                        // fragmented (or plain) write.
-                        if len != 0 {
-                            send_possibly_fragmented(upstream, &first[..len], &frag.to_spec())
-                                .await?;
-                        }
-                        return Ok(true);
-                    }
-                    // Keep accumulating. Safe against an empty read slice:
-                    // both undecided states imply len < first.len().
-                    Ok(false)
+                    Ok(decided)
                 }
                 n = upstream.read(&mut reply) => {
                     let n = n?;
                     if n == 0 {
-                        if len != 0 {
-                            send_possibly_fragmented(upstream, &first[..len], &frag.to_spec()).await?;
-                        }
-                        return Ok(true);
+                        // Upstream half-closed: nothing more will arrive,
+                        // flush whatever accumulated and stop deciding.
+                        Ok(true)
+                    } else {
+                        client.write_all(&reply[..n]).await?;
+                        Ok(false)
                     }
-                    client.write_all(&reply[..n]).await?;
-                    Ok(false)
                 }
             }
         };
-        match within_idle(idle, step).await? {
-            Some(true) => return Ok(true),
-            Some(false) => {}
-            // A cancelled write may have sent a prefix; never replay it.
+        let decided = match within_idle(idle, step).await? {
+            Some(decided) => decided,
+            // A cancelled read or relay may have moved bytes; never replay.
             None => return Ok(false),
+        };
+        if !decided {
+            continue;
         }
+        if len != 0 {
+            match send_possibly_fragmented(upstream, &first[..len], &frag.to_spec(), idle).await? {
+                SendProgress::Completed => return Ok(true),
+                // Idle elapsed mid-send with a partial prefix on the
+                // wire: terminal, same contract as a cancelled step
+                // (R3-02) — both streams close, no byte is sent twice.
+                SendProgress::Stalled => return Ok(false),
+            }
+        }
+        return Ok(true);
     }
 }
 
@@ -544,5 +551,81 @@ mod tests {
         assert!(task.await.unwrap().unwrap());
         let sum: usize = recorded_chunks.lock().unwrap().iter().sum();
         assert_eq!(sum, hello.len());
+    }
+
+    /// R5-03 regression: a fragmented ClientHello whose chunks keep
+    /// landing every 100 ms — well inside the 1 s idle window — must
+    /// complete even though the whole send takes ~80x the idle timeout.
+    /// Under the old whole-operation timer this send died at 1 s.
+    #[tokio::test(start_paused = true)]
+    async fn steady_fragment_drip_outlasts_idle_timeout() {
+        let (_client, client_inner) = duplex(64);
+        let (mut upstream, upstream_inner) = duplex(64);
+        let hello = client_hello_with_sni("steady.drip.example.org");
+        assert!(hello.len() > 10);
+        let expected = hello.clone();
+        let network = NetworkConfig {
+            tunnel_idle_timeout_sec: 1,
+            tunnel_max_lifetime_sec: 0,
+            ..Default::default()
+        };
+        let frag = TlsFragmentConfig {
+            enabled: true,
+            fragment_size: 1,
+            delay_ms: 100,
+        };
+        let task = tokio::spawn(async move {
+            forward_tunnel(client_inner, upstream_inner, hello, &frag, &network).await
+        });
+        let mut seen = vec![0u8; expected.len()];
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), upstream.read_exact(&mut seen))
+            .await
+            .expect("steady per-chunk progress must not trip the idle timeout")
+            .unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(100 * (expected.len() - 1) as u64),
+            "the send must actually have outlasted the idle window: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(seen, expected);
+        task.await.unwrap().unwrap();
+    }
+
+    /// R5-03 + R3-02 on the accumulation path: a send that genuinely
+    /// stalls mid-ClientHello terminates the tunnel, leaving exactly the
+    /// bytes already flushed on the wire — no replay, no hang.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_accumulated_send_closes_without_replay() {
+        let (mut client, client_inner) = duplex(64);
+        let (mut upstream, upstream_inner) = duplex(1);
+        let hello = client_hello_with_sni("stall.mid.send.example.org");
+        let network = NetworkConfig {
+            tunnel_idle_timeout_sec: 1,
+            tunnel_max_lifetime_sec: 0,
+            ..Default::default()
+        };
+        // Spawn before writing: the hello exceeds the 64-byte duplex, so
+        // the tunnel must be reading while we write.
+        let task = tokio::spawn(async move {
+            forward_tunnel(
+                client_inner,
+                upstream_inner,
+                Vec::new(),
+                &fragmentation_with_size(1),
+                &network,
+            )
+            .await
+        });
+        client.write_all(&hello).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("a stalled send must terminate the tunnel")
+            .unwrap()
+            .unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).await.unwrap();
+        // The first chunk fit the 1-byte duplex; the second stalled.
+        assert_eq!(received, hello[..1]);
     }
 }
