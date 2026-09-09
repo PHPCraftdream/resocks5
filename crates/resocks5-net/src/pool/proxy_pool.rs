@@ -7,8 +7,13 @@
 //!   `spare_per_proxy`.
 //! - On `checkout`, we pop one socket. If its age exceeds
 //!   `max_session_age_sec` (defends against silent idle-disconnects on
-//!   the proxy side) we discard it and pop the next. The refill task
-//!   notices the queue is below target and reconnects.
+//!   the proxy side), or a non-blocking probe shows the peer already
+//!   closed or broke the socket while it sat in the queue, we discard
+//!   it and pop the next. The refill task notices the queue is below
+//!   target and reconnects. Draining the queue this way lets
+//!   `acquire` fall through to a fresh connect, so a dead spare never
+//!   becomes the caller's hard failure while the upstream is still
+//!   reachable.
 //! - On a checkout that finds the queue empty (or all stale), the
 //!   caller falls back to a fresh `TcpStream::connect`. The pool is a
 //!   best-effort accelerator, never a hard dependency.
@@ -195,6 +200,33 @@ pub(crate) fn upstream_endpoint(proxy: &ProxyConfig) -> String {
     format!("{}:{}", proxy.host, proxy.port)
 }
 
+/// Non-blocking liveness probe for a queued spare.
+///
+/// A spare is worthless when the upstream already closed it — the
+/// upstream's own idle/greeting timeout can fire well before our
+/// `max_session_age_sec` — because the next handshake on such a socket
+/// fails on its first read or write. `try_read` never blocks and never
+/// waits: `Ok(0)` means the peer's FIN has already arrived, an error
+/// means the socket is broken (RST or worse), and `WouldBlock` means
+/// the connection is alive with nothing pending. Data already queued
+/// (`Ok(n > 0)`) also disqualifies the spare: sockets enter the queue
+/// before any handshake bytes are written, so any pending byte is
+/// unexpected and a consumed byte cannot be put back — the socket
+/// cannot serve a clean handshake either way.
+///
+/// This only narrows the race window; a FIN arriving after the probe
+/// and before first use is still seen by the caller. That residual
+/// race is inherent to pre-connect pools — the probe removes the
+/// common case of a socket that died long ago.
+fn spare_is_dead(stream: &TcpStream) -> bool {
+    let mut probe = [0u8; 1];
+    match stream.try_read(&mut probe) {
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+        // EOF (peer closed), socket error, or unexpected pending data.
+        _ => true,
+    }
+}
+
 /// Pre-connect TCP pool plus a per-upstream concurrency cap.
 ///
 /// See the module docs for the full lifecycle. Construct with
@@ -341,8 +373,6 @@ impl ProxyPool {
     /// Returns `UpstreamStream` so the permit lives exactly as long as
     /// the socket and the slot is released on drop.
     pub async fn acquire(&self, proxy: &ProxyConfig) -> anyhow::Result<UpstreamStream> {
-        let endpoint = upstream_endpoint(proxy);
-
         // Step 1: pre-warmed socket — its permit comes with it.
         if let Some(pw) = self.checkout_prewarmed(proxy) {
             return Ok(UpstreamStream {
@@ -352,23 +382,29 @@ impl ProxyPool {
             });
         }
 
-        // Step 2: fresh connect under the cap.
+        // Step 2: fresh connect under the cap. The diagnostic endpoint
+        // string is formatted only on the failure paths, and the dial
+        // address is passed as `(host, port)` so IP literals are parsed
+        // directly: `ProxyConfig.host` is stored WITHOUT IPv6 brackets,
+        // so `format!("{}:{}", host, port)` mangles an IPv6 literal
+        // like `::1` into `::1:1080`, which fails `SocketAddr` parsing
+        // and falls into the blocking system resolver.
         let permit = self.reserve_permit(proxy)?;
         let stream = match timeout(
             self.connect_timeout,
-            TcpStream::connect(format!("{}:{}", proxy.host, proxy.port)),
+            TcpStream::connect((proxy.host.as_str(), proxy.port)),
         )
         .await
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                return Err(anyhow!("connect to {}: {}", endpoint, e));
+                return Err(anyhow!("connect to {}: {}", upstream_endpoint(proxy), e));
             }
             Err(_) => {
                 return Err(anyhow!(
                     "connect timeout ({}s) to {}",
                     self.connect_timeout.as_secs(),
-                    endpoint
+                    upstream_endpoint(proxy)
                 ));
             }
         };
@@ -381,8 +417,9 @@ impl ProxyPool {
 
     /// Try to take a pre-warmed socket (with its bundled cap permit)
     /// for the given proxy. Returns `None` when the pool is disabled,
-    /// no entry exists yet, the queue is empty, or every entry has
-    /// aged out.
+    /// no entry exists yet, the queue is empty, every entry has aged
+    /// out, or every entry fails the liveness probe (the peer already
+    /// closed or broke the socket while it sat in the queue).
     fn checkout_prewarmed(&self, proxy: &ProxyConfig) -> Option<PreWarmed> {
         if !self.config.enabled {
             return None;
@@ -391,25 +428,29 @@ impl ProxyPool {
         let spares = self.pools.get(&key)?.value().clone();
         let max_age = Duration::from_secs(self.config.max_session_age_sec);
         let now = Instant::now();
-        // Drop stale entries lazily on checkout. Each pop notifies the
-        // refill task so it can replenish whatever we drained.
+        // Drop stale or already-dead entries lazily on checkout. Each
+        // pop notifies the refill task so it can replenish whatever we
+        // drained; draining the whole queue hands `acquire` its fresh-
+        // connect fallback instead of a dead socket.
         loop {
             let Some(pw) = spares.queue.pop() else {
                 spares.notify.notify_one();
                 return None;
             };
             spares.notify.notify_one();
-            if now.saturating_duration_since(pw.created_at) <= max_age {
+            if now.saturating_duration_since(pw.created_at) <= max_age && !spare_is_dead(&pw.stream)
+            {
                 return Some(pw);
             }
-            // stale — drop (releasing its socket and cap permit)
-            // and try the next.
+            // stale or dead — drop (releasing its socket and cap
+            // permit) and try the next.
         }
     }
 
     /// Try to take a fresh pre-warmed socket for the given proxy.
     /// Returns `None` when the pool is disabled, no entry exists yet,
-    /// the queue is empty, or every entry has aged out.
+    /// the queue is empty, every entry has aged out, or every entry
+    /// fails the liveness probe (the peer already closed it).
     ///
     /// When called directly (not via [`acquire`](ProxyPool::acquire))
     /// the bundled cap permit is dropped with the socket — this path
@@ -469,7 +510,6 @@ impl ProxyPool {
         // active together never exceed `max_per_upstream`.
         let sem = self.upstream_semaphore(&proxy.host, proxy.port);
         let handle = tokio::spawn(async move {
-            let addr = format!("{}:{}", proxy.host, proxy.port);
             let mut backoff = Duration::from_millis(100);
             loop {
                 while spares.queue.len() < target {
@@ -481,7 +521,12 @@ impl ProxyPool {
                         backoff = (backoff * 2).min(Duration::from_secs(10));
                         continue;
                     };
-                    match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+                    match timeout(
+                        connect_timeout,
+                        TcpStream::connect((proxy.host.as_str(), proxy.port)),
+                    )
+                    .await
+                    {
                         Ok(Ok(stream)) => {
                             let pw = PreWarmed {
                                 stream,
@@ -1060,5 +1105,231 @@ mod tests {
         );
         assert!(counters.open() <= 5);
         assert_eq!(counters.accepted(), 5);
+    }
+
+    #[tokio::test]
+    async fn acquire_hands_out_a_healthy_spare_without_discarding_it() {
+        // Guard for the dead-spare liveness probe: a connected, idle
+        // spare has no pending data, so the probe must classify it as
+        // alive. The spare must be handed out directly (no fresh
+        // connect) and must still carry data end-to-end.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy = make_proxy("127.0.0.1", addr.port());
+        let pool = ProxyPool::new(
+            PoolConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            Duration::from_secs(2),
+            1,
+        );
+        let permit = pool.reserve_permit(&proxy).unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let spares = Arc::new(ProxySpares {
+            queue: ArrayQueue::new(1),
+            notify: Notify::new(),
+        });
+        assert!(spares
+            .queue
+            .push(PreWarmed {
+                stream,
+                permit,
+                created_at: Instant::now()
+            })
+            .is_ok());
+        pool.pools
+            .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+        // Cap is 1 and the spare holds the only permit. If a regression
+        // discards healthy spares, acquire silently falls through to a
+        // fresh connect on a DIFFERENT socket — which this read on the
+        // original peer would then time out on.
+        let mut spare = pool
+            .acquire(&proxy)
+            .await
+            .expect("healthy spare handed out");
+        assert!(spares.queue.is_empty());
+
+        spare.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        timeout(Duration::from_secs(2), peer.read_exact(&mut buf))
+            .await
+            .expect("handed-out socket must be the original connection")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+
+        drop((spare, peer));
+        assert!(
+            pool.reserve_permit(&proxy).is_ok(),
+            "spare's permit must travel with the stream and back on drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_queued_spare_falls_back_to_a_fresh_connect() {
+        // R5-04 shape: the upstream closed the spare while it sat in
+        // the queue (its own idle/greeting timeout), but the upstream
+        // is healthy and still accepts connections. `acquire` must
+        // discard the dead spare and open a fresh connection in the
+        // same call, with correct permit accounting — a queued dead
+        // socket must not become the caller's final failure for a
+        // reachable upstream.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy = make_proxy("127.0.0.1", addr.port());
+        let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(5), 2);
+
+        // Build one spare manually, then close the PEER side — the same
+        // observable state an upstream idle timeout produces — and wait
+        // until the FIN is visible on the spare. `try_read` mirrors the
+        // pool's probe exactly, and EOF is sticky, so once this loop
+        // sees Ok(0) the probe will see it too.
+        let permit = pool.reserve_permit(&proxy).unwrap();
+        let spare = TcpStream::connect(addr).await.unwrap();
+        let (dead_peer, _) = listener.accept().await.unwrap();
+        drop(dead_peer);
+        let mut fin_seen = false;
+        for _ in 0..1000 {
+            match spare.try_read(&mut [0u8; 1]) {
+                Ok(0) => {
+                    fin_seen = true;
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Real wall-clock yield: FIN delivery on loopback is
+                    // immediate but not synchronous.
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // RST or any other socket error counts as dead too; no
+                // pending data is expected on this socket.
+                _ => {
+                    fin_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(fin_seen, "peer-side close was not observed on the spare");
+        let spares = Arc::new(ProxySpares {
+            queue: ArrayQueue::new(1),
+            notify: Notify::new(),
+        });
+        assert!(spares
+            .queue
+            .push(PreWarmed {
+                stream: spare,
+                permit,
+                created_at: Instant::now()
+            })
+            .is_ok());
+        pool.pools
+            .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+        let mut fresh = pool
+            .acquire(&proxy)
+            .await
+            .expect("dead spare must fall back to a fresh connect, not fail");
+        assert!(spares.queue.is_empty(), "dead spare must be discarded");
+
+        // The fallback socket is a live, NEW connection to the same
+        // (still-listening) upstream: data written on it must reach a
+        // freshly accepted peer.
+        let mut fallback_peer = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("fresh connect must reach the upstream")
+            .unwrap()
+            .0;
+        fresh.write_all(b"ok").await.unwrap();
+        let mut buf = [0u8; 2];
+        timeout(Duration::from_secs(2), fallback_peer.read_exact(&mut buf))
+            .await
+            .expect("read within timeout")
+            .unwrap();
+        assert_eq!(&buf, b"ok");
+
+        // Accounting: the discard released the dead spare's permit, the
+        // fresh connect re-reserved it; dropping everything hands both
+        // slots of cap 2 back.
+        drop((fresh, fallback_peer));
+        let a = pool.reserve_permit(&proxy);
+        let b = pool.reserve_permit(&proxy);
+        assert!(a.is_ok() && b.is_ok(), "both permits must be released");
+        assert!(
+            pool.reserve_permit(&proxy).is_err(),
+            "cap of 2 must still be enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_connect_dials_ipv6_literals_without_string_addr() {
+        // R5-11: `ProxyConfig.host` is stored WITHOUT IPv6 brackets, so
+        // `format!("{}:{}", "::1", port)` produces "::1:<port>" — not a
+        // parsable SocketAddr — and every IPv6-literal dial would fall
+        // through to the blocking system resolver. The `(host, port)`
+        // tuple form parses IP literals directly.
+        let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(5), 2);
+
+        // IPv6 loopback. Skip the leg on hosts without IPv6 at all.
+        let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipping IPv6 leg: IPv6 loopback unavailable");
+            return;
+        };
+        let v6_port = v6.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if v6.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let proxy_v6 = ProxyConfig {
+            ip: IPV::V6,
+            ..make_proxy("::1", v6_port)
+        };
+        let stream = pool
+            .acquire(&proxy_v6)
+            .await
+            .expect("IPv6 literal must connect via the tuple dial");
+        drop(stream);
+
+        // A domain still goes through the resolver, unchanged.
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v4_port = v4.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if v4.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let proxy_dom = make_proxy("localhost", v4_port);
+        let stream = pool
+            .acquire(&proxy_dom)
+            .await
+            .expect("domain host must still resolve and connect");
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn fresh_connect_failure_error_still_names_the_endpoint() {
+        // R5-11 moved the endpoint string into the failure paths; the
+        // diagnostics must survive the move. TEST-NET-1 (RFC 5737) is
+        // guaranteed non-routable.
+        let pool = ProxyPool::new(PoolConfig::default(), Duration::from_millis(300), 1);
+        let proxy = make_proxy("203.0.113.1", 1080);
+        let err = pool
+            .acquire(&proxy)
+            .await
+            .expect_err("TEST-NET-1 must not connect");
+        assert!(
+            err.to_string().contains("203.0.113.1:1080"),
+            "error must name the endpoint, got: {err}"
+        );
     }
 }
