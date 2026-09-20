@@ -52,12 +52,15 @@ impl std::fmt::Debug for UserOp {
 }
 
 /// Run the user-management subcommand and return. The caller dispatches
-/// to the server in the absence of a subcommand. Configs are auto-created
-/// here too — running `resocks5 users add admin` on a fresh install must
-/// just work; users shouldn't have to start the server first.
+/// to the server in the absence of a subcommand. Only the users config
+/// is loaded — or auto-created on a fresh install through the same
+/// protected first-run path the full startup uses — so `resocks5 users
+/// add admin` just works without starting the server first. Main and
+/// proxy-list configs are deliberately neither read nor parsed nor
+/// created here: a users subcommand has no use for them, and a broken
+/// sibling file must not break user management.
 pub fn run_user_command(action: UserAction) -> Result<()> {
-    let configs = config::load_or_init()?;
-    let users = configs.users;
+    let users = config::load_or_init::load_or_init_users_at(Path::new(config::USERS_PATH))?;
 
     let op = match action {
         UserAction::Add { name } => add_user(&users, &name)?,
@@ -168,22 +171,29 @@ fn set_direct(users: &UsersConfig, name: &str, direct: bool) -> Result<UserOp> {
     })
 }
 
-/// Apply `op` to the users file at `path`: take the cross-process lock,
-/// re-read what is currently on disk, apply the one operation to that
-/// fresh state, and atomically replace the file.
+fn commit_op_to(path: &Path, op: &UserOp) -> Result<()> {
+    commit_op_locked(path, op)?;
+    report(op);
+    Ok(())
+}
+
+/// Apply `op` under the cross-process lock and atomically replace the
+/// file. The lock guard lives only inside this function: it is dropped
+/// on return, BEFORE any success output is printed, so a slow or
+/// stalled stdout can never keep other CLI writers or server-side
+/// init-claims blocked out of the users file.
 ///
 /// The `UsersConfig` loaded at startup can be stale by the time we get
 /// here: a running server may have persisted an init-claim, or a second
 /// CLI invocation may have made another edit. Writing that stale
 /// snapshot back would silently revert those changes, so the operation
 /// is applied to what the file actually contains right now.
-fn commit_op_to(path: &Path, op: &UserOp) -> Result<()> {
+fn commit_op_locked(path: &Path, op: &UserOp) -> Result<()> {
     let _lock = UsersFileLock::acquire(path).with_context(|| format!("lock {}", path.display()))?;
     let mut fresh: UsersConfig =
         ktav::from_file(path).with_context(|| format!("read {}", path.display()))?;
     apply_op(op, &mut fresh)?;
     write_atomic(path, &fresh)?;
-    report(op);
     Ok(())
 }
 
@@ -317,6 +327,9 @@ fn validate_password(password: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::config::load_or_init::load_or_init_users_at;
 
     fn fresh() -> UsersConfig {
         UsersConfig { users: vec![] }
@@ -658,5 +671,107 @@ mod tests {
         assert_eq!(loaded.users[0].hash, "hash-a");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── R8-05: lock must not span the success report ───────────────
+
+    /// A unique temp DIRECTORY for the users-only load tests, following
+    /// the load_or_init.rs `unique_dir` pattern.
+    fn unique_cli_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let i = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("resocks5_cli_r806_{}_{}", std::process::id(), i));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn users_file_lock_released_before_report_prints() {
+        let path = temp_users_path("lock_release");
+        write_atomic(&path, &fresh()).unwrap();
+
+        let op = UserOp::AddInit(User {
+            name: "carol".into(),
+            hash: "init".into(),
+            is_enabled: true,
+            direct: false,
+        });
+
+        // This is commit_op_to's mutating work; its lock scope ends
+        // here — the guard is dropped when commit_op_locked returns.
+        commit_op_locked(&path, &op).unwrap();
+
+        // If the guard were still held across the report/print step,
+        // this acquisition must time out and fail.
+        let probe_path = path.clone();
+        let probe = std::thread::spawn(move || {
+            UsersFileLock::acquire_with_timeout(&probe_path, Duration::from_secs(5)).unwrap()
+        });
+        let probe_lock = probe
+            .join()
+            .expect("probe must acquire the lock once commit_op_locked returned");
+        drop(probe_lock);
+
+        // The success print happens only after the lock was proven
+        // free — commit first, report after.
+        report(&op);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+
+    #[test]
+    fn users_only_load_succeeds_despite_broken_or_absent_sibling_configs() {
+        // Scenario 1: a MALFORMED sibling config. The old shared
+        // load_or_init() aborted the whole command on the unreadable
+        // proxy list; the users-only path must not even parse it.
+        let dir = unique_cli_dir();
+        let users_path = dir.join(config::USERS_PATH);
+        write_atomic(
+            &users_path,
+            &UsersConfig {
+                users: vec![user_with_hash("alice", "hash-a")],
+            },
+        )
+        .unwrap();
+        let proxy_path = dir.join(config::PROXY_LIST_PATH);
+        std::fs::write(&proxy_path, "this is definitely not a ktav document\n").unwrap();
+
+        // The exact call run_user_command now makes.
+        let users = load_or_init_users_at(&users_path).unwrap();
+        assert_eq!(users.users.len(), 1);
+        assert_eq!(users.users[0].name, "alice");
+
+        // Prove the sibling really is unparseable — the old shared
+        // load_or_init path would have failed on it.
+        assert!(ktav::from_file::<config::ProxyListConfig, _>(&proxy_path).is_err());
+        assert!(
+            !dir.join(config::MAIN_PATH).exists(),
+            "users subcommands must not create other configs as a side effect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Scenario 2: an ABSENT sibling. The old full load_or_init
+        // would have created an empty proxy list here as a side
+        // effect; the users-only path must leave it untouched.
+        let dir = unique_cli_dir();
+        let users_path = dir.join(config::USERS_PATH);
+        write_atomic(
+            &users_path,
+            &UsersConfig {
+                users: vec![user_with_hash("bob", "hash-b")],
+            },
+        )
+        .unwrap();
+
+        let users = load_or_init_users_at(&users_path).unwrap();
+        assert_eq!(users.users.len(), 1);
+        assert!(users_path.exists(), "users file must exist afterwards");
+        assert!(
+            !dir.join(config::PROXY_LIST_PATH).exists(),
+            "users subcommands must not create the proxy list as a side effect"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -112,7 +112,7 @@ fn load_or_init_users() -> Result<UsersConfig> {
     load_or_init_users_at(Path::new(USERS_PATH))
 }
 
-fn load_or_init_users_at(path: &Path) -> Result<UsersConfig> {
+pub(crate) fn load_or_init_users_at(path: &Path) -> Result<UsersConfig> {
     if path.exists() {
         return ktav::from_file(path).with_context(|| format!("read {}", path.display()));
     }
