@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `resocks5-net` API: `connect::connect_proxy_once` — a one-shot
+  counterpart of `connect_proxy` for consumers that dial a single upstream
+  proxy without rotation or warm-socket reuse, and so should not have to
+  construct a `ProxyPool` at all. It is a thin wrapper: the per-protocol
+  handshakes (SOCKS5, HTTP CONNECT, HTTPS), the returned `AnyUpstream`
+  variants, and the error behaviour are identical to `connect_proxy`. The
+  cost is per call — a fresh TCP handshake to the proxy every time, and no
+  shared per-upstream concurrency cap, so callers that fan out concurrently
+  against the same proxy must bound that themselves.
+
 ## [0.1.1] - 2026-06-23
 
 ### Added

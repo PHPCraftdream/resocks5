@@ -34,6 +34,7 @@ pub use util::tcp_keepalive;
 pub use connect_http_proxy::connect_http_proxy;
 pub use connect_http_proxy::http_connect_handshake;
 pub use connect_proxy::connect_proxy;
+pub use connect_proxy::connect_proxy_once;
 pub use connect_socks5_proxy::connect_socks5_proxy;
 pub use handshake_over_stream::handshake_over_stream;
 pub use host_port::HostPort;
