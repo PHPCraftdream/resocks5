@@ -87,6 +87,15 @@ pub struct AuthState {
     /// temp file). Used only by the init-claim path to persist the
     /// freshly-hashed password.
     users_path: String,
+    /// Test-only observation seam for `claim_commit` (R7-04). Deliberately
+    /// per-INSTANCE, not a global static: cargo runs this file's tests
+    /// concurrently in one process, and a global sink would let one test's
+    /// claimant feed another test's observer. `None` in production
+    /// (`build`); a test installs a `std::sync::mpsc` sender and
+    /// `claim_commit` emits stage events into it. Compiles to nothing
+    /// outside test builds.
+    #[cfg(test)]
+    claim_probe: Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
 }
 
 /// Everything `claim_commit` needs to finish an init-claim, produced by
@@ -139,6 +148,8 @@ impl AuthState {
             server_secret,
             cache: DashMap::new(),
             users_path: users_path.into(),
+            #[cfg(test)]
+            claim_probe: Mutex::new(None),
         })
     }
 
@@ -363,6 +374,13 @@ impl AuthState {
     /// 3, outside the mutex) — hashing under the mutex would stall
     /// every other claim.
     fn claim_commit(&self, work: ClaimWork) -> ClaimOutcome {
+        // R7-04 test seam: the FIRST statement, before acquiring
+        // claim_lock. A waiting test learns the caller genuinely reached
+        // claim_commit — i.e. did not resolve via the pre-mutex fast path
+        // in prepare_claim — at the exact moment it arrives at the mutex.
+        #[cfg(test)]
+        self.claim_probe_emit("claim_commit_entered");
+
         let ClaimWork {
             name,
             candidate_hmac,
@@ -403,6 +421,12 @@ impl AuthState {
         // edited the file since we loaded it; writing our whole stale
         // snapshot back would silently revert those edits.
         // No users guard is held here.
+        // R7-04 test seam: fired only AFTER the post-mutex re-check and
+        // the users-file stat, immediately before the call into the
+        // persist helper — the exact guarded persistence region a
+        // regression would have to (re)enter.
+        #[cfg(test)]
+        self.claim_probe_emit("persist_region_entered");
         match persist_claim(
             Path::new(&self.users_path),
             &name,
@@ -479,6 +503,24 @@ impl AuthState {
             true
         } else {
             false
+        }
+    }
+}
+
+/// R7-04 test-only probe plumbing. The whole impl compiles to nothing
+/// outside test builds. Never blocks and never fails: emits drop when no
+/// probe is installed, and a send to a receiver whose test half is gone
+/// is dropped as well.
+#[cfg(test)]
+impl AuthState {
+    fn install_claim_probe(&mut self, tx: std::sync::mpsc::Sender<&'static str>) {
+        *self.claim_probe.lock().expect("claim probe mutex poisoned") = Some(tx);
+    }
+
+    fn claim_probe_emit(&self, event: &'static str) {
+        let probe = self.claim_probe.lock().expect("claim probe mutex poisoned");
+        if let Some(tx) = probe.as_ref() {
+            let _ = tx.send(event);
         }
     }
 }
@@ -652,6 +694,37 @@ mod tests {
         let (state, path) = build_state_persistent(users.clone(), allow_anonymous);
         crate::config::users_file::write_atomic(Path::new(&path), &UsersConfig { users }).unwrap();
         (state, path)
+    }
+
+    /// R7-04: block until the claim probe delivers `expected`, ignoring
+    /// any earlier event (seeing `claim_commit_entered` while waiting
+    /// for `persist_region_entered` is fine — keep looping). Panics with
+    /// a clear message if the specific event never arrives within
+    /// `guard`. Guards are sized several SECONDS — well above the worst
+    /// Argon2id-under-load stretches observed on this machine (hashing
+    /// degrades from ~15 ms to multiple seconds under concurrent CPU
+    /// load) — so the timeout fires only when the event is genuinely
+    /// missing (seam removed or guarded region restructured), never
+    /// because hashing was slow.
+    fn wait_for_claim_event(
+        rx: &mut std::sync::mpsc::Receiver<&'static str>,
+        expected: &'static str,
+        guard: std::time::Duration,
+        what: &str,
+    ) {
+        let deadline = std::time::Instant::now() + guard;
+        loop {
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(event) if event == expected => return,
+                Ok(_earlier) => {} // a legitimate earlier stage; keep waiting
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("claim probe: {what} did not happen within {guard:?}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("claim probe: channel closed before {expected:?} ({what})")
+                }
+            }
+        }
     }
 
     #[test]
@@ -1134,7 +1207,9 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+        let (mut state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
         let state = Arc::new(state);
 
         let (locked_tx, locked_rx) = mpsc::channel::<()>();
@@ -1181,6 +1256,33 @@ mod tests {
             let started = Instant::now();
             (s2.verify("bob", "same-pw"), started.elapsed())
         });
+        // R7-04: anchor to the probe, not to hope. BOTH racers must
+        // reach claim_commit — each emits claim_commit_entered as the
+        // first statement of claim_commit, so a racer that resolved via
+        // the pre-mutex fast path (its hashing finished only after the
+        // winner had already committed) never emits a second event and
+        // the second wait fails loudly instead of letting the test pass
+        // without ever exercising the post-mutex re-check. The winner's
+        // persist_region_entered may legitimately arrive between the two
+        // events and is ignored here. Guards are 15 s: each arrival
+        // requires one real Argon2id hash, which stretches to multiple
+        // seconds under concurrent CPU load (see the machine-load note),
+        // and the loser must additionally land while the winner is
+        // parked in persist_claim (phase A pins the users-file lock for
+        // 3 s).
+        wait_for_claim_event(
+            &mut claim_rx,
+            "claim_commit_entered",
+            Duration::from_secs(15),
+            "the first claimant reaching claim_commit",
+        );
+        wait_for_claim_event(
+            &mut claim_rx,
+            "claim_commit_entered",
+            Duration::from_secs(15),
+            "the second claimant reaching claim_commit (it must queue on \
+             claim_lock, not resolve via the pre-mutex fast path)",
+        );
         let (r1, e1) = t1.join().unwrap();
         let (r2, e2) = t2.join().unwrap();
         assert!(r1, "the winning login must succeed");
@@ -1263,7 +1365,10 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
-        let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)], false);
+        let (mut state, path) =
+            build_state_with_disk_file(vec![make_init_user("bob", true)], false);
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
         let state = Arc::new(state);
         let winner_hash = compute_hash("winner-pw").unwrap();
 
@@ -1285,17 +1390,29 @@ mod tests {
 
         // Hold claim_lock from before the racer starts so the racer is
         // guaranteed to park on this mutex right after its pre-mutex
-        // init check, then wait out the racer's Argon2id hashing (2 s is
-        // far beyond 100x the ~15 ms nominal, see the machine-load
-        // note) before scripting the winner's commit, so the pre-mutex
-        // check has certainly already run.
+        // init check. R7-04: wait for the probe event proving the racer
+        // actually REACHED claim_commit — its first statement emits
+        // claim_commit_entered — instead of sleeping a fixed 2 s and
+        // hoping its Argon2id hashing finished: under real CPU load that
+        // stretch is seconds, not the ~15 ms nominal, so no fixed sleep
+        // can prove arrival. The parent still holds claim_lock here, so
+        // after the event the racer is necessarily parked on the mutex
+        // and cannot pass the post-mutex re-check until the winner's
+        // state is injected and this guard is dropped. 15 s guard: the
+        // arrival needs one real Argon2id hash (see the machine-load
+        // note).
         let claim_guard = state.claim_lock.lock().expect("claim mutex poisoned");
         let racer_state = Arc::clone(&state);
         let racer = std::thread::spawn(move || {
             let started = Instant::now();
             (racer_state.verify("bob", "winner-pw"), started.elapsed())
         });
-        std::thread::sleep(Duration::from_secs(2));
+        wait_for_claim_event(
+            &mut claim_rx,
+            "claim_commit_entered",
+            Duration::from_secs(15),
+            "the racer reaching claim_commit (past its pre-mutex check)",
+        );
 
         // Script the winner's commit exactly as the Written branch would
         // leave it: real hash in memory and on disk. The cache is
@@ -1323,13 +1440,27 @@ mod tests {
 
         let (racer_ok, racer_elapsed) = racer.join().unwrap();
         assert!(racer_ok, "racer must verify against the winner's hash");
+        // R7-04 negative check: the racer's claim_commit_entered was
+        // already consumed by the wait above, so after the winner-state
+        // injection and the re-check resolution the probe channel must
+        // hold NOTHING — in particular no persist_region_entered, which
+        // would mean the racer entered persistence for a hash it never
+        // published.
+        assert!(
+            matches!(claim_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "racer emitted a further claim event after the winner-state \
+             injection — it entered the guarded persist region"
+        );
         // Any persistence attempt blocks ≥10 s against the pinned lock
         // (persist_claim → UsersFileLock::acquire → LOCK_TIMEOUT), so a
-        // sub-10 s total — of which 2 s is the deliberate parking wait —
-        // proves the racer never entered persistence. Margins: nominal
-        // fixed path ≈ 2.05 s; the bound tolerates several seconds of
-        // Argon2id degradation under load. The final-state asserts below
-        // are authoritative.
+        // sub-9 s total proves the racer never entered persistence. The
+        // bound sits in the ~8 s class on purpose (see the machine-load
+        // note): the fixed path runs TWO real Argon2id operations (the
+        // candidate hash and the verify against the winner's hash), and
+        // each has been observed to stretch into multiple seconds under
+        // concurrent CPU load — the bound is a generous safety margin,
+        // while the probe assertions above are the discriminator. The
+        // final-state asserts below are authoritative.
         assert!(
             racer_elapsed < Duration::from_secs(9),
             "racer elapsed {racer_elapsed:?} — it entered persistence and \
@@ -1579,22 +1710,25 @@ mod tests {
         //
         // Phase synchronization is by real events, not sleeps (R6-07):
         // the holder releases the file lock only on an explicit signal,
-        // and the parent only proceeds once T1's ownership of the claim
-        // mutex is CONFIRMED via try_lock — T1 is the only other party
-        // contending for that mutex in this test, so WouldBlock proves
-        // T1 is parked inside its claim critical section (persist_claim,
-        // waiting on the externally-held users-file lock).
+        // and the parent only proceeds once T1's presence at the guarded
+        // region is CONFIRMED (R7-04 probe): try_lock proving T1 HOLDS
+        // claim_lock, then the probe event fired immediately before the
+        // persist call proving T1 actually ENTERED the guarded
+        // persistence region — the mutex alone does not distinguish
+        // holding claim_lock from being parked inside persist_claim.
         use std::sync::mpsc;
         use std::sync::TryLockError;
         use std::time::{Duration, Instant};
 
-        let (state, path) = build_state_with_disk_file(
+        let (mut state, path) = build_state_with_disk_file(
             vec![
                 make_user("alice", "alice-pw", true),
                 make_init_user("bob", true),
             ],
             false,
         );
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
 
         // Holder thread: acquire the users-file lock, signal the parent
         // once it is ACTUALLY held, then keep it until the parent's
@@ -1648,6 +1782,23 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+
+        // R7-04: the try_lock loop above proves only that T1 HOLDS
+        // claim_lock — the post-mutex re-check and the users-file stat
+        // still sit between the mutex and the guarded persistence region
+        // whose users-guard-holding I/O a regression would have to
+        // (re)introduce. Anchor T2's measurement to the probe event
+        // fired immediately BEFORE the call into the persist helper:
+        // only then is T1 genuinely inside the region this test is
+        // about. 15 s guard: T1 hashes one real Argon2id digest before
+        // it can arrive, and that stretch reaches seconds under real
+        // CPU load (see the machine-load note).
+        wait_for_claim_event(
+            &mut claim_rx,
+            "persist_region_entered",
+            Duration::from_secs(15),
+            "T1 entering the guarded persistence region",
+        );
 
         // T2: a fresh cache-miss verify for alice (Argon2 only, no
         // claim machinery) must complete in milliseconds, not wait
