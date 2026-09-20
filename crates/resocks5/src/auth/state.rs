@@ -1368,8 +1368,17 @@ mod tests {
         // subprocess overhead. Actual cross-process release-on-owner-death
         // is separately covered by users_file.rs's crash test
         // `lock_is_released_when_owner_process_dies_without_cleanup`.
+        //
+        // Phase synchronization is by real events, not sleeps (R6-07):
+        // the holder releases the file lock only on an explicit signal,
+        // and the parent only proceeds once T1's ownership of the claim
+        // mutex is CONFIRMED via try_lock — T1 is the only other party
+        // contending for that mutex in this test, so WouldBlock proves
+        // T1 is parked inside its claim critical section (persist_claim,
+        // waiting on the externally-held users-file lock).
         use std::sync::mpsc;
-        use std::time::Duration;
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
 
         let (state, path) = build_state_with_disk_file(
             vec![
@@ -1379,9 +1388,13 @@ mod tests {
             false,
         );
 
-        // Holder thread: acquire the users-file lock and hold it for 3
-        // seconds, signalling the parent only once it is ACTUALLY held.
+        // Holder thread: acquire the users-file lock, signal the parent
+        // once it is ACTUALLY held, then keep it until the parent's
+        // explicit release signal — no fixed hold timer — and ack the
+        // release after dropping it.
         let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel::<()>();
         let holder_path = path.clone();
         let holder = std::thread::spawn(move || {
             let lock = UsersFileLock::acquire_with_timeout(
@@ -1389,9 +1402,12 @@ mod tests {
                 Duration::from_secs(5),
             )
             .expect("holder must acquire the users-file lock");
-            let _ = &lock;
             locked_tx.send(()).expect("signal lock held");
-            std::thread::sleep(Duration::from_secs(3));
+            release_rx
+                .recv()
+                .expect("holder must receive the release signal");
+            drop(lock);
+            released_tx.send(()).expect("signal lock released");
         });
         locked_rx.recv().expect("lock-holder signalled");
 
@@ -1402,32 +1418,67 @@ mod tests {
             let state = state.clone();
             move || state.verify("bob", "bob-pw")
         });
-        std::thread::sleep(Duration::from_millis(300)); // let T1 reach the persist
+
+        // Confirm T1 reached its critical section by polling for real
+        // claim_lock contention (R6-07), not by a fixed sleep: try_lock
+        // succeeding means T1 has not taken the mutex yet — drop the
+        // guard immediately so it cannot stall T1 — and WouldBlock means
+        // T1 holds it. Panic if the deadline passes without ever seeing
+        // contention; that means T1 never reached the critical section
+        // and the test's premise was never established.
+        let contention_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match state.claim_lock.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Ok(uncontended) => drop(uncontended),
+                Err(TryLockError::Poisoned(_)) => panic!("claim mutex poisoned"),
+            }
+            assert!(
+                Instant::now() < contention_deadline,
+                "T1 never took claim_lock within 10 s — the claim \
+                 contention this test relies on was never observed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         // T2: a fresh cache-miss verify for alice (Argon2 only, no
         // claim machinery) must complete in milliseconds, not wait
-        // behind the ~3s file-lock hold. Margin note: the old
-        // (write-guard-held-across-persist) implementation blocks this
-        // read until the holder releases (~2.7s remaining at this
-        // point), so the 1500ms bound discriminates with a >=2x margin;
-        // the fixed implementation returns in milliseconds.
-        let started = std::time::Instant::now();
+        // behind T1's parked persist. The 5 s bound is a generous
+        // companion guard (Argon2id can degrade from ~15 ms to seconds
+        // under concurrent CPU load on this machine — see the
+        // recovery-plan note), not the discriminator: in the old
+        // (write-guard-held-across-persist) implementation this read
+        // blocks until the holder releases the file lock — which only
+        // happens after these assertions — so the regression shows up
+        // as this verify never returning; the bound only catches any
+        // unexpected shorter stall.
+        let started = Instant::now();
         let ok = state.verify("alice", "alice-pw");
         let elapsed = started.elapsed();
         assert!(ok);
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < Duration::from_secs(5),
             "cache-miss verify for an unrelated user blocked {:?} behind the claim persist",
             elapsed
         );
 
-        // Deterministic: T1 cannot publish until the holder releases the
-        // lock, so bob must still be the sentinel here.
+        // Deterministic: the release signal has not been sent, so the
+        // file lock is still held and T1 must still be parked inside
+        // persist_claim — bob must still be the sentinel here.
         {
             let users = state.users.read().unwrap();
             let bob = users.iter().find(|u| u.name == "bob").unwrap();
             assert_eq!(bob.hash, INIT_HASH, "T1 must still be parked in persist");
         }
+
+        // Explicit release: only now may the holder drop the lock, so
+        // T1's parked persist can complete.
+        release_tx
+            .send(())
+            .expect("signal the holder to release the file lock");
+        released_rx
+            .recv()
+            .expect("holder acked the release (lock dropped)");
 
         holder.join().expect("join lock-holder thread");
         assert!(t1.join().unwrap());
