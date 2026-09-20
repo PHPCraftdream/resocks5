@@ -6,7 +6,7 @@ use regex::RegexSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Instant};
+use tokio::time::Instant;
 
 use tokio_rustls::TlsConnector;
 
@@ -14,7 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use crate::server::handle_client::{remaining_client_budget, run_phase_in_client_budget};
+use crate::server::handle_client::run_phase_in_client_budget;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni, HostPort};
@@ -29,7 +29,7 @@ use resocks5_net::rotator::ProxyRotator;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
 const RESP_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Proxy-Authenticate: Basic realm=\"resocks5\"\r\n\
+                          Proxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\n\
                           Connection: close\r\n\
                           Content-Length: 0\r\n\r\n";
 
@@ -291,38 +291,51 @@ async fn recover_and_tunnel_http(
         None => " [client=anon]".to_string(),
     };
 
-    // Early 200 so the client sends its first application record.
-    client_stream
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-
-    let recovery_budget = remaining_client_budget(client_deadline);
-    let peeked = match timeout(
-        recovery_budget,
-        peek_recovery(
-            &mut client_stream,
-            pipelined,
-            server::establish_connection(
-                target,
-                gate_rotator,
-                v6_rotator,
-                v4_rotator,
-                logger,
-                banned,
-                pool,
-                network,
-                client_user,
-                tls_connector,
-            ),
-        ),
+    // (R7-01) The WHOLE initial recovery phase — the early 200 reply
+    // AND the payload peek — sits behind the expired-deadline guard.
+    // With a decidable payload already pipelined past CONNECT, a bare
+    // `timeout` still polls the peek once before consulting the timer:
+    // the 200 would go out and the upstream dial would start even
+    // though the client-protocol budget is already dead.
+    // `run_phase_in_client_budget` checks the budget BEFORE the first
+    // poll.
+    let peeked = match run_phase_in_client_budget(
+        client_deadline,
+        async {
+            // Early 200 so the client sends its first application
+            // record.
+            client_stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+            Ok::<_, anyhow::Error>(
+                peek_recovery(
+                    &mut client_stream,
+                    pipelined,
+                    server::establish_connection(
+                        target,
+                        gate_rotator,
+                        v6_rotator,
+                        v4_rotator,
+                        logger,
+                        banned,
+                        pool,
+                        network,
+                        client_user,
+                        tls_connector,
+                    ),
+                )
+                .await?,
+            )
+        },
     )
     .await
     {
-        Ok(result) => result?,
-        Err(_) => {
+        Ok(Ok(peeked)) => peeked,
+        Ok(Err(e)) => return Err(e),
+        Err(budget) => {
             return Err(anyhow!(
                 "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
-                recovery_budget.as_secs(),
+                budget.as_secs(),
                 ctag,
             ))
         }
@@ -1353,6 +1366,117 @@ mod tests {
             targets.first().map(String::as_str),
             Some("203.0.113.9:443"),
             "the CONNECT target must be the only dialed host, targets: {targets:?}"
+        );
+    }
+
+    // ── R7-01: an expired deadline must not start recovery ──────────
+
+    #[tokio::test]
+    async fn expired_deadline_with_pipelined_payload_never_starts_recovery() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        // Already in the past: the client-protocol budget is exhausted
+        // before recovery is even entered.
+        let client_deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        // A decidable payload rides along pipelined past CONNECT — the
+        // recovery probes would decide on the very first poll (the
+        // exact shortcut a bare `timeout` used to take before
+        // consulting an already-expired timer).
+        let hello = client_hello_with_sni("pipelined.example");
+
+        let task = tokio::spawn(async move {
+            recover_and_tunnel_http(
+                server,
+                "203.0.113.9:443",
+                "443",
+                hello,
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+                client_deadline,
+            )
+            .await
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("expired deadline must not stall recovery")
+            .unwrap();
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+
+        // The 200 must never have gone out: the client sees a bare
+        // EOF, zero bytes. (A close can surface as RST on some
+        // platforms; any other error is a real failure.)
+        let mut received = Vec::new();
+        let eof = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("client must see EOF promptly");
+        if let Err(err) = eof {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "client must see EOF promptly, got: {err}"
+            );
+        }
+        assert!(
+            received.is_empty(),
+            "no byte may reach the client once the deadline is expired, got {received:?}"
+        );
+
+        // A healthy upstream was reachable, yet must never be dialed.
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.is_empty(),
+            "no upstream may be dialed on an expired deadline, targets: {targets:?}"
+        );
+    }
+
+    // ── R8-08: the Basic challenge declares its credential charset ──
+
+    #[tokio::test]
+    async fn proxy_auth_challenge_declares_utf8_charset() {
+        // A 407-triggering request (unsupported auth scheme): the
+        // credential decoder hard-requires UTF-8, so the challenge must
+        // say so (RFC 7617 §2.1 — charset after realm).
+        let (_, response) = parse_request(
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Bearer token\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 407 "));
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("Proxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\""),
+            "the 407 challenge must declare charset=UTF-8, got: {text:?}"
         );
     }
 }

@@ -6,7 +6,7 @@ use regex::RegexSet;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Instant};
+use tokio::time::Instant;
 
 use tokio_rustls::TlsConnector;
 
@@ -14,10 +14,10 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use crate::server::handle_client::{remaining_client_budget, run_phase_in_client_budget};
+use crate::server::handle_client::run_phase_in_client_budget;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
-use resocks5_net::connect::{parse_http_host, parse_sni};
+use resocks5_net::connect::{parse_http_host, parse_sni, HostPort};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -253,43 +253,57 @@ async fn recover_and_tunnel(
         None => " [client=anon]".to_string(),
     };
 
-    // Early SOCKS5 success reply — required so the client sends its
-    // ClientHello / HTTP request, which carries the name we need.
-    client_stream
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-
-    // Peek under the client-protocol deadline (slowloris guard: a
-    // client that completes CONNECT but never speaks must not pin the
-    // slot). The grace window inside distinguishes a slow client-first
-    // protocol from a server-speaks-first one.
-    let recovery_budget = remaining_client_budget(client_deadline);
-    let peeked = match timeout(
-        recovery_budget,
-        peek_recovery(
-            &mut client_stream,
-            Vec::new(),
-            server::establish_connection(
-                target_addr,
-                gate_rotator,
-                v6_rotator,
-                v4_rotator,
-                logger,
-                banned,
-                pool,
-                network,
-                client_user,
-                tls_connector,
-            ),
-        ),
+    // (R7-01) The WHOLE initial recovery phase — the early SOCKS5
+    // success reply AND the payload peek — sits behind the
+    // expired-deadline guard. With a decidable payload already
+    // buffered, a bare `timeout` still polls the peek once before
+    // consulting the timer: the early reply would go out and the
+    // upstream dial would start even though the client-protocol budget
+    // is already dead. `run_phase_in_client_budget` checks the budget
+    // BEFORE the first poll.
+    let peeked = match run_phase_in_client_budget(
+        client_deadline,
+        async {
+            // Early SOCKS5 success reply — required so the client
+            // sends its ClientHello / HTTP request, which carries the
+            // name we need.
+            client_stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            // Peek under the client-protocol deadline (slowloris
+            // guard: a client that completes CONNECT but never speaks
+            // must not pin the slot). The grace window inside
+            // distinguishes a slow client-first protocol from a
+            // server-speaks-first one.
+            Ok::<_, anyhow::Error>(
+                peek_recovery(
+                    &mut client_stream,
+                    Vec::new(),
+                    server::establish_connection(
+                        target_addr,
+                        gate_rotator,
+                        v6_rotator,
+                        v4_rotator,
+                        logger,
+                        banned,
+                        pool,
+                        network,
+                        client_user,
+                        tls_connector,
+                    ),
+                )
+                .await?,
+            )
+        },
     )
     .await
     {
-        Ok(result) => result?,
-        Err(_) => {
+        Ok(Ok(peeked)) => peeked,
+        Ok(Err(e)) => return Err(e),
+        Err(budget) => {
             return Err(anyhow!(
                 "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
-                recovery_budget.as_secs(),
+                budget.as_secs(),
                 ctag,
             ))
         }
@@ -528,11 +542,30 @@ async fn socks5_handshake(
             let mut port_bytes = [0u8; 2];
             client_stream.read_exact(&mut domain_buf).await?;
             client_stream.read_exact(&mut port_bytes).await?;
-            format!(
-                "{}:{}",
-                String::from_utf8(domain_buf)?,
-                u16::from_be_bytes(port_bytes)
-            )
+            let domain = String::from_utf8(domain_buf)?;
+            let target = format!("{}:{}", domain, u16::from_be_bytes(port_bytes));
+            // Validate DOMAINNAME BEFORE any pool acquire / dial: an
+            // empty domain, one carrying control/whitespace bytes, or
+            // a name the upstream HostPort grammar rejects is a client
+            // error — it must cost a client-facing SOCKS5 failure
+            // reply here, never a wasted upstream attempt booked
+            // against a healthy proxy's rating. (R8-03; mirrors the
+            // HTTP CONNECT input validation.)
+            if domain.is_empty()
+                || domain
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+                || HostPort::parse(&target).is_none()
+            {
+                let _ = client_stream
+                    .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                return Err(anyhow!(
+                    "Invalid DOMAINNAME in CONNECT request: {:?}",
+                    domain
+                ));
+            }
+            target
         }
         0x04 => {
             let mut ip_bytes = [0u8; 16];
@@ -1327,5 +1360,158 @@ mod tests {
             targets.is_empty(),
             "no upstream may be dialed when the client closed first, targets: {targets:?}"
         );
+    }
+
+    // ── R7-01: an expired deadline must not start recovery ──────────
+
+    #[tokio::test]
+    async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
+        let (up_addr, up_log) = spawn_socks5_stub(b"").await;
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            up_addr,
+        )])));
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        // Already in the past: the client-protocol budget is exhausted
+        // before recovery is even entered.
+        let client_deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let gate: Option<Arc<ProxyRotator>> = None;
+        let v6: Option<Arc<ProxyRotator>> = None;
+
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = l.local_addr().unwrap();
+        let mut client = TcpStream::connect(caddr).await.unwrap();
+        let server = l.accept().await.unwrap().0;
+
+        // A decidable payload is already sitting in the kernel receive
+        // buffer before recovery is entered — a full HTTP request whose
+        // Host header the recovery probes would decide on the very
+        // first poll (the exact shortcut a bare `timeout` used to
+        // take before consulting an already-expired timer).
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: buffered.example\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let task = tokio::spawn(async move {
+            recover_and_tunnel(
+                server,
+                "203.0.113.9:443",
+                "443",
+                &gate,
+                &v6,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                None,
+                client_deadline,
+            )
+            .await
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(8), task)
+            .await
+            .expect("expired deadline must not stall recovery")
+            .unwrap();
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+
+        // The early success reply must never have gone out: the client
+        // sees a bare EOF, zero bytes. (A close with the payload still
+        // unread can also surface as an RST — ConnectionReset — which
+        // proves the same thing; any other error is a real failure.)
+        let mut received = Vec::new();
+        let eof = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut received))
+            .await
+            .expect("client must see EOF promptly");
+        if let Err(err) = eof {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "client must see EOF promptly, got: {err}"
+            );
+        }
+        assert!(
+            received.is_empty(),
+            "no byte may reach the client once the deadline is expired, got {received:?}"
+        );
+
+        // A healthy upstream was reachable, yet must never be dialed.
+        let targets = up_log.lock().unwrap().clone();
+        assert!(
+            targets.is_empty(),
+            "no upstream may be dialed on an expired deadline, targets: {targets:?}"
+        );
+    }
+
+    // ── R8-03: DOMAINNAME validation happens before any dial ────────
+
+    /// Drive `socks5_handshake` directly — no pool, rotator, or
+    /// upstream exists in this test beyond the handshake itself, so a
+    /// rejection here provably happens before any upstream attempt or
+    /// rating change. Asserts the client-facing SOCKS5 failure reply
+    /// and that the error text is input validation, not an upstream
+    /// failure.
+    async fn connect_domain_expect_rejection(domain: &[u8], port: [u8; 2]) {
+        let auth = test_auth();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_one(listener, auth));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [0x05, 0x00]);
+
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+        req.extend_from_slice(domain);
+        req.extend_from_slice(&port);
+        client.write_all(&req).await.unwrap();
+
+        // rep=0x04 (host unreachable), BND.ADDR 0.0.0.0, BND.PORT 0.
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("timed out")
+            .unwrap();
+        let error = result.expect_err("handshake must reject the domain");
+        assert!(
+            !error.to_string().contains("upstream"),
+            "rejection must be input validation, not an upstream failure: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_length_domain_connect_is_rejected_with_client_error() {
+        connect_domain_expect_rejection(b"", [0x01, 0xBB]).await;
+    }
+
+    #[tokio::test]
+    async fn nul_byte_domain_connect_is_rejected_with_client_error() {
+        connect_domain_expect_rejection(b"exa\x00mple.com", [0x01, 0xBB]).await;
+    }
+
+    #[tokio::test]
+    async fn colon_in_domain_connect_is_rejected_with_client_error() {
+        connect_domain_expect_rejection(b"exa:mple.com", [0x01, 0xBB]).await;
     }
 }
