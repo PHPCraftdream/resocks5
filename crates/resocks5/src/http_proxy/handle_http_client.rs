@@ -458,20 +458,22 @@ async fn parse_http_connect(
     // doesn't use, so the block as a whole must NOT be required to be
     // UTF-8. Only the request line and the fields actually read below
     // are validated.
-    let mut lines: Vec<&[u8]> = Vec::new();
-    let mut rest = &buf[..header_end - 4];
-    while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
-        lines.push(&rest[..pos]);
-        rest = &rest[pos + 2..];
-    }
-    lines.push(rest);
+    let mut lines = ByteLines {
+        rest: &buf[..header_end - 4],
+    };
 
-    let request_line = match std::str::from_utf8(lines[0]) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = client_stream.write_all(RESP_400).await;
-            return Err(anyhow!("non-UTF-8 bytes in HTTP request line"));
-        }
+    let request_line = match lines.next() {
+        // An empty header block yields no line at all; the empty string
+        // then fails the request-line check below exactly like the old
+        // collect-then-index parser's empty first line did.
+        None => "",
+        Some(line) => match std::str::from_utf8(line) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = client_stream.write_all(RESP_400).await;
+                return Err(anyhow!("non-UTF-8 bytes in HTTP request line"));
+            }
+        },
     };
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
@@ -487,6 +489,22 @@ async fn parse_http_connect(
         return Err(anyhow!(
             "only CONNECT is supported, client sent {:?}",
             method
+        ));
+    }
+    // The upstream HTTP client (write_connect_request in
+    // resocks5-net/src/connect/connect_http_proxy.rs) rejects any target
+    // byte that is ASCII control or whitespace. Reject it here instead,
+    // BEFORE any pool acquire / dial: such a target is a client error
+    // (RFC 9110 §9.3.6) and must cost a 400 — never a wasted upstream
+    // attempt booked against a healthy proxy's rating.
+    if target
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        let _ = client_stream.write_all(RESP_400).await;
+        return Err(anyhow!(
+            "CONNECT target contains control or whitespace bytes — {:?}",
+            target
         ));
     }
     // Validate the authority with the same grammar the upstream applies
@@ -506,7 +524,7 @@ async fn parse_http_connect(
     // decoded further below) — opaque bytes in any other header are
     // skipped without affecting the parse.
     let mut proxy_auth_value: Option<&str> = None;
-    for &line in lines.iter().skip(1) {
+    for line in lines {
         if line.is_empty() {
             continue;
         }
@@ -600,6 +618,37 @@ async fn parse_http_connect(
 
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Lazy iterator over the CRLF-delimited lines of a byte block. Same
+/// enumeration as the former collect-a-`Vec<&[u8]>`-of-all-lines loop,
+/// minus the line table (R6-06): no allocation proportional to the
+/// header count. When no `\r\n` remains, the remaining slice is yielded
+/// once; an exhausted (empty) block yields nothing.
+struct ByteLines<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for ByteLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        match self.rest.windows(2).position(|w| w == b"\r\n") {
+            Some(pos) => {
+                let line = &self.rest[..pos];
+                self.rest = &self.rest[pos + 2..];
+                Some(line)
+            }
+            None => {
+                let line = self.rest;
+                self.rest = &[];
+                Some(line)
+            }
+        }
+    }
 }
 
 fn split_basic_token(value: &str) -> Option<&str> {
@@ -704,6 +753,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_bytes_in_connect_target_are_rejected_with_400_without_dialing() {
+        // parse_http_connect is called directly — no pool, rotator, or
+        // upstream exists in this test, so a 400 here provably happens
+        // before any upstream attempt or rating change.
+        for target in [
+            "exa\x00mple.com:443", // NUL
+            "exa\x01mple.com:443", // SOH
+            "exa\x7Fmple.com:443", // DEL
+            "exa\nmple.com:443",   // smuggled lone LF
+        ] {
+            let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+            let (result, response) = parse_request(request.as_bytes()).await;
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("target {target:?} must be rejected"));
+            assert!(
+                !error.to_string().contains("upstream"),
+                "target {target:?} must not be classified as an upstream failure: {error}"
+            );
+            assert!(
+                response.starts_with(b"HTTP/1.1 400 "),
+                "target {target:?} must get 400, got {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn valid_connect_authorities_still_parse() {
         for target in [
             "example.com:443",
@@ -750,6 +826,73 @@ mod tests {
                 .await;
         assert!(result.is_err());
         assert!(response.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn byte_lines_yields_the_old_collect_semantics_without_the_table() {
+        fn old_lines(mut rest: &[u8]) -> Vec<&[u8]> {
+            let mut lines = Vec::new();
+            while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+                lines.push(&rest[..pos]);
+                rest = &rest[pos + 2..];
+            }
+            lines.push(rest);
+            lines
+        }
+
+        let buffers: [&[u8]; 6] = [
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com",
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n",
+            b"\r\nFAST-OPEN-CLIENTHELLO",
+            b"single line without terminator",
+            b"",
+            b"first\r\n\r\nthird",
+        ];
+        for buf in buffers {
+            let mut expected = old_lines(buf);
+            // The ONLY difference from the old collect: an empty block
+            // and a CRLF-terminated block yield no trailing empty line
+            // (the old loop pushed one; downstream skipped/rejected it
+            // either way).
+            if expected.last().is_some_and(|last| last.is_empty()) {
+                expected.pop();
+            }
+            assert_eq!(
+                ByteLines { rest: buf }.collect::<Vec<&[u8]>>(),
+                expected,
+                "byte-lines mismatch for buffer {buf:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thousands_of_header_lines_are_still_fully_scanned() {
+        // ~4000 short filler headers fit under the 16 KiB header limit;
+        // Proxy-Authorization is the LAST line, so the scan must reach
+        // the end of the block without materializing a line table.
+        let mut request = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
+        request.extend_from_slice(&b"X:\r\n".repeat(4000));
+
+        let mut with_auth = request.clone();
+        with_auth.extend_from_slice(b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n");
+        let (result, response) = parse_request(&with_auth).await;
+        assert!(
+            result.is_err(),
+            "creds with no users configured must be rejected: {response:?}"
+        );
+        assert!(
+            response.starts_with(b"HTTP/1.1 407 "),
+            "Proxy-Authorization on the last line must still be found, got {response:?}"
+        );
+
+        request.extend_from_slice(b"\r\n");
+        let (result, response) = parse_request(&request).await;
+        let req = result.expect("filler headers alone must parse");
+        assert_eq!(req.target, "example.com:443");
+        assert!(
+            response.is_empty(),
+            "no error response expected on success, got {response:?}"
+        );
     }
 
     // ── Recovery-path tests ─────────────────────────────────────────
