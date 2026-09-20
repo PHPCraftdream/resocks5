@@ -16,7 +16,9 @@ repository = "https://github.com/PHPCraftdream/resocks5"
 
 [workspace.dependencies]
 # Shared across both crates — single source of truth for versions.
-tokio = { version = "1.43.0", features = ["full"] }
+# Version only — each crate declares the tokio features it actually needs,
+# so the library does not force "full" onto downstream consumers.
+tokio = { version = "1.43.0", default-features = false }
 anyhow = "1.0.95"
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"

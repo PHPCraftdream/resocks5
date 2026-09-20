@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared per-upstream concurrency cap, so callers that fan out concurrently
   against the same proxy must bound that themselves.
 
+### Changed
+
+- `resocks5-net` no longer depends on tokio's `"full"` feature. Each crate now
+  declares the tokio features it actually uses; the workspace entry carries
+  only the version. The library asks for `net`, `io-util`, `time`, `sync`,
+  `rt` and `macros` (plus `test-util` and `rt-multi-thread` as dev-only), so
+  downstream consumers no longer have `fs`, `process`, `signal`, `io-std` and
+  `rt-multi-thread` forced on them. The binary keeps what it genuinely needs —
+  it builds its own multi-threaded runtime, handles Ctrl+C and writes log
+  files — and drops only `process` and `parking_lot`. `Cargo.lock` loses the
+  `parking_lot` node, which was reachable solely through `"full"`; no
+  dependency version changed.
+
 ## [0.1.1] - 2026-06-23
 
 ### Added

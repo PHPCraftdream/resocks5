@@ -12,7 +12,7 @@ categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 resocks5-net = { path = "../resocks5-net" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true
 serde.workspace = true
 base64.workspace = true
