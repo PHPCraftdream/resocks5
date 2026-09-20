@@ -66,6 +66,11 @@ pub struct AuthState {
     /// claim work runs synchronously inside `spawn_blocking` threads
     /// and nothing `.await`s while the guard is held.
     entries: HashMap<String, UserEntry>,
+    /// Caps concurrent CPU-bound Argon2 verify work. Sized
+    /// `min(available_parallelism, 4)` (fallback 1). Permits are held
+    /// only around the hashing phases (R7-03): claim persistence waits
+    /// run WITHOUT a permit so a claim parked on the users-file lock
+    /// cannot starve other users' hashing.
     verify_slots: Arc<Semaphore>,
     /// Mirrors `auth.allow_anonymous` from `resocks5.main.ktav`. When
     /// `true`, the server advertises SOCKS5 method `0x00` to clients
@@ -82,6 +87,29 @@ pub struct AuthState {
     /// temp file). Used only by the init-claim path to persist the
     /// freshly-hashed password.
     users_path: String,
+}
+
+/// Everything `claim_commit` needs to finish an init-claim, produced by
+/// the CPU-bound phase 1 (`prepare_claim`) and consumed by the
+/// persistence phase 2 (`claim_commit`).
+struct ClaimWork {
+    name: String,
+    candidate_hmac: [u8; 32],
+    index: usize,
+    new_hash: String,
+}
+
+/// Result of phases 1/2: either a final answer, or a claim that still
+/// needs `claim_commit`, or (from `claim_commit`) a committed hash the
+/// caller must Argon2-verify OUTSIDE the claim mutex (phase 3).
+enum Prepared {
+    Done(bool),
+    Claim(ClaimWork),
+}
+
+enum ClaimOutcome {
+    Done(bool),
+    VerifyAgainst(String),
 }
 
 impl AuthState {
@@ -135,8 +163,11 @@ impl AuthState {
             .unwrap_or(false)
     }
 
-    /// cancel-safe: NO — admitted blocking work may finish an init-claim after
-    /// cancellation. Its permit stays with the work until hashing/persistence ends.
+    /// cancel-safe: NO — an admitted init-claim may still complete its
+    /// persistence after cancellation. Permits, however, are held only
+    /// around the hashing phases (R7-03): the persistence wait in
+    /// `claim_commit` runs without one, so a claim parked on the
+    /// users-file lock does not consume a hashing slot.
     pub async fn verify_async(self: &Arc<Self>, name: &str, password: &str) -> bool {
         if !self.entries.get(name).is_some_and(|u| u.enabled) {
             return false;
@@ -145,15 +176,56 @@ impl AuthState {
         if self.cache_matches(name, &candidate) {
             return true;
         }
+        // Phase 1 — CPU-bound hashing + entry/claim-state checks, under
+        // a hashing permit. The permit is owned by the closure and
+        // dropped when it returns, i.e. before any claim_lock or
+        // users-file wait.
+        let Ok(permit) = self.verify_slots.clone().acquire_owned().await else {
+            return false;
+        };
+        let name = name.to_owned();
+        let password = password.to_owned();
+        let prepared = {
+            let state = self.clone();
+            let name = name.clone();
+            let password = password.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                state.verify_prepare(&name, &password, candidate)
+            })
+            .await
+            .unwrap_or(Prepared::Done(false))
+        };
+
+        // Phase 2 — claim persistence: post-mutex re-check, lazy
+        // fallback snapshot, cross-process file I/O. NO hashing permit
+        // held here (R7-03): claims parked on the users-file lock must
+        // not starve other users' hashing.
+        let work = match prepared {
+            Prepared::Done(ok) => return ok,
+            Prepared::Claim(work) => work,
+        };
+        let outcome = {
+            let state = self.clone();
+            tokio::task::spawn_blocking(move || state.claim_commit(work))
+                .await
+                .unwrap_or(ClaimOutcome::Done(false))
+        };
+
+        // Phase 3 — verify against a committed hash (a concurrent claim
+        // winner or a disk value adopted from a concurrent CLI edit).
+        // Back under a hashing permit: this is real Argon2 work.
+        let stored_hash = match outcome {
+            ClaimOutcome::Done(ok) => return ok,
+            ClaimOutcome::VerifyAgainst(stored_hash) => stored_hash,
+        };
         let Ok(permit) = self.verify_slots.clone().acquire_owned().await else {
             return false;
         };
         let state = self.clone();
-        let name = name.to_owned();
-        let password = password.to_owned();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            state.verify(&name, &password)
+            state.verify_against_committed(&name, &stored_hash, &password, candidate)
         })
         .await
         .unwrap_or(false)
@@ -171,75 +243,124 @@ impl AuthState {
     /// to the client. Cache-first; falls back to Argon2 on miss; on a
     /// `"init"` placeholder, atomically claims the password for the
     /// account and persists it to disk.
+    ///
+    /// Test-only after R7-03: production goes through `verify_async`
+    /// (SOCKS5 + HTTP handlers). Synchronous composition of the same
+    /// three phases — prepare, commit, verify-against-committed — with
+    /// no semaphore involvement.
+    #[allow(dead_code)]
     pub fn verify(&self, name: &str, password: &str) -> bool {
-        let Some(entry) = self.entries.get(name).filter(|u| u.enabled) else {
-            return false;
-        };
         let candidate_hmac = compute_cache_hmac(&self.server_secret, name, password);
+        match self.verify_prepare(name, password, candidate_hmac) {
+            Prepared::Done(ok) => ok,
+            Prepared::Claim(work) => match self.claim_commit(work) {
+                ClaimOutcome::Done(ok) => ok,
+                ClaimOutcome::VerifyAgainst(stored_hash) => {
+                    self.verify_against_committed(name, &stored_hash, password, candidate_hmac)
+                }
+            },
+        }
+    }
+
+    /// Phase 1 of the verify pipeline: entry checks, cache check, then
+    /// either a plain Argon2 verify against the stored hash or the
+    /// CPU-bound prefix of an init-claim. Returns `Prepared::Done` when
+    /// no persistence is needed, or `Prepared::Claim` carrying the work
+    /// `claim_commit` must finish.
+    fn verify_prepare(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> Prepared {
+        let Some(entry) = self.entries.get(name).filter(|u| u.enabled) else {
+            return Prepared::Done(false);
+        };
         if self.cache_matches(name, &candidate_hmac) {
-            return true;
+            return Prepared::Done(true);
         }
         let hash = self.users.read().expect("users RwLock poisoned")[entry.index]
             .hash
             .clone();
 
-        if hash == INIT_HASH {
-            return self.try_claim_init(name, password, candidate_hmac);
+        if hash != INIT_HASH {
+            return Prepared::Done(self.verify_against_committed(
+                name,
+                &hash,
+                password,
+                candidate_hmac,
+            ));
         }
-
-        if argon2_verify(&hash, password) {
-            self.cache.insert(name.to_string(), candidate_hmac);
-            true
-        } else {
-            false
-        }
+        self.prepare_claim(name, password, candidate_hmac)
     }
 
-    /// Implements the `hash == "init"` first-login claim flow. Returns
-    /// `true` when the password was either just recorded for the user
-    /// (we won the race), or matches the hash that was recorded by a
-    /// concurrent winner — in-process or on disk. Returns `false` on
-    /// hash-compute failure, disk persistence failure, or a real
-    /// password mismatch.
-    ///
-    /// The init state is re-checked after `claim_lock` is acquired
-    /// (R6-01): a racer that queued behind a committed winner becomes a
-    /// plain login against the winner's hash and never enters
-    /// persistence, so its own persist failure cannot reset a hash it
-    /// never published.
-    fn try_claim_init(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> bool {
+    /// CPU-bound prefix of the init-claim flow: empty-password
+    /// rejection (R5-07), the Argon2id hash of the candidate password,
+    /// and the pre-mutex fast-path race check — a claim that already
+    /// committed while we hashed is resolved inline (we hold a hashing
+    /// permit in the async path). Returns `Prepared::Claim` when the
+    /// claim must still be persisted and published by `claim_commit`.
+    fn prepare_claim(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> Prepared {
         // An empty password must never be claimable. The CLI rejects
         // empty passwords (run_user_command::read_new_password); this
         // claim path is reachable from any input protocol, so it
         // enforces the same invariant independently of the SOCKS5
         // framing layer (R5-07).
         if password.is_empty() {
-            return false;
+            return Prepared::Done(false);
         }
 
         // Compute the new hash outside the write lock — Argon2id takes
         // ~15 ms and we don't want it blocking concurrent read-side
         // verify calls during that window.
         let Ok(new_hash) = compute_hash(password) else {
-            return false;
+            return Prepared::Done(false);
         };
 
         let Some(entry) = self.entries.get(name) else {
-            return false;
+            return Prepared::Done(false);
         };
         let idx = entry.index;
 
         // Fast path: the race is already decided — someone claimed the
-        // account while we were hashing. SHORT read guard.
-        if let Some(result) = self.verify_against_claimed(idx, name, password, candidate_hmac) {
-            return result;
+        // account while we were hashing. SHORT read guard; the Argon2
+        // verify runs outside it.
+        if let Some(claimed_hash) = self.claimed_hash_if_any(idx) {
+            return Prepared::Done(self.verify_against_committed(
+                name,
+                &claimed_hash,
+                password,
+                candidate_hmac,
+            ));
         }
 
-        // Serialise the persist+publish critical section on the claim
-        // mutex (NOT the users RwLock): claims serialize in-process
-        // here, the file lock inside persist_claim serializes across
-        // processes, and normal cache-miss verifies for unrelated users
-        // proceed unblocked while we wait on cross-process file I/O.
+        Prepared::Claim(ClaimWork {
+            name: name.to_string(),
+            candidate_hmac,
+            index: idx,
+            new_hash,
+        })
+    }
+
+    /// Phase 2 of the init-claim flow: serialise the persist+publish
+    /// critical section on the claim mutex (NOT the users RwLock) —
+    /// claims serialize in-process here, the file lock inside
+    /// persist_claim serializes across processes, and normal cache-miss
+    /// verifies for unrelated users proceed unblocked while we wait on
+    /// cross-process file I/O. Callers hold NO hashing permit here
+    /// (R7-03).
+    ///
+    /// The init state is re-checked after `claim_lock` is acquired
+    /// (R6-01): a racer that queued behind a committed winner becomes a
+    /// plain login against the winner's hash and never enters
+    /// persistence, so its own persist failure cannot reset a hash it
+    /// never published. The committed hash is immutable once published,
+    /// so the Argon2 verify against it is DEFERRED to the caller (phase
+    /// 3, outside the mutex) — hashing under the mutex would stall
+    /// every other claim.
+    fn claim_commit(&self, work: ClaimWork) -> ClaimOutcome {
+        let ClaimWork {
+            name,
+            candidate_hmac,
+            index: idx,
+            new_hash,
+        } = work;
+
         let _claim_guard = self.claim_lock.lock().expect("claim mutex poisoned");
 
         // Re-check AFTER the wait (R6-01): a concurrent claim may have
@@ -248,9 +369,9 @@ impl AuthState {
         // never reach persistence — its persist (which can legitimately
         // fail, e.g. another process holds the cross-process users-file
         // lock past its timeout) must not reset a hash this call never
-        // published.
-        if let Some(result) = self.verify_against_claimed(idx, name, password, candidate_hmac) {
-            return result;
+        // published. The verify itself is deferred to the caller.
+        if let Some(claimed_hash) = self.claimed_hash_if_any(idx) {
+            return ClaimOutcome::VerifyAgainst(claimed_hash);
         }
 
         // The fallback snapshot is consumed only by persist_claim's
@@ -273,74 +394,82 @@ impl AuthState {
         // edited the file since we loaded it; writing our whole stale
         // snapshot back would silently revert those edits.
         // No users guard is held here.
-        match persist_claim(Path::new(&self.users_path), name, &new_hash, fallback_users) {
+        match persist_claim(
+            Path::new(&self.users_path),
+            &name,
+            &new_hash,
+            fallback_users,
+        ) {
             ClaimPersist::Written => {
                 // Only claim threads write users[idx] and they serialize
                 // on claim_lock (which we hold across persist+publish),
                 // so a brief write guard is sufficient to publish.
                 self.users.write().expect("users RwLock poisoned")[idx].hash = new_hash.clone();
-                self.cache.insert(name.to_string(), candidate_hmac);
-                true
+                self.cache.insert(name.clone(), candidate_hmac);
+                ClaimOutcome::Done(true)
             }
             ClaimPersist::DiskHashChanged(disk_hash) => {
                 // The file's hash for this user stopped being "init"
                 // while we worked — a real password landed on disk via a
-                // concurrent CLI edit. Disk wins: adopt its hash and
-                // treat our candidate as a normal login against it
-                // instead of clobbering it.
+                // concurrent CLI edit. Disk wins: adopt its hash and let
+                // the caller treat our candidate as a normal login
+                // against it instead of clobbering it.
                 self.users.write().expect("users RwLock poisoned")[idx].hash = disk_hash.clone();
-                if argon2_verify(&disk_hash, password) {
-                    self.cache.insert(name.to_string(), candidate_hmac);
-                    true
-                } else {
-                    false
-                }
+                ClaimOutcome::VerifyAgainst(disk_hash)
             }
             ClaimPersist::Failed(e) => {
-                // Nothing to roll back (R6-01): the re-check above
-                // guarantees this attempt never published anything —
-                // only claim threads write users[idx], they serialize on
-                // the claim mutex we are holding, so the sentinel is
-                // still in place. Resetting it here could only clobber
-                // somebody else's committed hash.
+                // Restate the sentinel. Safe (R6-01): the re-check under
+                // this same lock guarantees this attempt never published
+                // a committed value — only claim threads write
+                // users[idx] and they serialize on the claim mutex we
+                // are holding — so this assignment can only restate the
+                // sentinel that is already in place.
+                self.users.write().expect("users RwLock poisoned")[idx].hash =
+                    INIT_HASH.to_string();
                 eprintln!(
                     "init-claim: failed to persist {} after first-login of '{}': {}",
                     self.users_path, name, e
                 );
-                false
+                ClaimOutcome::Done(false)
             }
         }
     }
 
-    /// If `users[idx]` is no longer the `"init"` sentinel, treat this
-    /// call as a normal login against the already-claimed hash:
-    /// Argon2-verify the password and populate the cache on match.
-    /// Returns `None` while the account is still unclaimed and the
-    /// caller may proceed with the claim itself.
+    /// If `users[idx]` is no longer the `"init"` sentinel, return the
+    /// committed hash; `None` while the account is still unclaimed and
+    /// the caller may proceed with the claim itself.
     ///
-    /// Used before queueing on the claim mutex (fast path) and again
-    /// after acquiring it (R6-01). The read guard is held only for the
-    /// hash clone; Argon2 and cache access run without it. This branch
+    /// Used before queueing on the claim mutex (fast path in
+    /// `prepare_claim`) and again after acquiring it (R6-01 in
+    /// `claim_commit`). The read guard is held only for the hash clone
+    /// (R5-10); Argon2 and cache access run without it. This helper
     /// never touches persistence or any other shared state.
-    fn verify_against_claimed(
+    fn claimed_hash_if_any(&self, idx: usize) -> Option<String> {
+        let users = self.users.read().expect("users RwLock poisoned");
+        if users[idx].hash == INIT_HASH {
+            return None;
+        }
+        Some(users[idx].hash.clone())
+    }
+
+    /// Plain Argon2 login against an already-committed hash — a
+    /// concurrent claim winner, a disk value adopted from a concurrent
+    /// CLI edit, or simply the stored hash. Populates the cache on
+    /// success. Runs OUTSIDE any lock: a committed hash is immutable
+    /// once published, so verifying after the claim mutex was released
+    /// cannot observe a torn value.
+    fn verify_against_committed(
         &self,
-        idx: usize,
         name: &str,
+        stored_hash: &str,
         password: &str,
         candidate_hmac: [u8; 32],
-    ) -> Option<bool> {
-        let claimed_hash = {
-            let users = self.users.read().expect("users RwLock poisoned");
-            if users[idx].hash == INIT_HASH {
-                return None;
-            }
-            users[idx].hash.clone()
-        };
-        if argon2_verify(&claimed_hash, password) {
+    ) -> bool {
+        if argon2_verify(stored_hash, password) {
             self.cache.insert(name.to_string(), candidate_hmac);
-            Some(true)
+            true
         } else {
-            Some(false)
+            false
         }
     }
 }
@@ -801,7 +930,10 @@ mod tests {
         // Same rejection directly through the claim fn, independent of
         // verify()'s framing.
         let hmac = compute_cache_hmac(&state.server_secret, "bob", "");
-        assert!(!state.try_claim_init("bob", "", hmac));
+        assert!(matches!(
+            state.prepare_claim("bob", "", hmac),
+            Prepared::Done(false)
+        ));
         {
             let users = state.users.read().unwrap();
             let bob = users.iter().find(|u| u.name == "bob").unwrap();
@@ -1492,6 +1624,177 @@ mod tests {
         let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
         assert_ne!(bob.hash, INIT_HASH);
         assert!(bob.hash.starts_with("$argon2id$"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    }
+
+    #[tokio::test]
+    async fn async_verify_completes_while_claim_parked_without_hashing_slot() {
+        // R7-03: the phase split must let an ordinary cache-miss
+        // verify_async run its Argon2 work while an init-claim is parked
+        // in claim_commit on the cross-process users-file lock — even
+        // with only ONE verify_slots permit free. This drives the REAL
+        // async server path; the sync sibling test
+        // users_lock_held_externally_... calls state.verify, which
+        // bypasses verify_slots entirely and so cannot catch a
+        // regression that keeps the permit across persistence.
+        //
+        // Phase synchronization is by real events, not sleeps (R6-07):
+        // the holder releases the file lock only on an explicit signal,
+        // and the parent confirms T1's parking via claim_lock try_lock
+        // contention — T1 is the only other party contending for that
+        // mutex, so WouldBlock proves T1 is parked inside its claim
+        // critical section.
+        use std::sync::mpsc;
+        use std::sync::TryLockError;
+        use std::time::{Duration, Instant};
+
+        let (state, path) = build_state_with_disk_file(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("bob", true),
+            ],
+            false,
+        );
+        let state = Arc::new(state);
+
+        // Holder thread: acquire the users-file lock, signal the parent
+        // once it is ACTUALLY held, then keep it until the parent's
+        // explicit release signal — no fixed hold timer — and ack the
+        // release after dropping it. A second UsersFileLock from a
+        // helper thread exercises the identical busy-lock path in
+        // persist_claim that a foreign process would (byte-range locks
+        // conflict across open file handles within one process).
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (released_tx, released_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            locked_tx.send(()).expect("signal lock held");
+            release_rx
+                .recv()
+                .expect("holder must receive the release signal");
+            drop(lock);
+            released_tx.send(()).expect("signal lock released");
+        });
+        locked_rx.recv().expect("lock-holder signalled");
+
+        // Leave exactly ONE hashing slot free: the parked claim must not
+        // need it (phase 2 runs without a permit), so it stays available
+        // for T2's hashing.
+        let slots = u32::try_from(state.verify_slots.available_permits()).unwrap();
+        let held = state
+            .verify_slots
+            .clone()
+            .acquire_many_owned(slots - 1)
+            .await
+            .unwrap();
+
+        // T1: init-claim for bob through the real async path — parks
+        // inside claim_commit's persist, waiting on the held file lock.
+        let t1_state = Arc::clone(&state);
+        let t1 = tokio::spawn(async move { t1_state.verify_async("bob", "bob-pw").await });
+
+        // Confirm T1 parked in claim_commit by polling for real
+        // claim_lock contention (R6-07), not by a fixed sleep: try_lock
+        // succeeding means T1 has not taken the mutex yet — drop the
+        // guard immediately so it cannot stall T1 — and WouldBlock means
+        // T1 holds it. Panic if the deadline passes without ever seeing
+        // contention; that means T1 never reached the critical section
+        // and the test's premise was never established.
+        let contention_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match state.claim_lock.try_lock() {
+                Err(TryLockError::WouldBlock) => break,
+                Ok(uncontended) => drop(uncontended),
+                Err(TryLockError::Poisoned(_)) => panic!("claim mutex poisoned"),
+            }
+            assert!(
+                Instant::now() < contention_deadline,
+                "T1 never took claim_lock within 10 s — the parked-claim \
+                 premise was never established"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The core R7-03 assertion: while T1 is parked on the users-file
+        // lock, its hashing permit is long gone (dropped when the
+        // phase-1 closure returned), so the free slot count is back
+        // to 1.
+        assert_eq!(
+            state.verify_slots.available_permits(),
+            1,
+            "a claim parked on the users-file lock must not hold a hashing slot (R7-03)"
+        );
+
+        // T2: a fresh cache-miss verify_async for alice — the REAL
+        // server path — must complete while T1 is still parked. The
+        // 5 s timeout bound is a generous companion guard (Argon2id can
+        // degrade from ~15 ms to seconds under concurrent CPU load on
+        // this machine — see the machine-load note in this file), not
+        // the discriminator: pre-fix, T1 holds the only free permit
+        // until the file lock is released, so T2 cannot even start
+        // hashing (the permit-count assert above already fails).
+        let started = Instant::now();
+        let ok = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.verify_async("alice", "alice-pw"),
+        )
+        .await
+        .expect("verify_async for an unrelated user timed out behind the parked claim");
+        let elapsed = started.elapsed();
+        assert!(ok);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "unrelated verify_async blocked {:?} behind the parked claim",
+            elapsed
+        );
+
+        // Deterministic: the release signal has not been sent, so the
+        // file lock is still held and T1 must still be parked inside
+        // persist_claim — bob must still be the sentinel here.
+        assert!(!t1.is_finished(), "T1 must still be parked in claim_commit");
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH, "T1 must still be parked in persist");
+        }
+
+        // Explicit release: only now may the holder drop the lock, so
+        // T1's parked persist can complete.
+        release_tx
+            .send(())
+            .expect("signal the holder to release the file lock");
+        let t1_ok = t1.await.expect("T1 task must not panic");
+        assert!(t1_ok, "T1's claim must succeed once the file lock frees");
+        released_rx
+            .recv()
+            .expect("holder acked the release (lock dropped)");
+        holder.join().expect("join lock-holder thread");
+
+        // T1's claim landed in memory and on disk.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert!(bob.hash.starts_with("$argon2id$"));
+        }
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, INIT_HASH);
+        assert!(bob.hash.starts_with("$argon2id$"));
+
+        // Every hashing slot is back: T1 dropped its phase-3 permit and
+        // T2 its phase-1 permit.
+        drop(held);
+        assert_eq!(
+            state.verify_slots.available_permits(),
+            usize::try_from(slots).unwrap()
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.lock", path));
