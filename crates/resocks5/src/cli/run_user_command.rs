@@ -269,15 +269,11 @@ fn user_position(users: &UsersConfig, name: &str) -> Result<usize> {
 fn read_new_password() -> Result<String> {
     if !std::io::stdin().is_terminal() {
         let p = rpassword::read_password().context("read password from stdin")?;
-        if p.is_empty() {
-            bail!("empty password");
-        }
+        validate_password(&p)?;
         return Ok(p);
     }
     let p1 = rpassword::prompt_password("Password: ")?;
-    if p1.is_empty() {
-        bail!("empty password");
-    }
+    validate_password(&p1)?;
     let p2 = rpassword::prompt_password("Confirm password: ")?;
     if p1 != p2 {
         bail!("passwords did not match");
@@ -303,6 +299,16 @@ fn validate_name(name: &str) -> Result<()> {
     }
     if name.contains(':') {
         bail!("username contains ':' — would collide with the SOCKS5 user/pass parser");
+    }
+    Ok(())
+}
+
+fn validate_password(password: &str) -> Result<()> {
+    if password.is_empty() {
+        bail!("empty password");
+    }
+    if password.len() > 255 {
+        bail!("password too long (max 255 bytes per RFC 1929)");
     }
     Ok(())
 }
@@ -400,6 +406,32 @@ mod tests {
         let long: String = "x".repeat(256);
         let err = add_init_user(&u, &long).unwrap_err();
         assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn validate_password_enforces_socks5_length_bounds() {
+        // 256 single-byte chars: over the RFC 1929 one-byte PASSWD
+        // length prefix.
+        let err = validate_password(&"a".repeat(256)).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+
+        // "é" is two bytes in UTF-8: 128 characters but 256 bytes —
+        // the limit is byte length, not character count.
+        assert_eq!("é".repeat(128).len(), 256);
+        let err = validate_password(&"é".repeat(128)).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+
+        // Boundaries stay legal: 1 byte, 255 bytes, and 127 two-byte
+        // chars + 1 ASCII char = 255 bytes.
+        assert!(validate_password("x").is_ok());
+        assert!(validate_password(&"a".repeat(255)).is_ok());
+        let mixed_255 = format!("{}x", "é".repeat(127));
+        assert_eq!(mixed_255.len(), 255);
+        assert!(validate_password(&mixed_255).is_ok());
+
+        // Empty is still rejected, with the original message.
+        let err = validate_password("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
     }
 
     #[test]

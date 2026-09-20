@@ -305,6 +305,15 @@ impl AuthState {
             return Prepared::Done(false);
         }
 
+        // SOCKS5's PASSWD field carries a one-byte length prefix
+        // (RFC 1929 §2): a password over 255 bytes could never be
+        // transmitted in full by a compliant client, so hashing and
+        // persisting one would permanently lock the account out of
+        // SOCKS5 login (R8-04). Bytes, not character count.
+        if password.len() > 255 {
+            return Prepared::Done(false);
+        }
+
         // Compute the new hash outside the write lock — Argon2id takes
         // ~15 ms and we don't want it blocking concurrent read-side
         // verify calls during that window.
@@ -972,6 +981,73 @@ mod tests {
             let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
             assert_ne!(bob.hash, INIT_HASH);
             assert!(bob.hash.starts_with("$argon2id$"));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn password_length_256_cannot_claim_init() {
+        let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+        let too_long = "a".repeat(256);
+        assert_eq!(too_long.len(), 256);
+        assert!(!state.verify("bob", &too_long));
+        // Rejected before any claim machinery: sentinel intact, no
+        // cache entry, no disk write.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(bob.hash, INIT_HASH);
+        }
+        assert!(state.cache.is_empty());
+        assert!(!Path::new(&path).exists());
+        // The claim path itself still works.
+        assert!(state.verify("bob", "real-pw"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn password_length_256_cannot_claim_init_async() {
+        // The production path (verify_async — both SOCKS5 and HTTP
+        // handlers go through it) must refuse to claim an over-255-byte
+        // password (R8-04) while the 1..=255 byte bounds keep working.
+        // "é" is two bytes in UTF-8, so 128 of them are 128 characters
+        // but 256 bytes: the limit is byte length, not char count.
+        let pw_1 = "x";
+        let pw_255 = "a".repeat(255);
+        let pw_255_mixed = format!("{}x", "é".repeat(127));
+        let pw_256 = "a".repeat(256);
+        let pw_256_mixed = "é".repeat(128);
+        let cases: [(&str, bool); 5] = [
+            (pw_1, true),
+            (pw_255.as_str(), true),
+            (pw_255_mixed.as_str(), true),
+            (pw_256.as_str(), false),
+            (pw_256_mixed.as_str(), false),
+        ];
+        for (pw, ok) in cases {
+            let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+            let state = Arc::new(state);
+            assert_eq!(
+                state.verify_async("bob", pw).await,
+                ok,
+                "pw len {}",
+                pw.len()
+            );
+            {
+                let users = state.users.read().unwrap();
+                let bob = users.iter().find(|u| u.name == "bob").unwrap();
+                if ok {
+                    assert!(bob.hash.starts_with("$argon2id$"));
+                } else {
+                    // Rejected before any claim machinery: sentinel
+                    // intact, no cache entry, no disk write.
+                    assert_eq!(bob.hash, INIT_HASH);
+                }
+            }
+            if !ok {
+                assert!(state.cache.is_empty());
+                assert!(!Path::new(&path).exists());
+            }
             let _ = std::fs::remove_file(&path);
         }
     }
