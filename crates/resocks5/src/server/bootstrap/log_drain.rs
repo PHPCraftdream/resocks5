@@ -29,7 +29,7 @@ const LOG_DRAIN_TIMEOUT_SEC: u64 = 5;
 /// instead of letting runtime teardown silently cancel the task
 /// mid-`recv()` (a timeout instead detaches it; the bounded teardown
 /// then abandons any wedged write — see
-/// [`SHUTDOWN_TEARDOWN_TIMEOUT_SEC`]).
+/// `SHUTDOWN_TEARDOWN_TIMEOUT_SEC`).
 ///
 /// A file write/flush failure is NOT swallowed: the first failure is
 /// reported on stderr and the task falls back to console-only for the

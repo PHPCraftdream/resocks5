@@ -7,10 +7,10 @@
 //! TLS connector, and ClientHello fragmentation — live in the submodules
 //! and are re-exported here for direct use.
 //!
-//! Grouping: [`proxy_connect`] holds the per-protocol connectors and the
-//! protocol dispatcher, [`tls`] the TLS-facing pieces (default connector,
+//! Grouping: `proxy_connect` holds the per-protocol connectors and the
+//! protocol dispatcher, `tls` the TLS-facing pieces (default connector,
 //! HTTPS upstream, record-layer walking, ClientHello fragmentation), and
-//! [`util`] the small parsing and socket helpers. The group folders are
+//! `util` the small parsing and socket helpers. The group folders are
 //! private; everything stays reachable under the flat `connect::` paths
 //! re-exported below, so external callers are unaffected.
 

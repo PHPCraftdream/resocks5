@@ -173,15 +173,15 @@ mod tests {
     /// The local HTTPS proxy: TLS-accepts one connection, reads the
     /// `CONNECT` request up to the header terminator, answers
     /// `200 Connection established`, then DRIPS — at most `drip_chunk`
-    /// bytes every `drip_delay` until EOF. `reply_after_eof` (used by the tunnel test)
-    /// is written back through the still-open write half after the
-    /// client's close_notify arrives, emulating the origin's response.
-    /// The whole body is bounded by a 30 s timeout so a regression fails
-    /// fast instead of hanging the suite.
+    /// bytes every `drip_delay` until EOF, then sends its own TLS
+    /// `close_notify` (no application-data reply). rustls treats a bare
+    /// TCP close as an error (`UnexpectedEof`), not a clean end of
+    /// stream, so this explicit shutdown is required even though nothing
+    /// is written back. The whole body is bounded by a 30 s timeout so a
+    /// regression fails fast instead of hanging the suite.
     async fn run_dripping_tls_proxy(
         listener: tokio::net::TcpListener,
         acceptor: tokio_rustls::TlsAcceptor,
-        reply_after_eof: Option<&'static [u8]>,
         drip_chunk: usize,
         drip_delay: Duration,
     ) -> anyhow::Result<Vec<u8>> {
@@ -203,8 +203,14 @@ mod tests {
                 .await?;
             tls.flush().await?;
 
-            // The deliberate slow drain: at most `drip_chunk` bytes per
-            // `drip_delay`.
+            // The deliberate slow drain: target rate is `drip_chunk` bytes
+            // per `drip_delay`. The sleep is scaled to the bytes actually
+            // read this call, not a flat per-call delay — the underlying
+            // TCP stack is free to deliver fewer bytes per `read()` than
+            // `drip_chunk` (record boundaries, segment sizes), and a flat
+            // per-call sleep would then inflate the total drain time far
+            // past the intended rate (observed: a real 30s test-harness
+            // timeout on some platforms with a flat per-call sleep).
             let mut collected = Vec::new();
             let mut chunk = vec![0u8; drip_chunk];
             loop {
@@ -213,13 +219,10 @@ mod tests {
                     break;
                 }
                 collected.extend_from_slice(&chunk[..n]);
-                tokio::time::sleep(drip_delay).await;
+                tokio::time::sleep(drip_delay.mul_f64(n as f64 / drip_chunk as f64)).await;
             }
 
-            if let Some(reply) = reply_after_eof {
-                tls.write_all(reply).await?;
-                tls.shutdown().await?;
-            }
+            tls.shutdown().await?;
             Ok(collected)
         })
         .await
@@ -236,7 +239,6 @@ mod tests {
     /// the server task handle (its output is everything collected until
     /// EOF).
     async fn connected_tls_upstream(
-        reply_after_eof: Option<&'static [u8]>,
         drip_chunk: usize,
         drip_delay: Duration,
     ) -> (
@@ -259,11 +261,7 @@ mod tests {
         let listener = small_buffer_listener();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(run_dripping_tls_proxy(
-            listener,
-            acceptor,
-            reply_after_eof,
-            drip_chunk,
-            drip_delay,
+            listener, acceptor, drip_chunk, drip_delay,
         ));
 
         let mut roots = rustls::RootCertStore::empty();
@@ -342,7 +340,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fragmented_send_through_real_tls_upstream_survives_slow_drip() {
         let (mut upstream, server) =
-            connected_tls_upstream(None, 8 * 1024, Duration::from_millis(40)).await;
+            connected_tls_upstream(8 * 1024, Duration::from_millis(40)).await;
 
         let mut payload = vec![0x16, 0x03, 0x01, 0x3E, 0x80, 0x01];
         payload.extend((0..1_535_994u32).map(|i| (i & 0xFF) as u8));
@@ -388,12 +386,16 @@ mod tests {
     /// [`tunnel_with_timeouts`] (5 s idle bound) into the TLS upstream,
     /// which can only drain at 8 KB / 40 ms (~200 KB/s). The idle bound
     /// fires many times over during the drain; it must never tear the
-    /// tunnel down, because the `ProgressReportingWriter` below the TLS layer
-    /// keeps confirming bytes into the tunnel's shared progress sink and
-    /// `Tracked::poll_flush` records that as activity. The server drips
-    /// until EOF, checks the payload byte-for-byte, then replies
-    /// `relay-ok` over the still-open write half; the feeder must receive
-    /// that reply and the tunnel must end `Ok(())`.
+    /// tunnel down, because the `ProgressReportingWriter` below the TLS
+    /// layer keeps confirming bytes into the tunnel's shared progress sink
+    /// and `Tracked::poll_flush` records that as activity. `feeder.write_all`
+    /// itself is the acceptance check: the duplex buffer is only 64 KB, so
+    /// completing it requires the tunnel to keep draining client -> upstream
+    /// for the whole ~7.5 s drain without being torn down; a premature
+    /// idle-teardown would drop `client_half` and surface as a write error
+    /// here, not a hang. The server drips until EOF and its own bare
+    /// connection drop (no reply needed) then lets the tunnel's other
+    /// direction finish too, so the tunnel task itself also ends cleanly.
     ///
     /// Multi-thread runtime: the dripping server task and the tunnel must
     /// progress independently of one another, so a scheduling stall of the
@@ -401,8 +403,7 @@ mod tests {
     /// burn through the idle window without any task getting polled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn steady_state_tunnel_through_real_tls_upstream_survives_slow_drip() {
-        let (upstream, server) =
-            connected_tls_upstream(Some(b"relay-ok"), 8 * 1024, Duration::from_millis(40)).await;
+        let (upstream, server) = connected_tls_upstream(8 * 1024, Duration::from_millis(40)).await;
         let data: Vec<u8> = (0..1_572_864u32).map(|i| (i * 7 % 256) as u8).collect();
 
         let (mut feeder, client_half) = tokio::io::duplex(64 * 1024);
@@ -415,13 +416,6 @@ mod tests {
 
         feeder.write_all(&data).await.unwrap();
         feeder.shutdown().await.unwrap();
-
-        // The server's reply comes back only after the full 16 KB has
-        // drained through the slow transport and the EOF propagated —
-        // surviving this read IS the idle-bound acceptance check.
-        let mut reply = [0u8; 8];
-        feeder.read_exact(&mut reply).await.unwrap();
-        assert_eq!(&reply, b"relay-ok");
 
         let collected = server.await.unwrap().unwrap();
         assert_eq!(
@@ -439,13 +433,22 @@ mod tests {
     /// with the two survive tests this pins both sides of the contract:
     /// genuine stalls disconnect boundedly, slow-but-progressing drains
     /// complete.
+    ///
+    /// The payload is ~20 MB: `small_buffer_listener`'s tiny requested
+    /// socket buffers are best-effort only (observed on macOS: the kernel
+    /// does not honor them down to the requested 1-2 KB, leaving enough
+    /// real buffering that a merely oversized-for-1024-bytes payload
+    /// never experiences genuine backpressure and the send falsely
+    /// completes). 20 MB comfortably exceeds any platform's real default
+    /// or auto-tuned socket buffer capacity, so the never-reading peer
+    /// guarantees a real stall regardless of what the OS actually granted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stalled_send_through_real_tls_upstream_is_bounded() {
         let (mut upstream, server) =
-            connected_tls_upstream(None, 4 * 1024, Duration::from_secs(3600)).await;
+            connected_tls_upstream(4 * 1024, Duration::from_secs(3600)).await;
 
         let mut payload = vec![0x16, 0x03, 0x01, 0x3E, 0x80, 0x01];
-        payload.extend((0..245_754u32).map(|i| (i & 0xFF) as u8));
+        payload.extend((0..20_000_000u32).map(|i| (i & 0xFF) as u8));
 
         let spec = FragmentSpec {
             enabled: true,

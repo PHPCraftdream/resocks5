@@ -113,11 +113,11 @@ pub(crate) fn confirmed_scope<F: Future>(
 }
 
 /// `AsyncWrite` wrapper that reports every successful write of `n > 0`
-/// bytes into the enclosing [`CONFIRMED_WRITE_PROGRESS`] scope, if any.
+/// bytes into the enclosing `CONFIRMED_WRITE_PROGRESS` scope, if any.
 ///
 /// Meant to sit BELOW a buffering/TLS layer, around the raw transport:
 /// wrap the socket, wrap the buffering layer on top. Outside a
-/// [`confirmed_scope`] the wrapper is a pure pass-through (reporting is
+/// `confirmed_scope` the wrapper is a pure pass-through (reporting is
 /// silently skipped).
 pub struct ProgressReportingWriter<W> {
     inner: W,
