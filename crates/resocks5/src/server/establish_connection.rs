@@ -1281,10 +1281,12 @@ mod tests {
         let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
         v4.link_proxy(target.to_string(), Arc::new(composite));
         let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
+        let gate_orders_before = gates.pick_order_calls();
+        let v4_orders_before = v4.pick_order_calls();
 
         let result = establish_connection(
             target,
-            &Some(gates),
+            &Some(gates.clone()),
             &None,
             &Some(v4.clone()),
             &logger,
@@ -1307,6 +1309,21 @@ mod tests {
         assert!(
             v4.get_linked(target).is_none(),
             "no phase may attempt (and succeed) after the budget is gone"
+        );
+        // R6-08: the assertions above hold even for the pre-R5-09
+        // code (its internal guards also stopped the dials); what
+        // they cannot see is wasted order building. Zero additional
+        // `pick_order` calls on both rotators is what actually pins
+        // the R5-09 hoist.
+        assert_eq!(
+            gates.pick_order_calls(),
+            gate_orders_before,
+            "budget exhaustion must skip building the gate order"
+        );
+        assert_eq!(
+            v4.pick_order_calls(),
+            v4_orders_before,
+            "budget exhaustion must skip building the direct order"
         );
     }
 

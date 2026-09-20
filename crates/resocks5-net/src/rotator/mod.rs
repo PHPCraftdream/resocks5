@@ -11,7 +11,7 @@
 
 use std::collections::{hash_map::RandomState, BTreeSet, HashMap};
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,6 +177,11 @@ pub struct ProxyRotator {
     sticky: Mutex<StickyCache>,
     /// Sand-model ratings for weighted-random proxy selection.
     ratings: Ratings,
+    /// Diagnostic count of `pick_order()` invocations. Always
+    /// compiled — a `#[cfg(test)]` field would be invisible to tests
+    /// in dependent crates. Test/diagnostic only: nothing in
+    /// production reads it.
+    pick_order_calls: AtomicU64,
 }
 
 impl ProxyRotator {
@@ -231,6 +236,7 @@ impl ProxyRotator {
             index: AtomicUsize::new(0),
             sticky: Mutex::new(StickyCache::new(max_entries, ttl)),
             ratings: Ratings::new(n, policy),
+            pick_order_calls: AtomicU64::new(0),
         }
     }
 
@@ -312,11 +318,22 @@ impl ProxyRotator {
 
     /// Returns proxies in weighted-random order via the sand model.
     pub fn pick_order(&self) -> Vec<Arc<ProxyConfig>> {
+        self.pick_order_calls.fetch_add(1, Ordering::Relaxed);
         self.ratings
             .pick_order()
             .into_iter()
             .map(|i| self.proxies[i].clone())
             .collect()
+    }
+
+    /// Diagnostic/test-only reader: how many times
+    /// [`ProxyRotator::pick_order`] has been called on this rotator.
+    /// Hidden from docs; nothing in production consumes it — it exists
+    /// so tests in dependent crates can assert that budget
+    /// exhaustion skips order building.
+    #[doc(hidden)]
+    pub fn pick_order_calls(&self) -> u64 {
+        self.pick_order_calls.load(Ordering::Relaxed)
     }
 }
 
