@@ -107,6 +107,8 @@ pub async fn handle_client(
     // and every downstream client-facing stage (peek, SOCKS5/HTTP
     // handshake, recovery) draws from this single absolute deadline.
     let client_deadline = Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
+    #[cfg(test)]
+    stage_probe::emit("client_handler_started");
     let peek_budget = remaining_client_budget(client_deadline);
     let mut peek_buf = [0u8; 1];
     let n = match timeout(peek_budget, client_stream.peek(&mut peek_buf)).await {
@@ -123,6 +125,8 @@ pub async fn handle_client(
     }
     match peek_buf[0] {
         0x05 => {
+            #[cfg(test)]
+            stage_probe::emit("socks5_handshake_entered");
             handle_socks5_client(
                 client_stream,
                 auth,
@@ -165,6 +169,46 @@ pub async fn handle_client(
     }
 }
 
+/// Test-only observation seam for the paused-clock deadline tests in
+/// [`tests`]: a process-global sink production code can notify from the
+/// exact points a test must observe — the client-protocol deadline being
+/// anchored, and the dispatcher routing into the SOCKS5 handler. Compiles
+/// to nothing outside `#[cfg(test)]` builds. Global, but per-instance
+/// safe: each test installs its OWN channel (overwriting any stale sink)
+/// while holding the test module's `STAGE_PROBE_SLOT` mutex, so no two
+/// sink-using tests can interleave.
+#[cfg(test)]
+pub(crate) mod stage_probe {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    use tokio::sync::mpsc::UnboundedSender;
+
+    static SINK: Mutex<Option<UnboundedSender<&'static str>>> = Mutex::new(None);
+
+    fn sink() -> MutexGuard<'static, Option<UnboundedSender<&'static str>>> {
+        SINK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replace the current sink with `tx`; a previous test's undelivered
+    /// events stay in that test's own receiver and are dropped with it.
+    pub(crate) fn install(tx: UnboundedSender<&'static str>) {
+        *sink() = Some(tx);
+    }
+
+    /// Detach the sink; later `emit`s are silently dropped.
+    pub(crate) fn remove() {
+        *sink() = None;
+    }
+
+    /// Never blocks and never fails: drops the event when no sink is
+    /// installed (an unbounded send only buffers).
+    pub(crate) fn emit(stage: &'static str) {
+        if let Some(tx) = sink().as_ref() {
+            let _ = tx.send(stage);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -174,8 +218,9 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
     use tokio::sync::Semaphore;
 
     use super::*;
@@ -203,23 +248,92 @@ mod tests {
         ))
     }
 
-    /// Give a freshly spawned task's first poll every real-scheduler
-    /// opportunity to happen before the paused virtual clock is
-    /// advanced. A single `sleep(1ms).await` can resolve via the
-    /// paused-clock auto-advance before the executor actually gets
-    /// around to polling the new task, under heavy real scheduler
-    /// pressure (observed in practice under simultaneous multi-crate
-    /// compilation/linking) — the freshly spawned task would then
-    /// anchor its deadline against an already-advanced virtual time,
-    /// silently invalidating this test's tight elapsed-time bounds.
-    /// Repeated real yields + a real sleep make that overwhelmingly
-    /// unlikely; same defensive pattern as `quiesce()` in
-    /// `proxy_pool.rs`'s tests for the same class of paused-clock /
-    /// real-scheduler interaction.
-    async fn anchor_first_poll() {
-        for _ in 0..50 {
+    /// Serializes the two tests that use the process-global
+    /// [`stage_probe`](super::stage_probe) sink: cargo runs one file's
+    /// tests on parallel OS threads by default, and the sink is global.
+    /// A tokio (async) mutex because the guard is held across `.await`s.
+    static STAGE_PROBE_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Event-driven replacement for the old fixed-iteration
+    /// `anchor_first_poll` settle loop: block the TEST task until the
+    /// handler has really reached the expected stage, spinning on
+    /// `try_recv` + `yield_now` + a real 1 ms `thread::sleep`. Neither
+    /// await in this loop is a timer, so the ready queue is never empty
+    /// and the paused virtual clock cannot auto-advance while we settle;
+    /// the loop runs until the EXACT expected event arrives — or, to
+    /// convert a hang into a loud failure, until a generous 10 s
+    /// REAL-time deadline expires (real `std::time::Instant`: the tokio
+    /// clock is paused in these tests).
+    async fn wait_for_stage_event(
+        rx: &mut UnboundedReceiver<&'static str>,
+        expected: &'static str,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok(stage) if stage == expected => return,
+                Ok(_) => {} // an earlier stage event; keep waiting
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("stage-probe channel closed before seeing {expected:?}")
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
             tokio::task::yield_now().await;
             std::thread::sleep(Duration::from_millis(1));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting 10 s (real time) for the {expected:?} stage event"
+            );
+        }
+    }
+
+    /// Write `data` to `stream` without ever awaiting a plain
+    /// `write_all` future: spin on `try_write` with `yield_now` + a real
+    /// 1 ms sleep. Awaiting the plain future can park the runtime with
+    /// "no ready work" while real bytes are still in flight, and
+    /// paused-clock auto-advance would then jump to the next virtual
+    /// timer before the peer even observes the write — the exact R6-07
+    /// flake. This loop keeps the ready queue non-empty, structurally
+    /// preventing that park.
+    async fn park_free_write_all(stream: &TcpStream, mut data: &[u8]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !data.is_empty() {
+            match stream.try_write(data) {
+                Ok(0) => panic!("try_write reported 0 bytes written"),
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("park-free write failed: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "park-free write did not complete within 10 s (real time)"
+            );
+        }
+    }
+
+    /// Read exactly `buf.len()` bytes from `stream` without ever
+    /// awaiting a plain `read_exact` future; same park-free spin as
+    /// [`park_free_write_all`]. Loopback may deliver partial reads, so
+    /// this accumulates into `buf` like `read_exact` does.
+    async fn park_free_read_exact(stream: &TcpStream, mut buf: &mut [u8]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !buf.is_empty() {
+            match stream.try_read(buf) {
+                Ok(0) => panic!("unexpected EOF during park-free read"),
+                Ok(n) => buf = &mut buf[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("park-free read failed: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "park-free read did not complete within 10 s (real time)"
+            );
         }
     }
 
@@ -231,6 +345,9 @@ mod tests {
     /// deadline (~1 s of virtual time), not at 1.9 s.
     #[tokio::test(start_paused = true)]
     async fn slow_first_byte_does_not_buy_a_fresh_handshake_budget() {
+        let _probe_slot = STAGE_PROBE_SLOT.lock().await;
+        let (stage_tx, mut stage_rx) = unbounded_channel();
+        stage_probe::install(stage_tx);
         let auth = test_auth();
         let logger = test_logger();
         let banned = Arc::new(regex::RegexSet::empty());
@@ -271,17 +388,25 @@ mod tests {
             .await
         });
 
-        // Let the freshly spawned handler run to its first poll so its
-        // accept-anchored deadline is really anchored at accept time;
-        // tokio auto-advance does not poll newly spawned tasks during
-        // `advance`.
-        anchor_first_poll().await;
+        // Wait until the freshly spawned handler has really anchored its
+        // accept-anchored deadline (the event is emitted right after the
+        // anchor, before the peek); tokio auto-advance does not poll
+        // newly spawned tasks during `advance`.
+        wait_for_stage_event(&mut stage_rx, "client_handler_started").await;
 
         let t0 = tokio::time::Instant::now();
         // Eat 90% of the budget in protocol detection: the first byte only
         // arrives when ~100 ms of the 1 s budget is left.
         tokio::time::advance(Duration::from_millis(900)).await;
         client.write_all(&[0x05]).await.unwrap();
+        // The handler must consume the greeting byte and route into the
+        // SOCKS5 handshake BEFORE the final virtual-time wait: once the
+        // peek has observed the byte its deadline timer is gone, so the
+        // only timer left is the handshake deadline the test wants to
+        // measure. Waiting for the event also guarantees the runtime
+        // never parks with the byte still in flight, which is what let
+        // paused-clock auto-advance fire the WRONG stage's timeout.
+        wait_for_stage_event(&mut stage_rx, "socks5_handshake_entered").await;
         // A real SOCKS5 greeting continues with NMETHODS + methods; the
         // client now stays silent. Under the shared deadline the handshake
         // stage gets only ~100 ms; a fresh per-stage budget would let it
@@ -305,6 +430,8 @@ mod tests {
             elapsed <= Duration::from_millis(1200),
             "handshake must inherit only the remaining ~100 ms of the shared budget, not a fresh 1 s (elapsed {elapsed:?})"
         );
+
+        stage_probe::remove();
     }
 
     /// R5-02 regression: time consumed before recovery must shrink the
@@ -314,6 +441,9 @@ mod tests {
     /// time), not receive a fresh 2 s recovery budget (~3.5 s).
     #[tokio::test(start_paused = true)]
     async fn time_spent_before_recovery_shrinks_the_recovery_budget() {
+        let _probe_slot = STAGE_PROBE_SLOT.lock().await;
+        let (stage_tx, mut stage_rx) = unbounded_channel();
+        stage_probe::install(stage_tx);
         let auth = test_auth();
         let logger = test_logger();
         let banned = Arc::new(regex::RegexSet::empty());
@@ -333,7 +463,7 @@ mod tests {
 
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
         let server = l.accept().await.unwrap().0;
 
         let task = tokio::spawn(async move {
@@ -354,11 +484,11 @@ mod tests {
             .await
         });
 
-        // Let the freshly spawned handler run to its first poll so its
-        // accept-anchored deadline is really anchored at accept time;
-        // tokio auto-advance does not poll newly spawned tasks during
-        // `advance`.
-        anchor_first_poll().await;
+        // Wait until the freshly spawned handler has really anchored its
+        // accept-anchored deadline (the event is emitted right after the
+        // anchor, before the peek); tokio auto-advance does not poll
+        // newly spawned tasks during `advance`.
+        wait_for_stage_event(&mut stage_rx, "client_handler_started").await;
 
         let t0 = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_millis(1500)).await;
@@ -369,17 +499,22 @@ mod tests {
         // early and starts the recovery peek with ~500 ms left. (No
         // upstream rotator is configured, so the speculative upstream dial
         // fails immediately and peek_recovery simply keeps waiting for the
-        // client.)
-        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        // client.) All of this exchange is park-free
+        // (`park_free_write_all`/`park_free_read_exact`): the runtime never
+        // finds an empty ready queue while real bytes are in flight, so
+        // paused-clock auto-advance cannot race ahead of actual delivery
+        // mid-handshake.
+        park_free_write_all(&client, &[0x05, 0x01, 0x00]).await;
         let mut method = [0u8; 2];
-        client.read_exact(&mut method).await.unwrap();
+        park_free_read_exact(&client, &mut method).await;
         assert_eq!(method, [0x05, 0x00]);
-        client
-            .write_all(&[0x05, 0x01, 0x00, 0x01, 203, 0, 113, 9, 0x01, 0xBB])
-            .await
-            .unwrap();
+        park_free_write_all(
+            &client,
+            &[0x05, 0x01, 0x00, 0x01, 203, 0, 113, 9, 0x01, 0xBB],
+        )
+        .await;
         let mut success = [0u8; 10];
-        client.read_exact(&mut success).await.unwrap();
+        park_free_read_exact(&client, &mut success).await;
         assert_eq!([success[0], success[1]], [0x05, 0x00]);
 
         // Now the client goes silent: the recovery peek gets only the
@@ -403,6 +538,8 @@ mod tests {
             elapsed <= Duration::from_millis(2600),
             "recovery must inherit only the remaining ~500 ms of the shared budget, not a fresh 2 s (elapsed {elapsed:?})"
         );
+
+        stage_probe::remove();
     }
 
     /// R5-02 regression: once the accept-anchored deadline has passed the
