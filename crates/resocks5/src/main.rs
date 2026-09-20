@@ -99,6 +99,55 @@ fn skipped_line_message(list_name: &str, line_no: usize) -> String {
     )
 }
 
+/// Which routing group an owned proxy entry belongs to. A trait, not a
+/// direct `ProxyConfig` field read, only so [`partition_proxy_groups`]
+/// can be unit-tested with a clone-counting stand-in: with no `Clone`
+/// bound the helper structurally cannot copy entries (review R8-07).
+trait GateSplit {
+    fn is_gate(&self) -> bool;
+}
+
+impl GateSplit for ProxyConfig {
+    fn is_gate(&self) -> bool {
+        self.is_gate
+    }
+}
+
+/// Split owned upstream entries into (plain v6, plain v4, gates) by
+/// MOVING each entry into exactly one group — no clone of any plain
+/// descriptor, so `host`/username/password Strings are never copied
+/// just to have their originals dropped (review R8-07: the previous
+/// `iter().filter().cloned()` pass deep-copied every plain entry right
+/// before the originals were consumed and discarded).
+///
+/// Group composition and relative order match the previous construction
+/// exactly: plains keep their source-list order, and gates collect as
+/// v6-list gates first, then v4-list gates (the previous
+/// `all_v6.into_iter().chain(all_v4)` gate order). Still O(N).
+fn partition_proxy_groups<P: GateSplit>(
+    all_v6: Vec<P>,
+    all_v4: Vec<P>,
+) -> (Vec<P>, Vec<P>, Vec<P>) {
+    let mut v6 = Vec::with_capacity(all_v6.len());
+    let mut gates = Vec::new();
+    for proxy in all_v6 {
+        if proxy.is_gate() {
+            gates.push(proxy);
+        } else {
+            v6.push(proxy);
+        }
+    }
+    let mut v4 = Vec::with_capacity(all_v4.len());
+    for proxy in all_v4 {
+        if proxy.is_gate() {
+            gates.push(proxy);
+        } else {
+            v4.push(proxy);
+        }
+    }
+    (v6, v4, gates)
+}
+
 /// `cb_*` key names found in the raw main-config text, in file order.
 /// Pure so the detection is unit-testable; matching is deliberately
 /// textual (ktav drops unknown keys during deserialize without
@@ -254,14 +303,7 @@ async fn run_server_inner() -> Result<()> {
         IP::V4,
     ));
 
-    let v6_proxies: Vec<ProxyConfig> = all_v6.iter().filter(|p| !p.is_gate).cloned().collect();
-    let v4_proxies: Vec<ProxyConfig> = all_v4.iter().filter(|p| !p.is_gate).cloned().collect();
-
-    let gate_proxies: Vec<ProxyConfig> = all_v6
-        .into_iter()
-        .chain(all_v4)
-        .filter(|p| p.is_gate)
-        .collect();
+    let (v6_proxies, v4_proxies, gate_proxies) = partition_proxy_groups(all_v6, all_v4);
 
     let has_https = !pl.https_v4.is_empty() || !pl.https_v6.is_empty();
 
@@ -689,6 +731,128 @@ mod tests {
         );
     }
 
+    /// Clone-counting stand-in for [`ProxyConfig`]: the group splitter
+    /// must MOVE entries (R8-07), so any `clone()` of a plain entry is
+    /// a failure. There is no `Arc<ProxyConfig>` anywhere in the
+    /// startup path (plain `Vec<ProxyConfig>` until rotator
+    /// construction), so a counting wrapper is the observable
+    /// mechanism here.
+    #[derive(Debug)]
+    struct CloneCountingProxy {
+        gate: bool,
+        id: usize,
+        clones: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Clone for CloneCountingProxy {
+        fn clone(&self) -> Self {
+            self.clones
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                gate: self.gate,
+                id: self.id,
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl GateSplit for CloneCountingProxy {
+        fn is_gate(&self) -> bool {
+            self.gate
+        }
+    }
+
+    #[test]
+    fn partition_proxy_groups_moves_plain_entries_without_cloning() {
+        let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entry = |gate: bool, id: usize| CloneCountingProxy {
+            gate,
+            id,
+            clones: Arc::clone(&clones),
+        };
+        // Interleave gates and plains in both source lists.
+        let all_v6 = vec![entry(false, 0), entry(true, 1), entry(false, 2)];
+        let all_v4 = vec![
+            entry(false, 3),
+            entry(true, 4),
+            entry(false, 5),
+            entry(true, 6),
+        ];
+
+        let (v6, v4, gates) = partition_proxy_groups(all_v6, all_v4);
+
+        assert_eq!(
+            clones.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "group construction must move owned entries, never clone them"
+        );
+        let ids = |group: &[CloneCountingProxy]| group.iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(ids(&v6), vec![0, 2], "plain v6 entries keep list order");
+        assert_eq!(ids(&v4), vec![3, 5], "plain v4 entries keep list order");
+        assert_eq!(
+            ids(&gates),
+            vec![1, 4, 6],
+            "gates keep v6-list order first, then v4-list order"
+        );
+    }
+
+    /// Pin the splitter's composition and order on the real
+    /// [`ProxyConfig`] type, matching the previous construction: plains
+    /// keep their list order; gates are v6-list gates then v4-list
+    /// gates, with credentials moved intact.
+    #[test]
+    fn partition_proxy_groups_preserves_composition_and_order_on_proxy_config() {
+        let parse = |line: &str, ip: IP| {
+            parse_proxy_str(line, ProxyProtocol::Socks5, ip).expect("test proxy line must parse")
+        };
+        let all_v6 = vec![
+            parse("[2001:db8::1]:1080", IP::V6),
+            parse("*u1:p1@[2001:db8::2]:1080", IP::V6),
+            parse("[2001:db8::3]:1080", IP::V6),
+        ];
+        let all_v4 = vec![
+            parse("10.0.0.1:1080", IP::V4),
+            parse("*u2:p2@10.0.0.2:1080", IP::V4),
+            parse("10.0.0.3:1080", IP::V4),
+            parse("*u3:p3@10.0.0.4:1080", IP::V4),
+        ];
+
+        let (v6, v4, gates) = partition_proxy_groups(all_v6, all_v4);
+
+        // Expected groups re-derived from the same source lines so the
+        // assertions don't depend on host-string formatting details.
+        let hosts = |group: &[ProxyConfig]| -> Vec<String> {
+            group.iter().map(|p| p.host.clone()).collect()
+        };
+        assert_eq!(
+            hosts(&v6),
+            hosts(&[
+                parse("[2001:db8::1]:1080", IP::V6),
+                parse("[2001:db8::3]:1080", IP::V6)
+            ])
+        );
+        assert_eq!(
+            hosts(&v4),
+            hosts(&[
+                parse("10.0.0.1:1080", IP::V4),
+                parse("10.0.0.3:1080", IP::V4)
+            ])
+        );
+        assert_eq!(
+            hosts(&gates),
+            hosts(&[
+                parse("*u1:p1@[2001:db8::2]:1080", IP::V6),
+                parse("*u2:p2@10.0.0.2:1080", IP::V4),
+                parse("*u3:p3@10.0.0.4:1080", IP::V4)
+            ])
+        );
+        assert!(gates.iter().all(|p| p.is_gate));
+        assert!(v6.iter().chain(v4.iter()).all(|p| !p.is_gate));
+        // Credentials moved into the gate group intact, not copied.
+        assert_eq!(gates[0].user.as_deref(), Some("u1"));
+        assert_eq!(gates[0].password.as_deref(), Some("p1"));
+    }
+
     /// A gates-only config (no plain v4/v6 upstream, no direct user) must
     /// bail at startup: gates alone carry no traffic.
     #[test]
@@ -781,9 +945,16 @@ mod tests {
     fn runtime_teardown_is_bounded_with_a_stuck_blocking_write() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Duration>();
 
         let helper = std::thread::spawn(move || {
+            // Measure at the real boundaries of the work (review
+            // R7-07): a parent-side `Instant::now()` starts whenever the
+            // parent is next scheduled, which can be long after this
+            // thread began the teardown — parent lag must not shrink
+            // the measured interval and reject a full-duration teardown
+            // as "too fast".
+            let start = std::time::Instant::now();
             let outcome = run_with_bounded_teardown(async move {
                 let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
                 // Stuck sink stand-in: a blocking-pool op that parks
@@ -807,23 +978,33 @@ mod tests {
                     .await
                     .expect("stuck blocking op must start before teardown");
             });
+            let elapsed = start.elapsed();
             done_tx
-                .send(())
+                .send(elapsed)
                 .expect("test harness: done channel must be alive");
             outcome
         });
 
-        // Generous hang-detector cap only, not the measurement (a
-        // companion task moves the measurement next to the teardown):
+        // Generous hang-detector cap only, not the measurement (the
+        // helper measures the teardown at its true boundaries — R7-07):
         // a wrapper reverted to unbounded `Runtime::drop` would block
         // the helper thread forever and trip this cap. Seconds of
         // headroom, because wall-clock bounds flake under CPU load.
         let cap = Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC + 20);
-        let start = std::time::Instant::now();
-        done_rx
+        let elapsed = done_rx
             .recv_timeout(cap)
             .expect("run_with_bounded_teardown must return despite the stuck blocking op");
-        let elapsed = start.elapsed();
+        // The stuck op is released only after the wrapper returned, so a
+        // correct wrapper must have waited out (at least) its budget;
+        // an over-eager teardown that abandons the op immediately would
+        // undershoot. A tight lower bound is safe now that the helper
+        // itself measured (R7-07): one second of slack for clock
+        // granularity.
+        assert!(
+            elapsed >= Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC.saturating_sub(1)),
+            "teardown must wait out its budget while the blocking op is stuck, \
+             helper measured {elapsed:?}"
+        );
         assert!(
             elapsed < cap,
             "teardown must abandon the stuck blocking op within its budget, took {elapsed:?}"
@@ -853,9 +1034,14 @@ mod tests {
     fn panic_in_body_still_tears_down_bounded_and_reraises() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Duration>();
 
         let helper = std::thread::spawn(move || {
+            // Measure at the real boundaries of the work (review
+            // R7-07), around the whole wrapper call: its teardown waits
+            // out the budget while the op is still parked, and the
+            // re-raised unwind is caught right after it returns.
+            let start = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_with_bounded_teardown(async move {
                     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
@@ -870,16 +1056,31 @@ mod tests {
                     panic!("body panic: the bounded teardown must still run");
                 })
             }));
+            let elapsed = start.elapsed();
             done_tx
-                .send(())
+                .send(elapsed)
                 .expect("test harness: done channel must be alive");
             outcome
         });
 
+        // Generous hang-detector cap only, not the measurement (see the
+        // companion test): boundedness is asserted on the helper's own
+        // measurement so parent scheduling delay cannot distort it.
         let cap = Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC + 20);
-        done_rx
+        let elapsed = done_rx
             .recv_timeout(cap)
             .expect("panicking body must still return from run_with_bounded_teardown");
+        // The op is still parked when the teardown runs, so it must wait
+        // out its budget here too (R7-07: measured inside the helper).
+        assert!(
+            elapsed >= Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC.saturating_sub(1)),
+            "teardown must still wait out its budget after a body panic, \
+             helper measured {elapsed:?}"
+        );
+        assert!(
+            elapsed < cap,
+            "panicking body teardown must remain bounded, took {elapsed:?}"
+        );
         let outcome = helper.join().expect("helper thread must not panic");
         assert!(
             outcome.is_err(),
