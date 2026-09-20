@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,45 @@ use resocks5_net::rotator::ProxyRotator;
 /// immediately instead of silently granting a new budget.
 pub(crate) fn remaining_client_budget(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// Run one client-facing stage under the remainder of the shared
+/// accept-anchored budget, refusing to enter the stage at all once the
+/// deadline has passed.
+///
+/// A bare `timeout(Duration::ZERO, op)` is not such a guard: Tokio's
+/// `Timeout::poll` polls the wrapped future FIRST and only consults the
+/// timer when that poll returns `Pending`, so an already-Ready
+/// operation completes normally even with a zero budget — and a
+/// Pending first poll may already have performed side effects (a
+/// buffered read, a response write, an auth check whose
+/// `spawn_blocking` claim outlives cancellation). This helper checks
+/// the remainder BEFORE the first poll: with an expired deadline it
+/// returns `Err(Duration::ZERO)` without polling `op` even once. On a
+/// live budget the stage runs under `timeout` exactly like the bare
+/// form it replaces; the `Err(Duration)` payload — the budget as of
+/// stage entry, `Duration::ZERO` in the already-expired case — lets
+/// callers keep their stage-specific "…timed out with only Ns left…"
+/// messages.
+///
+/// cancel-safety: on `Err(Duration::ZERO)` the stage was never polled;
+/// on a live-budget exhaustion the stage is dropped mid-flight, the
+/// same cancellation contract as the bare `timeout` form.
+pub(crate) async fn run_phase_in_client_budget<F, T>(
+    deadline: Instant,
+    op: F,
+) -> Result<anyhow::Result<T>, Duration>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let budget = remaining_client_budget(deadline);
+    if budget.is_zero() {
+        return Err(budget);
+    }
+    match timeout(budget, op).await {
+        Ok(result) => Ok(result),
+        Err(_) => Err(budget),
+    }
 }
 
 /// Single accept-loop dispatcher: peeks the first byte without
@@ -127,7 +167,11 @@ pub async fn handle_client(
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -365,6 +409,12 @@ mod tests {
     /// remaining budget is ZERO, and a stage wrapped in a ZERO timeout
     /// fails immediately as a timeout instead of hanging or getting a new
     /// budget.
+    ///
+    /// NOTE: this test alone does NOT distinguish "the stage was started
+    /// but stayed pending" from "the stage was never started" — Tokio's
+    /// `timeout(ZERO, op)` polls `op` once before the timer fires. The
+    /// R6-03 tests below (poll-counting Ready/Pending phases) pin the
+    /// never-started property on `run_phase_in_client_budget`.
     #[tokio::test(start_paused = true)]
     async fn expired_deadline_fails_the_next_stage_immediately() {
         let deadline = tokio::time::Instant::now();
@@ -374,5 +424,111 @@ mod tests {
         let res: Result<(), tokio::time::error::Elapsed> =
             tokio::time::timeout(budget, std::future::pending::<()>()).await;
         assert!(res.is_err(), "a ZERO budget must time out immediately");
+    }
+
+    // ── R6-03: the expired-deadline guard must precede the first poll ──
+
+    /// Poll-counting phase that completes on its first poll.
+    struct ReadyPhase {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for ReadyPhase {
+        type Output = anyhow::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Poll-counting phase that stays Pending forever and never
+    /// registers a waker (same style as `std::future::pending()`). Only
+    /// ever passed to the guard with an expired deadline, where the
+    /// guard must reject before polling.
+    struct PendingPhase {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingPhase {
+        type Output = anyhow::Result<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    /// R6-03: an expired deadline must not start a phase at all — not
+    /// even one poll — even when the phase would complete immediately.
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_never_polls_an_already_ready_phase() {
+        let deadline = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let res = run_phase_in_client_budget(
+            deadline,
+            ReadyPhase {
+                polls: polls.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            res.unwrap_err(),
+            Duration::ZERO,
+            "an expired deadline must be rejected with a ZERO budget"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "a Ready phase must not be polled even once past the deadline"
+        );
+    }
+
+    /// R6-03: same property for a Pending phase — the counter must stay
+    /// at zero, proving the guard fired before the first poll. (The
+    /// ZERO-budget-times-out test above cannot tell this apart:
+    /// `timeout(ZERO, pending)` also returns immediately, but only
+    /// AFTER having polled the future once.)
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_never_polls_a_pending_phase() {
+        let deadline = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let res = run_phase_in_client_budget(
+            deadline,
+            PendingPhase {
+                polls: polls.clone(),
+            },
+        )
+        .await;
+        assert_eq!(
+            res.unwrap_err(),
+            Duration::ZERO,
+            "an expired deadline must be rejected with a ZERO budget"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "a Pending phase must not be polled even once past the deadline"
+        );
+    }
+
+    /// R6-03: a live budget must still run the phase exactly once and
+    /// forward its result — the guard only rejects expired deadlines.
+    #[tokio::test(start_paused = true)]
+    async fn non_expired_deadline_runs_a_ready_phase_exactly_once() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let res = run_phase_in_client_budget(
+            deadline,
+            ReadyPhase {
+                polls: polls.clone(),
+            },
+        )
+        .await;
+        res.expect("a live deadline must run the phase")
+            .expect("the ready phase must succeed");
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 }

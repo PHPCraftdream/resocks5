@@ -14,7 +14,7 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use crate::server::handle_client::remaining_client_budget;
+use crate::server::handle_client::{remaining_client_budget, run_phase_in_client_budget};
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
@@ -45,20 +45,19 @@ pub async fn handle_socks5_client(
     // instead of pinning the task indefinitely.
     // The dispatcher already spent part of the accept-anchored budget
     // on protocol detection; only the remainder is ours to spend.
-    let handshake_budget = remaining_client_budget(client_deadline);
-    let (target_addr, client_user) = match timeout(
-        handshake_budget,
+    let (target_addr, client_user) = match run_phase_in_client_budget(
+        client_deadline,
         socks5_handshake(&mut client_stream, auth),
     )
     .await
     {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => return Err(e),
-        Err(_) => {
+        Err(budget) => {
             return Err(anyhow!(
-                    "client SOCKS5 handshake timed out with only {}s left of the client-protocol budget",
-                    handshake_budget.as_secs()
-                ));
+                "client SOCKS5 handshake timed out with only {}s left of the client-protocol budget",
+                budget.as_secs()
+            ));
         }
     };
 
