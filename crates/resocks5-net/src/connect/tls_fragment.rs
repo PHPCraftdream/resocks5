@@ -110,13 +110,16 @@ fn is_tls_client_hello(data: &[u8]) -> bool {
 /// If `cfg.enabled` is false, or the data is not a TLS ClientHello, the
 /// whole slice is written in one call — no overhead on the hot path.
 ///
-/// `idle` bounds each individual chunk write: a write_all+flush that
-/// does not complete within `idle` ends the send with
-/// [`SendProgress::Stalled`]. The bound is per write, not per send — a
-/// paced send whose chunks keep landing stays alive no matter how long
-/// the whole send takes, and the inter-fragment pause is deliberate
-/// pacing that never counts against `idle`. `Duration::ZERO` disables
-/// the bound entirely.
+/// `idle` measures write inactivity, not write duration: each
+/// individual write attempt gets a fresh idle window, and a window
+/// that expires without a single accepted byte ends the send with
+/// [`SendProgress::Stalled`]. A backpressured writer that keeps
+/// accepting bytes — however slowly — never trips the bound, so a
+/// paced send stays alive no matter how long the whole send takes.
+/// The configured inter-fragment pause (`FragmentSpec::delay_ms`) is
+/// deliberate pacing: it elapses between chunks, outside the
+/// per-write loop, and never counts as inactivity. `Duration::ZERO`
+/// disables the bound entirely.
 ///
 /// cancel-safe: NO — cancellation (or a [`SendProgress::Stalled`]
 /// outcome) can leave a prefix of `data` on the wire; close the writer,
@@ -147,11 +150,18 @@ where
 
 /// Write `buf` in full and flush it, bounded by `idle`.
 ///
-/// The bound covers one write attempt — write_all plus flush — measured
-/// from its start, not the time elapsed since the previous chunk. When
-/// the bound fires, the write future is dropped mid-flight: whatever
+/// `idle` measures write inactivity, not write duration: the buffer is
+/// driven one `poll_write` at a time and every individual write attempt
+/// gets a fresh idle window. A writer that keeps accepting bytes —
+/// however slowly — therefore never trips the bound, while a writer
+/// that stops accepting bytes entirely is reported as
+/// [`SendProgress::Stalled`] after one idle window of total silence. A
+/// successful write of zero bytes is an error (`WriteZero`), matching
+/// `write_all`'s own contract.
+///
+/// When the bound fires, the write is abandoned mid-flight: whatever
 /// prefix was accepted stays on the wire and the caller must treat the
-/// writer as terminal.
+/// writer as terminal. The final flush is bounded by the same window.
 async fn write_progress_bounded<W>(
     writer: &mut W,
     buf: &[u8],
@@ -165,12 +175,22 @@ where
         writer.flush().await?;
         return Ok(SendProgress::Completed);
     }
-    let write = async {
-        writer.write_all(buf).await?;
-        writer.flush().await?;
-        Ok::<(), anyhow::Error>(())
-    };
-    match tokio::time::timeout(idle, write).await {
+    let mut written = 0;
+    while written < buf.len() {
+        let n = match tokio::time::timeout(idle, writer.write(&buf[written..])).await {
+            Ok(status) => status?,
+            Err(_) => return Ok(SendProgress::Stalled),
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            )
+            .into());
+        }
+        written += n;
+    }
+    match tokio::time::timeout(idle, writer.flush()).await {
         Ok(status) => {
             status?;
             Ok(SendProgress::Completed)
@@ -183,6 +203,7 @@ where
 mod tests {
     use super::*;
 
+    use std::future::Future;
     use tokio::io::AsyncReadExt;
 
     fn ch(hs_type: u8) -> Vec<u8> {
@@ -484,5 +505,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, SendProgress::Stalled);
+    }
+
+    /// A mock writer under backpressure: accepts at most `per_poll`
+    /// bytes per successful poll_write, then goes silent for `interval`
+    /// of (virtual) time before becoming writable again.
+    /// `stalling_after` makes it go silent forever once that many bytes
+    /// have been accepted in total.
+    struct DripWriter {
+        /// Every byte the writer has accepted so far.
+        accepted: Vec<u8>,
+        per_poll: usize,
+        interval: Duration,
+        // Created with Duration::ZERO so the very first write is
+        // immediate; reset to `interval` after every accepted write.
+        cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+        stall_after: Option<usize>,
+    }
+
+    impl DripWriter {
+        fn new(per_poll: usize, interval: Duration) -> Self {
+            Self {
+                accepted: Vec::new(),
+                per_poll,
+                interval,
+                cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+                stall_after: None,
+            }
+        }
+
+        fn stalling_after(mut self, n: usize) -> Self {
+            self.stall_after = Some(n);
+            self
+        }
+    }
+
+    // All fields are Unpin, so get_mut() is enough to drive the writer.
+    impl tokio::io::AsyncWrite for DripWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(quota) = this.stall_after {
+                if this.accepted.len() >= quota {
+                    // Quota reached: silent forever from here on.
+                    return std::task::Poll::Pending;
+                }
+            }
+            if this.cooldown.as_mut().poll(cx).is_pending() {
+                // Still inside the silent window after the last drip.
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(this.per_poll);
+            this.accepted.extend_from_slice(&buf[..n]);
+            let deadline = tokio::time::Instant::now() + this.interval;
+            this.cooldown.as_mut().reset(deadline);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// R6-02: steady partial progress under backpressure must NOT trip
+    /// idle. The writer accepts 8 bytes per poll_write and then stays
+    /// silent for 200 ms, so 64 bytes take 8 drips: the first lands
+    /// immediately and each of the other 7 after 200 ms of silence —
+    /// 1400 ms in total. That outlasts the 1 s idle window, which is
+    /// exactly what the old single write_all+flush timeout got wrong;
+    /// fresh per-attempt windows keep the send alive.
+    #[tokio::test(start_paused = true)]
+    async fn steady_drip_progress_under_backpressure_never_trips_idle() {
+        let data = vec![0xAA; 64];
+        let mut w = DripWriter::new(8, Duration::from_millis(200));
+
+        let start = tokio::time::Instant::now();
+        let outcome = write_progress_bounded(&mut w, &data, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Completed);
+        // 8 drips of 8 bytes each.
+        assert_eq!(w.accepted, data);
+        assert!(
+            start.elapsed() >= Duration::from_millis(1400),
+            "7 of the 8 drips must pay their 200 ms silence: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// R6-02: a write that stops making ANY progress still trips idle.
+    /// The first attempt lands 8 bytes immediately and the writer then
+    /// never accepts another byte, so the send must end as `Stalled`
+    /// after one full 1 s idle window of total silence past the last
+    /// accepted byte.
+    #[tokio::test(start_paused = true)]
+    async fn silent_drip_writer_still_trips_idle() {
+        let data = vec![0xAA; 64];
+        let mut w = DripWriter::new(8, Duration::from_millis(200)).stalling_after(8);
+
+        let start = tokio::time::Instant::now();
+        let outcome = write_progress_bounded(&mut w, &data, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Stalled);
+        assert_eq!(w.accepted.len(), 8);
+        assert!(
+            start.elapsed() >= Duration::from_secs(1),
+            "the stall must pay the full idle window: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A successful poll_write of zero bytes is WriteZero, matching
+    /// write_all's contract.
+    #[tokio::test]
+    async fn zero_byte_poll_write_is_write_zero_error() {
+        struct ZeroWriter;
+        impl tokio::io::AsyncWrite for ZeroWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(0))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut w = ZeroWriter;
+        let err = write_progress_bounded(&mut w, b"payload", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let io_err = err.downcast_ref::<std::io::Error>().expect("io error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::WriteZero);
     }
 }

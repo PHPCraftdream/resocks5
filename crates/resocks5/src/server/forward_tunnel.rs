@@ -628,4 +628,127 @@ mod tests {
         // The first chunk fit the 1-byte duplex; the second stalled.
         assert_eq!(received, hello[..1]);
     }
+
+    /// Simulates a heavily backpressured upstream: each `poll_write`
+    /// accepts at most `per_poll` bytes, then stays silent for
+    /// `interval` of timer time before accepting the next slice — a
+    /// steady drip that is slow in aggregate but never idle between
+    /// individual writes. `stalling_after` (kept for symmetry with the
+    /// mock's contract) instead goes silent forever once `n` bytes have
+    /// been accepted, modelling a genuine stall.
+    struct DripWriter {
+        accepted: Vec<u8>,
+        per_poll: usize,
+        interval: Duration,
+        cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+        stall_after: Option<usize>,
+    }
+
+    impl DripWriter {
+        fn new(per_poll: usize, interval: Duration) -> Self {
+            Self {
+                accepted: Vec::new(),
+                per_poll,
+                interval,
+                // First write immediate.
+                cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+                stall_after: None,
+            }
+        }
+
+        // Kept for symmetry with the mock's contract; not exercised yet.
+        #[allow(dead_code)]
+        fn stalling_after(mut self, n: usize) -> Self {
+            self.stall_after = Some(n);
+            self
+        }
+    }
+
+    impl tokio::io::AsyncWrite for DripWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(quota) = this.stall_after {
+                if this.accepted.len() >= quota {
+                    return std::task::Poll::Pending;
+                }
+            }
+            // Polling the cooldown registers the timer waker — what
+            // drives paused-time resumption while we stay Pending.
+            if this.cooldown.as_mut().poll(cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(this.per_poll);
+            this.accepted.extend_from_slice(&buf[..n]);
+            let deadline = tokio::time::Instant::now() + this.interval;
+            this.cooldown.as_mut().reset(deadline);
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    // `prepare_payload` bounds both streams on AsyncRead; this side of
+    // the tunnel is never read on the initial-payload send path.
+    impl tokio::io::AsyncRead for DripWriter {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// R6-02, tunnel level: a backpressured upstream that keeps accepting
+    /// 8 bytes per 200 ms must survive the 1 s idle bound during the
+    /// initial payload send. The whole 90-byte hello goes out as ONE
+    /// write under fragment_size=4096, so the send takes
+    /// ceil(90/8) = 12 drips — 2.2 s in total, well over the idle
+    /// window. The old single write_all+flush timeout reported Stalled
+    /// at 1 s with a prefix on the wire; fresh per-attempt idle windows
+    /// must carry it to completion.
+    #[tokio::test(start_paused = true)]
+    async fn backpressured_drip_send_outlasts_idle_during_initial_payload() {
+        let hello = client_hello_with_sni("backpressure.drip.example.org");
+        let drips = hello.len().div_ceil(8);
+        let mut client = ChunkRecorder(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let mut upstream = DripWriter::new(8, Duration::from_millis(200));
+        let frag = fragmentation_with_size(4096);
+        let idle = Duration::from_secs(1);
+
+        let start = tokio::time::Instant::now();
+        let decided = tokio::time::timeout(
+            Duration::from_secs(30),
+            prepare_payload(&mut client, &mut upstream, hello.clone(), &frag, idle),
+        )
+        .await
+        .expect("steady drip progress must not hang the forward path")
+        .expect("forward must not error");
+
+        // Every drip paid its 200 ms silence: the send outlasted idle.
+        assert!(
+            start.elapsed() >= Duration::from_millis(200 * (drips - 1) as u64),
+            "the send must actually have outlasted the idle window: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            decided,
+            "steady partial progress must NOT be reported as Stalled"
+        );
+        assert_eq!(upstream.accepted, hello);
+    }
 }
