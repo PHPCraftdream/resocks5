@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use super::tls_fragment::{confirmed_scope, FlushProgress};
 use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
@@ -14,7 +15,12 @@ use tokio::time::Instant;
 /// Half-closes are propagated while the other direction continues to flow.
 ///
 /// `idle` measures time since the last successful read or write in either
-/// direction. `max_lifetime` also bounds stalled writes and shutdowns.
+/// direction. Progress confirmed inside a wrapping TLS/buffering stack — a
+/// `ProgressReportingWriter` below the tracked stream, reported through the
+/// tunnel's shared `FlushProgress` — counts as activity too: bytes moved
+/// inside the wrapper while the outer flush/shutdown is still unresolved
+/// are activity, not idleness. `max_lifetime` also bounds stalled writes
+/// and shutdowns.
 /// A zero duration disables the corresponding deadline. On timeout, shutdown
 /// is attempted once on each stream before dropping both; teardown never waits
 /// indefinitely for a peer to accept buffered data.
@@ -35,42 +41,48 @@ where
         epoch: Instant::now(),
         nanos: AtomicU64::new(0),
     };
+    let confirmed = FlushProgress::new();
     let mut a = Tracked {
         inner: a,
         activity: &activity,
+        confirmed: &confirmed,
     };
     let mut b = Tracked {
         inner: b,
         activity: &activity,
+        confirmed: &confirmed,
     };
-    {
-        let transfer = copy_bidirectional_with_sizes(&mut a, &mut b, 16 * 1024, 16 * 1024);
-        let lifetime = tokio::time::sleep(max_lifetime);
-        let idle_timer = tokio::time::sleep(idle);
-        tokio::pin!(transfer, lifetime, idle_timer);
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut lifetime, if !max_lifetime.is_zero() => break,
-                _ = &mut idle_timer, if !idle.is_zero() => {
-                    let last = activity.epoch + Duration::from_nanos(activity.nanos.load(Ordering::Relaxed));
-                    let deadline = last + idle;
-                    if Instant::now() >= deadline {
-                        break;
+    confirmed_scope(confirmed.clone(), async {
+        {
+            let transfer = copy_bidirectional_with_sizes(&mut a, &mut b, 16 * 1024, 16 * 1024);
+            let lifetime = tokio::time::sleep(max_lifetime);
+            let idle_timer = tokio::time::sleep(idle);
+            tokio::pin!(transfer, lifetime, idle_timer);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut lifetime, if !max_lifetime.is_zero() => break,
+                    _ = &mut idle_timer, if !idle.is_zero() => {
+                        let last = activity.epoch + Duration::from_nanos(activity.nanos.load(Ordering::Relaxed));
+                        let deadline = last + idle;
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        idle_timer.as_mut().reset(deadline);
                     }
-                    idle_timer.as_mut().reset(deadline);
+                    result = &mut transfer => return result.map(|_| ()),
                 }
-                result = &mut transfer => return result.map(|_| ()),
             }
         }
-    }
-    poll_fn(|cx| {
-        let _ = Pin::new(&mut a.inner).poll_shutdown(cx);
-        let _ = Pin::new(&mut b.inner).poll_shutdown(cx);
-        Poll::Ready(())
+        poll_fn(|cx| {
+            let _ = Pin::new(&mut a.inner).poll_shutdown(cx);
+            let _ = Pin::new(&mut b.inner).poll_shutdown(cx);
+            Poll::Ready(())
+        })
+        .await;
+        Ok(())
     })
-    .await;
-    Ok(())
+    .await
 }
 
 struct Activity {
@@ -89,6 +101,7 @@ impl Activity {
 struct Tracked<'a, S> {
     inner: S,
     activity: &'a Activity,
+    confirmed: &'a FlushProgress,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Tracked<'_, S> {
@@ -120,17 +133,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let confirmed_before = self.confirmed.total();
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        if self.confirmed.total() > confirmed_before {
+            self.activity.record();
+        }
+        result
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let confirmed_before = self.confirmed.total();
+        let result = Pin::new(&mut self.inner).poll_shutdown(cx);
+        if self.confirmed.total() > confirmed_before {
+            self.activity.record();
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::tls_fragment::ProgressReportingWriter;
+    use std::future::Future;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test(start_paused = true)]
@@ -450,5 +475,208 @@ mod tests {
         // The important property: the task terminates instead of
         // hanging forever.
         let _ = task.await.unwrap();
+    }
+
+    /// Raw transport below everything else: accepts at most `per_poll`
+    /// bytes per successful poll_write, then goes silent for `interval`
+    /// of (virtual) time before becoming writable again. Unlike the
+    /// send-path DripWriter it never stalls permanently. Every accepted
+    /// byte is appended into the shared `log` so the test can verify the
+    /// exact payload reached the wire; the mutex is locked only
+    /// synchronously, never across an await. `poll_flush` and
+    /// `poll_shutdown` are instantly ready.
+    struct LoggingDripTransport {
+        /// Every byte the transport has accepted so far.
+        log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        per_poll: usize,
+        interval: Duration,
+        // Created with Duration::ZERO so the very first write is
+        // immediate; reset to `interval` after every accepted write.
+        cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl LoggingDripTransport {
+        fn new(
+            per_poll: usize,
+            interval: Duration,
+            log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        ) -> Self {
+            Self {
+                log,
+                per_poll,
+                interval,
+                cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            }
+        }
+    }
+
+    // All fields are Unpin, so get_mut() is enough to drive the writer.
+    impl tokio::io::AsyncWrite for LoggingDripTransport {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.cooldown.as_mut().poll(cx).is_pending() {
+                // Still inside the silent window after the last drip.
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(this.per_poll);
+            this.log.lock().unwrap().extend_from_slice(&buf[..n]);
+            let deadline = tokio::time::Instant::now() + this.interval;
+            this.cooldown.as_mut().reset(deadline);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The TLS/buffering look-alike the tunnel is talking to: its
+    /// poll_write accepts the whole plaintext into an internal queue
+    /// without touching the transport (mimicking tokio-rustls buffering
+    /// records), and only poll_flush/poll_shutdown drain that queue into
+    /// the wrapped transport `piece` bytes per accepted write — so the
+    /// outer flush stays unresolved for the whole drain while real
+    /// writes happen underneath the `ProgressReportingWriter`. The read
+    /// leg is immediate EOF, so only the write leg keeps the tunnel busy.
+    struct BufferedTlsUpstream {
+        pending: std::collections::VecDeque<u8>,
+        piece: usize,
+        transport: ProgressReportingWriter<LoggingDripTransport>,
+    }
+
+    impl BufferedTlsUpstream {
+        fn new(
+            piece: usize,
+            interval: Duration,
+            log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        ) -> Self {
+            Self {
+                pending: std::collections::VecDeque::new(),
+                piece,
+                transport: ProgressReportingWriter::new(LoggingDripTransport::new(
+                    piece, interval, log,
+                )),
+            }
+        }
+
+        // Shared drain step: pushes at most one `piece` of `pending`
+        // into the transport per poll; once the queue runs dry, delegates
+        // the flush inward. All fields are Unpin, so get_mut() is enough.
+        fn poll_drain(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            loop {
+                if self.pending.is_empty() {
+                    return std::pin::Pin::new(&mut self.transport).poll_flush(cx);
+                }
+                // VecDeque has no range Index impl: normalise the layout
+                // into one contiguous slice and peek at most `piece`
+                // bytes off the front; only a successful poll_write
+                // drains them for real.
+                let contiguous = self.pending.make_contiguous();
+                let take = self.piece.min(contiguous.len());
+                match std::pin::Pin::new(&mut self.transport).poll_write(cx, &contiguous[..take]) {
+                    std::task::Poll::Ready(Ok(n)) => {
+                        self.pending.drain(..n);
+                    }
+                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for BufferedTlsUpstream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // Immediate EOF: nothing is ever readable from the upstream,
+            // so its read leg finishes instantly.
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for BufferedTlsUpstream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            // Accept the whole plaintext without transmitting — the TLS
+            // layer has the bytes, the wire does not (yet).
+            let this = self.get_mut();
+            this.pending.extend(buf.iter().copied());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.get_mut().poll_drain(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // Shutdown drives the same drain to completion first; the
+            // final Ready(Ok(())) is the drain's own ready state.
+            self.get_mut().poll_drain(cx)
+        }
+    }
+
+    /// R7-02 end-to-end: the upstream is a TLS/buffered look-alike that
+    /// accepts the whole 2000-byte payload on poll_write and only
+    /// transmits it 8 bytes every 200 ms during flush — ~50 s of virtual
+    /// time, dozens of windows past the 1 s idle deadline. The bytes
+    /// moving underneath are confirmed through the tunnel's shared
+    /// FlushProgress, Tracked::poll_flush records them as activity, and
+    /// the tunnel must stay alive until the drain finishes and exit Ok
+    /// with the transport holding the exact payload. Without the fix the
+    /// idle timer fires at 1 s (last activity was the initial poll_write)
+    /// and the tunnel tears down mid-drain around ~1 s.
+    #[tokio::test(start_paused = true)]
+    async fn idle_spares_tunnel_while_tls_flush_drains_slowly() {
+        let payload = vec![0xC3; 2000];
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (mut client, client_inner) = duplex(4096);
+        client.write_all(&payload).await.unwrap();
+        drop(client); // EOF: the client→upstream leg can finish
+
+        let upstream = BufferedTlsUpstream::new(8, Duration::from_millis(200), log.clone());
+        let start = tokio::time::Instant::now();
+        let res = tunnel_with_timeouts(
+            client_inner,
+            upstream,
+            Duration::from_secs(1), // idle
+            Duration::ZERO,         // lifetime disabled
+        )
+        .await;
+        res.expect("tunnel must not error");
+        assert!(
+            start.elapsed() >= Duration::from_millis(2000),
+            "tunnel must survive past the idle window while the TLS flush drains: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(&*log.lock().unwrap(), &payload);
     }
 }

@@ -2,9 +2,15 @@
 //!
 //! See `docs/ARCHITECTURE.md` for the threat model and limits.
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Parameters controlling TLS ClientHello fragmentation.
 ///
@@ -50,10 +56,122 @@ pub enum ClientHelloMatch {
 pub enum SendProgress {
     /// Every byte of the payload was written and flushed.
     Completed,
-    /// A chunk write did not complete within the idle window. A partial
-    /// prefix may already be on the wire — the writer must be closed,
-    /// never driven again with the same payload.
+    /// A chunk write did not complete within the idle window, or the
+    /// final flush stopped making confirmed progress for one idle
+    /// window. A partial prefix may already be on the wire — the writer
+    /// must be closed, never driven again with the same payload.
     Stalled,
+}
+
+/// Confirmed write progress reported by a writer stack below the layer
+/// that buffers.
+///
+/// This is an instrumentation sink, not a synchronization primitive:
+/// only a successful `poll_write` of `n > 0` bytes by a
+/// [`ProgressReportingWriter`] advances the counter. A bare task wake or
+/// an unresolved `Pending` never moves it, so "the counter advanced"
+/// always means "real bytes were handed to the transport underneath".
+/// `total()` is monotonic.
+#[derive(Debug, Clone, Default)]
+pub struct FlushProgress {
+    counter: Arc<AtomicU64>,
+}
+
+impl FlushProgress {
+    /// Creates an empty sink — zero bytes confirmed so far.
+    pub fn new() -> Self {
+        Self {
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Total number of bytes confirmed written underneath the buffering
+    /// layer so far.
+    pub fn total(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static CONFIRMED_WRITE_PROGRESS: FlushProgress;
+}
+
+/// Run `f` with `progress` installed as the confirmed-write sink for
+/// anything polled underneath (i.e. any [`ProgressReportingWriter`]).
+pub(crate) fn confirmed_scope<F: Future>(
+    progress: FlushProgress,
+    f: F,
+) -> impl Future<Output = F::Output> {
+    CONFIRMED_WRITE_PROGRESS.scope(progress, f)
+}
+
+/// `AsyncWrite` wrapper that reports every successful write of `n > 0`
+/// bytes into the enclosing [`CONFIRMED_WRITE_PROGRESS`] scope, if any.
+///
+/// Meant to sit BELOW a buffering/TLS layer, around the raw transport:
+/// wrap the socket, wrap the buffering layer on top. Outside a
+/// [`confirmed_scope`] the wrapper is a pure pass-through (reporting is
+/// silently skipped).
+pub struct ProgressReportingWriter<W> {
+    inner: W,
+}
+
+impl<W> ProgressReportingWriter<W> {
+    /// Wraps `inner` so its writes get reported into the enclosing
+    /// confirmed-progress scope.
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+
+    /// Unwraps back to the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
+        }
+        result
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &result {
+            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Match `data` against the ClientHello signature
@@ -161,7 +279,11 @@ where
 ///
 /// When the bound fires, the write is abandoned mid-flight: whatever
 /// prefix was accepted stays on the wire and the caller must treat the
-/// writer as terminal. The final flush is bounded by the same window.
+/// writer as terminal. The final flush is bounded by the same idle
+/// window, renewed whenever the writer stack underneath a
+/// [`ProgressReportingWriter`] confirms additional bytes reached the
+/// transport — a buffered/TLS writer that keeps draining underneath is
+/// not `Stalled` merely for taking longer than one window in total.
 async fn write_progress_bounded<W>(
     writer: &mut W,
     buf: &[u8],
@@ -175,27 +297,64 @@ where
         writer.flush().await?;
         return Ok(SendProgress::Completed);
     }
-    let mut written = 0;
-    while written < buf.len() {
-        let n = match tokio::time::timeout(idle, writer.write(&buf[written..])).await {
-            Ok(status) => status?,
-            Err(_) => return Ok(SendProgress::Stalled),
-        };
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write whole buffer",
-            )
-            .into());
+    let progress = FlushProgress::new();
+    confirmed_scope(progress.clone(), async {
+        let mut written = 0;
+        while written < buf.len() {
+            let n = match tokio::time::timeout(idle, writer.write(&buf[written..])).await {
+                Ok(status) => status?,
+                Err(_) => return Ok(SendProgress::Stalled),
+            };
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                )
+                .into());
+            }
+            written += n;
         }
-        written += n;
-    }
-    match tokio::time::timeout(idle, writer.flush()).await {
-        Ok(status) => {
-            status?;
-            Ok(SendProgress::Completed)
+        flush_bounded_by_confirmed_progress(writer, idle, &progress).await
+    })
+    .await
+}
+
+/// Bound `writer.flush()` by idle windows renewed only by confirmed
+/// write progress.
+///
+/// The flush future is pinned once and NEVER restarted: each
+/// `timeout(idle, ..)` wraps it by reference, so a window expiry drops
+/// only the timeout wrapper and the in-flight flush state underneath
+/// survives. If a window expires but [`FlushProgress::total`] advanced
+/// during it — real bytes reached the transport below a buffering/TLS
+/// layer while the outer flush was still unresolved — the window is
+/// renewed, so a slowly-draining writer is never disconnected for
+/// taking longer than one idle window in total. If a window expires
+/// with no confirmed progress, the flush is abandoned with
+/// [`SendProgress::Stalled`]. A bare wake or a plain `Pending` never
+/// renews the window: only reported bytes do. A writer stack without a
+/// [`ProgressReportingWriter`] underneath reports nothing and therefore
+/// keeps the old single-idle-window flush behavior.
+async fn flush_bounded_by_confirmed_progress<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    idle: Duration,
+    progress: &FlushProgress,
+) -> anyhow::Result<SendProgress> {
+    let mut flush = std::pin::pin!(writer.flush());
+    loop {
+        let confirmed_before = progress.total();
+        match tokio::time::timeout(idle, &mut flush).await {
+            Ok(status) => {
+                status?;
+                return Ok(SendProgress::Completed);
+            }
+            Err(_) => {
+                if progress.total() > confirmed_before {
+                    continue;
+                }
+                return Ok(SendProgress::Stalled);
+            }
         }
-        Err(_) => Ok(SendProgress::Stalled),
     }
 }
 
@@ -627,6 +786,259 @@ mod tests {
             "the stall must pay the full idle window: {:?}",
             start.elapsed()
         );
+    }
+
+    /// The raw transport below everything else: DripWriter-style, it
+    /// accepts at most `per_poll` bytes per successful poll_write and
+    /// then goes silent for `interval` of (virtual) time before becoming
+    /// writable again. Unlike DripWriter it never stalls permanently;
+    /// `poll_flush`/`poll_shutdown` are instantly ready.
+    struct DripTransport {
+        /// Every byte the transport has accepted so far.
+        accepted: Vec<u8>,
+        per_poll: usize,
+        interval: Duration,
+        // Created with Duration::ZERO so the very first write is
+        // immediate; reset to `interval` after every accepted write.
+        cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl DripTransport {
+        fn new(per_poll: usize, interval: Duration) -> Self {
+            Self {
+                accepted: Vec::new(),
+                per_poll,
+                interval,
+                cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            }
+        }
+    }
+
+    // All fields are Unpin, so get_mut() is enough to drive the writer.
+    impl tokio::io::AsyncWrite for DripTransport {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.cooldown.as_mut().poll(cx).is_pending() {
+                // Still inside the silent window after the last drip.
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(this.per_poll);
+            this.accepted.extend_from_slice(&buf[..n]);
+            let deadline = tokio::time::Instant::now() + this.interval;
+            this.cooldown.as_mut().reset(deadline);
+            std::task::Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The TLS/buffering layer look-alike: `poll_write` accepts the
+    /// whole payload into an internal queue without touching the inner
+    /// writer (mimicking tokio-rustls buffering plaintext), and only
+    /// `poll_flush` drains that queue to the inner writer `piece` bytes
+    /// per drip wake — so the outer flush stays Pending for the whole
+    /// drain while real progress happens underneath.
+    struct BufferedAcceptor<W> {
+        piece: usize,
+        pending: std::collections::VecDeque<u8>,
+        inner: W,
+    }
+
+    impl<W> BufferedAcceptor<W> {
+        fn new(piece: usize, inner: W) -> Self {
+            Self {
+                piece,
+                pending: std::collections::VecDeque::new(),
+                inner,
+            }
+        }
+
+        fn into_inner(self) -> W {
+            self.inner
+        }
+
+        // Shared drain step: pushes at most one `piece` of `pending`
+        // into the inner writer per poll; once the queue runs dry,
+        // delegates the flush inward. All fields are Unpin, so get_mut()
+        // is enough.
+        fn poll_flush_step(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>>
+        where
+            W: tokio::io::AsyncWrite + Unpin,
+        {
+            loop {
+                if self.pending.is_empty() {
+                    return std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+                }
+                // Peek at most `piece` bytes off the front of the queue
+                // (layout-normalised into one contiguous slice); only on
+                // a successful poll_write are they drained off the front.
+                let contiguous = self.pending.make_contiguous();
+                let take = self.piece.min(contiguous.len());
+                let written =
+                    match std::pin::Pin::new(&mut self.inner).poll_write(cx, &contiguous[..take]) {
+                        std::task::Poll::Ready(Ok(n)) => n,
+                        std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    };
+                self.pending.drain(..written);
+            }
+        }
+    }
+
+    impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for BufferedAcceptor<W> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.pending.extend(buf.iter().copied());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.get_mut().poll_flush_step(cx)
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // Shutdown drives the pending drain to completion first; the
+            // final Ready(Ok(())) is the drain's own ready state.
+            self.get_mut().poll_flush_step(cx)
+        }
+    }
+
+    /// R7-02: a buffered/TLS writer that accepts the whole payload on
+    /// poll_write and then drains it to the transport 8 bytes every
+    /// 200 ms keeps the outer flush Pending for ~50 s of virtual time —
+    /// 50 windows past the 1 s idle. With confirmed progress reported
+    /// underneath, the flush must complete instead of being killed as
+    /// Stalled.
+    #[tokio::test(start_paused = true)]
+    async fn flush_draining_slowly_completes_when_progress_is_confirmed() {
+        let data = vec![0x5A; 2000];
+        let drip = DripTransport::new(8, Duration::from_millis(200));
+        let mut w = BufferedAcceptor::new(8, ProgressReportingWriter::new(drip));
+
+        let start = tokio::time::Instant::now();
+        let outcome = write_progress_bounded(&mut w, &data, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Completed);
+        assert!(
+            start.elapsed() >= Duration::from_millis(2000),
+            "the drain must actually run past the idle window: {:?}",
+            start.elapsed()
+        );
+        // Byte-for-byte: the transport received the whole payload.
+        assert_eq!(w.into_inner().into_inner().accepted, data);
+    }
+
+    /// R7-02: bare waker activity proves nothing — only accepted bytes do.
+    /// This writer accepts the payload on poll_write, then its poll_flush
+    /// returns Pending forever, calling `cx.wake_by_ref()` for the first
+    /// handful of polls (a burst of wakeups with zero bytes underneath) and
+    /// plain waker-less Pending after that. The counter never moves, so the
+    /// flush must Stall after ONE idle window, not ride forever.
+    #[tokio::test(start_paused = true)]
+    async fn bare_wakes_or_pending_without_progress_still_stall() {
+        struct BareWakeFlusher {
+            accepted: Vec<u8>,
+            wakes_left: usize,
+        }
+        impl tokio::io::AsyncWrite for BareWakeFlusher {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let this = self.get_mut();
+                this.accepted.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let this = self.get_mut();
+                if this.wakes_left > 0 {
+                    this.wakes_left -= 1;
+                    cx.waker().wake_by_ref();
+                }
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut w = BareWakeFlusher {
+            accepted: Vec::new(),
+            wakes_left: 1000,
+        };
+        let start = tokio::time::Instant::now();
+        let outcome = write_progress_bounded(&mut w, b"payload", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Stalled);
+        assert!(
+            w.wakes_left < 1000,
+            "bare wakes must actually have happened"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_secs(1) && start.elapsed() < Duration::from_secs(2),
+            "must stall after exactly one idle window, not be renewed: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// R7-02 backward compatibility: without a ProgressReportingWriter in
+    /// the stack, nothing reports progress, so a flush that would drain
+    /// longer than idle still ends as Stalled after ONE window — the old
+    /// behavior — instead of being renewed for the whole drain.
+    #[tokio::test(start_paused = true)]
+    async fn uninstrumented_flush_keeps_single_idle_window() {
+        let data = vec![0x5A; 2000];
+        let mut w = BufferedAcceptor::new(8, DripTransport::new(8, Duration::from_millis(200)));
+
+        let start = tokio::time::Instant::now();
+        let outcome = write_progress_bounded(&mut w, &data, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendProgress::Stalled);
+        assert!(
+            start.elapsed() >= Duration::from_secs(1) && start.elapsed() < Duration::from_secs(2),
+            "one idle window only, not the ~50 s drain: {:?}",
+            start.elapsed()
+        );
+        assert!(w.into_inner().accepted.len() < data.len());
     }
 
     /// A successful poll_write of zero bytes is WriteZero, matching
