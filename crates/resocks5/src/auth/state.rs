@@ -201,6 +201,12 @@ impl AuthState {
     /// concurrent winner — in-process or on disk. Returns `false` on
     /// hash-compute failure, disk persistence failure, or a real
     /// password mismatch.
+    ///
+    /// The init state is re-checked after `claim_lock` is acquired
+    /// (R6-01): a racer that queued behind a committed winner becomes a
+    /// plain login against the winner's hash and never enters
+    /// persistence, so its own persist failure cannot reset a hash it
+    /// never published.
     fn try_claim_init(&self, name: &str, password: &str, candidate_hmac: [u8; 32]) -> bool {
         // An empty password must never be claimable. The CLI rejects
         // empty passwords (run_user_command::read_new_password); this
@@ -218,37 +224,16 @@ impl AuthState {
             return false;
         };
 
-        // Re-check the race winner under a SHORT read guard: another
-        // in-process thread may have completed its claim while we were
-        // hashing or waiting on the claim mutex.
         let Some(entry) = self.entries.get(name) else {
             return false;
         };
         let idx = entry.index;
-        {
-            let users = self.users.read().expect("users RwLock poisoned");
-            if users[idx].hash != INIT_HASH {
-                // Someone else won the race. Fall back to verifying our
-                // password against the claimed hash: if we're the same
-                // legitimate user we'll match, otherwise we get the
-                // usual rejection.
-                let claimed_hash = users[idx].hash.clone();
-                drop(users);
-                if argon2_verify(&claimed_hash, password) {
-                    self.cache.insert(name.to_string(), candidate_hmac);
-                    return true;
-                }
-                return false;
-            }
-        }
 
-        // Snapshot the fallback (file-does-not-exist-yet) list under a
-        // SHORT read guard, then drop it before any file I/O.
-        let fallback_users = {
-            let mut snapshot = self.users.read().expect("users RwLock poisoned").clone();
-            snapshot[idx].hash = new_hash.clone();
-            snapshot
-        };
+        // Fast path: the race is already decided — someone claimed the
+        // account while we were hashing. SHORT read guard.
+        if let Some(result) = self.verify_against_claimed(idx, name, password, candidate_hmac) {
+            return result;
+        }
 
         // Serialise the persist+publish critical section on the claim
         // mutex (NOT the users RwLock): claims serialize in-process
@@ -257,17 +242,38 @@ impl AuthState {
         // proceed unblocked while we wait on cross-process file I/O.
         let _claim_guard = self.claim_lock.lock().expect("claim mutex poisoned");
 
+        // Re-check AFTER the wait (R6-01): a concurrent claim may have
+        // committed while we were queued on the mutex. If so, this call
+        // becomes a plain login against the winner's hash and must
+        // never reach persistence — its persist (which can legitimately
+        // fail, e.g. another process holds the cross-process users-file
+        // lock past its timeout) must not reset a hash this call never
+        // published.
+        if let Some(result) = self.verify_against_claimed(idx, name, password, candidate_hmac) {
+            return result;
+        }
+
+        // The fallback snapshot is consumed only by persist_claim's
+        // missing-file branch, so build it (R6-05) only when the file
+        // is actually absent — and only now, after the mutex and the
+        // re-check, so the common existing-file claim (and every race
+        // loser that bailed out above) never clones the whole list.
+        // SHORT read guard; handed to persist_claim by value so that
+        // branch can move it into the config without a second copy.
+        let fallback_users = if Path::new(&self.users_path).exists() {
+            None
+        } else {
+            let mut snapshot = self.users.read().expect("users RwLock poisoned").clone();
+            snapshot[idx].hash = new_hash.clone();
+            Some(snapshot)
+        };
+
         // Persist this one claim on top of what is CURRENTLY on disk —
         // not on top of our startup snapshot. A CLI process may have
         // edited the file since we loaded it; writing our whole stale
         // snapshot back would silently revert those edits.
         // No users guard is held here.
-        match persist_claim(
-            Path::new(&self.users_path),
-            name,
-            &new_hash,
-            &fallback_users,
-        ) {
+        match persist_claim(Path::new(&self.users_path), name, &new_hash, fallback_users) {
             ClaimPersist::Written => {
                 // Only claim threads write users[idx] and they serialize
                 // on claim_lock (which we hold across persist+publish),
@@ -291,15 +297,50 @@ impl AuthState {
                 }
             }
             ClaimPersist::Failed(e) => {
-                // Roll back to the sentinel so a retry is possible.
-                self.users.write().expect("users RwLock poisoned")[idx].hash =
-                    INIT_HASH.to_string();
+                // Nothing to roll back (R6-01): the re-check above
+                // guarantees this attempt never published anything —
+                // only claim threads write users[idx], they serialize on
+                // the claim mutex we are holding, so the sentinel is
+                // still in place. Resetting it here could only clobber
+                // somebody else's committed hash.
                 eprintln!(
                     "init-claim: failed to persist {} after first-login of '{}': {}",
                     self.users_path, name, e
                 );
                 false
             }
+        }
+    }
+
+    /// If `users[idx]` is no longer the `"init"` sentinel, treat this
+    /// call as a normal login against the already-claimed hash:
+    /// Argon2-verify the password and populate the cache on match.
+    /// Returns `None` while the account is still unclaimed and the
+    /// caller may proceed with the claim itself.
+    ///
+    /// Used before queueing on the claim mutex (fast path) and again
+    /// after acquiring it (R6-01). The read guard is held only for the
+    /// hash clone; Argon2 and cache access run without it. This branch
+    /// never touches persistence or any other shared state.
+    fn verify_against_claimed(
+        &self,
+        idx: usize,
+        name: &str,
+        password: &str,
+        candidate_hmac: [u8; 32],
+    ) -> Option<bool> {
+        let claimed_hash = {
+            let users = self.users.read().expect("users RwLock poisoned");
+            if users[idx].hash == INIT_HASH {
+                return None;
+            }
+            users[idx].hash.clone()
+        };
+        if argon2_verify(&claimed_hash, password) {
+            self.cache.insert(name.to_string(), candidate_hmac);
+            Some(true)
+        } else {
+            Some(false)
         }
     }
 }
@@ -319,18 +360,34 @@ enum ClaimPersist {
 /// file lock, then atomically replace the file.
 ///
 /// `fallback_users` (the caller's full in-memory list, with the claimed
-/// hash already applied) is only written wholesale when the file does
-/// not exist yet — there is nothing on disk to merge into, so this
-/// preserves the old "first claim creates the file" behavior.
-fn persist_claim(path: &Path, name: &str, new_hash: &str, fallback_users: &[User]) -> ClaimPersist {
+/// hash already applied) is consumed — moved in, no extra deep copy
+/// (R6-05) — only when the file does not exist yet: there is nothing on
+/// disk to merge into, so this preserves the old "first claim creates
+/// the file" behavior. The caller builds the snapshot only when it last
+/// saw the file missing; if the file vanished since, there is nothing
+/// to merge into and no snapshot to recreate it from, so the claim
+/// fails closed (a retry re-runs the claim and takes the create path
+/// with a fresh snapshot).
+fn persist_claim(
+    path: &Path,
+    name: &str,
+    new_hash: &str,
+    fallback_users: Option<Vec<User>>,
+) -> ClaimPersist {
     let _lock = match UsersFileLock::acquire(path) {
         Ok(lock) => lock,
         Err(e) => return ClaimPersist::Failed(e.context("acquire users-file lock")),
     };
 
     if !path.exists() {
+        let Some(fallback_users) = fallback_users else {
+            return ClaimPersist::Failed(anyhow!(
+                "users file {} disappeared before the claim could be persisted",
+                path.display()
+            ));
+        };
         let cfg = UsersConfig {
-            users: fallback_users.to_vec(),
+            users: fallback_users,
         };
         return match write_atomic(path, &cfg) {
             Ok(()) => ClaimPersist::Written,
@@ -843,6 +900,298 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
+        // R6-01: two concurrent logins with the SAME correct password.
+        // A helper thread pins the cross-process users-file lock in two
+        // phases. Phase A (3 s) parks the first claimer inside
+        // persist_claim, so the second login queues on claim_lock behind
+        // it and both pass the pre-mutex init check. Phase B starts 5 s
+        // after A is released — the winner only needs to notice the file
+        // lock is free and grab it sometime in that window, which costs
+        // real milliseconds once scheduled, but this machine can see
+        // multi-second scheduling latency under heavy concurrent CPU
+        // load from sibling cargo processes (same class as the Argon2id
+        // degradation noted elsewhere in this file); a 200 ms gap was
+        // observed to let the external holder win that race under load,
+        // pushing the winner itself into a doomed persist attempt. Phase
+        // B then holds for 11 s — one second past persist_claim's 10 s
+        // UsersFileLock LOCK_TIMEOUT — so any persistence attempt by the
+        // loser would time out exactly like the review's "another
+        // process holds the lock past its timeout" scenario. The fixed
+        // loser must re-check the init state AFTER acquiring claim_lock,
+        // verify against the winner's hash, and return without ever
+        // entering persistence.
+        // The deterministic companion test below scripts the winner's commit directly.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+        let state = Arc::new(state);
+
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let phase_a = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock (phase A)");
+            locked_tx.send(()).expect("signal phase-A lock held");
+            std::thread::sleep(Duration::from_secs(3));
+            drop(phase_a); // the winner's persist completes in the gap below
+            std::thread::sleep(Duration::from_secs(5));
+            let phase_b = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must re-acquire the users-file lock (phase B)");
+            let _ = &phase_b;
+            // Held past persist_claim's 10 s LOCK_TIMEOUT: a persistence
+            // attempt in this window cannot succeed. The fixed loser
+            // never attempts one; this hold only makes the pre-fix
+            // failure mode (persist Failed → sentinel reset → winner
+            // clobbered) slow and loud if the re-check ever regresses.
+            std::thread::sleep(Duration::from_secs(11));
+        });
+        locked_rx.recv().expect("phase-A lock held");
+
+        // Detached on purpose: the 11 s phase-B hold only matters for
+        // the counterfactual persistence attempt; the fixed path is done
+        // in ~3.5 s and joining would pay that hold on every test run.
+        // The unique per-test path keeps the pin invisible to other
+        // tests; the OS releases the lock when the process exits.
+        drop(holder);
+
+        let s1 = Arc::clone(&state);
+        let s2 = Arc::clone(&state);
+        let t1 = std::thread::spawn(move || {
+            let started = Instant::now();
+            (s1.verify("bob", "same-pw"), started.elapsed())
+        });
+        let t2 = std::thread::spawn(move || {
+            let started = Instant::now();
+            (s2.verify("bob", "same-pw"), started.elapsed())
+        });
+        let (r1, e1) = t1.join().unwrap();
+        let (r2, e2) = t2.join().unwrap();
+        assert!(r1, "the winning login must succeed");
+        assert!(r2, "the loser must verify against the winner's hash");
+
+        // Timing bound (Argon2id on loaded machines can degrade from
+        // ~15 ms to multiple seconds — see the machine-load note):
+        // ANY persistence detour costs at least phase A (3 s, queued on
+        // claim_lock or parked on the file lock) plus the 10 s
+        // LOCK_TIMEOUT against the phase-B pin — a ≥13 s floor — so
+        // <12 s total proves no persistence attempt was made, while
+        // still allowing each of the two Argon2id operations ~4 s under
+        // heavy CPU load. The final-state asserts below are the
+        // authoritative clobber check; this bound is the fast companion.
+        assert!(e1 < Duration::from_secs(12), "winner elapsed {e1:?}");
+        assert!(
+            e2 < Duration::from_secs(12),
+            "loser elapsed {e2:?} — looks like it entered persistence and \
+             waited out the pinned users-file lock"
+        );
+
+        // Final state: the winner's commit is intact everywhere and
+        // memory, disk and cache agree on one and the same hash.
+        let winner_hash = {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert!(
+                bob.hash.starts_with("$argon2id$"),
+                "winner's committed hash must not be reset to the sentinel, got {:?}",
+                bob.hash
+            );
+            bob.hash.clone()
+        };
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_eq!(bob.hash, winner_hash, "disk and memory must agree");
+        assert!(
+            state.verify("bob", "same-pw"),
+            "winner hash must still verify"
+        );
+        assert!(
+            state.cache_matches(
+                "bob",
+                &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
+            ),
+            "cache must hold the entry for the winning password"
+        );
+
+        // A fresh state on the persisted file accepts the same password:
+        // both logins verified against one and the same winning hash.
+        let fresh = AuthState::build(
+            &AuthConfig {
+                allow_anonymous: false,
+            },
+            &loaded,
+            path.clone(),
+        )
+        .unwrap();
+        assert!(fresh.verify("bob", "same-pw"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    }
+
+    #[test]
+    fn init_claim_persist_failure_after_winner_cannot_reset_winner_hash() {
+        // R6-01, deterministic variant. A real two-thread race cannot
+        // reliably expose the pre-fix bug: the loser's persist enters
+        // only after the winner released the file lock, so on a fast
+        // machine it slips in, sees the winner's hash on disk, and
+        // returns via DiskHashChanged without any clobber. Here the
+        // winner's committed state (memory + disk) is scripted directly
+        // while the racer is parked on claim_lock, and the cross-process
+        // users-file lock is pinned continuously for longer than
+        // persist_claim's 10 s UsersFileLock LOCK_TIMEOUT from before
+        // the racer can reach persistence — so a pre-fix racer (no
+        // post-mutex re-check) deterministically blocks for the full
+        // 10 s, fails, and returns false, while the fixed racer
+        // re-checks after the mutex and never touches persistence.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)], false);
+        let state = Arc::new(state);
+        let winner_hash = compute_hash("winner-pw").unwrap();
+
+        // Pin the users-file lock continuously, well past the 10 s
+        // persist LOCK_TIMEOUT, for the whole scenario.
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            locked_tx.send(()).expect("signal lock held");
+            std::thread::sleep(Duration::from_secs(14));
+            let _ = &lock;
+        });
+        locked_rx.recv().expect("users-file lock pinned");
+
+        // Hold claim_lock from before the racer starts so the racer is
+        // guaranteed to park on this mutex right after its pre-mutex
+        // init check, then wait out the racer's Argon2id hashing (2 s is
+        // far beyond 100x the ~15 ms nominal, see the machine-load
+        // note) before scripting the winner's commit, so the pre-mutex
+        // check has certainly already run.
+        let claim_guard = state.claim_lock.lock().expect("claim mutex poisoned");
+        let racer_state = Arc::clone(&state);
+        let racer = std::thread::spawn(move || {
+            let started = Instant::now();
+            (racer_state.verify("bob", "winner-pw"), started.elapsed())
+        });
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Script the winner's commit exactly as the Written branch would
+        // leave it: real hash in memory and on disk. The cache is
+        // deliberately left empty — populating it is part of what the
+        // racer's claimed-hash path must do.
+        {
+            let mut users = state.users.write().unwrap();
+            let bob = users.iter_mut().find(|u| u.name == "bob").unwrap();
+            bob.hash = winner_hash.clone();
+        }
+        ktav::to_file(
+            &UsersConfig {
+                users: vec![User {
+                    name: "bob".into(),
+                    hash: winner_hash.clone(),
+                    is_enabled: true,
+                    direct: false,
+                }],
+            },
+            &path,
+        )
+        .unwrap();
+
+        drop(claim_guard); // let the racer into the claim critical section
+
+        let (racer_ok, racer_elapsed) = racer.join().unwrap();
+        assert!(racer_ok, "racer must verify against the winner's hash");
+        // Any persistence attempt blocks ≥10 s against the pinned lock
+        // (persist_claim → UsersFileLock::acquire → LOCK_TIMEOUT), so a
+        // sub-10 s total — of which 2 s is the deliberate parking wait —
+        // proves the racer never entered persistence. Margins: nominal
+        // fixed path ≈ 2.05 s; the bound tolerates several seconds of
+        // Argon2id degradation under load. The final-state asserts below
+        // are authoritative.
+        assert!(
+            racer_elapsed < Duration::from_secs(9),
+            "racer elapsed {racer_elapsed:?} — it entered persistence and \
+             waited out the pinned users-file lock"
+        );
+
+        // The winner's commit is intact everywhere: memory hash not
+        // reset to the sentinel, disk untouched, and the cache now holds
+        // the winning password's entry — populated by the racer's
+        // claimed-hash verify path.
+        {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert_eq!(
+                bob.hash, winner_hash,
+                "winner's committed hash must not be reset to the sentinel"
+            );
+        }
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(loaded.users[0].hash, winner_hash, "disk must be untouched");
+        assert!(
+            state.cache_matches(
+                "bob",
+                &compute_cache_hmac(&state.server_secret, "bob", "winner-pw")
+            ),
+            "cache must hold the winning password's entry"
+        );
+
+        // Detached on purpose (same reasoning as the concurrent racer
+        // test above): the remaining pin hold only matters for the
+        // pre-fix counterfactual.
+        drop(holder);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    }
+
+    #[test]
+    fn init_claim_into_missing_file_writes_full_fallback_list() {
+        // R6-05: the fallback snapshot is now built only for the
+        // missing-file branch, after claim_lock and the post-mutex
+        // re-check — but the branch's content contract is unchanged:
+        // creating the file writes the caller's FULL in-memory list
+        // (with the claimed hash applied), not just the claimed user.
+        let (state, path) = build_state_persistent(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("bob", true),
+            ],
+            false,
+        );
+        assert!(!Path::new(&path).exists());
+        assert!(state.verify("bob", "bob-pw"));
+
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        assert_eq!(loaded.users.len(), 2, "fallback must carry every user");
+        let alice = loaded.users.iter().find(|u| u.name == "alice").unwrap();
+        assert!(
+            alice.hash.starts_with("$argon2id$"),
+            "alice's real hash must survive the first-claim file creation"
+        );
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_ne!(bob.hash, INIT_HASH);
+        assert!(bob.hash.starts_with("$argon2id$"));
+        // Both accounts work against the freshly created file.
+        assert!(state.verify("alice", "alice-pw"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ─── cross-process safety: CLI edits vs init-claim (R13) ────────
 
     #[test]
@@ -971,7 +1320,7 @@ mod tests {
         // R12 through the claim path: the persist starts but fails
         // mid-way (the temp-file slot is sabotaged with a directory).
         // The previous on-disk file must survive byte-for-byte and the
-        // in-memory sentinel must be restored for a retry.
+        // in-memory sentinel must be left in place for a retry.
         let baseline = vec![
             make_user("alice", "alice-pw", true),
             make_init_user("bob", true),
@@ -992,7 +1341,10 @@ mod tests {
         {
             let users = state.users.read().unwrap();
             let bob = users.iter().find(|u| u.name == "bob").unwrap();
-            assert_eq!(bob.hash, INIT_HASH, "sentinel must be restored on failure");
+            assert_eq!(
+                bob.hash, INIT_HASH,
+                "sentinel must still be in place — the failed attempt never published anything"
+            );
         }
 
         std::fs::remove_dir(&tmp).unwrap();
