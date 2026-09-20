@@ -1,0 +1,738 @@
+use super::*;
+use crate::types::{ProxyProtocol, IP as IPV};
+
+#[tokio::test]
+async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = make_proxy("127.0.0.1", port);
+    let pool = ProxyPool::new(
+        PoolConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+        1,
+    );
+    let permit = pool.reserve_permit(&proxy).unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let spares = Arc::new(ProxySpares {
+        queue: ArrayQueue::new(1),
+        notify: Notify::new(),
+    });
+    assert!(spares
+        .queue
+        .push(PreWarmed {
+            stream,
+            permit,
+            created_at: Instant::now()
+        })
+        .is_ok());
+    pool.pools
+        .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+    let reservation = pool
+        .reserve_permit(&proxy)
+        .expect("an idle spare must not exclude a tunneled hop");
+    assert!(spares.queue.is_empty());
+    assert!(pool.reserve_permit(&proxy).is_err());
+    assert_eq!(
+        timeout(Duration::from_secs(2), peer.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    drop(reservation);
+    assert!(pool.reserve_permit(&proxy).is_ok());
+}
+
+fn make_proxy(host: &str, port: u16) -> ProxyConfig {
+    ProxyConfig {
+        protocol: ProxyProtocol::Socks5,
+        ip: IPV::V4,
+        host: host.to_string(),
+        port,
+        user: None,
+        password: None,
+        is_gate: false,
+        gate: None,
+    }
+}
+
+/// Bind a listener on a free local port and immediately accept-
+/// loop in the background — gives us a reachable upstream that
+/// completes TCP connect (so we exercise the success path of
+/// `pool.acquire`).
+async fn ephemeral_listener() -> (tokio::net::TcpListener, u16) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    (l, port)
+}
+
+#[tokio::test]
+async fn acquire_succeeds_below_cap_and_fails_fast_at_cap() {
+    // 2-permit semaphore: the third concurrent acquire must fail
+    // immediately instead of waiting.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 2);
+    let (listener, port) = ephemeral_listener().await;
+    // accept in background so connect() resolves promptly
+    tokio::spawn(async move {
+        loop {
+            if listener.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy = make_proxy("127.0.0.1", port);
+
+    let a = pool.acquire(&proxy).await.expect("first acquire");
+    let b = pool.acquire(&proxy).await.expect("second acquire");
+    let err = pool.acquire(&proxy).await.expect_err("third must fail");
+    assert!(
+        err.downcast_ref::<AtCapacity>().is_some(),
+        "unexpected error: {}",
+        err
+    );
+    // Keep first two alive until here.
+    drop((a, b));
+}
+
+#[tokio::test]
+async fn slot_is_released_on_stream_drop() {
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1);
+    let (listener, port) = ephemeral_listener().await;
+    tokio::spawn(async move {
+        loop {
+            if listener.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy = make_proxy("127.0.0.1", port);
+
+    let first = pool.acquire(&proxy).await.unwrap();
+    assert!(pool.acquire(&proxy).await.is_err(), "should be at capacity");
+    drop(first);
+    // Permit released → next acquire succeeds.
+    let _second = pool.acquire(&proxy).await.expect("after drop");
+}
+
+#[tokio::test]
+async fn different_upstreams_have_independent_caps() {
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1);
+    let (l1, p1) = ephemeral_listener().await;
+    let (l2, p2) = ephemeral_listener().await;
+    tokio::spawn(async move {
+        loop {
+            if l1.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            if l2.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy_a = make_proxy("127.0.0.1", p1);
+    let proxy_b = make_proxy("127.0.0.1", p2);
+
+    // Cap=1 each — both should succeed because they're on
+    // different (host, port) keys.
+    let _a = pool.acquire(&proxy_a).await.unwrap();
+    let _b = pool.acquire(&proxy_b).await.unwrap();
+}
+
+#[tokio::test]
+async fn cap_hit_produces_at_capacity_error() {
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1);
+    let (listener, port) = ephemeral_listener().await;
+    tokio::spawn(async move {
+        loop {
+            if listener.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy = make_proxy("127.0.0.1", port);
+
+    let _hold = pool.acquire(&proxy).await.unwrap();
+    let err = pool.acquire(&proxy).await.expect_err("should be at cap");
+    assert!(
+        err.downcast_ref::<AtCapacity>().is_some(),
+        "expected AtCapacity, got: {}",
+        err
+    );
+}
+
+#[test]
+fn zero_max_per_upstream_clamped_to_one() {
+    // A misconfigured `max_per_upstream: 0` would otherwise mean
+    // "Semaphore with zero permits" → every acquire fails. Clamp
+    // to 1 so the pool stays minimally usable.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 0);
+    assert_eq!(pool.max_per_upstream, 1);
+}
+
+#[test]
+fn reserve_permit_enforces_cap_and_releases_on_drop() {
+    // Pure accounting: no TCP connect happens, so an unreachable
+    // host is fine — the semaphore is created lazily from the
+    // config alone.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 2);
+    let proxy = make_proxy("203.0.113.1", 1080);
+
+    let a = pool.reserve_permit(&proxy).expect("first reserve");
+    let b = pool.reserve_permit(&proxy).expect("second reserve");
+    let err = pool.reserve_permit(&proxy).expect_err("cap is 2");
+    assert!(
+        err.downcast_ref::<AtCapacity>().is_some(),
+        "expected AtCapacity, got: {}",
+        err
+    );
+    drop((a, b));
+    let _c = pool.reserve_permit(&proxy).expect("released on drop");
+}
+
+#[tokio::test]
+async fn attached_permit_is_released_with_the_stream() {
+    // The gate path's shape: acquire (1 slot) + a logical reserve
+    // for the inner hop (2nd slot); dropping the tunnel must free
+    // BOTH.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 2);
+    let (listener, port) = ephemeral_listener().await;
+    tokio::spawn(async move {
+        loop {
+            if listener.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy = make_proxy("127.0.0.1", port);
+
+    let mut stream = pool.acquire(&proxy).await.expect("acquire");
+    stream.attach_permit(pool.reserve_permit(&proxy).expect("reserve inner hop"));
+    assert!(
+        pool.acquire(&proxy).await.is_err(),
+        "acquire + attached reserve must consume both slots"
+    );
+    drop(stream);
+    let _a = pool.acquire(&proxy).await.expect("socket slot back");
+    let _b = pool.reserve_permit(&proxy).expect("attached slot back");
+}
+
+// ---- Refill-task / spare-accounting tests -----------------------
+//
+// These use `start_paused = true` + `advance`: real local-TCP
+// connects complete fine under paused time; only timers (the
+// refill backoff) need advancing. `max_session_age_sec: 3600`
+// keeps the age-out path well out of reach of the small advances
+// used to drive progress.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Shared accept/open counters for the counting listener.
+#[derive(Default)]
+struct Counters {
+    accepted: AtomicUsize,
+    open: AtomicUsize,
+}
+
+impl Counters {
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+    fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+/// Accept-loop that counts total accepted connections and
+/// currently-open peer sockets. Each accepted socket is held by a
+/// handler task that reads until EOF; a guard decrements `open`
+/// when the socket drops (peer closed or task ends), so `open`
+/// drains to 0 once the pool-side sockets are gone.
+async fn counting_listener(l: tokio::net::TcpListener, counters: Arc<Counters>) {
+    loop {
+        let Ok((sock, _)) = l.accept().await else {
+            break;
+        };
+        counters.accepted.fetch_add(1, Ordering::SeqCst);
+        counters.open.fetch_add(1, Ordering::SeqCst);
+        struct OpenGuard(Arc<Counters>);
+        impl Drop for OpenGuard {
+            fn drop(&mut self) {
+                self.0.open.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let guard = OpenGuard(counters.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            use tokio::io::AsyncReadExt;
+            let mut sock = sock;
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+}
+
+/// Drive paused time in bounded steps until `cond` holds, so the
+/// tests are deterministic rather than timing-dependent. Total
+/// advanced time stays far below `max_session_age_sec = 3600`.
+///
+/// `cond` here waits on REAL socket I/O (a loopback TCP
+/// connect/accept), not just virtual timers. `tokio::time::advance`
+/// only fast-forwards tokio's paused clock — it does nothing to
+/// give the OS a chance to actually finish a pending handshake, and
+/// `yield_now` alone doesn't either. Under `start_paused = true`,
+/// with nothing but virtual-time advancement and cooperative
+/// yields, this loop can iterate its full budget in well under a
+/// millisecond of REAL wall-clock time in a release build — not
+/// necessarily enough real time for the kernel to complete a
+/// loopback handshake, which flaked this exact wait on this exact
+/// build profile. A tiny REAL (blocking) sleep forces genuine
+/// wall-clock progress every iteration without touching tokio's
+/// own paused clock, so real I/O actually gets a chance to land.
+async fn quiesce(cond: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if cond() {
+            return;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    panic!("condition did not become true within the advance budget");
+}
+
+fn pool_cfg(spare_per_proxy: usize) -> PoolConfig {
+    PoolConfig {
+        enabled: true,
+        spare_per_proxy,
+        max_session_age_sec: 3600,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_spawn_refill_for_races_to_single_task() {
+    let counters = Arc::new(Counters::default());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(counting_listener(l, counters.clone()));
+
+    // Cap 5 — deliberately above the spare target so permits
+    // never bind; this test isolates the race, not the cap.
+    // connect_timeout is generous (not 2s): `quiesce` advances the
+    // paused clock in 100ms steps regardless of real I/O progress,
+    // so under real scheduling delay (e.g. a loaded machine) the
+    // virtual clock can outrun a real, still-in-flight
+    // `TcpStream::connect` and trip a short internal timeout,
+    // aborting a connect the OS was about to complete — the client
+    // fd closes right after the server's `accept()` already counted
+    // it, flaking `open()` below `accepted()`. A large timeout here
+    // can never legitimately fire in this test.
+    let pool = Arc::new(ProxyPool::new(pool_cfg(3), Duration::from_secs(120), 5));
+    let proxy = Arc::new(make_proxy("127.0.0.1", port));
+
+    // 8 concurrent callers race to spawn for the SAME (host, port).
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let proxy = proxy.clone();
+        tasks.push(tokio::spawn(async move {
+            pool.spawn_refill_for(proxy);
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    quiesce(|| pool.pools.len() == 1 && counters.accepted() == 3).await;
+
+    // Exactly one ProxySpares entry and exactly one refill task's
+    // worth of connections (target 3). The old contains_key+insert
+    // code let two winners spawn, yielding 6+ accepts and an
+    // orphaned task filling a queue unreachable through the map.
+    assert_eq!(pool.pools.len(), 1);
+    assert_eq!(counters.accepted(), 3);
+    assert_eq!(counters.open(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_pool_stops_refill_task() {
+    let counters = Arc::new(Counters::default());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(counting_listener(l, counters.clone()));
+
+    // See the comment in `concurrent_spawn_refill_for_races_to_single_task`
+    // for why this needs a generous connect_timeout under `quiesce`.
+    let pool = ProxyPool::new(pool_cfg(2), Duration::from_secs(120), 4);
+    let proxy = Arc::new(make_proxy("127.0.0.1", port));
+    let key = (proxy.host.clone(), proxy.port);
+    pool.spawn_refill_for(proxy);
+
+    // Wait for the full steady state: both spares connected AND in
+    // the queue, so the refill task is parked with no connects in
+    // flight and the drop is side-effect-free on the accept count.
+    quiesce(|| {
+        counters.accepted() == 2 && pool.pools.get(&key).map(|s| s.queue.len()).unwrap_or(0) == 2
+    })
+    .await;
+    let n = counters.accepted();
+    assert_eq!(counters.open(), 2, "both spare sockets open");
+
+    // Dropping the pool aborts the refill task, so no further
+    // connects ever happen, and the spare sockets die with it.
+    drop(pool);
+    for _ in 0..50 {
+        assert!(
+            counters.accepted() <= n,
+            "refill task connected after pool drop"
+        );
+        if counters.open() == 0 {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(counters.open(), 0, "spare sockets must die with the pool");
+    assert!(counters.accepted() <= n);
+}
+
+#[tokio::test(start_paused = true)]
+async fn spares_and_active_share_one_cap() {
+    let counters = Arc::new(Counters::default());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(counting_listener(l, counters.clone()));
+
+    // Target 4 spares, cap 5. Steady state after the first
+    // acquire+refill: spares(4) + actives(1) = 5 sockets, all 5
+    // permits held, 5 accepted total — and no further connects for
+    // the rest of the test (no age-out, no drops: a popped spare
+    // IS the active socket, and the refill has no free permit).
+    // See the comment in `concurrent_spawn_refill_for_races_to_single_task`
+    // for why this needs a generous connect_timeout under `quiesce`.
+    let pool = Arc::new(ProxyPool::new(pool_cfg(4), Duration::from_secs(120), 5));
+    let proxy = make_proxy("127.0.0.1", port);
+    let key = (proxy.host.clone(), proxy.port);
+    pool.spawn_refill_for(Arc::new(proxy.clone()));
+
+    quiesce(|| {
+        counters.accepted() == 4 && pool.pools.get(&key).map(|s| s.queue.len()).unwrap_or(0) == 4
+    })
+    .await;
+    assert_eq!(counters.open(), 4, "4 real spare sockets");
+    assert_eq!(
+        pool.upstream_caps.get(&key).unwrap().available_permits(),
+        1,
+        "4 spares hold 4 of 5 permits"
+    );
+
+    let mut streams = Vec::new();
+    for i in 1..=5 {
+        streams.push(pool.acquire(&proxy).await.expect("acquire"));
+        if i == 1 {
+            // Immediately after the spare-path acquire the refill
+            // task has not been polled yet (no yield point since
+            // the notify), so exactly 4 slots are held and 1 is
+            // free — proving the spare's permit was REUSED, not
+            // double-reserved (a second reserve would give 0 here).
+            assert_eq!(
+                pool.upstream_caps.get(&key).unwrap().available_permits(),
+                1,
+                "spare-path acquire must not consume an extra permit"
+            );
+            // Wait for the refill to finish re-topping: push
+            // recorded and the last permit consumed → fully
+            // settled 5 held / 5 open.
+            quiesce(|| {
+                counters.accepted() == 5
+                    && pool.pools.get(&key).map(|s| s.queue.len()).unwrap_or(0) == 4
+                    && pool.upstream_caps.get(&key).unwrap().available_permits() == 0
+            })
+            .await;
+        } else {
+            // No permit free → refill cannot open anything.
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            counters.open() <= 5,
+            "open={} exceeded cap at acquire #{}",
+            counters.open(),
+            i
+        );
+        assert_eq!(
+            pool.upstream_caps.get(&key).unwrap().available_permits(),
+            0,
+            "all 5 slots held after quiescence at acquire #{}",
+            i
+        );
+    }
+
+    // Steady state: 5 live sockets (4 remaining spares were
+    // consumed one-by-one as actives... precisely: after acquire 1
+    // + refill, 4 spares + 1 active; acquires 2..5 pop those 4
+    // spares as actives, refill blocked by the full cap).
+    assert_eq!(counters.open(), 5);
+    assert_eq!(
+        counters.accepted(),
+        5,
+        "no socket churn beyond the initial 5"
+    );
+    assert_eq!(
+        pool.pools.get(&key).unwrap().queue.len(),
+        0,
+        "queue drained into actives"
+    );
+
+    // Queue empty + semaphore exhausted → fail fast with AtCapacity.
+    let err = pool.acquire(&proxy).await.expect_err("6th acquire");
+    assert!(
+        err.downcast_ref::<AtCapacity>().is_some(),
+        "expected AtCapacity, got: {}",
+        err
+    );
+    assert!(counters.open() <= 5);
+    assert_eq!(counters.accepted(), 5);
+}
+
+#[tokio::test]
+async fn acquire_hands_out_a_healthy_spare_without_discarding_it() {
+    // Guard for the dead-spare liveness probe: a connected, idle
+    // spare has no pending data, so the probe must classify it as
+    // alive. The spare must be handed out directly (no fresh
+    // connect) and must still carry data end-to-end.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = make_proxy("127.0.0.1", addr.port());
+    let pool = ProxyPool::new(
+        PoolConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+        1,
+    );
+    let permit = pool.reserve_permit(&proxy).unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let spares = Arc::new(ProxySpares {
+        queue: ArrayQueue::new(1),
+        notify: Notify::new(),
+    });
+    assert!(spares
+        .queue
+        .push(PreWarmed {
+            stream,
+            permit,
+            created_at: Instant::now()
+        })
+        .is_ok());
+    pool.pools
+        .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+    // Cap is 1 and the spare holds the only permit. If a regression
+    // discards healthy spares, acquire silently falls through to a
+    // fresh connect on a DIFFERENT socket — which this read on the
+    // original peer would then time out on.
+    let mut spare = pool
+        .acquire(&proxy)
+        .await
+        .expect("healthy spare handed out");
+    assert!(spares.queue.is_empty());
+
+    spare.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    timeout(Duration::from_secs(2), peer.read_exact(&mut buf))
+        .await
+        .expect("handed-out socket must be the original connection")
+        .unwrap();
+    assert_eq!(&buf, b"ping");
+
+    drop((spare, peer));
+    assert!(
+        pool.reserve_permit(&proxy).is_ok(),
+        "spare's permit must travel with the stream and back on drop"
+    );
+}
+
+#[tokio::test]
+async fn dead_queued_spare_falls_back_to_a_fresh_connect() {
+    // R5-04 shape: the upstream closed the spare while it sat in
+    // the queue (its own idle/greeting timeout), but the upstream
+    // is healthy and still accepts connections. `acquire` must
+    // discard the dead spare and open a fresh connection in the
+    // same call, with correct permit accounting — a queued dead
+    // socket must not become the caller's final failure for a
+    // reachable upstream.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = make_proxy("127.0.0.1", addr.port());
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(5), 2);
+
+    // Build one spare manually, then close the PEER side — the same
+    // observable state an upstream idle timeout produces — and wait
+    // until the FIN is visible on the spare. `try_read` mirrors the
+    // pool's probe exactly, and EOF is sticky, so once this loop
+    // sees Ok(0) the probe will see it too.
+    let permit = pool.reserve_permit(&proxy).unwrap();
+    let spare = TcpStream::connect(addr).await.unwrap();
+    let (dead_peer, _) = listener.accept().await.unwrap();
+    drop(dead_peer);
+    let mut fin_seen = false;
+    for _ in 0..1000 {
+        match spare.try_read(&mut [0u8; 1]) {
+            Ok(0) => {
+                fin_seen = true;
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Real wall-clock yield: FIN delivery on loopback is
+                // immediate but not synchronous.
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // RST or any other socket error counts as dead too; no
+            // pending data is expected on this socket.
+            _ => {
+                fin_seen = true;
+                break;
+            }
+        }
+    }
+    assert!(fin_seen, "peer-side close was not observed on the spare");
+    let spares = Arc::new(ProxySpares {
+        queue: ArrayQueue::new(1),
+        notify: Notify::new(),
+    });
+    assert!(spares
+        .queue
+        .push(PreWarmed {
+            stream: spare,
+            permit,
+            created_at: Instant::now()
+        })
+        .is_ok());
+    pool.pools
+        .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+    let mut fresh = pool
+        .acquire(&proxy)
+        .await
+        .expect("dead spare must fall back to a fresh connect, not fail");
+    assert!(spares.queue.is_empty(), "dead spare must be discarded");
+
+    // The fallback socket is a live, NEW connection to the same
+    // (still-listening) upstream: data written on it must reach a
+    // freshly accepted peer.
+    let mut fallback_peer = timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("fresh connect must reach the upstream")
+        .unwrap()
+        .0;
+    fresh.write_all(b"ok").await.unwrap();
+    let mut buf = [0u8; 2];
+    timeout(Duration::from_secs(2), fallback_peer.read_exact(&mut buf))
+        .await
+        .expect("read within timeout")
+        .unwrap();
+    assert_eq!(&buf, b"ok");
+
+    // Accounting: the discard released the dead spare's permit, the
+    // fresh connect re-reserved it; dropping everything hands both
+    // slots of cap 2 back.
+    drop((fresh, fallback_peer));
+    let a = pool.reserve_permit(&proxy);
+    let b = pool.reserve_permit(&proxy);
+    assert!(a.is_ok() && b.is_ok(), "both permits must be released");
+    assert!(
+        pool.reserve_permit(&proxy).is_err(),
+        "cap of 2 must still be enforced"
+    );
+}
+
+#[tokio::test]
+async fn fresh_connect_dials_ipv6_literals_without_string_addr() {
+    // R5-11: `ProxyConfig.host` is stored WITHOUT IPv6 brackets, so
+    // `format!("{}:{}", "::1", port)` produces "::1:<port>" — not a
+    // parsable SocketAddr — and every IPv6-literal dial would fall
+    // through to the blocking system resolver. The `(host, port)`
+    // tuple form parses IP literals directly.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(5), 2);
+
+    // IPv6 loopback. Skip the leg on hosts without IPv6 at all.
+    let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+        eprintln!("skipping IPv6 leg: IPv6 loopback unavailable");
+        return;
+    };
+    let v6_port = v6.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            if v6.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy_v6 = ProxyConfig {
+        ip: IPV::V6,
+        ..make_proxy("::1", v6_port)
+    };
+    let stream = pool
+        .acquire(&proxy_v6)
+        .await
+        .expect("IPv6 literal must connect via the tuple dial");
+    drop(stream);
+
+    // A domain still goes through the resolver, unchanged.
+    let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let v4_port = v4.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            if v4.accept().await.is_err() {
+                break;
+            }
+        }
+    });
+    let proxy_dom = make_proxy("localhost", v4_port);
+    let stream = pool
+        .acquire(&proxy_dom)
+        .await
+        .expect("domain host must still resolve and connect");
+    drop(stream);
+}
+
+#[tokio::test]
+async fn fresh_connect_failure_error_still_names_the_endpoint() {
+    // R5-11 moved the endpoint string into the failure paths; the
+    // diagnostics must survive the move. TEST-NET-1 (RFC 5737) is
+    // guaranteed non-routable.
+    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_millis(300), 1);
+    let proxy = make_proxy("203.0.113.1", 1080);
+    let err = pool
+        .acquire(&proxy)
+        .await
+        .expect_err("TEST-NET-1 must not connect");
+    assert!(
+        err.to_string().contains("203.0.113.1:1080"),
+        "error must name the endpoint, got: {err}"
+    );
+}
