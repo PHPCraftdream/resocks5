@@ -13,6 +13,7 @@ use regex::RegexSet;
 use resocks5_net::connect::parse_proxy_str;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol, IP};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -166,24 +167,38 @@ const SHUTDOWN_TEARDOWN_TIMEOUT_SEC: u64 = 5;
 /// [`emit_shutdown_diagnostic`]). One line should never need more.
 const SHUTDOWN_DIAGNOSTIC_TIMEOUT_SEC: u64 = 1;
 
-/// Sync entry point: owns the runtime so its teardown is bounded. The
-/// async work lives in [`run_server_inner`]; this wrapper makes the
-/// `Runtime` an explicit local so it ends in `shutdown_timeout` instead
-/// of an unbounded implicit `Drop`, even if the body panics.
+/// Sync entry point: the async work lives in [`run_server_inner`];
+/// [`run_with_bounded_teardown`] owns the runtime so its teardown is
+/// bounded even if the body panics. The `?` peels only the
+/// runtime-build-failure layer — the inner `Result` is this function's
+/// result.
 fn run_server() -> Result<()> {
+    run_with_bounded_teardown(run_server_inner())?
+}
+
+/// Run `future` on an explicitly owned multi-thread runtime whose
+/// teardown is bounded: the `Runtime` is an explicit local that ends in
+/// `shutdown_timeout` (budget: [`SHUTDOWN_TEARDOWN_TIMEOUT_SEC`])
+/// instead of an unbounded implicit `Drop` — see that const's
+/// documentation for why an implicit drop must never own the runtime
+/// (`Runtime::drop` waits without any timeout for every outstanding
+/// blocking-pool operation, review R5-06).
+///
+/// `catch_unwind` keeps a panicking body from unwinding past the
+/// bounded teardown (unwinding would drop the `Runtime` and block
+/// without limit on stuck blocking-pool I/O); the panic hook has
+/// already printed the message, and `resume_unwind` preserves the
+/// original unwind. The returned `Result` reflects only runtime-build
+/// failure — the future's own output is handed back unchanged.
+fn run_with_bounded_teardown<F: Future>(future: F) -> Result<F::Output> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    // catch_unwind so a panic can't unwind past the bounded teardown:
-    // unwinding would drop the `Runtime`, blocking without limit on
-    // stuck blocking-pool I/O. The panic hook has already printed the
-    // message; `resume_unwind` preserves the original unwind.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(run_server_inner())
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
     runtime.shutdown_timeout(Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC));
     match result {
-        Ok(result) => result,
+        Ok(result) => Ok(result),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -753,32 +768,132 @@ mod tests {
         );
     }
 
-    /// The R5-06 root cause as a test: a blocking-pool operation that
-    /// never finishes (exactly what a `tokio::io::stdout` write to a
-    /// stopped pipe becomes — `Blocking::poll_write` parks it in this
-    /// pool) must not extend process exit. The old `#[tokio::main]` path
-    /// ended with an implicit `Runtime::drop`, which waits unbounded for
-    /// exactly this; the explicit `shutdown_timeout` must return within
-    /// its budget instead.
+    /// The R5-06 root cause as a test, driven through the production
+    /// wrapper: a blocking-pool operation that never finishes (exactly
+    /// what a `tokio::io::stdout` write to a stopped pipe becomes —
+    /// `Blocking::poll_write` parks it in this pool) must not extend
+    /// process exit. Unlike the pre-R6-09 version this calls
+    /// [`run_with_bounded_teardown`] — the function production code
+    /// actually runs — instead of building a private runtime and
+    /// calling `shutdown_timeout` directly, so reverting the wrapper to
+    /// an unbounded `Runtime::drop` fails here.
     #[test]
     fn runtime_teardown_is_bounded_with_a_stuck_blocking_write() {
-        let start = std::time::Instant::now();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime must build");
-        runtime.block_on(async {
-            // Stuck sink stand-in: a blocking-pool op that never returns.
-            tokio::task::spawn_blocking(|| loop {
-                std::thread::park();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let helper = std::thread::spawn(move || {
+            let outcome = run_with_bounded_teardown(async move {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+                // Stuck sink stand-in: a blocking-pool op that parks
+                // until the test releases it. The `JoinHandle` is
+                // deliberately dropped — the op must outlive the
+                // wrapper's polite shutdown for this test to mean
+                // anything (fire-and-forget by design).
+                tokio::task::spawn_blocking(move || {
+                    // Prove the op STARTED executing before teardown
+                    // runs: a merely queued task could be cancelled
+                    // without ever running, which would not exercise
+                    // teardown at all.
+                    let _ = started_tx.send(());
+                    // Park on a release signal, NOT `loop { park() }` —
+                    // the latter has no release path and would leak the
+                    // thread past the test.
+                    let _ = release_rx.recv();
+                    let _ = exited_tx.send(());
+                });
+                started_rx
+                    .await
+                    .expect("stuck blocking op must start before teardown");
             });
+            done_tx
+                .send(())
+                .expect("test harness: done channel must be alive");
+            outcome
         });
-        runtime.shutdown_timeout(Duration::from_millis(500));
+
+        // Generous hang-detector cap only, not the measurement (a
+        // companion task moves the measurement next to the teardown):
+        // a wrapper reverted to unbounded `Runtime::drop` would block
+        // the helper thread forever and trip this cap. Seconds of
+        // headroom, because wall-clock bounds flake under CPU load.
+        let cap = Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC + 20);
+        let start = std::time::Instant::now();
+        done_rx
+            .recv_timeout(cap)
+            .expect("run_with_bounded_teardown must return despite the stuck blocking op");
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < cap,
             "teardown must abandon the stuck blocking op within its budget, took {elapsed:?}"
         );
+
+        let outcome = helper.join().expect("helper thread must not panic");
+        assert!(
+            outcome.is_ok(),
+            "async body must complete normally, got {outcome:?}"
+        );
+
+        // Release the stuck op and prove its thread actually exits, so
+        // the test leaks neither a parked thread nor a stuck runtime.
+        release_tx
+            .send(())
+            .expect("test harness: release channel must be alive");
+        exited_rx
+            .recv_timeout(cap)
+            .expect("stuck blocking op must exit once released");
+    }
+
+    /// Same stuck-op setup, but the async body panics after the op
+    /// started: the wrapper must still run the bounded teardown (proved
+    /// by the same started/release/exited protocol) AND re-raise the
+    /// panic instead of swallowing it.
+    #[test]
+    fn panic_in_body_still_tears_down_bounded_and_reraises() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let helper = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_with_bounded_teardown(async move {
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.recv();
+                        let _ = exited_tx.send(());
+                    });
+                    started_rx
+                        .await
+                        .expect("stuck blocking op must start before teardown");
+                    panic!("body panic: the bounded teardown must still run");
+                })
+            }));
+            done_tx
+                .send(())
+                .expect("test harness: done channel must be alive");
+            outcome
+        });
+
+        let cap = Duration::from_secs(SHUTDOWN_TEARDOWN_TIMEOUT_SEC + 20);
+        done_rx
+            .recv_timeout(cap)
+            .expect("panicking body must still return from run_with_bounded_teardown");
+        let outcome = helper.join().expect("helper thread must not panic");
+        assert!(
+            outcome.is_err(),
+            "body panic must be re-raised by the wrapper, not swallowed"
+        );
+
+        // Teardown ran while the op was still parked, so the op must
+        // still be alive and releasable afterwards.
+        release_tx
+            .send(())
+            .expect("test harness: release channel must be alive");
+        exited_rx
+            .recv_timeout(cap)
+            .expect("stuck blocking op must exit once released");
     }
 
     /// A drain task that never completes (sink wedged mid-write) must be
