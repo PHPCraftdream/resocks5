@@ -745,10 +745,16 @@ mod tests {
     /// immediately and each of the other 7 after 200 ms of silence —
     /// 1400 ms in total. That outlasts the 1 s idle window, which is
     /// exactly what the old single write_all+flush timeout got wrong;
-    /// fresh per-attempt windows keep the send alive.
+    /// fresh per-attempt windows keep the send alive. R7-05: the 64
+    /// payload bytes are position-distinct so the accepted-sequence
+    /// check below cannot be fooled by a repeated prefix.
     #[tokio::test(start_paused = true)]
     async fn steady_drip_progress_under_backpressure_never_trips_idle() {
-        let data = vec![0xAA; 64];
+        // R7-05: position-distinct bytes — a uniform payload would let
+        // a repeated prefix (or any reordering) reconstruct the very
+        // same `accepted` sequence and slip past the content check
+        // below with correct total count and timing.
+        let data: Vec<u8> = (0u8..64).collect();
         let mut w = DripWriter::new(8, Duration::from_millis(200));
 
         let start = tokio::time::Instant::now();
@@ -756,8 +762,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, SendProgress::Completed);
-        // 8 drips of 8 bytes each.
-        assert_eq!(w.accepted, data);
+        // 8 drips of 8 bytes each — and every drip must carry the NEXT
+        // slice of the payload: a repeated prefix, a reordering, or a
+        // dropped byte is corruption even when the total length, the
+        // drip count, and the timing all look correct.
+        assert_eq!(
+            w.accepted, data,
+            "accepted bytes must reconstruct the payload exactly"
+        );
         assert!(
             start.elapsed() >= Duration::from_millis(1400),
             "7 of the 8 drips must pay their 200 ms silence: {:?}",
@@ -769,10 +781,12 @@ mod tests {
     /// The first attempt lands 8 bytes immediately and the writer then
     /// never accepts another byte, so the send must end as `Stalled`
     /// after one full 1 s idle window of total silence past the last
-    /// accepted byte.
+    /// accepted byte. R7-05: what stopped must also be exactly the
+    /// first 8 bytes of a position-distinct payload — a mid-chunk stop
+    /// leaves a prefix of the payload on the wire, never other bytes.
     #[tokio::test(start_paused = true)]
     async fn silent_drip_writer_still_trips_idle() {
-        let data = vec![0xAA; 64];
+        let data: Vec<u8> = (0u8..64).collect();
         let mut w = DripWriter::new(8, Duration::from_millis(200)).stalling_after(8);
 
         let start = tokio::time::Instant::now();
@@ -781,6 +795,11 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, SendProgress::Stalled);
         assert_eq!(w.accepted.len(), 8);
+        assert_eq!(
+            w.accepted,
+            &data[..8],
+            "the stalled send must have accepted exactly the first 8 payload bytes"
+        );
         assert!(
             start.elapsed() >= Duration::from_secs(1),
             "the stall must pay the full idle window: {:?}",
