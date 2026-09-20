@@ -9,6 +9,11 @@
 //!   fragmentation for DPI evasion.
 //! - [`pool`] — a pre-connect TCP pool that keeps warm sockets to each
 //!   upstream, plus a per-upstream concurrency cap.
+//! - [`progress`] — confirmed-write-progress plumbing: the
+//!   [`FlushProgress`](progress::FlushProgress) counter sink and the
+//!   [`ProgressReportingWriter`](progress::ProgressReportingWriter)
+//!   wrapper that reports accepted bytes into it. Shared by the
+//!   tunnel, TLS, and pool layers; no TLS-specific logic.
 //! - [`rating`] — a sand-rating model: every upstream has an accumulator
 //!   that grows on failures and decays over time; the rotator picks
 //!   upstreams with weight inversely proportional to current sand, so
@@ -28,6 +33,7 @@
 
 pub mod connect;
 pub mod pool;
+pub mod progress;
 pub mod rating;
 pub mod rotator;
 pub mod types;

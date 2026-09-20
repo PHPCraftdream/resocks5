@@ -1,4 +1,5 @@
 use super::*;
+use crate::progress::ProgressReportingWriter;
 
 use std::future::Future;
 use tokio::io::AsyncReadExt;

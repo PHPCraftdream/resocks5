@@ -8,8 +8,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
-use crate::connect::tls_fragment::ProgressReportingWriter;
 use crate::pool::proxy_pool::UpstreamStream;
+use crate::progress::ProgressReportingWriter;
 
 /// Object-safe stream trait for the gate-tunnel path: the async halves
 /// plus access to the tunnel's innermost real TCP socket.

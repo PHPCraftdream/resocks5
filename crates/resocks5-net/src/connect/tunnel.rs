@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use super::tls_fragment::{confirmed_scope, FlushProgress};
+use crate::progress::{confirmed_scope, FlushProgress};
 use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
@@ -154,7 +154,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connect::tls_fragment::ProgressReportingWriter;
+    use crate::progress::ProgressReportingWriter;
     use std::future::Future;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 

@@ -2,15 +2,11 @@
 //!
 //! See `docs/ARCHITECTURE.md` for the threat model and limits.
 
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
+
+use crate::progress::{confirmed_scope, FlushProgress};
 
 /// Parameters controlling TLS ClientHello fragmentation.
 ///
@@ -61,134 +57,6 @@ pub enum SendProgress {
     /// window. A partial prefix may already be on the wire — the writer
     /// must be closed, never driven again with the same payload.
     Stalled,
-}
-
-/// Confirmed write progress reported by a writer stack below the layer
-/// that buffers.
-///
-/// This is an instrumentation sink, not a synchronization primitive:
-/// only a successful `poll_write` of `n > 0` bytes by a
-/// [`ProgressReportingWriter`] advances the counter. A bare task wake or
-/// an unresolved `Pending` never moves it, so "the counter advanced"
-/// always means "real bytes were handed to the transport underneath".
-/// `total()` is monotonic.
-#[derive(Debug, Clone, Default)]
-pub struct FlushProgress {
-    counter: Arc<AtomicU64>,
-}
-
-impl FlushProgress {
-    /// Creates an empty sink — zero bytes confirmed so far.
-    pub fn new() -> Self {
-        Self {
-            counter: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Total number of bytes confirmed written underneath the buffering
-    /// layer so far.
-    pub fn total(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed)
-    }
-
-    fn record(&self, n: usize) {
-        if n == 0 {
-            return;
-        }
-        self.counter.fetch_add(n as u64, Ordering::Relaxed);
-    }
-}
-
-tokio::task_local! {
-    pub(crate) static CONFIRMED_WRITE_PROGRESS: FlushProgress;
-}
-
-/// Run `f` with `progress` installed as the confirmed-write sink for
-/// anything polled underneath (i.e. any [`ProgressReportingWriter`]).
-pub(crate) fn confirmed_scope<F: Future>(
-    progress: FlushProgress,
-    f: F,
-) -> impl Future<Output = F::Output> {
-    CONFIRMED_WRITE_PROGRESS.scope(progress, f)
-}
-
-/// `AsyncWrite` wrapper that reports every successful write of `n > 0`
-/// bytes into the enclosing `CONFIRMED_WRITE_PROGRESS` scope, if any.
-///
-/// Meant to sit BELOW a buffering/TLS layer, around the raw transport:
-/// wrap the socket, wrap the buffering layer on top. Outside a
-/// `confirmed_scope` the wrapper is a pure pass-through (reporting is
-/// silently skipped).
-pub struct ProgressReportingWriter<W> {
-    inner: W,
-}
-
-impl<W> ProgressReportingWriter<W> {
-    /// Wraps `inner` so its writes get reported into the enclosing
-    /// confirmed-progress scope.
-    pub fn new(inner: W) -> Self {
-        Self { inner }
-    }
-
-    /// Unwraps back to the inner writer.
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-
-    /// Borrows the inner writer — for `&self`-only reach-through such as
-    /// socket options on the transport underneath a TLS layer.
-    pub fn get_ref(&self) -> &W {
-        &self.inner
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &result {
-            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
-        }
-        result
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if let Poll::Ready(Ok(n)) = &result {
-            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
-        }
-        result
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// Reads pass straight through: the wrapper instruments writes only.
-impl<W: AsyncRead + Unpin> AsyncRead for ProgressReportingWriter<W> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
 }
 
 /// Match `data` against the ClientHello signature
@@ -298,7 +166,8 @@ where
 /// prefix was accepted stays on the wire and the caller must treat the
 /// writer as terminal. The final flush is bounded by the same idle
 /// window, renewed whenever the writer stack underneath a
-/// [`ProgressReportingWriter`] confirms additional bytes reached the
+/// [`ProgressReportingWriter`](crate::progress::ProgressReportingWriter)
+/// confirms additional bytes reached the
 /// transport — a buffered/TLS writer that keeps draining underneath is
 /// not `Stalled` merely for taking longer than one window in total.
 async fn write_progress_bounded<W>(
@@ -342,7 +211,8 @@ where
 /// The flush future is pinned once and NEVER restarted: each
 /// `timeout(idle, ..)` wraps it by reference, so a window expiry drops
 /// only the timeout wrapper and the in-flight flush state underneath
-/// survives. If a window expires but [`FlushProgress::total`] advanced
+/// survives. If a window expires but
+/// [`FlushProgress::total`](crate::progress::FlushProgress::total) advanced
 /// during it — real bytes reached the transport below a buffering/TLS
 /// layer while the outer flush was still unresolved — the window is
 /// renewed, so a slowly-draining writer is never disconnected for
@@ -350,7 +220,8 @@ where
 /// with no confirmed progress, the flush is abandoned with
 /// [`SendProgress::Stalled`]. A bare wake or a plain `Pending` never
 /// renews the window: only reported bytes do. A writer stack without a
-/// [`ProgressReportingWriter`] underneath reports nothing and therefore
+/// [`ProgressReportingWriter`](crate::progress::ProgressReportingWriter)
+/// underneath reports nothing and therefore
 /// keeps the old single-idle-window flush behavior.
 async fn flush_bounded_by_confirmed_progress<W: AsyncWriteExt + Unpin>(
     writer: &mut W,

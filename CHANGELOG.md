@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `ProgressReportingWriter` and `FlushProgress` moved from
+  `connect::tls_fragment` to a new top-level `progress` module. They are
+  generic `AsyncWrite` instrumentation with no TLS-specific logic, and their
+  old home made `pool` depend on `connect` (`AnyUpstream::Tls` is a
+  `TlsStream<ProgressReportingWriter<UpstreamStream>>`) while `connect`
+  already depended on `pool` — a module cycle that blocked gating either
+  half behind a feature. `progress` has no outgoing crate-internal
+  dependencies, so the graph is now acyclic: `pool → {progress, types}`,
+  `connect → {pool, progress, types}`. No deprecated alias is kept at the
+  old path; code naming it gets a compile error with a mechanical fix.
 - `resocks5-net` no longer depends on tokio's `"full"` feature. Each crate now
   declares the tokio features it actually uses; the workspace entry carries
   only the version. The library asks for `net`, `io-util`, `time`, `sync`,

@@ -10,9 +10,9 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::connect::connect_http_proxy::http_connect_handshake;
-use crate::connect::tls_fragment::ProgressReportingWriter;
 use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
+use crate::progress::ProgressReportingWriter;
 use crate::types::ProxyConfig;
 
 /// Establish a tunnel to `target_addr` through an HTTPS proxy.
