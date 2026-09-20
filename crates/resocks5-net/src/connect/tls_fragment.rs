@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 /// Parameters controlling TLS ClientHello fragmentation.
 ///
@@ -134,6 +134,12 @@ impl<W> ProgressReportingWriter<W> {
     pub fn into_inner(self) -> W {
         self.inner
     }
+
+    /// Borrows the inner writer — for `&self`-only reach-through such as
+    /// socket options on the transport underneath a TLS layer.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
@@ -171,6 +177,17 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Reads pass straight through: the wrapper instruments writes only.
+impl<W: AsyncRead + Unpin> AsyncRead for ProgressReportingWriter<W> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 

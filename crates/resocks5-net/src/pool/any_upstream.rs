@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
+use crate::connect::tls_fragment::ProgressReportingWriter;
 use crate::pool::proxy_pool::UpstreamStream;
 
 /// Object-safe stream trait for the gate-tunnel path: the async halves
@@ -89,8 +90,12 @@ pub type BoxedUpstream = Box<dyn AsyncReadWrite>;
 pub enum AnyUpstream {
     /// A plaintext tunnelled socket (SOCKS5 or HTTP CONNECT upstream).
     Plain(UpstreamStream),
-    /// A TLS-wrapped tunnel (HTTPS upstream).
-    Tls(Box<TlsStream<UpstreamStream>>),
+    /// A TLS-wrapped tunnel (HTTPS upstream). The raw transport underneath
+    /// the TLS layer is wrapped in a `ProgressReportingWriter`, so
+    /// confirmed below-TLS write progress is reported into enclosing
+    /// confirmed-progress scopes (idle-bounded sends, tunnel activity
+    /// tracking).
+    Tls(Box<TlsStream<ProgressReportingWriter<UpstreamStream>>>),
     /// A direct `TcpStream` to the target (bypass user, no upstream proxy).
     Direct(TcpStream),
     /// A gate-tunnelled upstream. The stream may be plain, TLS, or
@@ -110,7 +115,7 @@ impl AnyUpstream {
     pub fn as_tcp(&self) -> Option<&TcpStream> {
         match self {
             AnyUpstream::Plain(s) => Some(s.as_tcp()),
-            AnyUpstream::Tls(s) => Some(s.get_ref().0.as_tcp()),
+            AnyUpstream::Tls(s) => Some(s.get_ref().0.get_ref().as_tcp()),
             AnyUpstream::Direct(s) => Some(s),
             AnyUpstream::Gate(s) => s.as_tcp(),
         }
@@ -120,7 +125,7 @@ impl AnyUpstream {
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             AnyUpstream::Plain(s) => s.set_nodelay(nodelay),
-            AnyUpstream::Tls(s) => s.get_ref().0.set_nodelay(nodelay),
+            AnyUpstream::Tls(s) => s.get_ref().0.get_ref().set_nodelay(nodelay),
             AnyUpstream::Direct(s) => s.set_nodelay(nodelay),
             AnyUpstream::Gate(s) => s.set_nodelay(nodelay),
         }
