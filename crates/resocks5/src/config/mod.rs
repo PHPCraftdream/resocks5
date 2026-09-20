@@ -12,31 +12,23 @@
 //! `socks5_ipv6_list.txt`) are migrated automatically on first launch
 //! when the new files don't exist yet.
 
-pub mod auth_config;
-pub mod configs;
-pub mod file_log_config;
+mod configs;
 pub mod load_or_init;
-pub mod main_config;
-pub mod main_path;
-pub mod network_config;
-pub mod proxy_list_config;
-pub mod proxy_list_path;
-pub mod tls_fragment_config;
-pub mod user;
-pub mod users_config;
-pub(crate) mod users_file;
-pub mod users_path;
+mod main;
+mod proxy_list;
+mod users;
 
-pub use auth_config::AuthConfig;
 pub use configs::Configs;
-pub use file_log_config::FileLogConfig;
 pub use load_or_init::load_or_init;
-pub use main_config::MainConfig;
-pub use main_path::MAIN_PATH;
-pub use network_config::NetworkConfig;
-pub use proxy_list_config::ProxyListConfig;
-pub use proxy_list_path::PROXY_LIST_PATH;
-pub use tls_fragment_config::TlsFragmentConfig;
-pub use user::User;
-pub use users_config::UsersConfig;
-pub use users_path::USERS_PATH;
+pub use main::AuthConfig;
+pub use main::FileLogConfig;
+pub use main::MainConfig;
+pub use main::NetworkConfig;
+pub use main::TlsFragmentConfig;
+pub use main::MAIN_PATH;
+pub use proxy_list::ProxyListConfig;
+pub use proxy_list::PROXY_LIST_PATH;
+pub(crate) use users::users_file;
+pub use users::User;
+pub use users::UsersConfig;
+pub use users::USERS_PATH;
