@@ -53,7 +53,7 @@ pub fn client_hello_is_complete(data: &[u8]) -> bool {
     handshake_prefix(data).is_some_and(|prefix| prefix.complete && prefix.kind == Some(0x01))
 }
 
-pub(super) fn client_hello_might_continue(data: &[u8]) -> bool {
+pub(in crate::connect) fn client_hello_might_continue(data: &[u8]) -> bool {
     if data.first().is_some_and(|&kind| kind != HANDSHAKE)
         || data.get(1).is_some_and(|&major| major != 0x03)
     {
@@ -67,7 +67,7 @@ pub(super) fn client_hello_might_continue(data: &[u8]) -> bool {
     }
 }
 
-pub(super) fn handshake_message(data: &[u8]) -> Option<Cow<'_, [u8]>> {
+pub(in crate::connect) fn handshake_message(data: &[u8]) -> Option<Cow<'_, [u8]>> {
     let prefix = handshake_prefix(data)?;
     Some(message_bytes(data, prefix.len))
 }

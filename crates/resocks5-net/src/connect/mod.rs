@@ -4,21 +4,32 @@
 //! proxy's [`ProxyProtocol`](crate::types::ProxyProtocol) to the right
 //! handshake. The lower-level pieces — per-protocol handshakes, a
 //! bidirectional tunneller, TCP keepalive, proxy-string parsing, a default
-//! TLS connector, and ClientHello fragmentation — live in the submodules and
-//! are re-exported here for direct use.
+//! TLS connector, and ClientHello fragmentation — live in the submodules
+//! and are re-exported here for direct use.
+//!
+//! Grouping: [`proxy_connect`] holds the per-protocol connectors and the
+//! protocol dispatcher, [`tls`] the TLS-facing pieces (default connector,
+//! HTTPS upstream, record-layer walking, ClientHello fragmentation), and
+//! [`util`] the small parsing and socket helpers. The group folders are
+//! private; everything stays reachable under the flat `connect::` paths
+//! re-exported below, so external callers are unaffected.
 
-pub mod connect_http_proxy;
-pub mod connect_proxy;
-pub mod connect_socks5_proxy;
-pub mod handshake_over_stream;
-pub mod host_port;
-pub mod parse_proxy_str;
-pub mod recover_host;
-pub mod tcp_keepalive;
-pub mod tls_fragment;
-pub mod tls_records;
+mod proxy_connect;
+mod tls;
 pub mod tunnel;
-pub mod upstream_tls;
+mod util;
+
+pub use proxy_connect::connect_http_proxy;
+pub use proxy_connect::connect_proxy;
+pub use proxy_connect::connect_socks5_proxy;
+pub use tls::tls_fragment;
+pub use tls::tls_records;
+pub use tls::upstream_tls;
+pub use util::handshake_over_stream;
+pub use util::host_port;
+pub use util::parse_proxy_str;
+pub use util::recover_host;
+pub use util::tcp_keepalive;
 
 pub use connect_http_proxy::connect_http_proxy;
 pub use connect_http_proxy::http_connect_handshake;
