@@ -11,7 +11,9 @@
 
 use std::collections::{hash_map::RandomState, BTreeSet, HashMap};
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "test-instrumentation")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,10 +179,14 @@ pub struct ProxyRotator {
     sticky: Mutex<StickyCache>,
     /// Sand-model ratings for weighted-random proxy selection.
     ratings: Ratings,
-    /// Diagnostic count of `pick_order()` invocations. Always
-    /// compiled — a `#[cfg(test)]` field would be invisible to tests
-    /// in dependent crates. Test/diagnostic only: nothing in
-    /// production reads it.
+    /// Diagnostic count of `pick_order()` invocations. Compiled only
+    /// with the `test-instrumentation` feature — a bare `#[cfg(test)]`
+    /// field would be invisible to tests in dependent crates, and an
+    /// always-compiled field would tax every production route-order
+    /// selection with an unused atomic RMW. Dependents enable the
+    /// feature from their `[dev-dependencies]`. Test/diagnostic only:
+    /// nothing in production reads it.
+    #[cfg(feature = "test-instrumentation")]
     pick_order_calls: AtomicU64,
 }
 
@@ -236,6 +242,7 @@ impl ProxyRotator {
             index: AtomicUsize::new(0),
             sticky: Mutex::new(StickyCache::new(max_entries, ttl)),
             ratings: Ratings::new(n, policy),
+            #[cfg(feature = "test-instrumentation")]
             pick_order_calls: AtomicU64::new(0),
         }
     }
@@ -318,6 +325,7 @@ impl ProxyRotator {
 
     /// Returns proxies in weighted-random order via the sand model.
     pub fn pick_order(&self) -> Vec<Arc<ProxyConfig>> {
+        #[cfg(feature = "test-instrumentation")]
         self.pick_order_calls.fetch_add(1, Ordering::Relaxed);
         self.ratings
             .pick_order()
@@ -330,8 +338,10 @@ impl ProxyRotator {
     /// [`ProxyRotator::pick_order`] has been called on this rotator.
     /// Hidden from docs; nothing in production consumes it — it exists
     /// so tests in dependent crates can assert that budget
-    /// exhaustion skips order building.
+    /// exhaustion skips order building. Compiled only with the
+    /// `test-instrumentation` feature.
     #[doc(hidden)]
+    #[cfg(feature = "test-instrumentation")]
     pub fn pick_order_calls(&self) -> u64 {
         self.pick_order_calls.load(Ordering::Relaxed)
     }

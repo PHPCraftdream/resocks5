@@ -31,3 +31,7 @@ ktav.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Rotator test instrumentation for this crate's own test binary.
+# Cargo enables dev-dependency features automatically for `cargo test`
+# (debug and release alike) and never for ordinary non-test builds.
+resocks5-net = { path = "../resocks5-net", features = ["test-instrumentation"] }

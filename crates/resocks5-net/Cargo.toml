@@ -10,6 +10,15 @@ repository.workspace = true
 keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
 categories = ["network-programming"]
 
+[features]
+# Test-only instrumentation for cross-crate test observability: exposes
+# the rotator's `pick_order_calls()` diagnostic counter. Dependents
+# enable it from their `[dev-dependencies]` (cargo turns dev-dep
+# features on automatically for their `cargo test` builds); it is NOT
+# a default feature, so ordinary release builds compile the counter
+# to nothing.
+test-instrumentation = []
+
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true
