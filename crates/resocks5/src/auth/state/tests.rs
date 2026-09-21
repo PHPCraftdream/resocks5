@@ -79,9 +79,17 @@ fn build_state_with_disk_file(users: Vec<User>, allow_anonymous: bool) -> (AuthS
 /// `guard`. Guards are sized several SECONDS — well above the worst
 /// Argon2id-under-load stretches observed on this machine (hashing
 /// degrades from ~15 ms to multiple seconds under concurrent CPU
-/// load) — so the timeout fires only when the event is genuinely
-/// missing (seam removed or guarded region restructured), never
-/// because hashing was slow.
+/// load).
+///
+/// A slow hash can make an event unreachable rather than merely
+/// late, and no guard size fixes that: `prepare_claim` resolves a
+/// racer inline when the winner published while it was hashing, so
+/// that racer never reaches `claim_commit` and never emits. Callers
+/// must keep the winner from publishing until they have observed
+/// what they are waiting for — see the signal-driven phase A in
+/// `init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner`.
+/// Sizing the guard against hashing speed alone is exactly what made
+/// that test fail ~50% of the time in a loaded full-suite run.
 fn wait_for_claim_event(
     rx: &mut std::sync::mpsc::Receiver<&'static str>,
     expected: &'static str,
@@ -96,6 +104,45 @@ fn wait_for_claim_event(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 panic!("claim probe: {what} did not happen within {guard:?}")
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("claim probe: channel closed before {expected:?} ({what})")
+            }
+        }
+    }
+}
+
+/// Like `wait_for_claim_event`, but returns after `expected` has
+/// arrived `count` times and records EVERY event it received into
+/// `sink` along the way.
+///
+/// Collecting matters whenever a later assertion counts a different
+/// event than the awaited one: `persist_region_entered` legitimately
+/// interleaves with the two `claim_commit_entered` arrivals, and a
+/// plain wait would consume and discard it, leaving the persistence
+/// check unable to tell "the winner persisted once" from "nobody
+/// persisted at all".
+fn collect_claim_events_until(
+    rx: &mut std::sync::mpsc::Receiver<&'static str>,
+    sink: &mut Vec<&'static str>,
+    expected: &'static str,
+    count: usize,
+    guard: std::time::Duration,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + guard;
+    let mut seen = 0usize;
+    while seen < count {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(event) => {
+                sink.push(event);
+                if event == expected {
+                    seen += 1;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "claim probe: {what} did not happen within {guard:?} \
+                 (saw {seen} of {count}; events so far: {sink:?})"
+            ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("claim probe: channel closed before {expected:?} ({what})")
             }
@@ -561,12 +608,14 @@ fn init_claim_concurrent_same_password_both_win() {
 fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
     // R6-01: two concurrent logins with the SAME correct password.
     // A helper thread pins the cross-process users-file lock in two
-    // phases. Phase A (3 s) parks the first claimer inside
-    // persist_claim, so the second login queues on claim_lock behind
-    // it and both pass the pre-mutex init check. Phase B starts 5 s
-    // after A is released — the winner only needs to notice the file
-    // lock is free and grab it sometime in that window, which costs
-    // real milliseconds once scheduled, but this machine can see
+    // phases. Phase A parks the first claimer inside persist_claim,
+    // so the second login queues on claim_lock behind it and both
+    // pass the pre-mutex init check. Phase A ends on a SIGNAL from
+    // this thread, not on a timer: it is released only once both
+    // racers have been observed entering claim_commit. Phase B starts
+    // 5 s after A is released — the winner only needs to notice the
+    // file lock is free and grab it sometime in that window, which
+    // costs real milliseconds once scheduled, but this machine can see
     // multi-second scheduling latency under heavy concurrent CPU
     // load from sibling cargo processes (same class as the Argon2id
     // degradation noted elsewhere in this file); a 200 ms gap was
@@ -581,7 +630,7 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
     // entering persistence.
     // The deterministic companion test below scripts the winner's commit directly.
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let (mut state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
     let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
@@ -589,13 +638,30 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
     let state = Arc::new(state);
 
     let (locked_tx, locked_rx) = mpsc::channel::<()>();
+    let (release_a_tx, release_a_rx) = mpsc::channel::<()>();
     let holder_path = path.clone();
     let holder = std::thread::spawn(move || {
         let phase_a =
             UsersFileLock::acquire_with_timeout(Path::new(&holder_path), Duration::from_secs(5))
                 .expect("holder must acquire the users-file lock (phase A)");
         locked_tx.send(()).expect("signal phase-A lock held");
-        std::thread::sleep(Duration::from_secs(3));
+        // Phase A ends on a signal, never on a timer. The window it
+        // holds open is the entire point of the test: the winner
+        // cannot publish its hash while its persist is parked here,
+        // and only an unpublished hash keeps the loser out of
+        // prepare_claim's pre-mutex fast path. A fixed 3 s sleep
+        // silently made the test require the loser's ABSOLUTE
+        // Argon2id time to fit inside that sleep. Under concurrent
+        // CPU load hashing degrades from ~15 ms to seconds, the loser
+        // then found a published hash, resolved inline, never entered
+        // claim_commit at all, and the wait below timed out on an
+        // event that could no longer ever arrive — a hard failure, in
+        // ~50% of loaded full-suite runs, that looked like flakiness
+        // but was this ordering assumption. Releasing on the probe
+        // instead reduces the requirement to the DIFFERENCE between
+        // the two racers' hashes, which load barely affects since
+        // both hash concurrently.
+        let _ = release_a_rx.recv();
         drop(phase_a); // the winner's persist completes in the gap below
         std::thread::sleep(Duration::from_secs(5));
         let phase_b =
@@ -620,60 +686,60 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
 
     let s1 = Arc::clone(&state);
     let s2 = Arc::clone(&state);
-    let t1 = std::thread::spawn(move || {
-        let started = Instant::now();
-        (s1.verify("bob", "same-pw"), started.elapsed())
-    });
-    let t2 = std::thread::spawn(move || {
-        let started = Instant::now();
-        (s2.verify("bob", "same-pw"), started.elapsed())
-    });
+    let t1 = std::thread::spawn(move || s1.verify("bob", "same-pw"));
+    let t2 = std::thread::spawn(move || s2.verify("bob", "same-pw"));
     // R7-04: anchor to the probe, not to hope. BOTH racers must
     // reach claim_commit — each emits claim_commit_entered as the
     // first statement of claim_commit, so a racer that resolved via
-    // the pre-mutex fast path (its hashing finished only after the
-    // winner had already committed) never emits a second event and
-    // the second wait fails loudly instead of letting the test pass
-    // without ever exercising the post-mutex re-check. The winner's
-    // persist_region_entered may legitimately arrive between the two
-    // events and is ignored here. Guards are 15 s: each arrival
-    // requires one real Argon2id hash, which stretches to multiple
-    // seconds under concurrent CPU load (see the machine-load note),
-    // and the loser must additionally land while the winner is
-    // parked in persist_claim (phase A pins the users-file lock for
-    // 3 s).
-    wait_for_claim_event(
+    // the pre-mutex fast path never emits a second event and this
+    // fails loudly instead of letting the test pass without ever
+    // exercising the post-mutex re-check. Events are COLLECTED, not
+    // merely awaited: the winner's persist_region_entered
+    // legitimately interleaves with the two, and the persistence
+    // check below counts it. The guard is generous because it now
+    // bounds only "did the seam fire at all" — phase A stays held
+    // until this returns, so no amount of Argon2id slowness can make
+    // the awaited event unreachable the way a fixed sleep could.
+    let mut events = Vec::new();
+    collect_claim_events_until(
         &mut claim_rx,
+        &mut events,
         "claim_commit_entered",
-        Duration::from_secs(15),
-        "the first claimant reaching claim_commit",
+        2,
+        Duration::from_secs(60),
+        "both claimants reaching claim_commit (neither may resolve via \
+         the pre-mutex fast path)",
     );
-    wait_for_claim_event(
-        &mut claim_rx,
-        "claim_commit_entered",
-        Duration::from_secs(15),
-        "the second claimant reaching claim_commit (it must queue on \
-         claim_lock, not resolve via the pre-mutex fast path)",
-    );
-    let (r1, e1) = t1.join().unwrap();
-    let (r2, e2) = t2.join().unwrap();
+    // Both racers are now past the fast-path check — one holding
+    // claim_lock, one queued on it — so releasing phase A can no
+    // longer let the winner publish ahead of the loser's check.
+    release_a_tx.send(()).expect("release phase A");
+
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
     assert!(r1, "the winning login must succeed");
     assert!(r2, "the loser must verify against the winner's hash");
 
-    // Timing bound (Argon2id on loaded machines can degrade from
-    // ~15 ms to multiple seconds — see the machine-load note):
-    // ANY persistence detour costs at least phase A (3 s, queued on
-    // claim_lock or parked on the file lock) plus the 10 s
-    // LOCK_TIMEOUT against the phase-B pin — a ≥13 s floor — so
-    // <12 s total proves no persistence attempt was made, while
-    // still allowing each of the two Argon2id operations ~4 s under
-    // heavy CPU load. The final-state asserts below are the
-    // authoritative clobber check; this bound is the fast companion.
-    assert!(e1 < Duration::from_secs(12), "winner elapsed {e1:?}");
-    assert!(
-        e2 < Duration::from_secs(12),
-        "loser elapsed {e2:?} — looks like it entered persistence and \
-         waited out the pinned users-file lock"
+    // Whatever the racers emitted after the collection above returned.
+    while let Ok(event) = claim_rx.try_recv() {
+        events.push(event);
+    }
+    // The authoritative "no persistence detour" check. It replaces an
+    // earlier wall-clock bound (<12 s per racer) that only INFERRED
+    // the same thing from elapsed time and therefore had to assume
+    // how slow Argon2id may get. persist_region_entered fires
+    // immediately before the call into persist_claim, so counting it
+    // measures the property directly: exactly one racer — the winner
+    // — may enter the persist region, while the fixed loser re-checks
+    // after claim_lock and returns without ever reaching it.
+    let persist_entries = events
+        .iter()
+        .filter(|event| **event == "persist_region_entered")
+        .count();
+    assert_eq!(
+        persist_entries, 1,
+        "exactly one racer (the winner) may enter the persist region, \
+         saw {persist_entries}; probe events: {events:?}"
     );
 
     // Final state: the winner's commit is intact everywhere and
