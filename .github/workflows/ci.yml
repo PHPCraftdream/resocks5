@@ -68,3 +68,93 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --workspace --locked
+
+  # The workspace jobs above never compile resocks5-net with a feature off:
+  # the binary enables tls/serde/rating/rotator in [dependencies] (and
+  # test-instrumentation in [dev-dependencies] for its test builds), and cargo
+  # unifies features across a workspace build. This matrix pins the library's
+  # feature combinations directly on `-p resocks5-net`, which cannot see the
+  # binary's feature choices.
+  #
+  # Single-feature builds are the point: a #[cfg] that silently depends on a
+  # sibling feature compiles fine both all-on and all-off and breaks only in
+  # between — that bug class happened here once (test-instrumentation gated
+  # code living inside the rotator module) and only a single-feature build
+  # catches it.
+  #
+  # cargo test (not check/build) per combination: it compiles the same package
+  # graph a check would (lib + unit + integration + doctests, plus the
+  # required-features-gated example when its feature is on) and then runs the
+  # tests, so a separate check step would double compile time for zero added
+  # coverage while leaving broken #[cfg(test)] gating invisible.
+  #
+  # The global RUSTFLAGS=-D warnings applies here too, so feature-off builds
+  # must also stay warning-free (dead code / unused imports appear only when
+  # a feature is off).
+  #
+  # ubuntu-only: feature gating is cfg(feature), orthogonal to the OS matrix
+  # the `test` job already covers.
+  #
+  # Hand-maintained on purpose: cargo-hack --feature-powerset over five
+  # features is 32 serial runs in one job (its implied-feature pairs like
+  # {rotator} == {rating, rotator} do not collapse), and it would add a
+  # third-party action (taiki-e/install-action) to the trust base. The cost
+  # of this shape: when you add a feature to resocks5-net, add a row below.
+  net-features:
+    name: net features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lean
+            args: --no-default-features
+          - name: tls
+            args: --no-default-features --features tls
+          - name: serde
+            args: --no-default-features --features serde
+          - name: rating
+            args: --no-default-features --features rating
+          - name: rotator
+            args: --no-default-features --features rotator
+          - name: test-instrumentation
+            args: --no-default-features --features test-instrumentation
+          - name: default
+            args: ""
+          - name: all
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p resocks5-net ${{ matrix.args }} --locked
+
+  # Lean clippy for the library: dead-code and unused-import lints surface
+  # only in feature-off builds, and the workspace `lint` job always sees
+  # every feature on (unified through the binary). The matrix above already
+  # denies rustc warnings via the global RUSTFLAGS; this adds the clippy-only
+  # lint set on the lean path.
+  clippy-net-lean:
+    name: clippy (net, no default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p resocks5-net --no-default-features --all-targets --locked -- -D warnings
+
+  # Lean docs for the library: the `doc` job always builds with every feature
+  # on, but gated items break intra-doc links exactly when the feature is
+  # off. Same RUSTDOCFLAGS=-D warnings discipline as the `doc` job.
+  doc-net-lean:
+    name: cargo doc (net, no default features)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc -p resocks5-net --no-default-features --no-deps --locked
