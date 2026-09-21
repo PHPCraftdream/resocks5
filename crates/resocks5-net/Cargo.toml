@@ -18,20 +18,42 @@ categories = ["network-programming"]
 # stay SOCKS5/HTTP-only; an HTTPS upstream requested then is a runtime
 # error naming the missing feature, never a silent plaintext fallback.
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+# Serde derives on `pool::PoolConfig` — the crate's only serde touchpoint.
+# The `dep:` form keeps serde from leaking an implicit feature name.
+# Builds without it drop serde and its proc-macro compile chain entirely;
+# the struct is unchanged apart from the derives (still `Debug`, `Clone`,
+# `Default`, and constructible by hand).
+serde = ["dep:serde"]
+# The sand-rating model (`rating` module): per-upstream exponential-decay
+# failure accumulators driving weighted-random selection. Uses only
+# `std` and `anyhow`, so opting out shrinks the public API surface and
+# compile time, not the dependency graph.
+rating = []
+# The rotator (`rotator` module): weighted-random rotation with a bounded
+# per-target sticky cache, driven by the rating model. Implies `rating`.
+rotator = ["rating"]
 # Today's behaviour for anyone who does not opt out.
-default = ["tls"]
+default = ["tls", "serde", "rating", "rotator"]
 # Test-only instrumentation for cross-crate test observability: exposes
-# the rotator's `pick_order_calls()` diagnostic counter. Dependents
+# the rotator's `pick_order_calls()` diagnostic counter. The counter
+# lives inside the rotator, so the feature implies `rotator`. Dependents
 # enable it from their `[dev-dependencies]` (cargo turns dev-dep
 # features on automatically for their `cargo test` builds); it is NOT
 # a default feature, so ordinary release builds compile the counter
 # to nothing.
-test-instrumentation = []
+test-instrumentation = ["rotator"]
+
+# The README-mirrored example rotates through `ProxyRotator`, so it is
+# only built when the rotator is compiled in; cargo skips the target
+# otherwise, keeping lean `--no-default-features` builds example-clean.
+[[example]]
+name = "connect_through_proxy"
+required-features = ["rotator"]
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 anyhow.workspace = true
-serde.workspace = true
+serde = { workspace = true, optional = true }
 base64.workspace = true
 socket2.workspace = true
 tokio-rustls = { workspace = true, optional = true }

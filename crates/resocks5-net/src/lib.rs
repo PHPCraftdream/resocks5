@@ -14,12 +14,18 @@
 //!   [`ProgressReportingWriter`](progress::ProgressReportingWriter)
 //!   wrapper that reports accepted bytes into it. Shared by the
 //!   tunnel, TLS, and pool layers; no TLS-specific logic.
-//! - [`rating`] — a sand-rating model: every upstream has an accumulator
-//!   that grows on failures and decays over time; the rotator picks
-//!   upstreams with weight inversely proportional to current sand, so
-//!   bad upstreams are deprioritised without ever being fully excluded.
-//! - [`rotator`] — weighted-random rotation over a set of upstreams,
-//!   driven by [`rating`].
+#![cfg_attr(
+    feature = "rating",
+    doc = "- [`rating`] — a sand-rating model: every upstream has an accumulator",
+    doc = "  that grows on failures and decays over time; the rotator picks",
+    doc = "  upstreams with weight inversely proportional to current sand, so",
+    doc = "  bad upstreams are deprioritised without ever being fully excluded."
+)]
+#![cfg_attr(
+    feature = "rotator",
+    doc = "- [`rotator`] — weighted-random rotation over a set of upstreams,",
+    doc = "  driven by [`rating`]."
+)]
 //! - [`types`] — the shared proxy descriptors ([`types::ProxyConfig`],
 //!   [`types::ProxyProtocol`], [`types::IP`]).
 //!
@@ -34,6 +40,8 @@
 pub mod connect;
 pub mod pool;
 pub mod progress;
+#[cfg(feature = "rating")]
 pub mod rating;
+#[cfg(feature = "rotator")]
 pub mod rotator;
 pub mod types;

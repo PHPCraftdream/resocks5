@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TLS stack. ClientHello fragmentation (`connect::tls_fragment`) stays
   available without the feature — it fragments raw bytes and never links
   the TLS stack.
+- `serde` Cargo feature on `resocks5-net` (on by default): the `serde`
+  dependency and the `Serialize`/`Deserialize` derives on `pool::PoolConfig`
+  — the crate's only serde touchpoint — are now optional. Consumers that
+  build their own config plumbing can build with `default-features = false`
+  (plus the features they do want) and drop serde and its proc-macro
+  compile chain from their build entirely. Without the feature the struct
+  is unchanged apart from the derives: still `Debug`, `Clone` and
+  `Default`, still constructible and mutable by hand, and the `Default`
+  values match what serde's field defaults produce.
+- `rating` and `rotator` Cargo features on `resocks5-net` (on by default;
+  `rotator` implies `rating`): the sand-rating model and the weighted
+  rotator built on it are now optional for consumers that want only the
+  connectors and the pool. The honest limits, unlike `tls` and `serde`:
+  this removes no dependency from the graph — both modules use only `std`
+  and `anyhow`, which the crate needs anyway — so the win is a smaller
+  public API surface and less to compile, nothing more. The
+  `test-instrumentation` feature now implies `rotator` (its
+  `pick_order_calls()` counter lives inside the rotator), and the
+  README-mirrored example declares `required-features = ["rotator"]` so
+  lean builds skip it instead of failing.
 
 ### Changed
 

@@ -33,6 +33,16 @@ no authentication.
   silent plaintext fallback. TLS ClientHello fragmentation stays available
   without the feature: it fragments raw bytes and links none of the TLS
   stack.
+- `serde` (**enabled by default**): the `Serialize`/`Deserialize` derives on
+  `pool::PoolConfig`, the crate's only serde touchpoint. Consumers that
+  build their own config plumbing opt out with `default-features = false`
+  and drop serde and its proc-macro compile chain; the struct itself —
+  `Debug`, `Clone`, `Default`, hand-construction — is unchanged.
+- `rating` / `rotator` (**enabled by default**; `rotator` implies
+  `rating`): the sand-rating model and the weighted rotator that drives
+  upstream selection. Connector/pool-only consumers can opt out for a
+  smaller public API and less to compile. Unlike `tls` and `serde` this
+  removes no dependency — both modules are `std` + `anyhow` only.
 
 ## Usage
 

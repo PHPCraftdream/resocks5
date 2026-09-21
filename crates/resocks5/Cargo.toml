@@ -11,7 +11,7 @@ keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-resocks5-net = { path = "../resocks5-net", features = ["tls"] }
+resocks5-net = { path = "../resocks5-net", features = ["tls", "serde", "rating", "rotator"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true
 serde.workspace = true
