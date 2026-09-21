@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Breaking:** `ProxyConfig`'s `Debug` output no longer prints `user` or
+  `password` in clear text. Both fields previously came from a plain
+  `#[derive(Debug)]`, so any ordinary debug log, `dbg!`, tracing field, or
+  panic diagnostic containing a `ProxyConfig` leaked proxy credentials —
+  recursively through a nested `gate`, at any depth. The new hand-written
+  `Debug` impl shows `protocol`/`ip`/`host`/`port`/`is_gate`/`gate` as
+  before and renders `user`/`password` as `Some("<redacted>")` or `None`
+  — presence is visible for diagnostics, values never are. Pre-existing
+  defect, not a regression from this release cycle.
+
 - **Breaking (fixes a worse break):** `connect_proxy` and `connect_proxy_once`
   now take a `tls_connector: Option<&TlsConnector>` argument under every
   build of `resocks5-net`, feature-gated or not. Previously that parameter
