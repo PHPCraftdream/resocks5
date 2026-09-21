@@ -2,8 +2,10 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
 
+#[cfg(feature = "tls")]
 use crate::connect::upstream_tls::connect_https_proxy;
 use crate::connect::{connect_http_proxy, connect_socks5_proxy};
 use crate::pool::{AnyUpstream, PoolConfig, ProxyPool};
@@ -11,18 +13,27 @@ use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Connect to `target_addr` through `proxy`, dispatching on its protocol.
 ///
-/// SOCKS5 and HTTP CONNECT return an [`AnyUpstream::Plain`]; HTTPS
-/// (TLS-wrapped CONNECT) wraps the stream in TLS and returns
-/// [`AnyUpstream::Tls`]. `tls_connector` is required for HTTPS upstreams and
-/// ignored otherwise — pass `None` unless the pool contains HTTPS proxies. A
-/// ready-made connector is available from
-/// [`make_tls_connector`](crate::connect::make_tls_connector).
+/// SOCKS5 and HTTP CONNECT return an [`AnyUpstream::Plain`].
+#[cfg_attr(
+    feature = "tls",
+    doc = "HTTPS (TLS-wrapped CONNECT) wraps the stream in TLS and returns [`AnyUpstream::Tls`]."
+)]
+#[cfg_attr(feature = "tls", doc = "")]
+#[cfg_attr(
+    feature = "tls",
+    doc = "`tls_connector` is required for HTTPS upstreams and ignored otherwise — pass `None` unless the pool contains HTTPS proxies. A ready-made connector is available from [`make_tls_connector`](crate::connect::make_tls_connector)."
+)]
+#[cfg_attr(not(feature = "tls"), doc = "")]
+#[cfg_attr(
+    not(feature = "tls"),
+    doc = "HTTPS (TLS-wrapped CONNECT) needs the crate's `tls` feature (on by default). Built without it, an HTTPS upstream is rejected with an error naming the missing feature — never a silent plaintext fallback — and this function takes no `tls_connector` argument."
+)]
 pub async fn connect_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
-    tls_connector: Option<&TlsConnector>,
+    #[cfg(feature = "tls")] tls_connector: Option<&TlsConnector>,
 ) -> anyhow::Result<AnyUpstream> {
     match proxy.protocol {
         ProxyProtocol::Socks5 => {
@@ -34,11 +45,23 @@ pub async fn connect_proxy(
             Ok(AnyUpstream::Plain(s))
         }
         ProxyProtocol::Https => {
-            let connector = tls_connector
-                .ok_or_else(|| anyhow::anyhow!("HTTPS upstream requires TLS connector"))?;
-            let s =
-                connect_https_proxy(target_addr, proxy, pool, handshake_timeout, connector).await?;
-            Ok(AnyUpstream::Tls(Box::new(s)))
+            #[cfg(feature = "tls")]
+            {
+                let connector = tls_connector
+                    .ok_or_else(|| anyhow::anyhow!("HTTPS upstream requires TLS connector"))?;
+                let s = connect_https_proxy(target_addr, proxy, pool, handshake_timeout, connector)
+                    .await?;
+                Ok(AnyUpstream::Tls(Box::new(s)))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                Err(anyhow::anyhow!(
+                    "HTTPS upstream to {} requested, but resocks5-net was built without the \
+                     `tls` feature; enable it (`features = [\"tls\"]`, on by default) to dial \
+                     TLS-wrapped CONNECT upstreams — refusing to fall back to plaintext",
+                    proxy.host
+                ))
+            }
         }
     }
 }
@@ -50,9 +73,9 @@ pub async fn connect_proxy(
 /// Prefer this over [`connect_proxy`] when calls are independent: a one-off
 /// tunnel, a script dialing through exactly one upstream, or any consumer
 /// with no rotation and no interest in warm-socket reuse. It delegates to
-/// the same per-protocol handshakes (SOCKS5, HTTP CONNECT, HTTPS via
-/// `tls_connector`), returns the same [`AnyUpstream`] variants, and fails
-/// with the same errors; only the pool plumbing differs.
+/// the same per-protocol handshakes (SOCKS5, HTTP CONNECT, HTTPS — the
+/// last behind the crate's `tls` feature), returns the same [`AnyUpstream`]
+/// variants, and fails with the same errors; only the pool plumbing differs.
 ///
 /// The cost is per call: every invocation pays a fresh TCP handshake to the
 /// proxy — nothing is pre-warmed or reused across calls — and a throwaway,
@@ -85,7 +108,10 @@ pub async fn connect_proxy(
 ///     &proxy,
 ///     Duration::from_secs(10), // TCP dial timeout
 ///     Duration::from_secs(10), // SOCKS5 handshake timeout
-///     None,                    // TLS connector — only needed for HTTPS upstreams
+#[cfg_attr(
+    feature = "tls",
+    doc = "    None,                    // TLS connector — only needed for HTTPS upstreams"
+)]
 /// )
 /// .await?;
 /// drop(stream);
@@ -97,7 +123,7 @@ pub async fn connect_proxy_once(
     proxy: &ProxyConfig,
     connect_timeout: Duration,
     handshake_timeout: Duration,
-    tls_connector: Option<&TlsConnector>,
+    #[cfg(feature = "tls")] tls_connector: Option<&TlsConnector>,
 ) -> anyhow::Result<AnyUpstream> {
     // Throwaway disabled pool: `PoolConfig::default()` has `enabled =
     // false`, so no refill task is spawned and no warm socket is ever
@@ -106,7 +132,11 @@ pub async fn connect_proxy_once(
     // for this one call and one `acquire`, so its per-upstream cap can
     // never bind.
     let pool = ProxyPool::new(PoolConfig::default(), connect_timeout, 1);
-    connect_proxy(target_addr, proxy, &pool, handshake_timeout, tls_connector).await
+    #[cfg(feature = "tls")]
+    let upstream = connect_proxy(target_addr, proxy, &pool, handshake_timeout, tls_connector).await;
+    #[cfg(not(feature = "tls"))]
+    let upstream = connect_proxy(target_addr, proxy, &pool, handshake_timeout).await;
+    upstream
 }
 
 #[cfg(test)]
@@ -164,12 +194,22 @@ mod tests {
         let client = async {
             // No `ProxyPool` constructed anywhere in this test: the
             // entry point must connect with the caller holding none.
+            #[cfg(feature = "tls")]
             let mut stream = connect_proxy_once(
                 "1.2.3.4:443",
                 &config,
                 Duration::from_secs(2),
                 Duration::from_secs(2),
                 None,
+            )
+            .await
+            .unwrap();
+            #[cfg(not(feature = "tls"))]
+            let mut stream = connect_proxy_once(
+                "1.2.3.4:443",
+                &config,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
             )
             .await
             .unwrap();
@@ -200,12 +240,22 @@ mod tests {
             sock.shutdown().await.unwrap();
         };
         let client = async {
+            #[cfg(feature = "tls")]
             let mut stream = connect_proxy_once(
                 "1.2.3.4:443",
                 &config,
                 Duration::from_secs(2),
                 Duration::from_secs(2),
                 None,
+            )
+            .await
+            .unwrap();
+            #[cfg(not(feature = "tls"))]
+            let mut stream = connect_proxy_once(
+                "1.2.3.4:443",
+                &config,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
             )
             .await
             .unwrap();

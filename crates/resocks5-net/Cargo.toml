@@ -11,6 +11,15 @@ keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
 categories = ["network-programming"]
 
 [features]
+# TLS upstream support: the HTTPS (TLS-wrapped CONNECT) connector, the
+# default Mozilla-root-store `TlsConnector`, and the `AnyUpstream::Tls`
+# variant. The `dep:` form keeps the optional crates from leaking
+# implicit features into the public feature surface. Builds without it
+# stay SOCKS5/HTTP-only; an HTTPS upstream requested then is a runtime
+# error naming the missing feature, never a silent plaintext fallback.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+# Today's behaviour for anyone who does not opt out.
+default = ["tls"]
 # Test-only instrumentation for cross-crate test observability: exposes
 # the rotator's `pick_order_calls()` diagnostic counter. Dependents
 # enable it from their `[dev-dependencies]` (cargo turns dev-dep
@@ -25,9 +34,9 @@ anyhow.workspace = true
 serde.workspace = true
 base64.workspace = true
 socket2.workspace = true
-tokio-rustls.workspace = true
-rustls.workspace = true
-webpki-roots.workspace = true
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 dashmap.workspace = true
 crossbeam-queue.workspace = true
 

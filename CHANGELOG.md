@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cost is per call — a fresh TCP handshake to the proxy every time, and no
   shared per-upstream concurrency cap, so callers that fan out concurrently
   against the same proxy must bound that themselves.
+- `tls` Cargo feature on `resocks5-net` (on by default): the `rustls`,
+  `tokio-rustls` and `webpki-roots` dependencies, the HTTPS upstream
+  connector with `make_tls_connector`, and the `AnyUpstream::Tls` variant
+  are now optional. Consumers that only dial SOCKS5 or HTTP CONNECT
+  upstreams can build with `default-features = false` and skip the whole
+  TLS stack. ClientHello fragmentation (`connect::tls_fragment`) stays
+  available without the feature — it fragments raw bytes and never links
+  the TLS stack.
 
 ### Changed
 
@@ -41,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files — and drops only `process` and `parking_lot`. `Cargo.lock` loses the
   `parking_lot` node, which was reachable solely through `"full"`; no
   dependency version changed.
+- **Breaking for feature-off builds only:** with `tls` disabled,
+  `connect_proxy`/`connect_proxy_once` lose their trailing
+  `tls_connector: Option<&TlsConnector>` argument, and an HTTPS upstream
+  is rejected with an error naming the missing feature instead of
+  silently falling back to plaintext. With the default features the
+  signatures are unchanged; the `resocks5` binary now enables the feature
+  explicitly (`resocks5-net = { ..., features = ["tls"] }`). The
+  `ProxyProtocol::Https` enum variant itself stays ungated, so config
+  parsing does not change shape with features.
 
 ## [0.1.1] - 2026-06-23
 

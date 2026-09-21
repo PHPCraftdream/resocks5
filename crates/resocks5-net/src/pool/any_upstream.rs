@@ -6,16 +6,18 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
 use tokio_rustls::client::TlsStream;
 
 use crate::pool::proxy_pool::UpstreamStream;
+#[cfg(feature = "tls")]
 use crate::progress::ProgressReportingWriter;
 
 /// Object-safe stream trait for the gate-tunnel path: the async halves
 /// plus access to the tunnel's innermost real TCP socket.
 ///
 /// Implemented individually for exactly the shapes a gate tunnel can
-/// produce — [`UpstreamStream`], [`TlsStream`] over a nested
+/// produce — [`UpstreamStream`], `TlsStream` over a nested
 /// [`AsyncReadWrite`], `Box<T>`, and a raw [`TcpStream`] — so
 /// `as_tcp`/`set_nodelay` keep reaching the gate socket through up to
 /// two TLS layers. There is deliberately NO blanket impl: the socket
@@ -40,6 +42,7 @@ impl AsyncReadWrite for UpstreamStream {
     }
 }
 
+#[cfg(feature = "tls")]
 impl<S: AsyncReadWrite> AsyncReadWrite for TlsStream<S> {
     fn as_tcp(&self) -> Option<&TcpStream> {
         self.get_ref().0.as_tcp()
@@ -95,6 +98,7 @@ pub enum AnyUpstream {
     /// confirmed below-TLS write progress is reported into enclosing
     /// confirmed-progress scopes (idle-bounded sends, tunnel activity
     /// tracking).
+    #[cfg(feature = "tls")]
     Tls(Box<TlsStream<ProgressReportingWriter<UpstreamStream>>>),
     /// A direct `TcpStream` to the target (bypass user, no upstream proxy).
     Direct(TcpStream),
@@ -115,6 +119,7 @@ impl AnyUpstream {
     pub fn as_tcp(&self) -> Option<&TcpStream> {
         match self {
             AnyUpstream::Plain(s) => Some(s.as_tcp()),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => Some(s.get_ref().0.get_ref().as_tcp()),
             AnyUpstream::Direct(s) => Some(s),
             AnyUpstream::Gate(s) => s.as_tcp(),
@@ -125,6 +130,7 @@ impl AnyUpstream {
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             AnyUpstream::Plain(s) => s.set_nodelay(nodelay),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => s.get_ref().0.get_ref().set_nodelay(nodelay),
             AnyUpstream::Direct(s) => s.set_nodelay(nodelay),
             AnyUpstream::Gate(s) => s.set_nodelay(nodelay),
@@ -140,6 +146,7 @@ impl AsyncRead for AnyUpstream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AnyUpstream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => Pin::new(s).poll_read(cx, buf),
             AnyUpstream::Direct(s) => Pin::new(s).poll_read(cx, buf),
             AnyUpstream::Gate(s) => Pin::new(s).poll_read(cx, buf),
@@ -155,6 +162,7 @@ impl AsyncWrite for AnyUpstream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             AnyUpstream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => Pin::new(s).poll_write(cx, buf),
             AnyUpstream::Direct(s) => Pin::new(s).poll_write(cx, buf),
             AnyUpstream::Gate(s) => Pin::new(s).poll_write(cx, buf),
@@ -163,6 +171,7 @@ impl AsyncWrite for AnyUpstream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AnyUpstream::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => Pin::new(s).poll_flush(cx),
             AnyUpstream::Direct(s) => Pin::new(s).poll_flush(cx),
             AnyUpstream::Gate(s) => Pin::new(s).poll_flush(cx),
@@ -171,6 +180,7 @@ impl AsyncWrite for AnyUpstream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             AnyUpstream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
             AnyUpstream::Tls(s) => Pin::new(s).poll_shutdown(cx),
             AnyUpstream::Direct(s) => Pin::new(s).poll_shutdown(cx),
             AnyUpstream::Gate(s) => Pin::new(s).poll_shutdown(cx),

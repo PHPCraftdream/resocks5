@@ -8,10 +8,11 @@
 //! and are re-exported here for direct use.
 //!
 //! Grouping: `proxy_connect` holds the per-protocol connectors and the
-//! protocol dispatcher, `tls` the TLS-facing pieces (default connector,
-//! HTTPS upstream, record-layer walking, ClientHello fragmentation), and
-//! `util` the small parsing and socket helpers. The group folders are
-//! private; everything stays reachable under the flat `connect::` paths
+//! protocol dispatcher, `tls` the TLS-facing pieces (ClientHello
+//! fragmentation and record-layer walking always; the default connector
+//! and the HTTPS upstream behind the `tls` feature), and `util` the
+//! small parsing and socket helpers. The group folders are private;
+//! everything stays reachable under the flat `connect::` paths
 //! re-exported below, so external callers are unaffected.
 
 mod proxy_connect;
@@ -24,6 +25,7 @@ pub use proxy_connect::connect_proxy;
 pub use proxy_connect::connect_socks5_proxy;
 pub use tls::tls_fragment;
 pub use tls::tls_records;
+#[cfg(feature = "tls")]
 pub use tls::upstream_tls;
 pub use util::handshake_over_stream;
 pub use util::host_port;
@@ -41,4 +43,5 @@ pub use host_port::HostPort;
 pub use parse_proxy_str::parse_proxy_str;
 pub use recover_host::{parse_http_host, parse_sni};
 pub use tls_fragment::{send_possibly_fragmented, FragmentSpec};
+#[cfg(feature = "tls")]
 pub use upstream_tls::make_tls_connector;

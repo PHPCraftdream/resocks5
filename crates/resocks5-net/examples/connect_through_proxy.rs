@@ -32,12 +32,23 @@ async fn main() -> anyhow::Result<()> {
     // Pick an upstream and tunnel to the target through it. The returned
     // stream is AsyncRead + AsyncWrite.
     let upstream = rotator.get_next();
+    // The `tls` feature (on by default) adds the trailing `tls_connector`
+    // argument to `connect_proxy`; without the feature it is cfg'd away.
+    #[cfg(feature = "tls")]
     let mut stream = connect_proxy(
         "example.com:80",
         &upstream,
         &pool,
         Duration::from_secs(10), // handshake timeout
         None,                    // TLS connector — Some(..) only for HTTPS upstreams
+    )
+    .await?;
+    #[cfg(not(feature = "tls"))]
+    let mut stream = connect_proxy(
+        "example.com:80",
+        &upstream,
+        &pool,
+        Duration::from_secs(10), // handshake timeout
     )
     .await?;
 

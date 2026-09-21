@@ -22,6 +22,18 @@ What's inside:
 No application concerns leak in: no config-file format, no logger,
 no authentication.
 
+## Features
+
+- `tls` (**enabled by default**): HTTPS (TLS-wrapped CONNECT) upstreams,
+  the Mozilla-root-store default connector (`connect::make_tls_connector`),
+  and the `AnyUpstream::Tls` variant, backed by `rustls`, `tokio-rustls`
+  and `webpki-roots`. Lean SOCKS5/HTTP-only builds opt out with
+  `default-features = false`; a config that then still names an HTTPS
+  upstream fails fast with an error naming the missing feature — never a
+  silent plaintext fallback. TLS ClientHello fragmentation stays available
+  without the feature: it fragments raw bytes and links none of the TLS
+  stack.
+
 ## Usage
 
 ```toml
