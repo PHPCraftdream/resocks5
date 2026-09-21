@@ -11,10 +11,16 @@ use crate::auth::params::argon2_instance;
 
 impl AuthState {
     /// cancel-safe: NO — an admitted init-claim may still complete its
-    /// persistence after cancellation. Permits, however, are held only
-    /// around the hashing phases (R7-03): the persistence wait in
-    /// `claim_commit` runs without one, so a claim parked on the
-    /// users-file lock does not consume a hashing slot.
+    /// persistence after cancellation. P1-01: the persistence phase has
+    /// its OWN admission limit (`claim_slots`): the permit is awaited
+    /// asynchronously BEFORE the `spawn_blocking` — a queued claimant
+    /// occupies no blocking thread — and then moves INTO the blocking
+    /// closure, so it is held until the persistence work actually
+    /// finishes, including when the client future is cancelled mid-claim.
+    /// Concurrent claims for the same account are deduplicated behind a
+    /// per-account async gate: at most one claim attempt per account is
+    /// in flight, and followers resolve against the committed hash
+    /// instead of parking a second blocking closure on `claim_lock`.
     pub async fn verify_async(self: &Arc<Self>, name: &str, password: &str) -> bool {
         if !self.entries.get(name).is_some_and(|u| u.enabled) {
             return false;
@@ -48,15 +54,42 @@ impl AuthState {
         // fallback snapshot, cross-process file I/O. NO hashing permit
         // held here (R7-03): claims parked on the users-file lock must
         // not starve other users' hashing.
+        //
+        // P1-01: before any blocking thread is spent, the claimant
+        // (1) takes the per-account claim gate — deduplicating
+        // concurrent claims for the same account asynchronously — and
+        // re-checks the committed hash it may now find, then (2) awaits
+        // a `claim_slots` permit asynchronously and moves it into the
+        // `spawn_blocking` closure. The permit therefore lives until the
+        // persistence work actually finishes, even if THIS future is
+        // cancelled while awaiting the closure; a cancelled waiter never
+        // occupied a blocking thread in the first place.
         let work = match prepared {
             Prepared::Done(ok) => return ok,
             Prepared::Claim(work) => work,
         };
         let outcome = {
-            let state = self.clone();
-            tokio::task::spawn_blocking(move || state.claim_commit(work))
+            let gate = self.claim_gate(&work.name);
+            let _gate_guard = gate.lock().await;
+            // A concurrent claim for this account (or a disk value
+            // adopted from a concurrent CLI edit) may have committed
+            // while we hashed and queued — resolve as a plain login
+            // against the committed hash without entering the claim
+            // machinery at all.
+            if let Some(claimed_hash) = self.claimed_hash_if_any(work.index) {
+                ClaimOutcome::VerifyAgainst(claimed_hash)
+            } else {
+                let Ok(permit) = self.claim_slots.clone().acquire_owned().await else {
+                    return false;
+                };
+                let state = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    state.claim_commit(work)
+                })
                 .await
                 .unwrap_or(ClaimOutcome::Done(false))
+            }
         };
 
         // Phase 3 — verify against a committed hash (a concurrent claim
@@ -76,6 +109,15 @@ impl AuthState {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// P1-01: per-account claim gate (see `claim_gates`). Returns a
+    /// clone of the account's gate; the std guard is dropped before
+    /// returning so the async lock is awaited without any sync guard
+    /// held across an `.await`.
+    fn claim_gate(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.claim_gates.lock().expect("claim gates poisoned");
+        gates.entry(name.to_owned()).or_default().clone()
     }
 
     pub(super) fn cache_matches(&self, name: &str, candidate: &[u8; 32]) -> bool {

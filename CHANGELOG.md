@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Init-claim admission could exhaust the shared Tokio blocking pool
+  (conditional denial of service).** Each concurrent init-on-first-login
+  claim launched its own `spawn_blocking` for the persistence phase with
+  no admission limit, and that closure could park its blocking-pool
+  thread on the in-process claim mutex and then the cross-process
+  users-file lock (up to 10 seconds) with no separate cap. On a runtime
+  with a small blocking pool, a handful of concurrent claims against a
+  delayed persist could occupy every blocking thread, starving ordinary
+  cache-miss logins, DNS and file I/O sharing that executor; a client
+  timeout freed the client's own permit but did not cancel work already
+  running in `spawn_blocking`. Fixed with an independent admission
+  semaphore acquired asynchronously before `spawn_blocking` (a queued
+  claimant holds no thread) and moved into the blocking closure so it is
+  held until the persistence work actually finishes, including after
+  client cancellation; concurrent claims for the same account are also
+  deduplicated behind a per-account async gate so at most one claim
+  attempt per account occupies a blocking thread at a time. No
+  password-verification behaviour changed.
+
 ### Added
 
 - New `resocks5-net` API: `connect::connect_proxy_once` — a one-shot

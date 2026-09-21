@@ -43,7 +43,11 @@ struct UserEntry {
 /// held across the cross-process persist); the `users` write lock is
 /// taken only for short publish/rollback updates. The loser of the race
 /// either authenticates against the winner's hash (same password →
-/// success) or fails (different password → standard rejection).
+/// success) or fails (different password → standard rejection). Since
+/// P1-01 the persistence phase is additionally capped by an independent
+/// admission permit (`claim_slots`) and deduplicated per account behind
+/// an async gate, so a pile-up of concurrent claims queues on the async
+/// runtime instead of on blocking-pool threads.
 pub struct AuthState {
     /// `RwLock` because `verify` may mutate the list (init-claim path)
     /// while other connections are doing read-only lookups in parallel.
@@ -68,6 +72,34 @@ pub struct AuthState {
     /// run WITHOUT a permit so a claim parked on the users-file lock
     /// cannot starve other users' hashing.
     verify_slots: Arc<Semaphore>,
+    /// P1-01: independent admission cap for init-claim persistence.
+    /// `verify_slots` bounds only the CPU hashing phases; without a
+    /// separate cap every `Prepared::Claim` went straight into its own
+    /// `spawn_blocking` and parked a blocking-pool thread on `claim_lock`
+    /// or the cross-process users-file lock, so a pile-up of concurrent
+    /// init-claims could occupy an unbounded number of threads from the
+    /// pool shared with ordinary cache-miss logins, DNS and file I/O —
+    /// a conditional denial of service. The permit is acquired
+    /// ASYNCHRONOUSLY before the phase-2 `spawn_blocking` (a queued
+    /// claimant occupies no blocking thread at all) and then moves INTO
+    /// the blocking closure, so it is held until the persistence work
+    /// ACTUALLY finishes — including after client cancellation, because
+    /// `spawn_blocking` work is not cancelled when the awaiting future
+    /// is dropped. Default 2: in-process claims serialize on
+    /// `claim_lock` anyway (useful concurrency is 1), so this keeps one
+    /// handoff slot warm while capping the claim footprint on the
+    /// shared pool at two threads.
+    claim_slots: Arc<Semaphore>,
+    /// P1-01: per-account claim gates. A claimant that finds another
+    /// claim for the SAME account still in flight waits on the
+    /// account's async mutex instead of queueing a second blocking
+    /// closure behind `claim_lock`; when the gate frees it re-checks
+    /// the committed hash and resolves as a plain login (or, if the
+    /// in-flight claim failed and re-armed the sentinel, retries the
+    /// claim itself). Entries are created lazily per init-claimed
+    /// account name and live for the process lifetime — bounded by the
+    /// startup user count.
+    claim_gates: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Mirrors `auth.allow_anonymous` from `resocks5.main.ktav`. When
     /// `true`, the server advertises SOCKS5 method `0x00` to clients
     /// (and skips Proxy-Authorization on HTTP); when `false`, only
@@ -117,6 +149,8 @@ impl AuthState {
             claim_lock: Mutex::new(()),
             entries,
             verify_slots: Arc::new(Semaphore::new(workers)),
+            claim_slots: Arc::new(Semaphore::new(2)),
+            claim_gates: Mutex::new(HashMap::new()),
             allow_anonymous: auth_cfg.allow_anonymous,
             server_secret,
             cache: DashMap::new(),

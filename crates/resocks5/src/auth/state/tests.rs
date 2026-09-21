@@ -1457,3 +1457,497 @@ async fn async_verify_completes_while_claim_parked_without_hashing_slot() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}.lock", path));
 }
+// ─── P1-01: claim admission cannot exhaust the shared blocking pool ──
+
+#[test]
+fn claim_pileup_cannot_starve_ordinary_login_on_small_blocking_pool() {
+    // P1-01 release gate. A runtime whose blocking pool holds TWO
+    // threads; three concurrent init-claims on three different accounts
+    // while an external holder pins the cross-process users-file lock;
+    // and one ordinary cache-miss login (alice) that MUST complete
+    // while the file lock is still held.
+    //
+    // Fixed (admission cap forced to 1 here): exactly one claim occupies
+    // a blocking thread — parked inside claim_commit on the pinned file
+    // lock — while the other two wait for their admission permit on the
+    // async runtime without touching any thread, leaving the second pool
+    // thread for alice.
+    //
+    // Unfixed (mechanism reverted): every claim goes straight into its
+    // own spawn_blocking; the first parks on the file lock and each
+    // follower parks on claim_lock behind it, so both pool threads end
+    // up permanently parked and alice's spawn_blocking never runs — the
+    // login times out and the test fails.
+    //
+    // Sequencing is event/state anchored, never sleep-sized (R6-07): the
+    // admitted claim's arrival at claim_commit is taken from the R7-04
+    // probe, and alice starts only after verify_slots has been observed
+    // FULL for three consecutive 50 ms polls — every phase-1 Argon2 hash
+    // has finished and stayed finished, so on the unfixed code every
+    // phase-2 closure a follower submits (submission follows phase-1
+    // completion immediately) was queued BEFORE alice in tokio's FIFO
+    // blocking queue (pool.rs push_back/pop_front, tokio 1.43.1) and
+    // parks its thread first. If a phase-1 is starved because the pool
+    // is already fully parked, the 30 s anchor deadline simply expires
+    // and the test proceeds — alice then starves behind the parked
+    // threads and fails with the meaningful message below.
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async move {
+        let (mut state, path) = build_state_with_disk_file(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("bob", true),
+                make_init_user("carl", true),
+                make_init_user("dave", true),
+            ],
+            false,
+        );
+        // Deterministic admission arithmetic: exactly one claim may run
+        // its persistence at a time (the production default is 2; the
+        // explicit knob keeps the pool budget independent of the build
+        // machine's CPU count).
+        state.claim_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
+        let state = Arc::new(state);
+        let slots_before = state.verify_slots.available_permits();
+        assert_eq!(
+            state.claim_slots.available_permits(),
+            1,
+            "test premise: admission cap forced to 1"
+        );
+
+        // External holder: pins the users-file lock until the explicit
+        // release signal (R6-07: no fixed hold timer).
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            locked_tx.send(()).expect("signal lock held");
+            release_rx
+                .recv()
+                .expect("holder must receive the release signal");
+            drop(lock);
+        });
+        locked_rx.recv().expect("users-file lock pinned");
+
+        // Three concurrent claims through the real async path.
+        let mut claims = Vec::new();
+        for (name, pw) in [("bob", "bob-pw"), ("carl", "carl-pw"), ("dave", "dave-pw")] {
+            let state = Arc::clone(&state);
+            claims.push(tokio::spawn(
+                async move { state.verify_async(name, pw).await },
+            ));
+        }
+
+        // Event anchor: the one ADMITTED claim is inside claim_commit.
+        wait_for_claim_event(
+            &mut claim_rx,
+            "claim_commit_entered",
+            Duration::from_secs(60),
+            "the admitted claim reaching claim_commit",
+        );
+        // State anchor: phase-1 hashing fully drained for three
+        // consecutive polls (see the FIFO rationale above).
+        let anchor_deadline = Instant::now() + Duration::from_secs(30);
+        let mut steady = 0;
+        while steady < 3 && Instant::now() < anchor_deadline {
+            if state.verify_slots.available_permits() == slots_before {
+                steady += 1;
+            } else {
+                steady = 0;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The ordinary cache-miss login must complete while the file
+        // lock is still held.
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.verify_async("alice", "alice-pw"),
+        )
+        .await
+        .expect("ordinary cache-miss login starved by the claim pile-up");
+        assert!(ok);
+
+        // The admitted claim kept its permit across the whole park.
+        assert_eq!(
+            state.claim_slots.available_permits(),
+            0,
+            "the parked claim must hold its admission permit until its work finishes"
+        );
+
+        // The file lock is still pinned: nobody has persisted, every
+        // init account is still the sentinel.
+        {
+            let users = state.users.read().unwrap();
+            for name in ["bob", "carl", "dave"] {
+                let u = users.iter().find(|u| u.name == name).unwrap();
+                assert_eq!(u.hash, INIT_HASH, "{name} must still be unclaimed");
+            }
+        }
+
+        release_tx.send(()).expect("release the users-file lock");
+
+        for claim in claims {
+            assert!(
+                claim.await.expect("claim task must not panic"),
+                "every claim must eventually succeed"
+            );
+        }
+        assert_eq!(
+            state.claim_slots.available_permits(),
+            1,
+            "the admission permit must be back once every claim finished"
+        );
+
+        // All three claims landed in memory (with cache entries) and on
+        // disk; alice's own hash is intact.
+        {
+            let users = state.users.read().unwrap();
+            for (name, pw) in [("bob", "bob-pw"), ("carl", "carl-pw"), ("dave", "dave-pw")] {
+                let u = users.iter().find(|u| u.name == name).unwrap();
+                assert!(u.hash.starts_with("$argon2id$"), "{name} hash in memory");
+                assert!(
+                    state.cache_matches(name, &compute_cache_hmac(&state.server_secret, name, pw)),
+                    "{name} cache entry"
+                );
+            }
+        }
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        for name in ["bob", "carl", "dave"] {
+            let u = loaded.users.iter().find(|u| u.name == name).unwrap();
+            assert!(u.hash.starts_with("$argon2id$"), "{name} hash on disk");
+        }
+        let alice = loaded.users.iter().find(|u| u.name == "alice").unwrap();
+        assert!(alice.hash.starts_with("$argon2id$"), "alice hash on disk");
+
+        holder.join().expect("join holder");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    });
+}
+
+#[test]
+fn cancelled_claim_keeps_admission_permit_until_persistence_finishes() {
+    // P1-01 cancellation semantics, checked separately from the queue
+    // test. The client future is aborted while its claim is parked on
+    // the pinned users-file lock. The abort must NOT release the
+    // admission permit early — the blocking closure is not cancellable
+    // and keeps it until the persistence work actually finishes — must
+    // not poison the pool for an ordinary login, and the abandoned
+    // claim must still land in memory and on disk once the lock frees.
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .max_blocking_threads(3)
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async move {
+        let (mut state, path) = build_state_with_disk_file(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("zed", true),
+            ],
+            false,
+        );
+        state.claim_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
+        let state = Arc::new(state);
+
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            locked_tx.send(()).expect("signal lock held");
+            release_rx
+                .recv()
+                .expect("holder must receive the release signal");
+            drop(lock);
+        });
+        locked_rx.recv().expect("users-file lock pinned");
+
+        let zed = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.verify_async("zed", "zed-pw").await })
+        };
+
+        // Event anchor: the probe fires as the FIRST statement of
+        // claim_commit, INSIDE the spawn_blocking closure — so by the
+        // time it arrives the persistence work exists on a blocking
+        // thread and aborting the client future cannot cancel it.
+        wait_for_claim_event(
+            &mut claim_rx,
+            "claim_commit_entered",
+            Duration::from_secs(60),
+            "zed's claim reaching claim_commit",
+        );
+        zed.abort();
+        assert!(
+            zed.await.is_err(),
+            "the client future must be gone after abort"
+        );
+
+        // The permit travelled WITH the blocking work: still held while
+        // the orphaned persistence is parked on the file lock.
+        assert_eq!(
+            state.claim_slots.available_permits(),
+            0,
+            "the orphaned claim must keep its admission permit until its work finishes"
+        );
+
+        // The pool stays healthy for an ordinary login while the
+        // orphaned claim sits parked.
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.verify_async("alice", "alice-pw"),
+        )
+        .await
+        .expect("ordinary login starved by the cancelled claim");
+        assert!(ok);
+
+        // Still parked: zed is not published yet.
+        {
+            let users = state.users.read().unwrap();
+            let z = users.iter().find(|u| u.name == "zed").unwrap();
+            assert_eq!(z.hash, INIT_HASH, "zed must still be parked in persist");
+        }
+
+        release_tx.send(()).expect("release the users-file lock");
+
+        // The orphaned persistence completes and publishes zed.
+        let published = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let users = state.users.read().unwrap();
+                let z = users.iter().find(|u| u.name == "zed").unwrap();
+                if z.hash != INIT_HASH {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < published,
+                "the orphaned claim never finished its persistence"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        let z = loaded.users.iter().find(|u| u.name == "zed").unwrap();
+        assert!(
+            z.hash.starts_with("$argon2id$"),
+            "a cancelled client's claim must still persist"
+        );
+        assert!(state.verify("zed", "zed-pw"), "zed's password must work");
+        assert_eq!(
+            state.claim_slots.available_permits(),
+            1,
+            "the admission permit must be back once the orphaned work finished"
+        );
+
+        holder.join().expect("join holder");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    });
+}
+
+#[test]
+fn same_account_claim_follower_waits_on_gate_not_on_a_blocking_thread() {
+    // P1-01 dedup: a second concurrent claim for the SAME init account
+    // must wait on the per-account async gate instead of queueing its
+    // own blocking closure behind claim_lock. While the leader is
+    // parked on the pinned users-file lock, the ordinary alice login
+    // completes on the second pool thread, and over the WHOLE scenario
+    // exactly ONE claim_commit_entered / persist_region_entered may be
+    // emitted — the follower resolves against the committed hash after
+    // the gate frees and never enters the claim machinery at all.
+    // Unfixed, the follower parks a second blocking thread on
+    // claim_lock and emits a second claim_commit_entered: the alice
+    // login starves and the event count is 2.
+    // The release is held until the follower's decision is established:
+    // unfixed, its second claim_commit_entered is awaited while the file
+    // lock is still pinned (the leader cannot publish, so the follower
+    // cannot escape through the pre-mutex fast path); fixed, the permit
+    // count proves the gate is what the follower is parked on.
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .max_blocking_threads(2)
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async move {
+        let (mut state, path) = build_state_with_disk_file(
+            vec![
+                make_user("alice", "alice-pw", true),
+                make_init_user("bob", true),
+            ],
+            false,
+        );
+        state.claim_slots = Arc::new(tokio::sync::Semaphore::new(2));
+        // Fix-presence signal for the discriminator below: while the
+        // leader is parked, the FIXED code holds one of these two
+        // permits (the follower will queue on the async gate); the
+        // UNFIXED code never acquires any, so the count stays at 2.
+        let admission_cap = state.claim_slots.available_permits();
+        let (claim_tx, mut claim_rx) = mpsc::channel::<&'static str>();
+        state.install_claim_probe(claim_tx);
+        let state = Arc::new(state);
+
+        let (locked_tx, locked_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = UsersFileLock::acquire_with_timeout(
+                Path::new(&holder_path),
+                Duration::from_secs(5),
+            )
+            .expect("holder must acquire the users-file lock");
+            locked_tx.send(()).expect("signal lock held");
+            release_rx
+                .recv()
+                .expect("holder must receive the release signal");
+            drop(lock);
+        });
+        locked_rx.recv().expect("users-file lock pinned");
+
+        let leader = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.verify_async("bob", "same-pw").await })
+        };
+        // Collected, not plainly waited: the discriminator below counts
+        // persist_region_entered, which legitimately interleaves with the
+        // awaited claim_commit_entered, and a plain wait would consume and
+        // discard it (the leader parks INSIDE claim_commit on the pinned
+        // file lock, so both events sit in the channel until release).
+        let mut events = Vec::new();
+        collect_claim_events_until(
+            &mut claim_rx,
+            &mut events,
+            "claim_commit_entered",
+            1,
+            Duration::from_secs(60),
+            "the leader reaching claim_commit",
+        );
+        let follower = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.verify_async("bob", "same-pw").await })
+        };
+
+        // Establish the follower's decision BEFORE releasing the lock
+        // (otherwise the leader may publish during the follower's hash
+        // and the follower escapes through the pre-mutex fast path
+        // without ever entering the claim machinery — the observed
+        // pre-fix pass). Unfixed: the follower must eventually park its
+        // second blocking closure on claim_lock — the leader cannot
+        // publish while the file lock is pinned, so the second
+        // claim_commit_entered is guaranteed to arrive and the final
+        // count assertion below fails deterministically. Fixed: the
+        // permit count proves the admission mechanism is active, the
+        // follower is parked on the gate and NO second event can ever
+        // arrive, so waiting for it would deadlock — skip the wait.
+        if state.claim_slots.available_permits() == admission_cap {
+            wait_for_claim_event(
+                &mut claim_rx,
+                "claim_commit_entered",
+                Duration::from_secs(60),
+                "the unfixed follower parking on claim_lock (second entry into \
+                 the claim machinery)",
+            );
+        }
+
+        // The follower must not occupy a blocking thread: alice's
+        // ordinary cache-miss login completes before the file lock is
+        // released.
+        let ok = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.verify_async("alice", "alice-pw"),
+        )
+        .await
+        .expect("ordinary login starved behind the same-account follower");
+        assert!(ok);
+
+        release_tx.send(()).expect("release the users-file lock");
+
+        assert!(
+            leader.await.expect("leader task must not panic"),
+            "the leader must claim the account"
+        );
+        assert!(
+            follower.await.expect("follower task must not panic"),
+            "the follower must verify against the leader's hash"
+        );
+
+        // The discriminator: exactly ONE entry into the claim machinery
+        // over the whole scenario — the leader's, already recorded in
+        // `events` by the anchor. Unfixed, the follower's second entry
+        // (awaited above while the lock was still pinned) shows up in
+        // the drain and this fails with entered == 2.
+        while let Ok(event) = claim_rx.try_recv() {
+            events.push(event);
+        }
+        let entered = events
+            .iter()
+            .filter(|event| **event == "claim_commit_entered")
+            .count();
+        let persisted = events
+            .iter()
+            .filter(|event| **event == "persist_region_entered")
+            .count();
+        assert_eq!(
+            entered, 1,
+            "the follower must not enter claim_commit; events: {events:?}"
+        );
+        assert_eq!(
+            persisted, 1,
+            "only the leader may persist; events: {events:?}"
+        );
+
+        // Memory, cache and disk agree on one winning hash.
+        let winner_hash = {
+            let users = state.users.read().unwrap();
+            let bob = users.iter().find(|u| u.name == "bob").unwrap();
+            assert!(bob.hash.starts_with("$argon2id$"));
+            bob.hash.clone()
+        };
+        let loaded: UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert_eq!(bob.hash, winner_hash, "disk and memory must agree");
+        assert!(state.verify("bob", "same-pw"));
+        assert!(state.cache_matches(
+            "bob",
+            &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
+        ));
+
+        holder.join().expect("join holder");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path));
+    });
+}

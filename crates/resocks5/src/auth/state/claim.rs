@@ -16,9 +16,9 @@ pub(super) const INIT_HASH: &str = "init";
 /// the CPU-bound phase 1 (`prepare_claim`) and consumed by the
 /// persistence phase 2 (`claim_commit`).
 pub(super) struct ClaimWork {
-    name: String,
+    pub(super) name: String,
     candidate_hmac: [u8; 32],
-    index: usize,
+    pub(super) index: usize,
     new_hash: String,
 }
 
@@ -250,7 +250,7 @@ impl AuthState {
     /// `claim_commit`). The read guard is held only for the hash clone
     /// (R5-10); Argon2 and cache access run without it. This helper
     /// never touches persistence or any other shared state.
-    fn claimed_hash_if_any(&self, idx: usize) -> Option<String> {
+    pub(super) fn claimed_hash_if_any(&self, idx: usize) -> Option<String> {
         let users = self.users.read().expect("users RwLock poisoned");
         if users[idx].hash == INIT_HASH {
             return None;
