@@ -2,16 +2,19 @@
 
 Дата: 2026-09-21. Объект: приложение resocks5 и SDK resocks5-net.
 Недельный диапазон: 2026-09-14 00:00 — 2026-09-22 00:00 Europe/Berlin;
-33 коммита, фактически от 20–21 сентября.
+34 коммита, фактически от 20–21 сентября.
 База: 2b4ef7a994a915260d8081ed475a155a584083c9.
-Проверенный HEAD: c85d9613b67fba81da476fd2f37b7917ebef3297.
-Диапазон diff: 2b4ef7a..c85d961.
+Проверенный HEAD: 6c508e121085a297074fdbab03db07e8f077e05e.
+Диапазон diff: 2b4ef7a..6c508e1.
 
 Заключение: сборочная готовность существенно лучше поведенческой и готовности
 SDK к включению в чужой dependency graph. Изолированные feature-сборки,
-rustdoc, MSRV и проверочная сборка SDK-пакета проходят. Найдены один P1
-и пять P2; без устранения или явного ограничения соответствующих сценариев
-выпускать приложение и SDK как завершённый релиз не рекомендую.
+rustdoc, MSRV и проверочная сборка SDK-пакета проходят. Коммит 6c508e1
+добавил постоянную изолированную feature-матрицу SDK, lean clippy и lean
+rustdoc в CI, закрыв прежнее отсутствие этих gates. Это повышает
+защиту от регрессий сборки, но не исправляет найденные один P1 и пять P2:
+runtime/API не менялись. Без устранения или явного ограничения соответствующих
+сценариев выпускать приложение и SDK как завершённый релиз не рекомендую.
 P0 = blocker, P1 = critical, P2 = high. Менее серьёзные замечания не повышены
 искусственно до P2; они обозначены как ограничения готовности ниже.
 
@@ -20,6 +23,12 @@ git log, реальные изменения и вызывающие места,
 коммитов. Это ограниченный release review, а не заявление о полном покрытии
 всех модулей rust-intel или формальном доказательстве безопасности.
 Рабочий код, версии, lockfile, CI и существующая документация не изменялись.
+Дополнение по 6c508e1 выполнено чтением фактического diff workflow. Все
+исполненные ниже Cargo-проверки относятся к исходникам c85d961; сравнением
+c85d961..6c508e1 подтверждено, что crates, Cargo.toml и Cargo.lock идентичны,
+а единственный изменённый файл — .github/workflows/ci.yml. Поэтому результаты
+сборок применимы к тому же коду, но не выдаются за просмотр нового GitHub
+Actions run. После изменения только CI тесты повторно не запускались.
 
 ## P0
 
@@ -112,6 +121,8 @@ P0: нет подтверждённых находок.
 - Release gate: downstream fixture с двумя зависимыми crates: один использует
   lean API, другой включает tls. Оба собираются вместе и отдельно без
   изменения исходников lean consumer.
+  Новая матрица 6c508e1 запускает каждый feature-набор самого SDK отдельно;
+  такой смешанный downstream graph в ней отсутствует, поэтому P2-01 открыт.
 
 ## P2-02 — HTTPS через gate не получает подтверждение transport progress
 
@@ -259,6 +270,7 @@ P0: нет подтверждённых находок.
 | Область | Фактический результат и граница вывода |
 | --- | --- |
 | SDK feature graph | Все 12 различных closure-наборов обычных features собраны отдельно: none; tls; serde; rating; rotator; tls+serde; tls+rating; tls+rotator; serde+rating; serde+rotator; tls+serde+rating; tls+serde+rotator. rotator включает rating. Дополнительно собран test-instrumentation. Команда каждого варианта: cargo check -p resocks5-net --all-targets --no-default-features --features SET --locked --offline -j 2, RUSTFLAGS=-D warnings; для none параметр features опущен. Все code 0. |
+| Постоянные CI gates | Фактический diff 6c508e1 проверен статически: net-features запускает cargo test -p resocks5-net с --locked для lean, tls, serde, rating, rotator, test-instrumentation, default и all-features на Ubuntu. Глобальный RUSTFLAGS=-D warnings действует на матрицу. clippy-net-lean проверяет lean --all-targets с -D warnings, doc-net-lean строит lean rustdoc с RUSTDOCFLAGS=-D warnings. Scope новых commands не включает --workspace. Результат удалённого Actions run не проверен; counts из commit message не засчитаны как собственный запуск ревью. |
 | Default features | Default остаётся tls+serde+rating+rotator. Его эквивалент проверен в matrix; focused tests и package verification исполнялись с обычными defaults. |
 | Progress | Это всегда доступный module, а не Cargo feature. Нет feature progress. Lean SDK сохраняет fragmentation/progress без rustls; rating/rotator корректно скрыты. |
 | Rustdoc | cargo doc -p resocks5-net --no-default-features --no-deps --locked --offline -j 2 и вариант --all-features, оба с RUSTDOCFLAGS=-D warnings: code 0. Проверенные intra-doc links целы; все промежуточные rustdoc combinations отдельно не строились. |
@@ -287,6 +299,8 @@ rustls 0.23.40, serde 1.0.228, anyhow 1.0.103, ktav 0.6.1.
   AtCapacity для capacity-policy, always-on progress, non_exhaustive
   AnyUpstream и отдельный one-shot connector. До SDK release нужны P2-01
   и P2-04/P2-05; одного успешного примера из собственного workspace недостаточно.
+  Feature-матрица 6c508e1 теперь защищает standalone SDK в CI, но не проверяет
+  совместное использование lean consumer и другого consumer с TLS.
   Большинство connector errors остаются anyhow; structured protocol/timeout
   error enum и fallible empty-rotator selection были бы полезными будущими
   улучшениями, но сами по себе не объявлены high-дефектами.
@@ -315,11 +329,14 @@ rustls 0.23.40, serde 1.0.228, anyhow 1.0.103, ktav 0.6.1.
   хотя manifest и README указывают dual license; root license-файлы входят
   в native archives, но не в crate автоматически. Перед registry publication
   проверить комплект лицензий в самом архиве. Юридическая оценка не проводилась.
-- CI: на проверенном HEAD .github/workflows/ci.yml собирает workspace с
-  defaults; приложение всегда включает весь SDK. Постоянного SDK feature
-  matrix и смешанного downstream graph в этом HEAD нет. Локальная матрица
-  этого ревью закрывает текущую сборку, но не будущие регрессии.
-  Работа на других ветках в выводы о c85d961 не включена.
+- CI: отсутствие постоянных feature-off gates закрыто коммитом 6c508e1:
+  восемь изолированных SDK test-комбинаций плюс lean clippy/rustdoc добавлены
+  к прежним workspace jobs. Оставшийся gap — взаимодействия feature-пар
+  вне default/all (например serde+rotator без tls), смешанный downstream graph
+  P2-01 и lean-матрица на MSRV/других ОС. Это границы выбранной матрицы,
+  не утверждение, что соответствующие комбинации сейчас сломаны: локальные
+  Windows checks покрыли все 12 обычных feature closures. CI jobs нужно
+  дождаться на проверенном HEAD; по одному YAML нельзя объявить run зелёным.
 - Документация: rustdoc links проверены, но docs/ARCHITECTURE.md продолжает
   ссылаться на старые пути server/handle_client.rs, auth/state.rs,
   pool/proxy_pool.rs и connect/tls_fragment.rs после реорганизации.
@@ -354,7 +371,7 @@ rustls 0.23.40, serde 1.0.228, anyhow 1.0.103, ktav 0.6.1.
   file-lock timeout и sleeps в phase B; длительное scheduling starvation
   требует отдельной проверки, искусственно создавать его не пытались.
 - Compatibility/security gates: semver-checks против выбранного прошлого
-  опубликованного SDK, полный тестовый suite, cargo audit/cargo deny,
+  опубликованного SDK, полный тестовый suite в рамках этого ревью, cargo audit/cargo deny,
   обновлённая advisory database, fuzz/Miri и release-tag workflow в этом
   ревью не исполнялись. Intentional breaking progress-path migration
   99eec2c должна соответствовать выбранной release version; версии не менялись.
@@ -369,8 +386,11 @@ docs/REVIEW-2026-09-21-weekly-release.md.
 
     git log -1 --format=%H -- docs/REVIEW-2026-09-21-weekly-release.md
 
-Его фактический SHA возвращается вместе с результатом ревью. Вставить SHA
+Первая редакция отчёта закоммичена как
+b65af77215b6c276ca5082458b707fdf704691af; текущая редакция дополнительно
+учитывает CI-коммит 6c508e1.
+Фактический SHA обновления возвращается вместе с результатом ревью. Вставить SHA
 того же коммита внутрь собственного содержимого невозможно без изменения
 этого SHA; здесь сознательно указан воспроизводимый идентификатор-запрос,
-а не устаревший hash предыдущей редакции. Commit message:
-docs: add weekly release P-notes review.
+а не устаревший hash предыдущей редакции. Commit message обновления:
+docs: update weekly release P-notes for feature matrix CI.
