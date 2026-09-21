@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Breaking (fixes a worse break):** `connect_proxy` and `connect_proxy_once`
+  now take a `tls_connector: Option<&TlsConnector>` argument under every
+  build of `resocks5-net`, feature-gated or not. Previously that parameter
+  was itself `#[cfg(feature = "tls")]`, which is incompatible with how
+  Cargo unifies features across a dependency graph: a lean consumer
+  (`default-features = false`) compiled standalone, but broke with
+  `error[E0061]: this function takes 5 arguments but 4 arguments were
+  supplied` the moment any OTHER crate in the same build enabled `tls` —
+  a defect a lean consumer cannot detect or guard against from its own
+  `cfg`. Without the `tls` feature, `TlsConnector` is a private
+  zero-sized placeholder type that can only ever be constructed as
+  `None`, so the call shape is identical either way. `ProxyProtocol::Https`
+  requested without `tls` is still rejected with a clear error naming the
+  missing feature, never a silent plaintext fallback — that part of the
+  design is unchanged. A permanent, checked-in regression fixture at
+  `tests/feature_unification/` builds two downstream crates together (one
+  lean, one with `tls`) and proves the lean consumer's source needs no
+  change either way.
+
 - **Init-claim admission could exhaust the shared Tokio blocking pool
   (conditional denial of service).** Each concurrent init-on-first-login
   claim launched its own `spawn_blocking` for the persistence phase with

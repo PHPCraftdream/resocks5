@@ -32,7 +32,12 @@ no authentication.
   upstream fails fast with an error naming the missing feature — never a
   silent plaintext fallback. TLS ClientHello fragmentation stays available
   without the feature: it fragments raw bytes and links none of the TLS
-  stack.
+  stack. The trailing `tls_connector` argument of `connect_proxy`/
+  `connect_proxy_once` is present in every build — lean builds included —
+  and takes `None` for SOCKS5/HTTP upstreams, so one call site compiles no
+  matter which features other crates in the same build enable; in a
+  `default-features = false` build its type is an unconstructible
+  placeholder, making `None` the only possible value.
 - `serde` (**enabled by default**): the `Serialize`/`Deserialize` derives on
   `pool::PoolConfig`, the crate's only serde touchpoint. Consumers that
   build their own config plumbing opt out with `default-features = false`

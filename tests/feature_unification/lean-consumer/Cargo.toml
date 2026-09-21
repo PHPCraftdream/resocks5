@@ -1,0 +1,8 @@
+[package]
+name = "lean-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+resocks5-net = { path = "../../../crates/resocks5-net", default-features = false }

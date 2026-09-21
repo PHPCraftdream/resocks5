@@ -1,0 +1,9 @@
+[package]
+name = "tls-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Defaults include `tls` — the other half of the unification pair.
+resocks5-net = { path = "../../../crates/resocks5-net" }

@@ -2,6 +2,10 @@
 resolver = "2"
 members = ["crates/resocks5-net", "crates/resocks5"]
 
+# Compile fixtures with their own deliberately separate workspace; see
+# tests/feature_unification/README.md.
+exclude = ["tests/feature_unification"]
+
 [workspace.package]
 version = "0.1.1"
 edition = "2021"

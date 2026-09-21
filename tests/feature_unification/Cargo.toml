@@ -1,0 +1,11 @@
+# Dev-only compile fixture — the P2-01 feature-unification regression gate.
+#
+# NOT a member of the root workspace, never published. Two downstream
+# crates share one cargo graph: `lean-consumer` depends on resocks5-net
+# with `default-features = false`, `tls-consumer` with the defaults
+# (`tls` on). A single `cargo build --workspace` here unifies features
+# and compiles resocks5-net ONCE with `tls` on — `lean-consumer`'s
+# source must still compile against it unchanged. See README.md.
+[workspace]
+resolver = "2"
+members = ["lean-consumer", "tls-consumer"]

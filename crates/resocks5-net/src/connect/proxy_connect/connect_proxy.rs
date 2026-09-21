@@ -11,6 +11,26 @@ use crate::connect::{connect_http_proxy, connect_socks5_proxy};
 use crate::pool::{AnyUpstream, PoolConfig, ProxyPool};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
+/// Lean-build placeholder that occupies the `tls_connector` parameter slot
+/// of [`connect_proxy`] and [`connect_proxy_once`] when resocks5-net is
+/// compiled without the `tls` feature.
+///
+/// These entry points take a trailing `Option<&TlsConnector>` under *every*
+/// feature combination. Cargo unifies features across a whole dependency
+/// graph, so a consumer compiled against the lean
+/// (`default-features = false`) signature must keep compiling unchanged
+/// when some other crate in the same final binary turns `tls` on; an
+/// argument whose presence depended on the feature would change that
+/// consumer's arity out from under it. This zero-sized type keeps the slot
+/// occupied in lean builds.
+///
+/// It has no public constructor, so a lean build's slot can only ever hold
+/// `None` — there is nothing to plug into it without TLS support.
+#[cfg(not(feature = "tls"))]
+pub struct TlsConnector {
+    _private: (),
+}
+
 /// Connect to `target_addr` through `proxy`, dispatching on its protocol.
 ///
 /// SOCKS5 and HTTP CONNECT return an [`AnyUpstream::Plain`].
@@ -26,14 +46,19 @@ use crate::types::{ProxyConfig, ProxyProtocol};
 #[cfg_attr(not(feature = "tls"), doc = "")]
 #[cfg_attr(
     not(feature = "tls"),
-    doc = "HTTPS (TLS-wrapped CONNECT) needs the crate's `tls` feature (on by default). Built without it, an HTTPS upstream is rejected with an error naming the missing feature — never a silent plaintext fallback — and this function takes no `tls_connector` argument."
+    doc = "The trailing `tls_connector` slot exists in every build — without the `tls` feature its type is the placeholder [`TlsConnector`] defined in this module — so one call site compiles identically no matter which features other crates in the same build enable. In a lean build it can only be `None`."
+)]
+#[cfg_attr(not(feature = "tls"), doc = "")]
+#[cfg_attr(
+    not(feature = "tls"),
+    doc = "HTTPS (TLS-wrapped CONNECT) needs the crate's `tls` feature (on by default). Built without it, an HTTPS upstream is rejected with an error naming the missing feature — never a silent plaintext fallback."
 )]
 pub async fn connect_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
-    #[cfg(feature = "tls")] tls_connector: Option<&TlsConnector>,
+    tls_connector: Option<&TlsConnector>,
 ) -> anyhow::Result<AnyUpstream> {
     match proxy.protocol {
         ProxyProtocol::Socks5 => {
@@ -55,6 +80,10 @@ pub async fn connect_proxy(
             }
             #[cfg(not(feature = "tls"))]
             {
+                // The slot exists purely for signature stability across
+                // feature unification; there is nothing to plug in without
+                // the `tls` feature.
+                let _ = tls_connector;
                 Err(anyhow::anyhow!(
                     "HTTPS upstream to {} requested, but resocks5-net was built without the \
                      `tls` feature; enable it (`features = [\"tls\"]`, on by default) to dial \
@@ -108,10 +137,7 @@ pub async fn connect_proxy(
 ///     &proxy,
 ///     Duration::from_secs(10), // TCP dial timeout
 ///     Duration::from_secs(10), // SOCKS5 handshake timeout
-#[cfg_attr(
-    feature = "tls",
-    doc = "    None,                    // TLS connector — only needed for HTTPS upstreams"
-)]
+///     None,                    // TLS connector slot — always present; Some(..) only for HTTPS upstreams
 /// )
 /// .await?;
 /// drop(stream);
@@ -123,7 +149,7 @@ pub async fn connect_proxy_once(
     proxy: &ProxyConfig,
     connect_timeout: Duration,
     handshake_timeout: Duration,
-    #[cfg(feature = "tls")] tls_connector: Option<&TlsConnector>,
+    tls_connector: Option<&TlsConnector>,
 ) -> anyhow::Result<AnyUpstream> {
     // Throwaway disabled pool: `PoolConfig::default()` has `enabled =
     // false`, so no refill task is spawned and no warm socket is ever
@@ -132,11 +158,7 @@ pub async fn connect_proxy_once(
     // for this one call and one `acquire`, so its per-upstream cap can
     // never bind.
     let pool = ProxyPool::new(PoolConfig::default(), connect_timeout, 1);
-    #[cfg(feature = "tls")]
-    let upstream = connect_proxy(target_addr, proxy, &pool, handshake_timeout, tls_connector).await;
-    #[cfg(not(feature = "tls"))]
-    let upstream = connect_proxy(target_addr, proxy, &pool, handshake_timeout).await;
-    upstream
+    connect_proxy(target_addr, proxy, &pool, handshake_timeout, tls_connector).await
 }
 
 #[cfg(test)]
@@ -194,22 +216,12 @@ mod tests {
         let client = async {
             // No `ProxyPool` constructed anywhere in this test: the
             // entry point must connect with the caller holding none.
-            #[cfg(feature = "tls")]
             let mut stream = connect_proxy_once(
                 "1.2.3.4:443",
                 &config,
                 Duration::from_secs(2),
                 Duration::from_secs(2),
                 None,
-            )
-            .await
-            .unwrap();
-            #[cfg(not(feature = "tls"))]
-            let mut stream = connect_proxy_once(
-                "1.2.3.4:443",
-                &config,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
             )
             .await
             .unwrap();
@@ -240,22 +252,12 @@ mod tests {
             sock.shutdown().await.unwrap();
         };
         let client = async {
-            #[cfg(feature = "tls")]
             let mut stream = connect_proxy_once(
                 "1.2.3.4:443",
                 &config,
                 Duration::from_secs(2),
                 Duration::from_secs(2),
                 None,
-            )
-            .await
-            .unwrap();
-            #[cfg(not(feature = "tls"))]
-            let mut stream = connect_proxy_once(
-                "1.2.3.4:443",
-                &config,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
             )
             .await
             .unwrap();
