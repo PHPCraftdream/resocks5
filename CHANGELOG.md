@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`handshake_over_stream`'s SOCKS5 handshake could hang forever over any
+  buffered stream, with no timeout of its own.** Each of the four
+  request/response steps (auth-method negotiation, username/password
+  sub-negotiation, CONNECT request) called `write_all` immediately
+  followed by `read_exact`, with no `flush` in between. `write_all` only
+  guarantees the bytes reach the writer's own internal buffer, not the
+  underlying transport; this happened to work only because the existing
+  tests drove it over a raw, unbuffered `DuplexStream`. Any buffered
+  wrapper — `tokio::io::BufStream`, and per the review also relevant to
+  TLS/gate stacks under backpressure — could leave a request sitting in
+  the buffer indefinitely while both sides waited on a read that would
+  never be satisfied. Each write is now followed by an explicit `flush`
+  before the matching read. Two new regression tests drive the handshake
+  (no-auth and with username/password auth) through a real `BufStream`
+  and prove it completes; run against the pre-fix code they reproduce the
+  hang directly (`Elapsed` after 5s).
 - **`make_tls_connector`'s crypto-provider prerequisite was undocumented,
   so a downstream application could hit an unexpected panic before any
   network I/O.** rustls requires a process-level `CryptoProvider`
