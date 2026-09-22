@@ -53,8 +53,21 @@ impl FlushProgress {
             return;
         }
         self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        #[cfg(feature = "test-instrumentation")]
+        CONFIRMED_WRITE_PROGRESS_TOTAL.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
+
+/// Test-only process-global total of every byte ever reported into any
+/// [`FlushProgress`] (enabled by the crate's `test-instrumentation`
+/// feature, which the `resocks5` dev-dependencies turn on).
+///
+/// Cumulative, monotonic, and shared by every instance in the process:
+/// compare deltas, never absolutes, and treat a delta as a LOWER bound
+/// on a single chain's confirmed traffic — concurrently running tests
+/// can only inflate it.
+#[cfg(feature = "test-instrumentation")]
+pub static CONFIRMED_WRITE_PROGRESS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 tokio::task_local! {
     pub(crate) static CONFIRMED_WRITE_PROGRESS: FlushProgress;

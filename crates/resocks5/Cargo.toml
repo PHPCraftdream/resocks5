@@ -31,6 +31,9 @@ ktav.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Client send-buffer shrink in the gate slow-drain tests (same recipe
+# as the resocks5-net TLS tests).
+socket2.workspace = true
 # Rotator test instrumentation for this crate's own test binary.
 # Cargo enables dev-dependency features automatically for `cargo test`
 # (debug and release alike) and never for ordinary non-test builds.

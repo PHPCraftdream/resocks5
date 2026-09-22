@@ -670,6 +670,7 @@ dependencies = [
  "rpassword",
  "serde",
  "sha2",
+ "socket2",
  "subtle",
  "tokio",
  "tokio-rustls",

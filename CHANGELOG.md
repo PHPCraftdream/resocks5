@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTPS-through-gate never reported transport progress, so a
+  slow-draining upstream behind any HTTPS gate hop could be killed as
+  falsely idle.** The false-idle protection added for the direct HTTPS
+  connector reports confirmed write progress from a `ProgressReportingWriter`
+  wrapped around the raw transport, but the gate dialer never wrapped its
+  raw transport this way — a gate chain's `FlushProgress` never advanced,
+  so a bounded send through any HTTP→HTTPS, HTTPS→HTTP or HTTPS→HTTPS gate
+  variant could stall and be torn down after one idle window even while
+  the underlying TCP connection was actively moving bytes. Fixed by
+  wrapping the gate chain's single raw transport (the one TCP connection
+  every hop multiplexes over) below the first TLS hop, and by adding the
+  missing `AsyncReadWrite` implementation for `ProgressReportingWriter` so
+  socket reach-through (`as_tcp`/`set_nodelay`) still digs through it.
+  Verified with byte-for-byte slow-drain tests through all three
+  HTTPS-involving gate variants, a negative control built with the
+  pre-fix construction (which must and does lose the resilience the fix
+  provides), and a dead-transport control confirming the zero-progress
+  timeout still fires promptly.
+
 - **Breaking:** `ProxyConfig`'s `Debug` output no longer prints `user` or
   `password` in clear text. Both fields previously came from a plain
   `#[derive(Debug)]`, so any ordinary debug log, `dbg!`, tracing field, or

@@ -10,7 +10,6 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::pool::proxy_pool::UpstreamStream;
-#[cfg(feature = "tls")]
 use crate::progress::ProgressReportingWriter;
 
 /// Object-safe stream trait for the gate-tunnel path: the async halves
@@ -18,11 +17,13 @@ use crate::progress::ProgressReportingWriter;
 ///
 /// Implemented individually for exactly the shapes a gate tunnel can
 /// produce — [`UpstreamStream`], `TlsStream` over a nested
+/// [`AsyncReadWrite`], [`ProgressReportingWriter`] over a nested
 /// [`AsyncReadWrite`], `Box<T>`, and a raw [`TcpStream`] — so
 /// `as_tcp`/`set_nodelay` keep reaching the gate socket through up to
-/// two TLS layers. There is deliberately NO blanket impl: the socket
-/// accessors need per-type behaviour, which a blanket impl cannot
-/// override (and would collide with, E0119).
+/// two TLS layers plus the progress-reporting wrapper the gate dialer
+/// puts around the raw transport. There is deliberately NO blanket
+/// impl: the socket accessors need per-type behaviour, which a blanket
+/// impl cannot override (and would collide with, E0119).
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     /// Best-effort reference to the tunnel's innermost real
     /// `TcpStream` (for a gate tunnel: the gate socket), digging
@@ -58,6 +59,15 @@ impl<T: AsyncReadWrite + ?Sized> AsyncReadWrite for Box<T> {
     }
     fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         (**self).set_nodelay(nodelay)
+    }
+}
+
+impl<S: AsyncReadWrite> AsyncReadWrite for ProgressReportingWriter<S> {
+    fn as_tcp(&self) -> Option<&TcpStream> {
+        self.get_ref().as_tcp()
+    }
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.get_ref().set_nodelay(nodelay)
     }
 }
 
@@ -109,6 +119,11 @@ pub enum AnyUpstream {
     /// `set_nodelay` still reach the tunnel's one real TCP connection
     /// (the gate socket) through the erasure, so keepalive and
     /// TLS-fragmentation nodelay keep working for gate-routed tunnels.
+    /// The raw gate transport at the base of the erased stack is
+    /// wrapped in a [`ProgressReportingWriter`] by the gate dialer, so
+    /// confirmed write progress below the FIRST TLS hop is reported
+    /// into enclosing confirmed-progress scopes (idle-bounded sends,
+    /// tunnel activity tracking) exactly as for [`AnyUpstream::Tls`].
     Gate(BoxedUpstream),
 }
 
@@ -238,5 +253,56 @@ mod tests {
         let mut buf = [0u8; 4];
         upstream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
+    }
+
+    /// The progress-reporting wrapper must be usable as the erased base
+    /// of a gate stack: object-safe boxing, socket reach-through for
+    /// `as_tcp`/`set_nodelay`, and confirmed-progress reporting into an
+    /// enclosing scope.
+    #[tokio::test]
+    async fn progress_reporting_writer_boxes_reaches_socket_and_reports() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Consume the client's write BEFORE dropping, so the peer
+            // never writes into a fully-closed socket (the RST that a
+            // closed peer answers with would also discard the buffered
+            // `ping` below and flake the read_exact on Windows).
+            let mut consumed = [0u8; 4];
+            sock.read_exact(&mut consumed).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut sock, b"ping")
+                .await
+                .unwrap();
+        });
+
+        let progress = crate::progress::FlushProgress::new();
+        let mut upstream: BoxedUpstream = Box::new(ProgressReportingWriter::new(
+            TcpStream::connect(addr).await.unwrap(),
+        ));
+
+        let tcp = upstream
+            .as_tcp()
+            .expect("the wrapper must expose the innermost socket");
+        tcp.set_nodelay(true).unwrap();
+        assert!(tcp.nodelay().unwrap(), "TCP_NODELAY applied");
+
+        let before = progress.total();
+        crate::progress::confirmed_scope(progress.clone(), async {
+            tokio::io::AsyncWriteExt::write_all(&mut upstream, b"ping")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            progress.total() - before,
+            4,
+            "every byte written below the wrapper must be reported"
+        );
+
+        let mut buf = [0u8; 4];
+        upstream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "reads pass straight through");
     }
 }

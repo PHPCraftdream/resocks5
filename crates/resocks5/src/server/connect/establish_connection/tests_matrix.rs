@@ -61,7 +61,7 @@ fn stub_tls_acceptor() -> TlsAcceptor {
     TlsAcceptor::from(Arc::new(config))
 }
 
-fn stub_tls_connector() -> TlsConnector {
+pub(super) fn stub_tls_connector() -> TlsConnector {
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(pem_der(STUB_CERT_PEM)))
@@ -73,8 +73,10 @@ fn stub_tls_connector() -> TlsConnector {
 }
 
 /// One stub hop: which wire behaviour to expect next on the socket.
+/// `pub(super)` so the sibling test modules can name answered
+/// exchanges through [`StubLog`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StubPhase {
+pub(super) enum StubPhase {
     /// Answer a SOCKS5 exchange (records the requested target).
     Socks5,
     /// Answer an HTTP CONNECT (records the requested target).
@@ -91,7 +93,36 @@ fn stub_phases(proto: ProxyProtocol) -> Vec<StubPhase> {
     }
 }
 
-type StubLog = Arc<Mutex<Vec<(StubPhase, String)>>>;
+pub(super) type StubLog = Arc<Mutex<Vec<(StubPhase, String)>>>;
+
+/// What the stub does with the client's payload AFTER the last
+/// handshake phase completes.
+#[derive(Clone)]
+pub(super) enum Drain {
+    /// Drain as fast as possible into the void (matrix tests: payload
+    /// content is irrelevant there).
+    Void,
+    /// Drip-read at a paced rate and collect every byte. The sleep is
+    /// scaled to the bytes actually read per call (commit edb1230):
+    /// the TCP stack may deliver fewer bytes than `chunk`, and a flat
+    /// per-read delay would inflate the total drain far past the
+    /// intended rate. On EOF the stream is shut down cleanly — a TLS
+    /// layer therefore emits `close_notify`, which a rustls peer needs
+    /// to see a clean EOF instead of `UnexpectedEof`.
+    Slow {
+        chunk: usize,
+        delay: Duration,
+        collected: CollectedPayload,
+    },
+    /// Hold the connection open without ever reading again: the
+    /// transport congests with zero confirmed progress — the
+    /// dead-transport control for the zero-progress timeout. The
+    /// parked task dies with the test runtime.
+    Dead,
+}
+
+/// Every payload byte the stub has read so far.
+pub(super) type CollectedPayload = Arc<Mutex<Vec<u8>>>;
 
 /// Serve ONE client connection through its expected phase sequence.
 /// The tunnel is a single socket: both hops' exchanges arrive here,
@@ -102,38 +133,100 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 type ErasedStream = Box<dyn Stream>;
 
 fn serve_phases<'a>(
-    mut stream: ErasedStream,
+    stream: ErasedStream,
     phases: &'a [StubPhase],
     tls: &'a TlsAcceptor,
     log: &'a StubLog,
+    drain: &'a Drain,
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        let Some((phase, rest)) = phases.split_first() else {
+        serve_phases_rec(stream, phases, tls, log, drain).await;
+    })
+}
+
+/// Recursive driver behind [`serve_phases`]. Each level owns its
+/// stream layer and hands it BACK once its subtree completed, so a
+/// TLS level can clean-close itself (`shutdown`) afterwards: boxing
+/// the layer as a `&mut` borrow would default the trait object to
+/// `+ 'static`, and generic (non-boxed) async recursion would not
+/// terminate at the type level.
+async fn serve_phases_rec(
+    mut stream: ErasedStream,
+    phases: &[StubPhase],
+    tls: &TlsAcceptor,
+    log: &StubLog,
+    drain: &Drain,
+) -> Option<ErasedStream> {
+    let Some((phase, rest)) = phases.split_first() else {
+        drain_stream(&mut stream, drain).await;
+        return Some(stream);
+    };
+    match phase {
+        StubPhase::TlsAccept => {
+            let Ok(tls_stream) = tls.accept(stream).await else {
+                return None;
+            };
+            // `?`: on subtree failure the socket is already gone.
+            let mut restored = Box::pin(serve_phases_rec(
+                Box::new(tls_stream),
+                rest,
+                tls,
+                log,
+                drain,
+            ))
+            .await?;
+            // Clean close of THIS TLS layer: close_notify, so a
+            // rustls peer reads a clean EOF instead of a bare TCP
+            // close (`UnexpectedEof`). A no-op on a dead socket.
+            let _ = restored.shutdown().await;
+            Some(restored)
+        }
+        StubPhase::Socks5 => {
+            if let Some(target) = socks5_exchange(&mut stream).await {
+                log.lock().unwrap().push((StubPhase::Socks5, target));
+            }
+            Box::pin(serve_phases_rec(Box::new(stream), rest, tls, log, drain)).await
+        }
+        StubPhase::HttpConnect => {
+            if let Some(target) = http_connect_exchange(&mut stream).await {
+                log.lock().unwrap().push((StubPhase::HttpConnect, target));
+            }
+            Box::pin(serve_phases_rec(Box::new(stream), rest, tls, log, drain)).await
+        }
+    }
+}
+
+/// Terminal behaviour shared by all stub connections: what happens to
+/// the client's payload once the last handshake phase has been
+/// answered.
+async fn drain_stream(stream: &mut ErasedStream, drain: &Drain) {
+    match drain {
+        Drain::Void => {
             let mut buf = [0u8; 512];
             while stream.read(&mut buf).await.unwrap_or(0) != 0 {}
-            return;
-        };
-        match phase {
-            StubPhase::TlsAccept => {
-                let Ok(tls_stream) = tls.accept(stream).await else {
-                    return;
-                };
-                serve_phases(Box::new(tls_stream), rest, tls, log).await;
-            }
-            StubPhase::Socks5 => {
-                if let Some(target) = socks5_exchange(&mut stream).await {
-                    log.lock().unwrap().push((StubPhase::Socks5, target));
-                }
-                serve_phases(Box::new(stream), rest, tls, log).await;
-            }
-            StubPhase::HttpConnect => {
-                if let Some(target) = http_connect_exchange(&mut stream).await {
-                    log.lock().unwrap().push((StubPhase::HttpConnect, target));
-                }
-                serve_phases(Box::new(stream), rest, tls, log).await;
-            }
         }
-    })
+        Drain::Slow {
+            chunk,
+            delay,
+            collected,
+        } => {
+            let mut buf = vec![0u8; *chunk];
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                collected.lock().unwrap().extend_from_slice(&buf[..n]);
+                // Paced drain: scale the silence to the bytes actually
+                // read (edb1230) — never a flat per-read sleep.
+                tokio::time::sleep(delay.mul_f64(n as f64 / *chunk as f64)).await;
+            }
+            let _ = stream.shutdown().await;
+        }
+        Drain::Dead => {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Answer one no-auth SOCKS5 exchange; returns the requested target.
@@ -217,22 +310,72 @@ where
 
 /// Spawn a stub speaking `gate_proto` then `inner_proto` (in the
 /// same order `use_gate` drives its two hops) on one listener; both
-/// the gate and the inner config point at it. Returns the address
-/// and the log of answered exchanges as (phase, requested target).
-async fn spawn_protocol_stub(
+/// the gate and the inner config point at it. Payload is drained into
+/// the void. Returns the address and the log of answered exchanges as
+/// (phase, requested target).
+pub(super) async fn spawn_protocol_stub(
     gate_proto: ProxyProtocol,
     inner_proto: ProxyProtocol,
 ) -> (SocketAddr, StubLog) {
+    let (addr, log, _collected) = spawn_draining_stub(gate_proto, inner_proto, Drain::Void).await;
+    (addr, log)
+}
+
+/// Loopback listener with a best-effort tiny receive buffer, the
+/// same trick as `small_buffer_listener` in resocks5-net's
+/// upstream_tls tests: accepted sockets inherit the listener's
+/// window, so the drip — not OS auto-tuning a large one — paces the
+/// slow-drain tests and the client's congestion onset is immediate.
+/// Advisory only — the oversized payloads remain the guaranteed
+/// backstop. (tokio 1.x exposes the buffer setter on `TcpSocket`
+/// only, not on `TcpStream`, so it is applied pre-listen; socket2 is
+/// not a dependency of this crate.)
+async fn small_buffer_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // Best-effort 1 KiB buffers (the repo's proven recipe from the
+    // resocks5-net TLS tests): a tiny receive window empties fully
+    // on every drip read, so each drip forces a TCP window update
+    // and the client observes fresh writability — instead of the
+    // receiver's silly-window rule suppressing updates and
+    // blocking the sender completely. Advisory only; the oversized
+    // payloads remain the guaranteed backstop.
+    let _ = socket.set_recv_buffer_size(1024);
+    let _ = socket.set_send_buffer_size(1024);
+    socket.bind(addr)?;
+    socket.listen(128)
+}
+
+/// Spawn a stub speaking `gate_proto` then `inner_proto` (in the
+/// same order `use_gate` drives its two hops) on one listener; both
+/// the gate and the inner config point at it. `drain` selects what
+/// happens to the client's payload after the last handshake phase.
+/// Returns the address, the exchange log as (phase, requested target),
+/// and the payload collector (an empty vec for [`Drain::Void`] and
+/// [`Drain::Dead`]).
+pub(super) async fn spawn_draining_stub(
+    gate_proto: ProxyProtocol,
+    inner_proto: ProxyProtocol,
+    drain: Drain,
+) -> (SocketAddr, StubLog, CollectedPayload) {
     let phases: Vec<StubPhase> = stub_phases(gate_proto)
         .into_iter()
         .chain(stub_phases(inner_proto))
         .collect();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = small_buffer_listener("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     // `localhost` may resolve to ::1 first; a stalled IPv6 connect
     // attempt would eat the pool's connect timeout, so serve both
     // loopback families on the same port.
-    let v6 = tokio::net::TcpListener::bind(format!("[::1]:{}", addr.port())).await;
+    let v6 = small_buffer_listener(format!("[::1]:{}", addr.port()).parse().unwrap()).await;
+    let collected: CollectedPayload = match &drain {
+        Drain::Slow { collected, .. } => Arc::clone(collected),
+        _ => Arc::new(Mutex::new(Vec::new())),
+    };
     let log: StubLog = Arc::new(Mutex::new(Vec::new()));
     let tls = stub_tls_acceptor();
     let log_task = Arc::clone(&log);
@@ -240,14 +383,16 @@ async fn spawn_protocol_stub(
         if let Ok(v6) = v6 {
             let phases = phases.clone();
             let tls = tls.clone();
+            let drain = drain.clone();
             let log6 = Arc::clone(&log_task);
             tokio::spawn(async move {
                 while let Ok((sock, _)) = v6.accept().await {
                     let phases = phases.clone();
                     let tls = tls.clone();
+                    let drain = drain.clone();
                     let log = Arc::clone(&log6);
                     tokio::spawn(async move {
-                        serve_phases(Box::new(sock), &phases, &tls, &log).await;
+                        serve_phases(Box::new(sock), &phases, &tls, &log, &drain).await;
                     });
                 }
             });
@@ -255,16 +400,17 @@ async fn spawn_protocol_stub(
         while let Ok((sock, _)) = listener.accept().await {
             let phases = phases.clone();
             let tls = tls.clone();
+            let drain = drain.clone();
             let log = Arc::clone(&log_task);
             tokio::spawn(async move {
-                serve_phases(Box::new(sock), &phases, &tls, &log).await;
+                serve_phases(Box::new(sock), &phases, &tls, &log, &drain).await;
             });
         }
     });
-    (addr, log)
+    (addr, log, collected)
 }
 
-fn stub_config(addr: SocketAddr, protocol: ProxyProtocol, is_gate: bool) -> ProxyConfig {
+pub(super) fn stub_config(addr: SocketAddr, protocol: ProxyProtocol, is_gate: bool) -> ProxyConfig {
     ProxyConfig {
         protocol,
         ip: resocks5_net::types::IP::V4,

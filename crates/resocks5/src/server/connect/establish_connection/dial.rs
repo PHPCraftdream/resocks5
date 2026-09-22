@@ -14,6 +14,7 @@ use resocks5_net::connect::{
     connect_proxy, handshake_over_stream, http_connect_handshake, HostPort,
 };
 use resocks5_net::pool::{AnyUpstream, BoxedUpstream, ProxyPool};
+use resocks5_net::progress::ProgressReportingWriter;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
@@ -29,7 +30,7 @@ use super::route::*;
 /// instead of enumerating that matrix as distinct Rust types. Each hop
 /// is bounded by `handshake_timeout` (TLS + CONNECT count as one hop),
 /// mirroring the per-hop timeouts of the direct path.
-async fn tunnel_hop(
+pub(super) async fn tunnel_hop(
     stream: BoxedUpstream,
     hop: &ProxyConfig,
     target_addr: &str,
@@ -128,7 +129,16 @@ pub(super) async fn use_gate(
             .with_context(|| format!("Failed to reserve permit for {}", print_cfg(proxy_config)))?,
     );
     let stream = tunnel_hop(
-        Box::new(gate_stream),
+        // The base of the whole gate chain: every hop multiplexes over
+        // this ONE TCP connection (the gate socket), so wrapping it
+        // here sits below the FIRST TLS hop whatever the hop protocols
+        // are. Ciphertext the outermost TLS layer manages to push to
+        // the wire counts as confirmed progress; plaintext buffered by
+        // a nested TLS layer never passes this wrapper and cannot fake
+        // progress. Without the wrapping writer a gate chain is
+        // invisible to FlushProgress and the false-idle protection
+        // never engages (review P2-02).
+        Box::new(ProgressReportingWriter::new(gate_stream)),
         gate_config,
         &proxy_addr,
         tls_connector,
