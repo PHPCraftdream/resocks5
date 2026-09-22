@@ -52,10 +52,10 @@ pub enum ClientHelloMatch {
 pub enum SendProgress {
     /// Every byte of the payload was written and flushed.
     Completed,
-    /// A chunk write did not complete within the idle window, or the
-    /// final flush stopped making confirmed progress for one idle
-    /// window. A partial prefix may already be on the wire — the writer
-    /// must be closed, never driven again with the same payload.
+    /// A chunk write or the final flush stopped making confirmed
+    /// progress for one idle window. A partial prefix may already be on
+    /// the wire — the writer must be closed, never driven again with
+    /// the same payload.
     Stalled,
 }
 
@@ -114,11 +114,15 @@ fn is_tls_client_hello(data: &[u8]) -> bool {
 /// whole slice is written in one call — no overhead on the hot path.
 ///
 /// `idle` measures write inactivity, not write duration: each
-/// individual write attempt gets a fresh idle window, and a window
-/// that expires without a single accepted byte ends the send with
+/// individual write attempt is bounded by idle windows, and a window
+/// that expires without the writer stack accepting new bytes or
+/// confirming progress underneath ends the send with
 /// [`SendProgress::Stalled`]. A backpressured writer that keeps
-/// accepting bytes — however slowly — never trips the bound, so a
-/// paced send stays alive no matter how long the whole send takes.
+/// accepting bytes — or keeps draining previously accepted bytes to
+/// the transport below a
+/// [`ProgressReportingWriter`](crate::progress::ProgressReportingWriter)
+/// — however slowly, never trips the bound, so a paced send stays
+/// alive no matter how long the whole send takes.
 /// The configured inter-fragment pause (`FragmentSpec::delay_ms`) is
 /// deliberate pacing: it elapses between chunks, outside the
 /// per-write loop, and never counts as inactivity. `Duration::ZERO`
@@ -154,13 +158,16 @@ where
 /// Write `buf` in full and flush it, bounded by `idle`.
 ///
 /// `idle` measures write inactivity, not write duration: the buffer is
-/// driven one `poll_write` at a time and every individual write attempt
-/// gets a fresh idle window. A writer that keeps accepting bytes —
-/// however slowly — therefore never trips the bound, while a writer
-/// that stops accepting bytes entirely is reported as
-/// [`SendProgress::Stalled`] after one idle window of total silence. A
-/// successful write of zero bytes is an error (`WriteZero`), matching
-/// `write_all`'s own contract.
+/// driven one `poll_write` attempt at a time, each attempt bounded by
+/// idle windows. A writer that keeps accepting bytes — however slowly —
+/// therefore never trips the bound, and neither does a writer stack
+/// that keeps draining previously accepted bytes to the transport
+/// below a
+/// [`ProgressReportingWriter`](crate::progress::ProgressReportingWriter)
+/// while still refusing the new bytes this call offers; a writer that
+/// does neither for one full idle window is reported as
+/// [`SendProgress::Stalled`]. A successful write of zero bytes is an
+/// error (`WriteZero`), matching `write_all`'s own contract.
 ///
 /// When the bound fires, the write is abandoned mid-flight: whatever
 /// prefix was accepted stays on the wire and the caller must treat the
@@ -187,9 +194,12 @@ where
     confirmed_scope(progress.clone(), async {
         let mut written = 0;
         while written < buf.len() {
-            let n = match tokio::time::timeout(idle, writer.write(&buf[written..])).await {
-                Ok(status) => status?,
-                Err(_) => return Ok(SendProgress::Stalled),
+            let attempt =
+                write_bounded_by_confirmed_progress(writer, &buf[written..], idle, &progress)
+                    .await?;
+            let n = match attempt {
+                Some(n) => n,
+                None => return Ok(SendProgress::Stalled),
             };
             if n == 0 {
                 return Err(std::io::Error::new(
@@ -203,6 +213,54 @@ where
         flush_bounded_by_confirmed_progress(writer, idle, &progress).await
     })
     .await
+}
+
+/// Bound one `writer.write(buf)` attempt by idle windows renewed only
+/// by confirmed write progress, never restarting the attempt.
+///
+/// The write future is pinned once and polled across window renewals —
+/// NEVER recreated: re-offering `buf` from scratch after a window
+/// expiry could duplicate bytes the writer stack already consumed from
+/// the first attempt. Each `timeout(idle, ..)` wraps the pinned future
+/// by reference, so an expiry drops only the timeout wrapper and the
+/// in-flight write state underneath survives. If a window expires but
+/// [`FlushProgress::total`](crate::progress::FlushProgress::total) advanced
+/// during it — a buffering/TLS layer moved previously accepted bytes to
+/// the transport while still refusing the new plaintext this attempt
+/// offers (tokio-rustls' `(0, would_block)` shape) — the window is
+/// renewed and the same future keeps being polled. If a window expires
+/// with no confirmed progress, the attempt is abandoned and `None` is
+/// returned. A bare wake or a plain `Pending` never renews the window:
+/// only reported bytes do. A writer stack without a
+/// [`ProgressReportingWriter`](crate::progress::ProgressReportingWriter)
+/// underneath reports nothing and therefore keeps the old
+/// single-idle-window write behavior.
+///
+/// cancel-safe: NO — dropping this mid-attempt abandons a partially
+/// accepted write exactly like the unbounded form; the caller treats
+/// the writer as terminal.
+async fn write_bounded_by_confirmed_progress<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    buf: &[u8],
+    idle: Duration,
+    progress: &FlushProgress,
+) -> anyhow::Result<Option<usize>> {
+    let mut write = std::pin::pin!(writer.write(buf));
+    loop {
+        let confirmed_before = progress.total();
+        match tokio::time::timeout(idle, &mut write).await {
+            Ok(status) => {
+                let n = status?;
+                return Ok(Some(n));
+            }
+            Err(_) => {
+                if progress.total() > confirmed_before {
+                    continue;
+                }
+                return Ok(None);
+            }
+        }
+    }
 }
 
 /// Bound `writer.flush()` by idle windows renewed only by confirmed

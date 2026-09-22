@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release cycle, and not a rustls or cryptography defect — provider
   selection is explicitly the application's responsibility; the gap was
   purely that the SDK never said so.
+- **Confirmed transport progress made DURING a `Pending` write attempt was
+  never counted, so a bounded send or the tunnel's idle tracking could
+  falsely declare a healthy, backpressured writer stalled.** Both
+  `write_progress_bounded` (the client-dial bounded send) and
+  `Tracked::poll_write` (the tunnel's idle-activity tracking) bounded or
+  recorded activity only on the outer call's own `Ready`/timeout outcome.
+  But tokio-rustls' `poll_write` can perform several real writes to the
+  transport underneath — each one genuinely advancing
+  `FlushProgress` — while still returning `Pending` overall, because the
+  *new* plaintext this call is offering was not itself accepted (its
+  internal ciphertext buffer was already full from an earlier call): the
+  `(0, would_block)` branch verified directly against tokio-rustls
+  0.26.4's vendored source. Both call sites now poll a single,
+  never-restarted write future/poll and renew their idle window (or mark
+  activity) whenever confirmed progress advances during the wait — never
+  on a bare wakeup or a plain `Pending`, which still stall exactly as
+  before. Mirrors the pattern the final flush already used.
 - **HTTPS-through-gate never reported transport progress, so a
   slow-draining upstream behind any HTTPS gate hop could be killed as
   falsely idle.** The false-idle protection added for the direct HTTPS

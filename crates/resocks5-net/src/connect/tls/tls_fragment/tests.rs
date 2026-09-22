@@ -731,3 +731,331 @@ async fn zero_byte_poll_write_is_write_zero_error() {
     let io_err = err.downcast_ref::<std::io::Error>().expect("io error");
     assert_eq!(io_err.kind(), std::io::ErrorKind::WriteZero);
 }
+
+/// The raw transport for the P2-03 write-phase doubles: accepts at
+/// most `per_poll` bytes per successful poll_write, then goes silent
+/// for `interval` of (virtual) time. `stalling_after` makes it refuse
+/// forever (Pending, no waker — re-polls come only from the caller's
+/// idle windows) once that many bytes have been accepted in total.
+/// Every accepted byte lands in `accepted` for exact-wire checks.
+struct GatedTransport {
+    accepted: Vec<u8>,
+    per_poll: usize,
+    interval: Duration,
+    // Created with Duration::ZERO so the very first write is
+    // immediate; reset to `interval` after every accepted write.
+    cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+    stall_after: Option<usize>,
+}
+
+impl GatedTransport {
+    fn new(per_poll: usize, interval: Duration) -> Self {
+        Self {
+            accepted: Vec::new(),
+            per_poll,
+            interval,
+            cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            stall_after: None,
+        }
+    }
+
+    fn stalling_after(mut self, n: usize) -> Self {
+        self.stall_after = Some(n);
+        self
+    }
+}
+
+// All fields are Unpin, so get_mut() is enough to drive it.
+impl tokio::io::AsyncWrite for GatedTransport {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Some(quota) = this.stall_after {
+            if this.accepted.len() >= quota {
+                // Quota reached: silent forever, and no waker is
+                // registered — only the caller's idle windows re-poll.
+                return std::task::Poll::Pending;
+            }
+        }
+        if this.cooldown.as_mut().poll(cx).is_pending() {
+            return std::task::Poll::Pending;
+        }
+        let n = buf.len().min(this.per_poll);
+        this.accepted.extend_from_slice(&buf[..n]);
+        let deadline = tokio::time::Instant::now() + this.interval;
+        this.cooldown.as_mut().reset(deadline);
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// P2-03 test double: a buffering writer that mimics tokio-rustls'
+/// `(0, would_block)` poll_write — when previously accepted bytes are
+/// still in flight, a write attempt for NEW plaintext first drains
+/// toward the transport (one `piece` per call; each accepted piece is
+/// confirmed progress below the `ProgressReportingWriter` when
+/// instrumented) and then returns Pending WITHOUT consuming any of the
+/// new bytes. New bytes are buffered — never put on the wire directly
+/// — and only once the buffer has fully drained, at most
+/// `accept_per_poll` per Ready, so the caller's write loop keeps being
+/// re-invoked while earlier bytes are still draining. `wakes_left`
+/// emits that many progress-free `wake_by_ref()` calls on the Pending
+/// path, for the bare-wake negative control.
+struct DrainingBuffer<W> {
+    pending: std::collections::VecDeque<u8>,
+    accept_per_poll: usize,
+    piece: usize,
+    /// Total NEW bytes accepted into the buffer (never onto the wire
+    /// directly).
+    accepted_total: usize,
+    wakes_left: usize,
+    transport: W,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> DrainingBuffer<W> {
+    fn new(accept_per_poll: usize, piece: usize, transport: W) -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            accept_per_poll,
+            piece,
+            accepted_total: 0,
+            wakes_left: 0,
+            transport,
+        }
+    }
+
+    fn with_bare_wakes(mut self, n: usize) -> Self {
+        self.wakes_left = n;
+        self
+    }
+
+    fn transport(&self) -> &W {
+        &self.transport
+    }
+
+    fn into_transport(self) -> W {
+        self.transport
+    }
+
+    fn accepted_total(&self) -> usize {
+        self.accepted_total
+    }
+
+    // Drain toward the transport while it accepts; Ok(true) means the
+    // buffer has fully drained, Ok(false) that old bytes are still in
+    // flight. All fields are Unpin, so &mut self is enough.
+    fn poll_pending(&mut self, cx: &mut std::task::Context<'_>) -> std::io::Result<bool> {
+        while !self.pending.is_empty() {
+            let contiguous = self.pending.make_contiguous();
+            let take = self.piece.min(contiguous.len());
+            match std::pin::Pin::new(&mut self.transport).poll_write(cx, &contiguous[..take]) {
+                std::task::Poll::Ready(Ok(n)) => {
+                    self.pending.drain(..n);
+                }
+                std::task::Poll::Ready(Err(e)) => return Err(e),
+                std::task::Poll::Pending => {
+                    if self.wakes_left > 0 {
+                        self.wakes_left -= 1;
+                        cx.waker().wake_by_ref();
+                    }
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DrainingBuffer<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        // Refuse new plaintext while anything is in flight: drain one
+        // piece per call (the transport gates each piece behind its
+        // cooldown) and accept only from a fully drained buffer.
+        match this.poll_pending(cx) {
+            Ok(true) => {}
+            Ok(false) => return std::task::Poll::Pending,
+            Err(e) => return std::task::Poll::Ready(Err(e)),
+        }
+        let n = buf.len().min(this.accept_per_poll);
+        this.pending.extend(&buf[..n]);
+        this.accepted_total += n;
+        std::task::Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_pending(cx) {
+            Ok(true) => std::pin::Pin::new(&mut this.transport).poll_flush(cx),
+            Ok(false) => std::task::Poll::Pending,
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_pending(cx) {
+            Ok(true) => std::pin::Pin::new(&mut this.transport).poll_flush(cx),
+            Ok(false) => std::task::Poll::Pending,
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
+/// P2-03 release gate (write phase): the double's poll_write keeps
+/// refusing NEW plaintext (Pending) while it drains previously
+/// accepted bytes into the transport one 2-byte piece per second —
+/// confirmed progress below the ProgressReportingWriter renews the
+/// caller's idle window, so a 40-byte payload whose write attempts go
+/// Pending completes after ~14 s of virtual drain, ten idle-window
+/// renewals past the 1.5 s idle. The old single-timeout write loop
+/// returned Stalled at the first window (~1.5 s) with 2 bytes on the
+/// wire. Payload bytes are position-distinct, so byte-for-byte wire
+/// equality also rules out duplication or reordering from any
+/// re-polled attempt.
+#[tokio::test(start_paused = true)]
+async fn write_phase_survives_on_confirmed_drain_progress() {
+    let data: Vec<u8> = (0u8..40).collect();
+    let mut w = DrainingBuffer::new(
+        10,
+        2,
+        ProgressReportingWriter::new(GatedTransport::new(2, Duration::from_secs(1))),
+    );
+    let start = tokio::time::Instant::now();
+    let outcome = write_progress_bounded(&mut w, &data, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    assert_eq!(outcome, SendProgress::Completed);
+    assert!(
+        start.elapsed() >= Duration::from_secs(6),
+        "the send must have ridden many idle-window renewals: {:?}",
+        start.elapsed()
+    );
+    // Byte-for-byte: the transport received the whole payload exactly
+    // once, in order — no duplication from any re-polled attempt.
+    assert_eq!(w.into_transport().into_inner().accepted, data);
+}
+
+/// P2-03 (write phase): renewals ride ONLY confirmed progress. The
+/// transport drains happily for 6 bytes (renewals at 1.5 s and 3 s),
+/// then hits its quota and poll_write goes silent WITHOUT progress —
+/// the send must end as Stalled at the first progress-free window
+/// (4.5 s), not ride on. The abandoned attempt must not have
+/// duplicated anything: the wire holds exactly the drained prefix, no
+/// byte beyond it was ever accepted by the transport, and the buffer's
+/// stranded tail (accepted_new stays 10) was never re-offered.
+#[tokio::test(start_paused = true)]
+async fn write_phase_stalls_once_confirmed_progress_stops() {
+    let data: Vec<u8> = (0u8..40).collect();
+    let mut w = DrainingBuffer::new(
+        10,
+        2,
+        ProgressReportingWriter::new(
+            GatedTransport::new(2, Duration::from_secs(1)).stalling_after(6),
+        ),
+    );
+    let start = tokio::time::Instant::now();
+    let outcome = write_progress_bounded(&mut w, &data, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    assert_eq!(outcome, SendProgress::Stalled);
+    assert!(
+        start.elapsed() >= Duration::from_millis(4500)
+            && start.elapsed() < Duration::from_millis(6000),
+        "must renew on progress, then stall at the first progress-free window: {:?}",
+        start.elapsed()
+    );
+    // Wire: exactly the drained prefix — no duplicates, no reordering,
+    // nothing beyond the consumed frontier.
+    assert_eq!(w.transport().get_ref().accepted, &data[..6]);
+    // The double accepted only the first slice; the rest was never
+    // re-offered after abandonment.
+    assert_eq!(w.accepted_total(), 10);
+}
+
+/// P2-03 (write phase): bare wakeups and plain Pending prove nothing.
+/// The transport never accepts anything (quota 0) and the double fires
+/// 1000 progress-free wake_by_ref() calls from its Pending path — the
+/// counter never moves, so the send must stall after exactly ONE idle
+/// window.
+#[tokio::test(start_paused = true)]
+async fn write_phase_bare_wakes_without_progress_still_stall() {
+    let data: Vec<u8> = (0u8..40).collect();
+    let mut w = DrainingBuffer::new(
+        10,
+        2,
+        ProgressReportingWriter::new(
+            GatedTransport::new(2, Duration::from_secs(1)).stalling_after(0),
+        ),
+    )
+    .with_bare_wakes(1000);
+    let start = tokio::time::Instant::now();
+    let outcome = write_progress_bounded(&mut w, &data, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    assert_eq!(outcome, SendProgress::Stalled);
+    assert!(
+        w.wakes_left < 1000,
+        "bare wakes must actually have happened"
+    );
+    assert!(
+        w.transport().get_ref().accepted.is_empty(),
+        "no byte may reach the transport without room"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(1500)
+            && start.elapsed() < Duration::from_millis(2500),
+        "must stall after exactly one idle window: {:?}",
+        start.elapsed()
+    );
+}
+
+/// P2-03 backward compatibility (write phase): without a
+/// ProgressReportingWriter in the stack nothing reports progress, so
+/// even a genuinely-draining write phase keeps the old single idle
+/// window: two pieces reached the wire (the transport's cooldown
+/// starts ready, so one lands immediately), the window expired with
+/// no confirmed delta, Stalled.
+#[tokio::test(start_paused = true)]
+async fn uninstrumented_write_phase_keeps_single_idle_window() {
+    let data: Vec<u8> = (0u8..40).collect();
+    let mut w = DrainingBuffer::new(10, 2, GatedTransport::new(2, Duration::from_secs(1)));
+    let start = tokio::time::Instant::now();
+    let outcome = write_progress_bounded(&mut w, &data, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    assert_eq!(outcome, SendProgress::Stalled);
+    assert!(
+        start.elapsed() >= Duration::from_millis(1500)
+            && start.elapsed() < Duration::from_millis(2500),
+        "uninstrumented drains must keep the single idle window: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(w.into_transport().accepted, &data[..4]);
+}

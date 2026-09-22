@@ -18,8 +18,9 @@ use tokio::time::Instant;
 /// direction. Progress confirmed inside a wrapping TLS/buffering stack — a
 /// `ProgressReportingWriter` below the tracked stream, reported through the
 /// tunnel's shared `FlushProgress` — counts as activity too: bytes moved
-/// inside the wrapper while the outer flush/shutdown is still unresolved
-/// are activity, not idleness. `max_lifetime` also bounds stalled writes
+/// inside the wrapper while the outer write/flush/shutdown is still
+/// unresolved are activity, not idleness. `max_lifetime` also bounds
+/// stalled writes
 /// and shutdowns.
 /// A zero duration disables the corresponding deadline. On timeout, shutdown
 /// is attempted once on each stream before dropping both; teardown never waits
@@ -125,8 +126,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let confirmed_before = self.confirmed.total();
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+        if matches!(result, Poll::Ready(Ok(n)) if n > 0)
+            || self.confirmed.total() > confirmed_before
+        {
             self.activity.record();
         }
         result
@@ -678,5 +682,290 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(&*log.lock().unwrap(), &payload);
+    }
+
+    /// P2-03 raw transport for the write-phase doubles: accepts at most
+    /// `per_poll` bytes per successful poll_write, then goes silent for
+    /// `interval` of (virtual) time. `stalling_after` makes it refuse
+    /// forever (Pending, no waker — re-polls come only from the
+    /// caller's own timers) once that many bytes have been accepted in
+    /// total. Every accepted byte is appended into the shared `log` so
+    /// the test can verify the exact wire content after the tunnel
+    /// consumed the stream.
+    struct GatedTransport {
+        log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        per_poll: usize,
+        interval: Duration,
+        cooldown: std::pin::Pin<Box<tokio::time::Sleep>>,
+        stall_after: Option<usize>,
+    }
+
+    impl GatedTransport {
+        fn new(
+            per_poll: usize,
+            interval: Duration,
+            log: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        ) -> Self {
+            Self {
+                log,
+                per_poll,
+                interval,
+                cooldown: Box::pin(tokio::time::sleep(Duration::ZERO)),
+                stall_after: None,
+            }
+        }
+
+        fn stalling_after(mut self, n: usize) -> Self {
+            self.stall_after = Some(n);
+            self
+        }
+    }
+
+    // All fields are Unpin, so get_mut() is enough to drive it.
+    impl AsyncWrite for GatedTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if let Some(quota) = this.stall_after {
+                if this.log.lock().unwrap().len() >= quota {
+                    // Quota reached: silent forever, no waker
+                    // registered — only the caller's timers re-poll.
+                    return Poll::Pending;
+                }
+            }
+            if this.cooldown.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(this.per_poll);
+            this.log.lock().unwrap().extend_from_slice(&buf[..n]);
+            let deadline = tokio::time::Instant::now() + this.interval;
+            this.cooldown.as_mut().reset(deadline);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// P2-03 TLS look-alike for the WRITE phase: its poll_write, when
+    /// asked to accept NEW plaintext while previously accepted bytes
+    /// are still in flight, first pushes one `piece` of the old bytes
+    /// into the transport (confirmed progress below the
+    /// `ProgressReportingWriter`) and then returns Pending WITHOUT
+    /// consuming any of the new bytes — the tokio-rustls
+    /// `(0, would_block)` shape. New bytes are buffered — never put on
+    /// the wire directly — and only once the buffer has fully drained,
+    /// at most `accept_per_poll` per Ready, so the copy loop keeps
+    /// re-invoking poll_write while earlier bytes are still draining.
+    /// Flush and shutdown drive any remaining buffer into the
+    /// transport. The read leg is immediate EOF.
+    struct DrainingTlsPeer<W> {
+        pending: std::collections::VecDeque<u8>,
+        accept_per_poll: usize,
+        piece: usize,
+        transport: W,
+    }
+
+    impl<W: AsyncWrite + Unpin> DrainingTlsPeer<W> {
+        fn new(accept_per_poll: usize, piece: usize, transport: W) -> Self {
+            Self {
+                pending: std::collections::VecDeque::new(),
+                accept_per_poll,
+                piece,
+                transport,
+            }
+        }
+
+        // Loop until the buffer is fully drained or the transport
+        // blocks, then delegate the flush inward.
+        fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            while !self.pending.is_empty() {
+                let contiguous = self.pending.make_contiguous();
+                let take = self.piece.min(contiguous.len());
+                match Pin::new(&mut self.transport).poll_write(cx, &contiguous[..take]) {
+                    Poll::Ready(Ok(n)) => {
+                        self.pending.drain(..n);
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            Pin::new(&mut self.transport).poll_flush(cx)
+        }
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncRead for DrainingTlsPeer<W> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            // Immediate EOF: the upstream's read leg never blocks the
+            // tunnel; only the write leg keeps it busy.
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for DrainingTlsPeer<W> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            // Refuse new plaintext while anything is in flight: drain
+            // toward the transport only while it accepts, and accept
+            // new bytes only once the buffer has fully drained.
+            while !this.pending.is_empty() {
+                let contiguous = this.pending.make_contiguous();
+                let take = this.piece.min(contiguous.len());
+                match Pin::new(&mut this.transport).poll_write(cx, &contiguous[..take]) {
+                    Poll::Ready(Ok(n)) => {
+                        this.pending.drain(..n);
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    // Old bytes still in flight: the new ones are not
+                    // even looked at (the `(0, would_block)` shape).
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            let n = buf.len().min(this.accept_per_poll);
+            this.pending.extend(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().poll_drain(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().poll_drain(cx)
+        }
+    }
+
+    /// P2-03 end-to-end for the tunnel's own idle tracking: the
+    /// upstream's poll_write keeps refusing new plaintext (Pending)
+    /// while it drains previously accepted bytes to the wire 2 bytes
+    /// every 400 ms. Those drains are confirmed through the tunnel's
+    /// shared FlushProgress, and with the fix Tracked::poll_write
+    /// records them as activity, so the tunnel survives its 1 s idle
+    /// deadline (the Ready-writes alone land ~1.6 s apart) and exits Ok
+    /// with the exact 30-byte payload on the wire. Before the fix the
+    /// idle timer fired at 1 s and tore the tunnel down mid-drain with
+    /// only the drained prefix on the wire.
+    #[tokio::test(start_paused = true)]
+    async fn idle_spares_tunnel_while_tls_write_drains_slowly() {
+        let payload: Vec<u8> = (0u8..30).collect();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut client, client_inner) = duplex(4096);
+        client.write_all(&payload).await.unwrap();
+        drop(client); // EOF: the client→upstream leg can finish
+
+        let upstream = DrainingTlsPeer::new(
+            10,
+            2,
+            ProgressReportingWriter::new(GatedTransport::new(
+                2,
+                Duration::from_millis(400),
+                log.clone(),
+            )),
+        );
+        let start = tokio::time::Instant::now();
+        let res = tunnel_with_timeouts(
+            client_inner,
+            upstream,
+            Duration::from_secs(1), // idle
+            Duration::ZERO,         // lifetime disabled
+        )
+        .await;
+        res.expect("tunnel must not error");
+        assert!(
+            start.elapsed() >= Duration::from_millis(3000),
+            "tunnel must survive past the idle window while the write phase drains: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(&*log.lock().unwrap(), &payload);
+    }
+
+    /// P2-03 negative control: once the confirmed progress stops (the
+    /// transport hit its 2-byte quota and goes silent, Pending without
+    /// a waker), bare Pending from poll_write must NOT keep the tunnel
+    /// alive — it dies at the idle deadline with exactly the drained
+    /// prefix on the wire and nothing beyond it.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_write_phase_stalls_when_confirmed_progress_stops() {
+        let payload: Vec<u8> = (0u8..30).collect();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut client, client_inner) = duplex(4096);
+        client.write_all(&payload).await.unwrap();
+        drop(client);
+
+        let upstream = DrainingTlsPeer::new(
+            10,
+            2,
+            ProgressReportingWriter::new(
+                GatedTransport::new(2, Duration::from_millis(400), log.clone()).stalling_after(2),
+            ),
+        );
+        let start = tokio::time::Instant::now();
+        let res = tunnel_with_timeouts(
+            client_inner,
+            upstream,
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await;
+        res.expect("idle teardown must be clean");
+        assert!(
+            start.elapsed() >= Duration::from_secs(1)
+                && start.elapsed() < Duration::from_millis(1500),
+            "must die at the first idle deadline, not ride bare Pending: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(&*log.lock().unwrap(), &payload[..2]);
+    }
+
+    /// P2-03 backward compatibility: without a ProgressReportingWriter
+    /// in the stack nothing reports progress, so the write-phase drains
+    /// count for nothing and the old idle behavior stands — the tunnel
+    /// dies at the first idle deadline even though the wire kept
+    /// moving underneath.
+    #[tokio::test(start_paused = true)]
+    async fn uninstrumented_tunnel_write_drains_do_not_count() {
+        let payload: Vec<u8> = (0u8..30).collect();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut client, client_inner) = duplex(4096);
+        client.write_all(&payload).await.unwrap();
+        drop(client);
+
+        let upstream = DrainingTlsPeer::new(
+            10,
+            2,
+            GatedTransport::new(2, Duration::from_millis(400), log.clone()),
+        );
+        let start = tokio::time::Instant::now();
+        let res = tunnel_with_timeouts(
+            client_inner,
+            upstream,
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await;
+        res.expect("idle teardown must be clean");
+        assert!(
+            start.elapsed() >= Duration::from_secs(1)
+                && start.elapsed() < Duration::from_millis(1500),
+            "uninstrumented drains must keep the single idle window: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(&*log.lock().unwrap(), &payload[..6]);
     }
 }
