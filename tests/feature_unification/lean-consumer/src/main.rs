@@ -6,9 +6,18 @@
 
 use std::time::Duration;
 
+use resocks5_net::connect::connect_proxy::TlsConnector;
 use resocks5_net::connect::{connect_proxy, connect_proxy_once, parse_proxy_str};
 use resocks5_net::pool::{PoolConfig, ProxyPool};
 use resocks5_net::types::{IP, ProxyProtocol};
+
+/// A real lean consumer may NAME the parameter type, not just pass an
+/// untyped `None` — the named path `connect::connect_proxy::TlsConnector`
+/// must stay public and resolve to the same type under every feature
+/// combination (review R2-P2-01).
+fn named_connector_slot() -> Option<&'static TlsConnector> {
+    None
+}
 
 fn main() {
     let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Socks5, IP::V4)
@@ -29,5 +38,6 @@ fn main() {
     // Never polled: this fixture proves compilation, not connectivity.
     drop(once);
     drop(pooled);
+    let _ = named_connector_slot();
     println!("lean-consumer: compiled OK (lean dependency, no tls of its own)");
 }

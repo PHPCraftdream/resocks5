@@ -103,6 +103,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lean, one with `tls`) and proves the lean consumer's source needs no
   change either way.
 
+- **The TLS build's `TlsConnector` name was private, so a lean consumer
+  that named the type itself (not just passed `None`) broke under
+  feature unification even after the arity fix above.**
+  `connect::connect_proxy::TlsConnector` resolved to a private
+  `use tokio_rustls::TlsConnector;` import whenever `tls` was enabled,
+  while the lean build's placeholder of the same name was `pub`. A
+  downstream crate built with `default-features = false` that wrote
+  `use resocks5_net::connect::connect_proxy::TlsConnector;` to declare
+  its own `Option<&'static TlsConnector>` compiled standalone, then
+  failed with `error[E0603]: struct TlsConnector is private` the moment
+  some other crate in the same build graph turned `tls` on — the same
+  feature-unification hazard as the arity break above, surviving one
+  round of fixes because that fix only closed the untyped `None` call
+  shape. The import is now `pub use`, so the name is public and
+  resolves to the same real type under every feature combination. The
+  checked-in fixture at `tests/feature_unification/` now also names the
+  type explicitly, not just infers it from `None`, so it catches this
+  class of regression going forward.
+
 - **Init-claim admission could exhaust the shared Tokio blocking pool
   (conditional denial of service).** Each concurrent init-on-first-login
   claim launched its own `spawn_blocking` for the persistence phase with

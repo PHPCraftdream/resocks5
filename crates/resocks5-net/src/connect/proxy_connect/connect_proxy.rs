@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 #[cfg(feature = "tls")]
-use tokio_rustls::TlsConnector;
+pub use tokio_rustls::TlsConnector;
 
 #[cfg(feature = "tls")]
 use crate::connect::upstream_tls::connect_https_proxy;

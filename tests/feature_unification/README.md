@@ -4,7 +4,10 @@ Two downstream crates share one cargo graph and depend on this repo's
 `resocks5-net` by path:
 
 - `lean-consumer` — `default-features = false`; calls `connect_proxy` and
-  `connect_proxy_once` with the universal call shape (trailing `None`).
+  `connect_proxy_once` with the universal call shape (trailing `None`), and
+  additionally names the parameter type itself
+  (`use resocks5_net::connect::connect_proxy::TlsConnector;` +
+  `Option<&'static TlsConnector>`).
 - `tls-consumer` — default features (`tls` on); passes a real connector
   from `make_tls_connector` for an HTTPS upstream.
 
@@ -14,7 +17,11 @@ source must still compile against it unchanged. That is exactly the
 failure mode from review P2-01, where `#[cfg(feature = "tls")]` on the
 `tls_connector` parameter changed the entry points' arity and broke lean
 consumers under unification (`error[E0061]: this function takes 5
-arguments but 4 arguments were supplied`).
+arguments but 4 arguments were supplied`); the named-type check above is
+the counterpart regression gate for review R2-P2-01, where the TLS build
+kept the arity but made the type private (`error[E0603]: struct
+TlsConnector is private`) because `tokio_rustls::TlsConnector` was only
+imported, not re-exported.
 
 This directory is not part of the root workspace (`exclude`d in the root
 `Cargo.toml`) and is never published; it is a compile-time gate, the
@@ -55,3 +62,14 @@ satisfy the old cfg'd-on signature too once `tls` is unified on. The
 fixture demonstrates the fix; catching a future regression the same way
 would require rewriting the lean consumer back to the old call shape, as
 above.
+
+The named-type half of the fixture got the same treatment when R2-P2-01
+was fixed: with `pub use tokio_rustls::TlsConnector;` in
+`connect_proxy.rs` temporarily reverted to the private
+`use tokio_rustls::TlsConnector;`, `cargo check --workspace` from this
+directory failed with `error[E0603]: struct TlsConnector is private` on
+lean-consumer's named-type use (tls-consumer had unified `tls` on), while
+`cargo check -p lean-consumer` alone still passed against the lean
+placeholder. Restoring the `pub use` made both green again. Note the
+pre-fix source of this file (untyped `None` only) did NOT trip that
+variant — the named-type use above is what makes the fixture catch it.
