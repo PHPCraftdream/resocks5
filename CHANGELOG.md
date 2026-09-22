@@ -7,8 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New `resocks5-net` API: `connect::make_tls_connector_with_provider` — the
+  provider-explicit twin of `make_tls_connector`. Where the convenience
+  function defers to rustls' process-level/feature-based provider
+  resolution (which panics in a build graph rustls cannot resolve — see
+  below), this variant takes an explicit `Arc<rustls::crypto::CryptoProvider>`
+  and never consults process-global state, so it works in every graph
+  state including the ones that would otherwise panic.
+
 ### Fixed
 
+- **`make_tls_connector`'s crypto-provider prerequisite was undocumented,
+  so a downstream application could hit an unexpected panic before any
+  network I/O.** rustls requires a process-level `CryptoProvider`
+  decision; `resocks5-net`'s own default build graph (only `ring`
+  enabled) has always auto-resolved this transparently, so today's
+  behaviour for ordinary consumers is unchanged and verified unchanged.
+  But an application that links a second crypto backend alongside this
+  SDK's `ring`, or enables rustls' `custom-provider` feature, takes that
+  auto-resolution away — and without installing its own default
+  provider, `make_tls_connector` then panics inside rustls with no
+  warning that this prerequisite existed. `make_tls_connector` now
+  documents the exact three-case resolution order, the exact panic
+  message (verified byte-for-byte against rustls 0.23.40's source, both
+  in the default graph and reproduced live in a real
+  `ring`+`aws_lc_rs`-ambiguous build), and a working example of
+  installing a provider once at startup. Not a regression from this
+  release cycle, and not a rustls or cryptography defect — provider
+  selection is explicitly the application's responsibility; the gap was
+  purely that the SDK never said so.
 - **HTTPS-through-gate never reported transport progress, so a
   slow-draining upstream behind any HTTPS gate hop could be killed as
   falsely idle.** The false-idle protection added for the direct HTTPS

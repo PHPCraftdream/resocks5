@@ -45,3 +45,5 @@ pub use recover_host::{parse_http_host, parse_sni};
 pub use tls_fragment::{send_possibly_fragmented, FragmentSpec};
 #[cfg(feature = "tls")]
 pub use upstream_tls::make_tls_connector;
+#[cfg(feature = "tls")]
+pub use upstream_tls::make_tls_connector_with_provider;

@@ -27,7 +27,15 @@ no authentication.
 - `tls` (**enabled by default**): HTTPS (TLS-wrapped CONNECT) upstreams,
   the Mozilla-root-store default connector (`connect::make_tls_connector`),
   and the `AnyUpstream::Tls` variant, backed by `rustls`, `tokio-rustls`
-  and `webpki-roots`. Lean SOCKS5/HTTP-only builds opt out with
+  and `webpki-roots`. The default connector relies on rustls'
+  process-level crypto-provider resolution: install a provider once at
+  process startup
+  (`rustls::crypto::ring::default_provider().install_default()`) or hand
+  one in via `connect::make_tls_connector_with_provider` / your own
+  `TlsConnector`. A build that links both `ring` and `aws-lc-rs` (or
+  enables rustls' `custom-provider` feature) makes `connect::make_tls_connector`
+  panic unless such an install happened first — see its `# Panics`
+  documentation. Lean SOCKS5/HTTP-only builds opt out with
   `default-features = false`; a config that then still names an HTTPS
   upstream fails fast with an error naming the missing feature — never a
   silent plaintext fallback. TLS ClientHello fragmentation stays available

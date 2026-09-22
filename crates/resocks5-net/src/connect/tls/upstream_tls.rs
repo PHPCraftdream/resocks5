@@ -80,13 +80,116 @@ pub async fn connect_https_proxy(
 ///
 /// Convenience for callers without their own rustls config — both the
 /// library example and the binary's HTTPS-upstream path use this.
+///
+/// # Crypto-provider prerequisite
+///
+/// Every rustls config build needs a [`rustls::crypto::CryptoProvider`]
+/// decision, and rustls assigns that decision to the *application*. This
+/// function defers to `ClientConfig::builder()`, whose process-level
+/// resolution order is:
+///
+/// 1. a process-global default previously installed by the application
+///    ([`rustls::crypto::CryptoProvider::install_default`], typically
+///    once at startup, before any TLS is attempted) — it always wins;
+/// 2. otherwise, when the `rustls` compiled into the final build graph
+///    enables exactly one built-in backend (`ring` XOR `aws_lc_rs`) and
+///    not its `custom-provider` feature — that provider is
+///    auto-selected and auto-installed into the process global;
+/// 3. otherwise — a panic, before any network I/O (see **Panics**).
+///
+/// `resocks5-net`'s `tls` feature enables only `ring`, so a downstream
+/// build that links no second backend and leaves `custom-provider` off
+/// always lands in case 2 — today's behaviour, unchanged. The panic is
+/// reachable only when the application's own feature choices take that
+/// decision away from this crate (a second backend alongside `ring`, or
+/// rustls' `custom-provider` feature) without the application installing
+/// a default of its own — which is the application's prerogative; the
+/// contract here just makes the consequence visible.
+///
+/// # Panics
+///
+/// Panics when neither resolution step applies: no process-global default
+/// is installed *and* the graph's `rustls` enables both `ring` and
+/// `aws_lc_rs` (ambiguous), or enables its `custom-provider` feature. The
+/// panic is raised inside rustls itself
+/// (`CryptoProvider::get_default_or_install_from_crate_features`), not in
+/// this crate, with the exact message:
+///
+/// ```text
+/// Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+/// Call CryptoProvider::install_default() before this point to select a provider manually, or make sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+/// See the documentation of the CryptoProvider type for more information.
+/// ```
+///
+/// To avoid it, install a provider once at process startup (the example
+/// below), or use [`make_tls_connector_with_provider`] to hand one in
+/// directly, or pass your own already-configured `TlsConnector` to
+/// [`connect_proxy`](crate::connect::connect_proxy::connect_proxy) /
+/// [`connect_https_proxy`] — the connector argument those entry points
+/// take is the original explicit-configuration escape hatch and bypasses
+/// provider resolution entirely.
+///
+/// # Example
+///
+/// ```
+/// // Once per process, before any TLS is attempted (e.g. in `main`):
+/// rustls::crypto::ring::default_provider()
+///     .install_default()
+///     .expect("crypto provider not yet installed");
+///
+/// let connector = resocks5_net::connect::make_tls_connector();
+/// ```
 pub fn make_tls_connector() -> TlsConnector {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(root_cert_store())
         .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
+}
+
+/// Build a [`TlsConnector`] rooted at the Mozilla `webpki-roots` trust
+/// store, from an explicitly supplied crypto `provider`.
+///
+/// The provider-explicit twin of [`make_tls_connector`] (named after
+/// rustls' own `ClientConfig::builder_with_provider`; sibling-suffix
+/// style, as with `connect_proxy_once` beside `connect_proxy`). Where
+/// the convenience defers to rustls' process-level/feature-based
+/// resolution — which panics in graphs rustls cannot resolve (see its
+/// **Panics**) — this function never consults process-global state at
+/// all: the application's own provider choice (ring, aws-lc-rs, or
+/// fully custom) is passed straight through, so it works in every
+/// graph state, including the ambiguous and `custom-provider` ones, and
+/// including processes that install no global default at all.
+///
+/// # Panics
+///
+/// Only if `provider` supports none of [`rustls::ALL_VERSIONS`] (TLS
+/// 1.2 and 1.3) — the same unwrap rustls' own `ClientConfig::builder()`
+/// performs internally. Unreachable for rustls' built-in providers;
+/// possible only for a hand-rolled provider whose suite list omits both
+/// protocol versions.
+///
+/// # Example
+///
+/// ```
+/// let connector = resocks5_net::connect::make_tls_connector_with_provider(
+///     std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+/// );
+/// ```
+pub fn make_tls_connector_with_provider(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> TlsConnector {
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .expect("provider supports none of rustls' default protocol versions")
+        .with_root_certificates(root_cert_store())
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+}
+
+/// The Mozilla `webpki-roots` trust store, shared by both connector
+/// constructors.
+fn root_cert_store() -> rustls::RootCertStore {
+    rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
 #[cfg(test)]
