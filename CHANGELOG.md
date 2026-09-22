@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-22
+
+Version bump, not just a rollup: `cargo-semver-checks` against the `v0.1.1`
+baseline confirms two breaking API changes already present in this release
+(see `### Changed` below); several other entries in this section are
+independently marked **Breaking**. `0.1.1` is already tagged and published
+under the old, incompatible shape, so publishing under that same number
+again is not an option either technically (registries reject re-publishing
+a version) or honestly. No other manifest or dependency versions changed as
+part of the bump itself.
+
+### Changed
+
+- **Breaking:** `AnyUpstream` is now `#[non_exhaustive]` — a `match` over
+  its variants in a downstream crate must carry a wildcard arm. Landed
+  alongside earlier review fixes (before this bump), so a lean `0.1.1`
+  consumer that matched exhaustively would already have been broken by it;
+  the version number simply never caught up until now.
+- **Breaking:** `send_possibly_fragmented` gained a fourth parameter
+  (`idle: Duration`, the idle-timeout bound also used by the rest of the
+  bounded-send/tunnel progress machinery) and its return type changed from
+  `Result<()>` to `Result<SendProgress>`, so callers can observe a
+  false-idle-protected stall instead of it being indistinguishable from
+  success. Same situation as `AnyUpstream` above: shipped as part of the
+  Pending-write-progress fix, ahead of the version bump that should have
+  accompanied it.
+
+### Security
+
+- **`rustls` was pinned at 0.23.40, affected by
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
+  / [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc):**
+  TLS 1.3 handshake messages sent at the wrong encryption level (e.g. a
+  plaintext `EncryptedExtensions` packed into the same record as
+  `ServerHello`) were incorrectly accepted instead of terminating the
+  connection per RFC 8446 §5.1. The handshake transcript stays
+  authenticated — this is not a MITM or certificate-bypass primitive — but
+  rustls should reject such messages regardless. Raised the
+  `[workspace.dependencies]` floor to `rustls = "0.23.45"` (the fixed
+  version) so a future `cargo update` cannot resolve back down to a
+  vulnerable patch, and updated `Cargo.lock` accordingly (also pulls in
+  `rustls-webpki` 0.103.15). `cargo deny check advisories` no longer flags
+  this advisory. The full TLS-facing test suite (fragmentation, tunnel,
+  gate-progress, crypto-provider contract) was re-run against the new
+  version, in both debug and release, with no change in behavior.
+
 ### Added
 
 - New `resocks5-net` API: `connect::make_tls_connector_with_provider` — the
