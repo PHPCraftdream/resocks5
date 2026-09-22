@@ -123,7 +123,7 @@ pub enum AnyUpstream {
     /// wrapped in a [`ProgressReportingWriter`] by the gate dialer, so
     /// confirmed write progress below the FIRST TLS hop is reported
     /// into enclosing confirmed-progress scopes (idle-bounded sends,
-    /// tunnel activity tracking) exactly as for [`AnyUpstream::Tls`].
+    /// tunnel activity tracking) exactly as for `AnyUpstream::Tls`.
     Gate(BoxedUpstream),
 }
 
