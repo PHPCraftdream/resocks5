@@ -116,6 +116,40 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: true
 
+  # Publish the resocks5-net SDK crate to crates.io. `version.workspace =
+  # true` ties resocks5-net's version to the same tag as the native/Docker
+  # release, so a v* push always corresponds to a new (never-before-seen)
+  # resocks5-net version — no separate SDK tag or trigger needed.
+  #
+  # The dry-run always runs (no secret needed — it's a plain packaging +
+  # build sanity check). The actual upload step skips cleanly (not a
+  # failure) when CARGO_REGISTRY_TOKEN isn't configured, so this job is a
+  # safe no-op on the upload side until a maintainer adds the secret: repo
+  # Settings → Secrets and variables → Actions → CARGO_REGISTRY_TOKEN, an
+  # API token from https://crates.io/settings/tokens scoped to
+  # publish-new + publish-update for resocks5-net.
+  publish-sdk:
+    name: publish resocks5-net to crates.io
+    runs-on: ubuntu-latest
+    # `secrets` isn't readable from an `if:` condition directly (GitHub
+    # Actions restriction) — mirror it into `env` once at job level, where
+    # `secrets` access is allowed, then branch on the `env` context instead.
+    env:
+      HAS_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-sdk
+      - name: Dry-run (packaging + build sanity, no upload)
+        run: cargo publish -p resocks5-net --locked --dry-run
+      - name: Publish
+        if: ${{ env.HAS_CARGO_REGISTRY_TOKEN == 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p resocks5-net --locked
+
   # Multi-arch container image → ghcr.io/<owner>/resocks5.
   # Built with Buildx + QEMU so a single ubuntu runner emits both linux/amd64
   # and linux/arm64 manifests. `metadata-action` lowercases the repo name

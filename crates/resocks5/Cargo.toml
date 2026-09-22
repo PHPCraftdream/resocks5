@@ -11,7 +11,13 @@ keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-resocks5-net = { path = "../resocks5-net", features = ["tls", "serde", "rating", "rotator"] }
+# `version` is required for `cargo package`/`cargo publish`: a registry
+# consumer has no `../resocks5-net` on disk, so Cargo resolves this from
+# crates.io instead, using `path` only for the local workspace build. Not
+# covered by workspace inheritance (that's for a crate's own version, not
+# a sibling dependency's) — bump this alongside `[workspace.package].version`
+# whenever resocks5-net's API changes.
+resocks5-net = { path = "../resocks5-net", version = "0.2.0", features = ["tls", "serde", "rating", "rotator"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true
 serde.workspace = true

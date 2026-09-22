@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CI: `release.yml` gains a `publish-sdk` job that publishes
+  `resocks5-net` to crates.io on every `v*` tag push (after a
+  packaging/build dry-run that always runs regardless). Skips the actual
+  upload cleanly, without failing the workflow, until a maintainer adds
+  the `CARGO_REGISTRY_TOKEN` repo secret — previously there was no
+  automated SDK publish step at all, only a manual `cargo publish` a
+  maintainer would have had to remember to run.
+
+### Fixed
+
+- **`cargo package -p resocks5` failed outright (`does not specify a
+  version`) because its path dependency on `resocks5-net` had no
+  `version` requirement.** A registry consumer of `resocks5` has no
+  `../resocks5-net` checkout on disk, so Cargo refuses to package a path
+  dependency with no version to resolve it from instead. Added
+  `version = "0.2.0"` alongside the existing `path = "../resocks5-net"`
+  in `crates/resocks5/Cargo.toml` — `path` still wins for the local
+  workspace build, `version` only matters when packaging for a registry.
+  This clears the manifest-level blocker; `cargo package -p resocks5`
+  still can't fully verify until `resocks5-net` is actually live on
+  crates.io (expected publish-order dependency, not a defect), and
+  `resocks5` itself still isn't published (that's a separate, undecided
+  question — see `CONTRIBUTING.md`).
+
 ## [0.2.0] - 2026-09-22
 
 Version bump, not just a rollup: `cargo-semver-checks` against the `v0.1.1`

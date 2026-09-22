@@ -72,6 +72,31 @@ TLS-fragmentation, safety nets), see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 Use the [PR template](.github/pull_request_template.md). The reviewers
 need to see what changed, why, and how you verified it.
 
+## Releasing (maintainers)
+
+1. Bump `[workspace.package].version` in the root `Cargo.toml` — both
+   crates share one version. Roll `CHANGELOG.md`'s `## [Unreleased]`
+   section into a dated `## [X.Y.Z] - YYYY-MM-DD` section, and add a
+   fresh empty `## [Unreleased]` above it. If `resocks5-net`'s public API
+   changed at all this cycle, this must be at least a minor bump (0.x
+   SemVer treats a minor bump as the breaking-change boundary) —
+   `cargo semver-checks -p resocks5-net --baseline-rev <previous tag>`
+   catches what plain review misses.
+2. Also bump the `version = "..."` on the `resocks5-net` path dependency
+   in `crates/resocks5/Cargo.toml` to match — it's a separate field from
+   `version.workspace`, not auto-derived, since it's declaring a registry
+   version requirement for a *sibling* crate, not this crate's own version.
+3. Commit, push, then push a `v<version>` tag. That single tag push
+   triggers `.github/workflows/release.yml`: native archives + a GitHub
+   Release, a multi-arch Docker image to `ghcr.io`, and — once a
+   maintainer has added the `CARGO_REGISTRY_TOKEN` repo secret — a
+   `cargo publish` of `resocks5-net` to crates.io. `resocks5` itself
+   (the binary) is not published to crates.io yet: its own path
+   dependency on `resocks5-net` now carries a version requirement, but
+   nobody has decided whether `cargo install resocks5` should be a
+   supported install path or whether native archives/Docker/git remain
+   the only sanctioned channels.
+
 ## License
 
 Contributions are dual-licensed under MIT or Apache-2.0, matching the
