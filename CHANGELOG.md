@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated SDK publish step at all, only a manual `cargo publish` a
   maintainer would have had to remember to run.
 
+### Security
+
+- **`ktav` was pinned at the yanked 0.6.1** (yanked 2026-09-16, cause not
+  disclosed upstream; no runtime vulnerability was claimed or found —
+  `cargo deny check advisories` flags a yank on its own, independent of
+  any CVE/RUSTSEC advisory). Moved to `0.6.4`, the latest release under
+  the existing `ktav = "0.6.0"` manifest requirement (no manifest change
+  needed, `cargo update -p ktav` was enough). `cargo deny check
+  advisories` is now fully clean — this was the last of the two findings
+  from this week's review rounds; the other (`rustls`) was fixed in the
+  `[0.2.0]` release above. Config parsing exercises `ktav` on nearly every
+  test in the `resocks5`
+  binary; the full 192-test binary suite was re-run and passed unchanged.
+
 ### Fixed
 
 - **`cargo package -p resocks5` failed outright (`does not specify a

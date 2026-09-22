@@ -468,9 +468,9 @@ dependencies = [
 
 [[package]]
 name = "ktav"
-version = "0.6.1"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe719f9d82e0037947fbdc767d986863bb195df42560cd2ca17767b466d5bd8c"
+checksum = "1504089feedb8cf7abbf9d90782c007066e7c010c760eb94b23178ed6aeaf18e"
 dependencies = [
  "bumpalo",
  "compact_str",
