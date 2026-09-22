@@ -19,6 +19,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A cancelled init-claim could let a same-account follower start a second
+  concurrent blocking claim, weakening the "at most one claim attempt per
+  account" guarantee.** The per-account claim gate's guard lived in
+  `verify_async`'s own async stack frame; if the caller cancelled that
+  future while the admitted `spawn_blocking` persistence closure was
+  still running (`spawn_blocking` work is not itself cancelled when the
+  awaiting future is dropped — the same tokio semantics the admission
+  permit already relied on), the frame's drop released the gate
+  immediately, even though the orphaned closure kept running. A
+  same-account follower could then take the now-free gate, find no
+  committed hash yet, and start its own blocking claim while the first
+  one was still in flight. The overall admission cap still bounded total
+  blocking-pool usage, so this did not reopen the P1-01 denial-of-service;
+  it broke per-account deduplication specifically under cancellation. The
+  gate guard is now an owned guard (`Mutex::lock_owned`) moved into the
+  same blocking closure as the permit, so it lives exactly as long as the
+  persistence work it protects. A deterministic test cancels a leader
+  claim while its persistence is parked on a pinned file lock and asserts
+  a same-account follower cannot enter the claim machinery a second time
+  until the leader's orphaned closure actually finishes.
 - **Docs and CLI help described the sand-rating model's zero-`fail_penalty`
   escape hatch as "round-robin", but the selection path it falls back to
   (`Ratings::pick_order`) is a weighted-random permutation that becomes

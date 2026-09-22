@@ -21,6 +21,11 @@ impl AuthState {
     /// per-account async gate: at most one claim attempt per account is
     /// in flight, and followers resolve against the committed hash
     /// instead of parking a second blocking closure on `claim_lock`.
+    /// R3-P3-02: the gate guard is an owned guard moved INTO the same
+    /// blocking closure as the permit, so the gate is held until the
+    /// persistence work actually finishes — cancelling this future
+    /// cannot free the gate for a same-account follower while a claim
+    /// is still in flight.
     pub async fn verify_async(self: &Arc<Self>, name: &str, password: &str) -> bool {
         if !self.entries.get(name).is_some_and(|u| u.enabled) {
             return false;
@@ -63,14 +68,21 @@ impl AuthState {
         // `spawn_blocking` closure. The permit therefore lives until the
         // persistence work actually finishes, even if THIS future is
         // cancelled while awaiting the closure; a cancelled waiter never
-        // occupied a blocking thread in the first place.
+        // occupied a blocking thread in the first place. The gate guard
+        // travels WITH the closure for the same reason (R3-P3-02): a
+        // guard held only in this frame would be dropped by cancellation
+        // while the non-cancellable closure keeps running, letting a
+        // same-account follower start a second claim for the account.
+        // In the fast-path branch (a committed hash is already there)
+        // the owned guard is simply dropped with the block — there is
+        // no persistence work left to protect.
         let work = match prepared {
             Prepared::Done(ok) => return ok,
             Prepared::Claim(work) => work,
         };
         let outcome = {
             let gate = self.claim_gate(&work.name);
-            let _gate_guard = gate.lock().await;
+            let gate_guard = gate.lock_owned().await;
             // A concurrent claim for this account (or a disk value
             // adopted from a concurrent CLI edit) may have committed
             // while we hashed and queued — resolve as a plain login
@@ -85,6 +97,7 @@ impl AuthState {
                 let state = self.clone();
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    let _gate_guard = gate_guard;
                     state.claim_commit(work)
                 })
                 .await
@@ -114,7 +127,9 @@ impl AuthState {
     /// P1-01: per-account claim gate (see `claim_gates`). Returns a
     /// clone of the account's gate; the std guard is dropped before
     /// returning so the async lock is awaited without any sync guard
-    /// held across an `.await`.
+    /// held across an `.await`. Callers take the lock with
+    /// `lock_owned`, producing a self-owned guard that can be moved
+    /// into the phase-2 blocking closure (R3-P3-02).
     fn claim_gate(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.claim_gates.lock().expect("claim gates poisoned");
         gates.entry(name.to_owned()).or_default().clone()
