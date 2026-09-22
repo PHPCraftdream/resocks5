@@ -19,6 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Docs and CLI help described the sand-rating model's zero-`fail_penalty`
+  escape hatch as "round-robin", but the selection path it falls back to
+  (`Ratings::pick_order`) is a weighted-random permutation that becomes
+  uniform *random* selection at equal weights, not a deterministic
+  round-robin rotation** — consecutive picks can repeat before every
+  upstream has had a turn, unlike true round-robin. Corrected the wording
+  in `RatingPolicy::fail_penalty`'s doc comment, `NetworkConfig`'s
+  `sand_fail_penalty` doc comment, the CLI's `print-config-docs` output,
+  `resocks5-net`'s README, and `docs/ARCHITECTURE.md`. No selection
+  behavior changed — `ProxyRotator::get_next`'s own separate fetch-and-increment
+  fallback genuinely is round-robin and was already described correctly.
+- **The published SDK archive was missing `LICENSE-MIT`/`LICENSE-APACHE`
+  despite declaring `license = "MIT OR Apache-2.0"`.** `cargo package`
+  only includes files inside a crate's own directory; the workspace's
+  license files live at the repo root, one level up from
+  `crates/resocks5-net/`, so they were silently absent from every SDK
+  package. Copied both license files into `crates/resocks5-net/` so they
+  are included in the packaged archive going forward.
+- **`cargo deny check licenses` had no project policy, so its default
+  policy rejected the workspace's own MIT/Apache-2.0 dependencies outright**
+  (`bans`/`sources` were unaffected and already passed). Added `deny.toml`
+  with an explicit allow-list covering every license actually present in
+  the locked dependency graph. Deliberately does not touch `advisories`
+  policy — the currently-failing rustls advisory and yanked `ktav` pin are
+  real, unresolved, version-bump decisions for the release owner, not
+  something to silence here.
 - **`handshake_over_stream`'s SOCKS5 handshake could hang forever over any
   buffered stream, with no timeout of its own.** Each of the four
   request/response steps (auth-method negotiation, username/password
@@ -264,7 +290,7 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
   decaying failure accumulator. Selection is weighted-random with
   `weight = exp(-K·sand)`, so failing upstreams are picked less often but
   never excluded, and recover automatically as their sand drains. When every
-  upstream is bad the weights equalise into uniform round-robin.
+  upstream is bad the weights equalise into uniform random selection.
 - **Sticky cache:** per-target affinity to whichever upstream last succeeded
   for that target. On failure the cache entry is dropped and the next
   weighted draw picks fresh.

@@ -16,7 +16,7 @@ What's inside:
   with weight `exp(-k · sand)`: failing upstreams are picked less often
   but never excluded, and recover automatically as their sand drains.
   When every upstream is bad the weights equalise, so a full outage
-  degrades to uniform round-robin instead of locking out.
+  degrades to uniform random selection instead of locking out.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
 
 No application concerns leak in: no config-file format, no logger,

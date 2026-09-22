@@ -1,0 +1,21 @@
+# cargo-deny license policy. Explicit allow-list for the licenses actually
+# present in the locked dependency graph (see R3 review's "Dependency
+# policy" gate — the project previously had no deny.toml, so the default
+# policy rejected ordinary MIT/Apache-2.0 dependencies with no allowlist).
+# `advisories`/`bans`/`sources` are left at cargo-deny's built-in defaults
+# on purpose: those already pass, and an advisories ignore-list is a
+# release-owner decision, not something to add here.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unlicense",
+    "0BSD",
+    "Zlib",
+    "ISC",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]

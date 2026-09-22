@@ -7,7 +7,7 @@ use anyhow::anyhow;
 pub struct RatingPolicy {
     /// Time (seconds) for sand level to decay by half.
     pub half_life_sec: f64,
-    /// Sand added per failure observation. 0.0 disables the model (pure round-robin).
+    /// Sand added per failure observation. 0.0 disables the model (pure uniform-random selection).
     pub fail_penalty: f64,
     /// Hard ceiling on accumulated sand.
     pub sand_max: f64,

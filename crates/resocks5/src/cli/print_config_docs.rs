@@ -250,7 +250,7 @@ network: { ... }                (timeouts and TCP keepalive)
         Higher values make a single failure weigh more heavily.
 
         Setting sand_fail_penalty: 0.0 disables the sand model
-        entirely and gives pure round-robin selection (escape hatch).
+        entirely and gives pure uniform-random selection (escape hatch).
 
     network.sand_max: f64                  (default 8.0)
         Hard ceiling on accumulated sand per upstream. Prevents any

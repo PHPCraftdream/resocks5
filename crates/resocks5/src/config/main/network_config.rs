@@ -108,7 +108,7 @@ pub struct NetworkConfig {
     pub sand_half_life_sec: f64,
 
     /// Sand model: sand added per upstream failure. Setting this to
-    /// 0.0 disables the sand model entirely (pure round-robin).
+    /// 0.0 disables the sand model entirely (pure uniform-random selection).
     #[serde(default = "default_sand_fail_penalty")]
     pub sand_fail_penalty: f64,
 

@@ -123,7 +123,7 @@ after that lock is released.
 | Property | Why it holds |
 |---|---|
 | "Out of the whole pool, always" | `weight > 0` always → no upstream is ever excluded. The MIN_WEIGHT floor is the built-in probe. |
-| "All bad → all equal" | Equal `level` ⇒ equal weight ⇒ uniform probability. So a global outage degrades to uniform round-robin. |
+| "All bad → all equal" | Equal `level` ⇒ equal weight ⇒ uniform probability. So a global outage degrades to uniform random selection. |
 | "Worse → less often, never zero" | Monotonicity of `exp(−K·level)` plus the floor. |
 
 ### Convergence — why state cannot run away
