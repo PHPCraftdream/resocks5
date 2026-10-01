@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `resocks5-net`: `tests/send_bounds.rs`, a compile-time guard that
+  `dial`, `dial_plain`, `connect_proxy_once`, `connect_proxy` (with `pool`),
+  the SOCKS5 handshake and `tunnel_with_timeouts` futures are `Send` (also
+  inside a `tokio::spawn`-style `async move` block), `AnyUpstream` /
+  `UpstreamStream` are `Send + Unpin`, and `ConnectError`, `ProxyConfig`,
+  `DialOptions` are `Send + Sync`. A regression now fails this crate's
+  tests instead of a consumer's build.
 - `resocks5-net`: `socks5_rep_description(code)` — the RFC 1928 §6 meaning
   of a SOCKS5 reply code, for `ConnectError::ProxyRejected { code, .. }`
   (unknown codes give `"unassigned"`).
@@ -70,6 +77,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Dependency: `socket2` 0.5 → 0.6 (a non-optional `resocks5-net` dependency
+  used by TCP keepalive). Current `tokio` releases already depend on
+  `socket2` 0.6, so a consumer's build no longer carries two copies. The
+  workspace `Cargo.lock` (and the feature-unification fixture's) moves
+  `tokio` 1.43.1 → 1.53.1 with it, for the same single-copy result; the
+  declared `tokio` requirement is unchanged.
 - **Breaking** (`resocks5-net`, not yet published): `ConnectError::Protocol`
   now carries a structured `ProtocolViolation` (`Socks5BadVersion { got }`,
   `Socks5BadAuthVersion { got }`, `Socks5UnknownAddressType { got }`,
