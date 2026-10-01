@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-01
+
 ### Added
 
 - `resocks5-net`: `tests/send_bounds.rs`, a compile-time guard that
@@ -79,6 +81,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FlushProgress::report_confirmed()` let a third-party buffering/TLS
   wrapper feed `send_possibly_fragmented` and `tunnel_with_timeouts`.
 
+
+- New `resocks5-net` API: `connect::make_tls_connector_with_provider` — the
+  provider-explicit twin of `make_tls_connector`. Where the convenience
+  function defers to rustls' process-level/feature-based provider
+  resolution (which panics in a build graph rustls cannot resolve — see
+  below), this variant takes an explicit `Arc<rustls::crypto::CryptoProvider>`
+  and never consults process-global state, so it works in every graph
+  state including the ones that would otherwise panic.
+
+
+- New `resocks5-net` API: `connect::connect_proxy_once` — a one-shot
+  counterpart of `connect_proxy` for consumers that dial a single upstream
+  proxy without rotation or warm-socket reuse, and so should not have to
+  construct a `ProxyPool` at all. It is a thin wrapper: the per-protocol
+  handshakes (SOCKS5, HTTP CONNECT, HTTPS), the returned `AnyUpstream`
+  variants, and the error behaviour are identical to `connect_proxy`. The
+  cost is per call — a fresh TCP handshake to the proxy every time, and no
+  shared per-upstream concurrency cap, so callers that fan out concurrently
+  against the same proxy must bound that themselves.
+- `tls` Cargo feature on `resocks5-net` (on by default): the `rustls`,
+  `tokio-rustls` and `webpki-roots` dependencies, the HTTPS upstream
+  connector with `make_tls_connector`, and the `AnyUpstream::Tls` variant
+  are now optional. Consumers that only dial SOCKS5 or HTTP CONNECT
+  upstreams can build with `default-features = false` and skip the whole
+  TLS stack. ClientHello fragmentation (`connect::tls_fragment`) stays
+  available without the feature — it fragments raw bytes and never links
+  the TLS stack.
+- `serde` Cargo feature on `resocks5-net` (on by default): the `serde`
+  dependency and the `Serialize`/`Deserialize` derives on `pool::PoolConfig`
+  — the crate's only serde touchpoint — are now optional. Consumers that
+  build their own config plumbing can build with `default-features = false`
+  (plus the features they do want) and drop serde and its proc-macro
+  compile chain from their build entirely. Without the feature the struct
+  is unchanged apart from the derives: still `Debug`, `Clone` and
+  `Default`, still constructible and mutable by hand, and the `Default`
+  values match what serde's field defaults produce.
+- `rating` and `rotator` Cargo features on `resocks5-net` (on by default;
+  `rotator` implies `rating`): the sand-rating model and the weighted
+  rotator built on it are now optional for consumers that want only the
+  connectors and the pool. The honest limits, unlike `tls` and `serde`:
+  this removes no dependency from the graph — both modules use only `std`
+  and `anyhow`, which the crate needs anyway — so the win is a smaller
+  public API surface and less to compile, nothing more. The
+  `test-instrumentation` feature now implies `rotator` (its
+  `pick_order_calls()` counter lives inside the rotator), and the
+  README-mirrored example declares `required-features = ["rotator"]` so
+  lean builds skip it instead of failing.
+
 ### Changed
 
 - `resocks5`: handler errors that are only a peer dropping the connection
@@ -136,19 +186,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suite (config load/init, users-file round-trips), `clippy -D warnings`
   and `cargo deny check advisories` pass unchanged.
 
-### Security
 
-- **`ktav` was pinned at the yanked 0.6.1** (yanked 2026-09-16, cause not
-  disclosed upstream; no runtime vulnerability was claimed or found —
-  `cargo deny check advisories` flags a yank on its own, independent of
-  any CVE/RUSTSEC advisory). Moved to `0.6.4`, the latest release under
-  the existing `ktav = "0.6.0"` manifest requirement (no manifest change
-  needed, `cargo update -p ktav` was enough). `cargo deny check
-  advisories` is now fully clean — this was the last of the two findings
-  from this week's review rounds; the other (`rustls`) was fixed in the
-  `[0.2.0]` release above. Config parsing exercises `ktav` on nearly every
-  test in the `resocks5`
-  binary; the full 192-test binary suite was re-run and passed unchanged.
+- **Breaking:** `AnyUpstream` is now `#[non_exhaustive]` — a `match` over
+  its variants in a downstream crate must carry a wildcard arm. Landed
+  alongside earlier review fixes (before this bump), so a lean `0.1.1`
+  consumer that matched exhaustively would already have been broken by it;
+  the version number simply never caught up until now.
+- **Breaking:** `send_possibly_fragmented` gained a fourth parameter
+  (`idle: Duration`, the idle-timeout bound also used by the rest of the
+  bounded-send/tunnel progress machinery) and its return type changed from
+  `Result<()>` to `Result<SendProgress>`, so callers can observe a
+  false-idle-protected stall instead of it being indistinguishable from
+  success. Same situation as `AnyUpstream` above: shipped as part of the
+  Pending-write-progress fix, ahead of the version bump that should have
+  accompanied it.
+
+
+- **Breaking:** `ProgressReportingWriter` and `FlushProgress` moved from
+  `connect::tls_fragment` to a new top-level `progress` module. They are
+  generic `AsyncWrite` instrumentation with no TLS-specific logic, and their
+  old home made `pool` depend on `connect` (`AnyUpstream::Tls` is a
+  `TlsStream<ProgressReportingWriter<UpstreamStream>>`) while `connect`
+  already depended on `pool` — a module cycle that blocked gating either
+  half behind a feature. `progress` has no outgoing crate-internal
+  dependencies, so the graph is now acyclic: `pool → {progress, types}`,
+  `connect → {pool, progress, types}`. No deprecated alias is kept at the
+  old path; code naming it gets a compile error with a mechanical fix.
+- `resocks5-net` no longer depends on tokio's `"full"` feature. Each crate now
+  declares the tokio features it actually uses; the workspace entry carries
+  only the version. The library asks for `net`, `io-util`, `time`, `sync`,
+  `rt` and `macros` (plus `test-util` and `rt-multi-thread` as dev-only), so
+  downstream consumers no longer have `fs`, `process`, `signal`, `io-std` and
+  `rt-multi-thread` forced on them. The binary keeps what it genuinely needs —
+  it builds its own multi-threaded runtime, handles Ctrl+C and writes log
+  files — and drops only `process` and `parking_lot`. `Cargo.lock` loses the
+  `parking_lot` node, which was reachable solely through `"full"`; no
+  dependency version changed.
+- **Breaking for feature-off builds only:** with `tls` disabled,
+  `connect_proxy`/`connect_proxy_once` lose their trailing
+  `tls_connector: Option<&TlsConnector>` argument, and an HTTPS upstream
+  is rejected with an error naming the missing feature instead of
+  silently falling back to plaintext. With the default features the
+  signatures are unchanged; the `resocks5` binary now enables the feature
+  explicitly (`resocks5-net = { ..., features = ["tls"] }`). The
+  `ProxyProtocol::Https` enum variant itself stays ungated, so config
+  parsing does not change shape with features.
 
 ### Fixed
 
@@ -166,7 +248,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resocks5` itself still isn't published (that's a separate, undecided
   question — see `CONTRIBUTING.md`).
 
-## [0.2.0] - 2026-09-22
 
 Version bump, not just a rollup: `cargo-semver-checks` against the `v0.1.1`
 baseline confirms two breaking API changes already present in this release
@@ -177,52 +258,6 @@ again is not an option either technically (registries reject re-publishing
 a version) or honestly. No other manifest or dependency versions changed as
 part of the bump itself.
 
-### Changed
-
-- **Breaking:** `AnyUpstream` is now `#[non_exhaustive]` — a `match` over
-  its variants in a downstream crate must carry a wildcard arm. Landed
-  alongside earlier review fixes (before this bump), so a lean `0.1.1`
-  consumer that matched exhaustively would already have been broken by it;
-  the version number simply never caught up until now.
-- **Breaking:** `send_possibly_fragmented` gained a fourth parameter
-  (`idle: Duration`, the idle-timeout bound also used by the rest of the
-  bounded-send/tunnel progress machinery) and its return type changed from
-  `Result<()>` to `Result<SendProgress>`, so callers can observe a
-  false-idle-protected stall instead of it being indistinguishable from
-  success. Same situation as `AnyUpstream` above: shipped as part of the
-  Pending-write-progress fix, ahead of the version bump that should have
-  accompanied it.
-
-### Security
-
-- **`rustls` was pinned at 0.23.40, affected by
-  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
-  / [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc):**
-  TLS 1.3 handshake messages sent at the wrong encryption level (e.g. a
-  plaintext `EncryptedExtensions` packed into the same record as
-  `ServerHello`) were incorrectly accepted instead of terminating the
-  connection per RFC 8446 §5.1. The handshake transcript stays
-  authenticated — this is not a MITM or certificate-bypass primitive — but
-  rustls should reject such messages regardless. Raised the
-  `[workspace.dependencies]` floor to `rustls = "0.23.45"` (the fixed
-  version) so a future `cargo update` cannot resolve back down to a
-  vulnerable patch, and updated `Cargo.lock` accordingly (also pulls in
-  `rustls-webpki` 0.103.15). `cargo deny check advisories` no longer flags
-  this advisory. The full TLS-facing test suite (fragmentation, tunnel,
-  gate-progress, crypto-provider contract) was re-run against the new
-  version, in both debug and release, with no change in behavior.
-
-### Added
-
-- New `resocks5-net` API: `connect::make_tls_connector_with_provider` — the
-  provider-explicit twin of `make_tls_connector`. Where the convenience
-  function defers to rustls' process-level/feature-based provider
-  resolution (which panics in a build graph rustls cannot resolve — see
-  below), this variant takes an explicit `Arc<rustls::crypto::CryptoProvider>`
-  and never consults process-global state, so it works in every graph
-  state including the ones that would otherwise panic.
-
-### Fixed
 
 - **A cancelled init-claim could let a same-account follower start a second
   concurrent blocking claim, weakening the "at most one claim attempt per
@@ -408,77 +443,37 @@ part of the bump itself.
   attempt per account occupies a blocking thread at a time. No
   password-verification behaviour changed.
 
-### Added
+### Security
 
-- New `resocks5-net` API: `connect::connect_proxy_once` — a one-shot
-  counterpart of `connect_proxy` for consumers that dial a single upstream
-  proxy without rotation or warm-socket reuse, and so should not have to
-  construct a `ProxyPool` at all. It is a thin wrapper: the per-protocol
-  handshakes (SOCKS5, HTTP CONNECT, HTTPS), the returned `AnyUpstream`
-  variants, and the error behaviour are identical to `connect_proxy`. The
-  cost is per call — a fresh TCP handshake to the proxy every time, and no
-  shared per-upstream concurrency cap, so callers that fan out concurrently
-  against the same proxy must bound that themselves.
-- `tls` Cargo feature on `resocks5-net` (on by default): the `rustls`,
-  `tokio-rustls` and `webpki-roots` dependencies, the HTTPS upstream
-  connector with `make_tls_connector`, and the `AnyUpstream::Tls` variant
-  are now optional. Consumers that only dial SOCKS5 or HTTP CONNECT
-  upstreams can build with `default-features = false` and skip the whole
-  TLS stack. ClientHello fragmentation (`connect::tls_fragment`) stays
-  available without the feature — it fragments raw bytes and never links
-  the TLS stack.
-- `serde` Cargo feature on `resocks5-net` (on by default): the `serde`
-  dependency and the `Serialize`/`Deserialize` derives on `pool::PoolConfig`
-  — the crate's only serde touchpoint — are now optional. Consumers that
-  build their own config plumbing can build with `default-features = false`
-  (plus the features they do want) and drop serde and its proc-macro
-  compile chain from their build entirely. Without the feature the struct
-  is unchanged apart from the derives: still `Debug`, `Clone` and
-  `Default`, still constructible and mutable by hand, and the `Default`
-  values match what serde's field defaults produce.
-- `rating` and `rotator` Cargo features on `resocks5-net` (on by default;
-  `rotator` implies `rating`): the sand-rating model and the weighted
-  rotator built on it are now optional for consumers that want only the
-  connectors and the pool. The honest limits, unlike `tls` and `serde`:
-  this removes no dependency from the graph — both modules use only `std`
-  and `anyhow`, which the crate needs anyway — so the win is a smaller
-  public API surface and less to compile, nothing more. The
-  `test-instrumentation` feature now implies `rotator` (its
-  `pick_order_calls()` counter lives inside the rotator), and the
-  README-mirrored example declares `required-features = ["rotator"]` so
-  lean builds skip it instead of failing.
+- **`ktav` was pinned at the yanked 0.6.1** (yanked 2026-09-16, cause not
+  disclosed upstream; no runtime vulnerability was claimed or found —
+  `cargo deny check advisories` flags a yank on its own, independent of
+  any CVE/RUSTSEC advisory). Moved to `0.6.4`, the latest release under
+  the existing `ktav = "0.6.0"` manifest requirement (no manifest change
+  needed, `cargo update -p ktav` was enough). `cargo deny check
+  advisories` is now fully clean — this was the last of the two findings
+  from this week's review rounds; the other (`rustls`) was fixed in the
+  `[0.2.0]` release above. Config parsing exercises `ktav` on nearly every
+  test in the `resocks5`
+  binary; the full 192-test binary suite was re-run and passed unchanged.
 
-### Changed
 
-- **Breaking:** `ProgressReportingWriter` and `FlushProgress` moved from
-  `connect::tls_fragment` to a new top-level `progress` module. They are
-  generic `AsyncWrite` instrumentation with no TLS-specific logic, and their
-  old home made `pool` depend on `connect` (`AnyUpstream::Tls` is a
-  `TlsStream<ProgressReportingWriter<UpstreamStream>>`) while `connect`
-  already depended on `pool` — a module cycle that blocked gating either
-  half behind a feature. `progress` has no outgoing crate-internal
-  dependencies, so the graph is now acyclic: `pool → {progress, types}`,
-  `connect → {pool, progress, types}`. No deprecated alias is kept at the
-  old path; code naming it gets a compile error with a mechanical fix.
-- `resocks5-net` no longer depends on tokio's `"full"` feature. Each crate now
-  declares the tokio features it actually uses; the workspace entry carries
-  only the version. The library asks for `net`, `io-util`, `time`, `sync`,
-  `rt` and `macros` (plus `test-util` and `rt-multi-thread` as dev-only), so
-  downstream consumers no longer have `fs`, `process`, `signal`, `io-std` and
-  `rt-multi-thread` forced on them. The binary keeps what it genuinely needs —
-  it builds its own multi-threaded runtime, handles Ctrl+C and writes log
-  files — and drops only `process` and `parking_lot`. `Cargo.lock` loses the
-  `parking_lot` node, which was reachable solely through `"full"`; no
-  dependency version changed.
-- **Breaking for feature-off builds only:** with `tls` disabled,
-  `connect_proxy`/`connect_proxy_once` lose their trailing
-  `tls_connector: Option<&TlsConnector>` argument, and an HTTPS upstream
-  is rejected with an error naming the missing feature instead of
-  silently falling back to plaintext. With the default features the
-  signatures are unchanged; the `resocks5` binary now enables the feature
-  explicitly (`resocks5-net = { ..., features = ["tls"] }`). The
-  `ProxyProtocol::Https` enum variant itself stays ungated, so config
-  parsing does not change shape with features.
+- **`rustls` was pinned at 0.23.40, affected by
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
+  / [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc):**
+  TLS 1.3 handshake messages sent at the wrong encryption level (e.g. a
+  plaintext `EncryptedExtensions` packed into the same record as
+  `ServerHello`) were incorrectly accepted instead of terminating the
+  connection per RFC 8446 §5.1. The handshake transcript stays
+  authenticated — this is not a MITM or certificate-bypass primitive — but
+  rustls should reject such messages regardless. Raised the
+  `[workspace.dependencies]` floor to `rustls = "0.23.45"` (the fixed
+  version) so a future `cargo update` cannot resolve back down to a
+  vulnerable patch, and updated `Cargo.lock` accordingly (also pulls in
+  `rustls-webpki` 0.103.15). `cargo deny check advisories` no longer flags
+  this advisory. The full TLS-facing test suite (fragmentation, tunnel,
+  gate-progress, crypto-provider contract) was re-run against the new
+  version, in both debug and release, with no change in behavior.
 
 ## [0.1.1] - 2026-06-23
 
@@ -568,6 +563,7 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/PHPCraftdream/resocks5/releases/tag/v0.1.0
