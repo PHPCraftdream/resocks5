@@ -17,6 +17,11 @@
 //! - On a checkout that finds the queue empty (or all stale), the
 //!   caller falls back to a fresh `TcpStream::connect`. The pool is a
 //!   best-effort accelerator, never a hard dependency.
+//! - `forget(proxy)` tears down one endpoint eagerly: it removes the
+//!   `(host, port)` entry from the spare map (dropping its queued
+//!   spares) and from the cap map, and aborts that endpoint's refill
+//!   task. Without it, endpoints only disappear when the pool drops.
+//!   Endpoints therefore live until `forget` or the pool's drop.
 //! - Dropping the pool aborts its refill tasks — no task outlives the
 //!   pool it serves.
 //!
@@ -37,6 +42,12 @@
 //! their cool-down (observed symptom: 10-second handshake timeouts on
 //! every direct attempt, while via-Tor still works because each Tor
 //! circuit sources from a different exit IP).
+//!
+//! `forget` removes a whole endpoint: permits already
+//! handed out keep their own `Arc<Semaphore>` clone and release
+//! normally when their connection drops, but a later acquire for the
+//! same endpoint creates a FRESH semaphore (a fresh cap budget) —
+//! outstanding permits no longer count against the new one.
 //!
 //! Gate-tunneled connections additionally hold a socket-less permit
 //! for the inner proxy (see `reserve_permit`), so direct traffic and
@@ -149,11 +160,14 @@ pub struct ProxyPool {
     /// per upstream forever) so concurrent acquires share the same
     /// permit pool.
     upstream_caps: DashMap<ProxyKey, Arc<Semaphore>>,
-    /// Background refill tasks, one per `(host, port)`. Kept so
-    /// `Drop` can abort them — otherwise a dropped pool would leave
-    /// tasks opening sockets forever. A `std` Mutex suffices: the
-    /// guard is only ever held synchronously, never across an await.
-    refill_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Background refill tasks, one per `(host, port)`, keyed by the
+    /// same endpoint key as `pools` so `forget` can abort a single
+    /// endpoint's task — otherwise a forgotten endpoint would keep
+    /// opening sockets forever. `Drop` aborts all of them. A `std`
+    /// Mutex suffices: the guard is only ever held synchronously,
+    /// never across an await.
+    refill_tasks:
+        std::sync::Mutex<std::collections::HashMap<ProxyKey, tokio::task::JoinHandle<()>>>,
 }
 
 impl ProxyPool {
@@ -173,7 +187,7 @@ impl ProxyPool {
             max_per_upstream,
             pools: DashMap::new(),
             upstream_caps: DashMap::new(),
-            refill_tasks: std::sync::Mutex::new(Vec::new()),
+            refill_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,7 +202,7 @@ impl ProxyPool {
             .refill_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for handle in tasks.drain(..) {
+        for (_, handle) in tasks.drain() {
             handle.abort();
         }
     }
@@ -347,16 +361,56 @@ impl ProxyPool {
         }
     }
 
-    /// Try to take a fresh pre-warmed socket for the given proxy.
-    /// Returns `None` when the pool is disabled, no entry exists yet,
-    /// the queue is empty, every entry has aged out, or every entry
-    /// fails the liveness probe (the peer already closed it).
-    ///
-    /// When called directly (not via [`acquire`](ProxyPool::acquire))
-    /// the bundled cap permit is dropped with the socket — this path
-    /// is deliberately zero-accounting.
-    pub fn checkout(&self, proxy: &ProxyConfig) -> Option<TcpStream> {
+    /// Take a pre-warmed socket for the given proxy WITH its bundled
+    /// cap permit: the returned [`UpstreamStream`] holds the permit
+    /// until it is dropped, exactly like the pre-warmed branch of
+    /// [`acquire`](ProxyPool::acquire), so the live connection keeps
+    /// counting against `max_per_upstream` for as long as the caller
+    /// keeps it. This is the default — the unguarded variant is an
+    /// escape hatch.
+    pub fn checkout(&self, proxy: &ProxyConfig) -> Option<UpstreamStream> {
+        self.checkout_prewarmed(proxy).map(|pw| UpstreamStream {
+            stream: pw.stream,
+            _permit: pw.permit,
+            extra_permits: Vec::new(),
+        })
+    }
+
+    /// Like [`checkout`](ProxyPool::checkout) but returns the bare
+    /// [`TcpStream`], deliberately releasing the cap permit at the
+    /// call: the returned socket is NOT counted against
+    /// `max_per_upstream` while it lives, so it is possible to exceed
+    /// the per-upstream cap with this API. Escape hatch only, for
+    /// callers that do their own accounting.
+    pub fn checkout_unguarded(&self, proxy: &ProxyConfig) -> Option<TcpStream> {
         self.checkout_prewarmed(proxy).map(|pw| pw.stream)
+    }
+
+    /// Forget one endpoint: remove its spare queue (dropping the
+    /// queued spares), its per-upstream cap semaphore, and abort its
+    /// refill task. Idempotent — an unknown `(host, port)` is a no-op.
+    ///
+    /// Tradeoff: permits already handed out for this endpoint keep
+    /// their own `Arc<Semaphore>` clone and release normally when
+    /// their connections drop; but the cap map entry is gone, so the
+    /// next acquire for the same endpoint creates a FRESH semaphore
+    /// with a full budget — outstanding old permits no longer count
+    /// against it, and the two generations do not share accounting.
+    ///
+    /// Endpoints otherwise live until `forget` or until the pool
+    /// drops; there is no automatic shrinking.
+    pub fn forget(&self, proxy: &ProxyConfig) {
+        let key = (proxy.host.clone(), proxy.port);
+        self.pools.remove(&key);
+        self.upstream_caps.remove(&key);
+        if let Some(handle) = self
+            .refill_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key)
+        {
+            handle.abort();
+        }
     }
 
     /// Launch a long-lived refill task for `proxy`. Idempotent: if a
@@ -384,7 +438,7 @@ impl ProxyPool {
         let mut won_race = false;
         let spares = self
             .pools
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| {
                 won_race = true;
                 Arc::new(ProxySpares {
@@ -480,7 +534,21 @@ impl ProxyPool {
         self.refill_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(handle);
+            .insert(key, handle);
+    }
+    /// Introspection for tests: `(pools has key, caps has key,
+    /// refill task running)` for this endpoint.
+    #[cfg(test)]
+    fn endpoint_state(&self, proxy: &ProxyConfig) -> (bool, bool, bool) {
+        let key = (proxy.host.clone(), proxy.port);
+        (
+            self.pools.contains_key(&key),
+            self.upstream_caps.contains_key(&key),
+            self.refill_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&key),
+        )
     }
 }
 

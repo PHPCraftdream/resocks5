@@ -736,3 +736,190 @@ async fn fresh_connect_failure_error_still_names_the_endpoint() {
         "error must name the endpoint, got: {err}"
     );
 }
+
+// ---- checkout / checkout_unguarded / forget tests ---------------
+
+#[tokio::test]
+async fn guarded_checkout_holds_permit_until_stream_drop() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = make_proxy("127.0.0.1", addr.port());
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(2), 1);
+    let permit = pool.reserve_permit(&proxy).unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (peer, _) = listener.accept().await.unwrap();
+    let spares = Arc::new(ProxySpares {
+        queue: ArrayQueue::new(1),
+        notify: Notify::new(),
+    });
+    assert!(spares
+        .queue
+        .push(PreWarmed {
+            stream,
+            permit,
+            created_at: Instant::now()
+        })
+        .is_ok());
+    pool.pools
+        .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+    // Cap is 1 and the queued spare holds the only permit. A guarded
+    // checkout must hand that permit OUT (still held), not release it.
+    let guarded = pool.checkout(&proxy).expect("spare available");
+    assert!(spares.queue.is_empty());
+    assert!(
+        pool.reserve_permit(&proxy).is_err(),
+        "checked-out socket must still hold the only permit"
+    );
+
+    drop((guarded, peer));
+    assert!(
+        pool.reserve_permit(&proxy).is_ok(),
+        "permit must release when the UpstreamStream drops"
+    );
+}
+
+#[tokio::test]
+async fn unguarded_checkout_releases_permit_immediately() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = make_proxy("127.0.0.1", addr.port());
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(2), 1);
+    let permit = pool.reserve_permit(&proxy).unwrap();
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (peer, _) = listener.accept().await.unwrap();
+    let spares = Arc::new(ProxySpares {
+        queue: ArrayQueue::new(1),
+        notify: Notify::new(),
+    });
+    assert!(spares
+        .queue
+        .push(PreWarmed {
+            stream,
+            permit,
+            created_at: Instant::now()
+        })
+        .is_ok());
+    pool.pools
+        .insert((proxy.host.clone(), proxy.port), spares.clone());
+
+    let raw = pool.checkout_unguarded(&proxy).expect("spare available");
+    assert!(spares.queue.is_empty());
+    // The permit was released AT the call: the only slot is free even
+    // though the raw socket is still alive.
+    let _reacquired = pool
+        .reserve_permit(&proxy)
+        .expect("unguarded checkout must not hold a permit");
+    drop((raw, peer));
+}
+
+#[tokio::test(start_paused = true)]
+async fn forget_removes_entries_and_stops_refill_task() {
+    let counters = Arc::new(Counters::default());
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(counting_listener(l, counters.clone()));
+
+    // See the comment in `concurrent_spawn_refill_for_races_to_single_task`
+    // for why this needs a generous connect_timeout under `quiesce`.
+    let pool = ProxyPool::new(pool_cfg(2), Duration::from_secs(120), 4);
+    let proxy = make_proxy("127.0.0.1", port);
+    let key = (proxy.host.clone(), proxy.port);
+    pool.spawn_refill_for(Arc::new(proxy.clone()));
+
+    quiesce(|| {
+        counters.accepted() == 2 && pool.pools.get(&key).map(|s| s.queue.len()).unwrap_or(0) == 2
+    })
+    .await;
+    assert_eq!(
+        pool.endpoint_state(&proxy),
+        (true, true, true),
+        "endpoint fully registered before forget"
+    );
+    let n = counters.accepted();
+
+    pool.forget(&proxy);
+    assert_eq!(
+        pool.endpoint_state(&proxy),
+        (false, false, false),
+        "spare queue, cap semaphore, and refill task must all be gone"
+    );
+
+    // The aborted refill task can never connect again, and its spare
+    // sockets (its `ProxySpares` Arc) die with it.
+    for _ in 0..50 {
+        assert!(
+            counters.accepted() <= n,
+            "refill task connected after forget"
+        );
+        if counters.open() == 0 {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(counters.open(), 0, "queued spares must die on forget");
+    assert_eq!(counters.accepted(), n);
+}
+
+#[tokio::test]
+async fn forget_unknown_endpoint_is_a_no_op() {
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(2), 2);
+    let proxy = make_proxy("203.0.113.1", 1080);
+    pool.forget(&proxy);
+    assert_eq!(pool.endpoint_state(&proxy), (false, false, false));
+    // A live endpoint is unaffected by forgetting a different one.
+    let live = make_proxy("203.0.113.2", 1081);
+    pool.spawn_refill_for(Arc::new(live.clone()));
+    pool.forget(&proxy);
+    assert_eq!(
+        pool.endpoint_state(&live),
+        (true, true, true),
+        "unrelated endpoint untouched (spawn_refill_for creates its cap too)"
+    );
+}
+
+#[tokio::test]
+async fn forget_with_outstanding_permit_does_not_panic_and_permit_releases() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = make_proxy("127.0.0.1", addr.port());
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(2), 2);
+    // Hand out a permit via acquire (fresh-connect path).
+    let live = pool.acquire(&proxy).await.expect("acquire");
+    // Keep a handle to the semaphore generation so we can observe
+    // that the outstanding permit still releases into IT, not into a
+    // fresh one.
+    let old_sem = pool
+        .upstream_caps
+        .get(&(proxy.host.clone(), proxy.port))
+        .unwrap()
+        .value()
+        .clone();
+
+    pool.forget(&proxy);
+    assert_eq!(pool.endpoint_state(&proxy), (false, false, false));
+
+    // The old-generation semaphore must be back to 2/2 available once
+    // the outstanding connection drops — forget must not have leaked
+    // or panicked over it.
+    assert_eq!(old_sem.available_permits(), 1, "still held by `live`");
+    drop(live);
+    assert_eq!(old_sem.available_permits(), 2, "released into its own Arc");
+
+    // And a post-forget acquire builds a fresh cap that is untouched
+    // by the old generation.
+    let fresh = pool
+        .acquire(&proxy)
+        .await
+        .expect("fresh generation acquire");
+    assert_eq!(
+        pool.upstream_caps
+            .get(&(proxy.host.clone(), proxy.port))
+            .unwrap()
+            .available_permits(),
+        1,
+        "fresh cap starts from a full budget minus the new connection"
+    );
+    drop(fresh);
+}
