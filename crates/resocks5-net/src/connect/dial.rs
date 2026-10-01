@@ -137,6 +137,30 @@ pub async fn dial(
     }
 }
 
+/// Dial `host:port` through the single upstream `proxy` with no TLS slot.
+///
+/// Exactly `dial(proxy, host, port, opts, None)`: the convenience entry
+/// point for the common SOCKS5 / HTTP CONNECT case, where no TLS connector
+/// is ever needed and a plain build should not have to write a `None`
+/// placeholder.
+///
+/// For an HTTPS upstream this returns the same typed error `dial` with
+/// `None` returns — without the `tls` feature `TlsFeatureMissing`, with it
+/// a `Tls` error — because HTTPS needs a connector and therefore
+/// `dial` itself.
+///
+/// # Errors
+///
+/// Same as `dial` with no connector; see [`dial`].
+pub async fn dial_plain(
+    proxy: &ProxyConfig,
+    host: &str,
+    port: u16,
+    opts: &DialOptions,
+) -> Result<AnyUpstream, ConnectError> {
+    dial(proxy, host, port, opts, None).await
+}
+
 async fn dial_inner(
     proxy: &ProxyConfig,
     host: &str,

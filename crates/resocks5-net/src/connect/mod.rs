@@ -1,7 +1,8 @@
 //! Upstream connectors and stream plumbing.
 //!
-//! The pool-free entry points are [`dial`](dial::dial) and
-//! [`connect_proxy_once`]. With the `pool` feature, `connect_proxy` is the
+//! The pool-free entry points are [`dial`](dial::dial),
+//! [`dial_plain`] and [`connect_proxy_once`]. With the
+//! `pool` feature, `connect_proxy` is the
 //! pool-taking dispatcher on the proxy's
 //! [`ProxyProtocol`](crate::types::ProxyProtocol). The lower-level pieces —
 //! per-protocol handshakes, a bidirectional tunneller, TCP keepalive, proxy-string parsing, a default
@@ -49,7 +50,7 @@ pub use connect_proxy::connect_proxy;
 pub use connect_proxy::connect_proxy_once;
 #[cfg(feature = "pool")]
 pub use connect_socks5_proxy::connect_socks5_proxy;
-pub use dial::{dial, DialOptions};
+pub use dial::{dial, dial_plain, DialOptions};
 pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};
 pub use host_port::HostPort;
 pub use parse_proxy_str::{parse_proxy_str, ParseProxyError};

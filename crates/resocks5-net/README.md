@@ -55,7 +55,8 @@ no authentication.
   and takes `None` for SOCKS5/HTTP upstreams, so one call site compiles no
   matter which features other crates in the same build enable; in a
   `default-features = false` build its type is an unconstructible
-  placeholder, making `None` the only possible value.
+  placeholder, making `None` the only possible value. For the common
+  SOCKS5/HTTP case the slot-free `dial_plain` exists in every build.
 - `serde` (**enabled by default**): the `Serialize`/`Deserialize` derives on
   `pool::PoolConfig`, the crate's only serde touchpoint (a no-op without
   `pool`). Consumers that
@@ -128,20 +129,22 @@ async fn main() -> anyhow::Result<()> {
 ### Without a pool
 
 `dial` connects through one upstream with no `ProxyPool` (this is what
-`default-features = false` leaves you with). Cap accounting is then up to
-the caller.
+`default-features = false` leaves you with). For SOCKS5 and HTTP
+CONNECT upstreams `dial_plain` is the simpler entry point; `dial`
+returns an `AnyUpstream` through an extra `tls_connector` argument and
+is the one to use when the upstream is HTTPS (pass a `TlsConnector`).
+Cap accounting is then up to the caller.
 
 ```rust,no_run
 use std::time::Duration;
 
-use resocks5_net::connect::{dial, DialOptions};
+use resocks5_net::connect::{dial_plain, DialOptions};
 use resocks5_net::types::ProxyConfig;
 
 # async fn run() -> Result<(), resocks5_net::ConnectError> {
 let proxy = ProxyConfig::socks5("198.51.100.7", 1080).with_auth("user", "pass");
 let opts = DialOptions::new().with_total_timeout(Duration::from_secs(20));
-// Last argument: `None` unless the upstream is HTTPS (then a `TlsConnector`).
-let stream = dial(&proxy, "example.com", 80, &opts, None).await?;
+let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 # drop(stream);
 # Ok(())
 # }

@@ -7,7 +7,9 @@
 use std::time::Duration;
 
 use resocks5_net::connect::connect_proxy::TlsConnector;
-use resocks5_net::connect::{connect_proxy_once, dial, parse_proxy_str, AnyUpstream, DialOptions};
+use resocks5_net::connect::{
+    connect_proxy_once, dial, dial_plain, parse_proxy_str, AnyUpstream, DialOptions,
+};
 use resocks5_net::types::ProxyProtocol;
 
 /// A real lean consumer may NAME the parameter type, not just pass an
@@ -37,11 +39,13 @@ fn main() {
     // turns it on.
     let opts = DialOptions::new();
     let dialed = dial(&proxy, "example.com", 443, &opts, None);
+    let plain = dial_plain(&proxy, "example.com", 443, &opts);
     let _: Option<AnyUpstream> = None;
 
     // Never polled: this fixture proves compilation, not connectivity.
     drop(once);
     drop(dialed);
+    drop(plain);
     let _ = named_connector_slot();
     println!("lean-consumer: compiled OK (lean dependency, no tls/pool of its own)");
 }

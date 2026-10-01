@@ -115,6 +115,17 @@ async fn dial_err(proxy: &ProxyConfig, host: &str, port: u16, opts: &DialOptions
     }
 }
 
+async fn dial_plain_guarded(
+    proxy: &ProxyConfig,
+    host: &str,
+    port: u16,
+    opts: &DialOptions,
+) -> Result<AnyUpstream, ConnectError> {
+    timeout(GUARD, dial_plain(proxy, host, port, opts))
+        .await
+        .expect("test guard")
+}
+
 async fn expect_ok_payload(mut up: AnyUpstream) {
     let mut buf = [0u8; 2];
     up.read_exact(&mut buf).await.unwrap();
@@ -295,6 +306,81 @@ async fn socks5_stall_in_handshake() {
     assert!(err
         .to_string()
         .starts_with("[SOCKS5] handshake timeout (0s) to "));
+}
+
+#[tokio::test]
+async fn dial_plain_socks5_matches_dial_with_none() {
+    let (l, port) = bind().await;
+    let stub = socks5_stub(l, None, 0x05, 0);
+    let proxy = ProxyConfig::socks5("127.0.0.1", port);
+    let up = dial_plain_guarded(&proxy, "example.com", 443, &opts())
+        .await
+        .unwrap();
+    assert!(matches!(up, AnyUpstream::Plain(_)));
+    expect_ok_payload(up).await;
+    let req = stub.await.unwrap();
+    assert_eq!(&req[..5], &[0x05, 0x01, 0x00, 0x03, 11]);
+    assert_eq!(&req[5..16], b"example.com");
+    assert_eq!(&req[16..], &443u16.to_be_bytes());
+}
+
+#[tokio::test]
+async fn dial_plain_http_connect_matches_dial_with_none() {
+    let (l, port) = bind().await;
+    let stub = http_stub(l, b"HTTP/1.1 200 OK\r\n\r\nok");
+    let proxy = ProxyConfig::http("127.0.0.1", port);
+    let up = dial_plain_guarded(&proxy, "example.com", 443, &opts())
+        .await
+        .unwrap();
+    assert!(matches!(up, AnyUpstream::Plain(_)));
+    expect_ok_payload(up).await;
+    let req = stub.await.unwrap();
+    assert!(req.starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn dial_plain_https_proxy_is_typed_error() {
+    let err = match dial_plain_guarded(&ProxyConfig::https("127.0.0.1", 1), "x.test", 443, &opts())
+        .await
+    {
+        Ok(_) => panic!("dial_plain must fail for HTTPS"),
+        Err(e) => e,
+    };
+    #[cfg(feature = "tls")]
+    assert!(
+        matches!(&err, ConnectError::Tls { source: None, .. }),
+        "{err:?}"
+    );
+    #[cfg(not(feature = "tls"))]
+    assert!(
+        matches!(&err, ConnectError::TlsFeatureMissing { host } if host == "127.0.0.1"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dial_plain_reports_connect_timeout() {
+    // TEST-NET-1: Timeout, or Io where the network is unreachable.
+    let o = opts().with_connect_timeout(Duration::from_millis(300));
+    let err = match dial_plain_guarded(&ProxyConfig::socks5("203.0.113.1", 1080), "x.test", 80, &o)
+        .await
+    {
+        Ok(_) => panic!("must fail"),
+        Err(e) => e,
+    };
+    match &err {
+        ConnectError::Timeout {
+            stage: Stage::Connect,
+            kind: TimeoutKind::TcpConnect,
+            endpoint,
+            ..
+        } => assert_eq!(endpoint, "203.0.113.1:1080"),
+        ConnectError::Io {
+            stage: Stage::Connect,
+            ..
+        } => {}
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[tokio::test]

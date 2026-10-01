@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `resocks5-net`: `connect::dial_plain(proxy, host, port, &DialOptions)` —
+  a convenience entry point identical to
+  `dial(proxy, host, port, opts, None)` for the common SOCKS5 / HTTP
+  CONNECT case, so lean builds no longer write a `None` TLS placeholder.
+  An HTTPS upstream yields the same typed error as `dial` without a
+  connector (`TlsFeatureMissing` without the `tls` feature, a `Tls` error
+  with it); use `dial` with a `TlsConnector` there.
 - CI: `release.yml` gains a `publish-sdk` job that publishes
   `resocks5-net` to crates.io on every `v*` tag push (after a
   packaging/build dry-run that always runs regardless). Skips the actual
