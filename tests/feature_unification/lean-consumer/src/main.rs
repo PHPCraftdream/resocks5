@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use resocks5_net::connect::connect_proxy::TlsConnector;
 use resocks5_net::connect::{connect_proxy_once, dial, parse_proxy_str, AnyUpstream, DialOptions};
-use resocks5_net::types::{IP, ProxyProtocol};
+use resocks5_net::types::ProxyProtocol;
 
 /// A real lean consumer may NAME the parameter type, not just pass an
 /// untyped `None` — the named path `connect::connect_proxy::TlsConnector`
@@ -19,7 +19,7 @@ fn named_connector_slot() -> Option<&'static TlsConnector> {
 }
 
 fn main() {
-    let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Socks5, IP::V4)
+    let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Socks5)
         .expect("valid proxy line");
 
     // The trailing `None` slot exists under every feature combination;

@@ -291,12 +291,11 @@ mod tests {
     use crate::connect::handshake_over_stream::handshake_over_stream;
     #[cfg(feature = "pool")]
     use crate::pool::{PoolConfig, ProxyPool};
-    use crate::types::{ProxyConfig, ProxyProtocol, IP};
+    use crate::types::{ProxyConfig, ProxyProtocol};
 
     fn http_proxy_config(host: &str, port: u16) -> ProxyConfig {
         ProxyConfig {
             protocol: ProxyProtocol::Http,
-            ip: IP::V4,
             host: host.into(),
             port,
             user: None,
@@ -310,7 +309,6 @@ mod tests {
     fn socks5_proxy_config(host: &str, port: u16) -> ProxyConfig {
         ProxyConfig {
             protocol: ProxyProtocol::Socks5,
-            ip: IP::V4,
             host: host.into(),
             port,
             user: None,
@@ -688,7 +686,6 @@ mod tests {
     async fn https_without_connector_yields_tls_variant_with_legacy_text() {
         let proxy = ProxyConfig {
             protocol: ProxyProtocol::Https,
-            ip: IP::V4,
             host: "proxy.example".into(),
             port: 443,
             user: None,
@@ -717,7 +714,6 @@ mod tests {
     async fn https_in_lean_build_yields_tls_feature_missing() {
         let proxy = ProxyConfig {
             protocol: ProxyProtocol::Https,
-            ip: IP::V4,
             host: "proxy.example".into(),
             port: 443,
             user: None,

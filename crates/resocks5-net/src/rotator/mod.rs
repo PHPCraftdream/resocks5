@@ -456,10 +456,10 @@ impl ProxyRotator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProxyProtocol, IP as IPV};
+    use crate::types::ProxyProtocol;
 
     fn make_proxy(host: &str, port: u16) -> ProxyConfig {
-        ProxyConfig::socks5(host, port).with_family(IPV::V4)
+        ProxyConfig::socks5(host, port)
     }
 
     #[test]
@@ -895,7 +895,6 @@ mod construction_tests {
     fn make_proxy(host: &str, port: u16) -> ProxyConfig {
         ProxyConfig {
             protocol: crate::types::ProxyProtocol::Socks5,
-            ip: crate::types::IP::V4,
             host: host.to_string(),
             port,
             user: None,

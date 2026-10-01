@@ -40,8 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `connect` and are always available (still re-exported from `pool`).
   `UpstreamStream::from_tcp` wraps a plain socket without a cap permit.
 - `resocks5-net`: **`ProxyConfig` constructors** — `new`, `socks5`, `http`,
-  `https`, `with_auth`, `with_family`, `with_gate`, `as_gate`; the address
-  family label `ip` is derived from the host.
+  `https`, `with_auth`, `with_gate`, `as_gate`, and `from_addr` (parse a
+  `[*]user:pass@host:port` line directly).
 - `resocks5-net`: fallible `ProxyRotator::try_new` / `try_with_policy` /
   `try_with_cache_limits` and `Ratings::try_new` (`RotatorError`,
   `RatingError`): an empty upstream list or an invalid `RatingPolicy` is an
@@ -60,12 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking** (`resocks5-net`, not yet published): the address-family label
+  `ip` is removed from the SDK. `ProxyConfig.ip`, `ProxyConfig::with_family`
+  and the public `types::IP` enum are gone (dialing only ever used
+  `host`/`port`), and `parse_proxy_str` lost its `ip` parameter — it is now
+  `parse_proxy_str(conn_str, protocol)`. Applications that grouped or printed
+  proxies by family derive the label from the host literal themselves (e.g.
+  `host.parse::<Ipv6Addr>()`). Added `ProxyConfig::from_addr(protocol, addr)`
+  as a convenience shorthand for `parse_proxy_str`.
 - **Breaking** (`resocks5-net`, not yet published): `ProxyConfig` is
   `#[non_exhaustive]` — build it with the constructors above;
   `parse_proxy_str` returns `Result<ProxyConfig, ParseProxyError>` (`Empty`,
-  `Comment`, `BadHostPort`, `BadGate`) instead of `Option`. The `ip` and
-  `gate` docs are corrected: `ip` is only a family label, `gate` is the outer
-  gate node and is not interpreted by `connect_proxy` / `dial`.
+  `Comment`, `BadHostPort`, `BadGate`) instead of `Option`. The `gate` doc is
+  corrected: `gate` is the outer gate node and is not interpreted by
+  `connect_proxy` / `dial`.
 - **Breaking** (`resocks5-net`): connect and pool entry points
   (`connect_proxy`, `connect_proxy_once`, `connect_http_proxy`,
   `connect_socks5_proxy`, `connect_https_proxy`, `http_connect_handshake`,

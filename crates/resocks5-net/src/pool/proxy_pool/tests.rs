@@ -1,5 +1,4 @@
 use super::*;
-use crate::types::IP as IPV;
 
 #[tokio::test]
 async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
@@ -53,7 +52,7 @@ async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
 }
 
 fn make_proxy(host: &str, port: u16) -> ProxyConfig {
-    ProxyConfig::socks5(host, port).with_family(IPV::V4)
+    ProxyConfig::socks5(host, port)
 }
 
 /// Bind a listener on a free local port and immediately accept-
@@ -683,10 +682,7 @@ async fn fresh_connect_dials_ipv6_literals_without_string_addr() {
             }
         }
     });
-    let proxy_v6 = ProxyConfig {
-        ip: IPV::V6,
-        ..make_proxy("::1", v6_port)
-    };
+    let proxy_v6 = make_proxy("::1", v6_port);
     let stream = pool
         .acquire(&proxy_v6)
         .await

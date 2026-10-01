@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::HostPort;
-use crate::types::{ProxyConfig, ProxyProtocol, IP};
+use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Why [`parse_proxy_str`] rejected a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +40,11 @@ impl std::error::Error for ParseProxyError {}
 /// (`2001:db8::1:443`) is also accepted for backward compatibility. The
 /// password may contain `:` — only the first colon separates user and
 /// password. Blank lines, `#` comments and anything that fails to parse
-/// yield a [`ParseProxyError`]. `protocol` and `ip` are supplied by the
-/// caller because the line itself carries no protocol or address-family
-/// info.
+/// yield a [`ParseProxyError`]. `protocol` is supplied by the caller
+/// because the line itself carries no protocol info.
 pub fn parse_proxy_str(
     conn_str: &str,
     protocol: ProxyProtocol,
-    ip: IP,
 ) -> Result<ProxyConfig, ParseProxyError> {
     if conn_str.trim().is_empty() {
         return Err(ParseProxyError::Empty);
@@ -83,7 +81,7 @@ pub fn parse_proxy_str(
 
     let HostPort { host, port } = HostPort::parse(host_port).ok_or(ParseProxyError::BadHostPort)?;
 
-    let mut cfg = ProxyConfig::new(protocol, host, port).with_family(ip);
+    let mut cfg = ProxyConfig::new(protocol, host, port);
     cfg.user = user;
     cfg.password = password;
     cfg.is_gate = is_gate;
@@ -92,13 +90,13 @@ pub fn parse_proxy_str(
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{ProxyProtocol, IP};
+    use crate::types::{ProxyConfig, ProxyProtocol};
 
     use super::{parse_proxy_str, ParseProxyError};
 
     #[test]
     fn bracketed_ipv6() {
-        let cfg = parse_proxy_str("[::1]:1080", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("[::1]:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.host, "::1");
         assert_eq!(cfg.port, 1080);
         assert_eq!(cfg.user, None);
@@ -108,31 +106,31 @@ mod tests {
 
     #[test]
     fn bare_ipv6_backward_compat() {
-        let cfg = parse_proxy_str("::1:1080", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("::1:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.host, "::1");
         assert_eq!(cfg.port, 1080);
     }
 
     #[test]
     fn bare_full_ipv6() {
-        let cfg = parse_proxy_str("2001:db8::1:443", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("2001:db8::1:443", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.host, "2001:db8::1");
         assert_eq!(cfg.port, 443);
     }
 
     #[test]
     fn ipv4_and_domain() {
-        let cfg = parse_proxy_str("1.2.3.4:1080", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("1.2.3.4:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.host, "1.2.3.4");
         assert_eq!(cfg.port, 1080);
-        let cfg = parse_proxy_str("example.com:1080", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("example.com:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.host, "example.com");
         assert_eq!(cfg.port, 1080);
     }
 
     #[test]
     fn colon_in_password() {
-        let cfg = parse_proxy_str("user:pa:ss@[::1]:1080", ProxyProtocol::Socks5, IP::V4).unwrap();
+        let cfg = parse_proxy_str("user:pa:ss@[::1]:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.user.as_deref(), Some("user"));
         assert_eq!(cfg.password.as_deref(), Some("pa:ss"));
         assert_eq!(cfg.host, "::1");
@@ -141,12 +139,7 @@ mod tests {
 
     #[test]
     fn credentials() {
-        let cfg = parse_proxy_str(
-            "alice:s3cret@198.51.100.7:1080",
-            ProxyProtocol::Socks5,
-            IP::V4,
-        )
-        .unwrap();
+        let cfg = parse_proxy_str("alice:s3cret@198.51.100.7:1080", ProxyProtocol::Socks5).unwrap();
         assert_eq!(cfg.user.as_deref(), Some("alice"));
         assert_eq!(cfg.password.as_deref(), Some("s3cret"));
         assert_eq!(cfg.host, "198.51.100.7");
@@ -156,12 +149,8 @@ mod tests {
 
     #[test]
     fn gate_marker() {
-        let cfg = parse_proxy_str(
-            "*gateuser:gatepass@203.0.113.9:1080",
-            ProxyProtocol::Socks5,
-            IP::V4,
-        )
-        .unwrap();
+        let cfg =
+            parse_proxy_str("*gateuser:gatepass@203.0.113.9:1080", ProxyProtocol::Socks5).unwrap();
         assert!(cfg.is_gate);
         assert_eq!(cfg.user.as_deref(), Some("gateuser"));
         assert_eq!(cfg.password.as_deref(), Some("gatepass"));
@@ -180,7 +169,7 @@ mod tests {
             "host:",
         ] {
             assert_eq!(
-                parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).unwrap_err(),
+                parse_proxy_str(s, ProxyProtocol::Socks5).unwrap_err(),
                 ParseProxyError::BadHostPort,
                 "expected BadHostPort for {s:?}"
             );
@@ -189,7 +178,7 @@ mod tests {
 
     #[test]
     fn error_variants() {
-        let parse = |s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).unwrap_err();
+        let parse = |s| parse_proxy_str(s, ProxyProtocol::Socks5).unwrap_err();
         assert_eq!(parse(""), ParseProxyError::Empty);
         assert_eq!(parse("   "), ParseProxyError::Empty);
         assert_eq!(parse("# comment"), ParseProxyError::Comment);
@@ -200,10 +189,46 @@ mod tests {
     }
 
     #[test]
-    fn family_label_from_caller() {
-        let cfg = parse_proxy_str("[::1]:1", ProxyProtocol::Socks5, IP::V4).unwrap();
-        assert_eq!(cfg.ip, IP::V4);
-        let cfg = parse_proxy_str("1.2.3.4:1", ProxyProtocol::Socks5, IP::V6).unwrap();
-        assert_eq!(cfg.ip, IP::V6);
+    fn from_addr_accepts_every_host_form() {
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Socks5, "example.com:1080").unwrap();
+        assert_eq!(cfg.host, "example.com");
+        assert_eq!(cfg.port, 1080);
+
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Http, "192.0.2.10:8080").unwrap();
+        assert_eq!(cfg.host, "192.0.2.10");
+        assert_eq!(cfg.port, 8080);
+
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Https, "[2001:db8::7]:443").unwrap();
+        assert_eq!(cfg.host, "2001:db8::7");
+        assert_eq!(cfg.port, 443);
+
+        // Bare IPv6 literal stays backward-compatible.
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Socks5, "2001:db8::7:1080").unwrap();
+        assert_eq!(cfg.host, "2001:db8::7");
+        assert_eq!(cfg.port, 1080);
+    }
+
+    #[test]
+    fn from_addr_credentials_and_gate_marker() {
+        // Colon in the password: only the first colon separates user/pass.
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Socks5, "u:pa:ss@10.0.0.1:1080").unwrap();
+        assert_eq!(cfg.user.as_deref(), Some("u"));
+        assert_eq!(cfg.password.as_deref(), Some("pa:ss"));
+        assert!(!cfg.is_gate);
+
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Socks5, "*g:p@[::1]:1080").unwrap();
+        assert!(cfg.is_gate);
+        assert_eq!(cfg.user.as_deref(), Some("g"));
+        assert_eq!(cfg.password.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn from_addr_error_variants() {
+        let err = |s| ProxyConfig::from_addr(ProxyProtocol::Socks5, s).unwrap_err();
+        assert_eq!(err(""), ParseProxyError::Empty);
+        assert_eq!(err("# comment"), ParseProxyError::Comment);
+        assert_eq!(err("*"), ParseProxyError::BadGate);
+        assert_eq!(err("**host:1"), ParseProxyError::BadGate);
+        assert_eq!(err("user@host:80"), ParseProxyError::BadHostPort);
     }
 }

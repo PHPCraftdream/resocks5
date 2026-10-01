@@ -10,10 +10,10 @@ use resocks5_net::connect::{
     connect_proxy, connect_proxy_once, make_tls_connector, parse_proxy_str,
 };
 use resocks5_net::pool::{PoolConfig, ProxyPool};
-use resocks5_net::types::{IP, ProxyProtocol};
+use resocks5_net::types::ProxyProtocol;
 
 fn main() {
-    let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Https, IP::V4)
+    let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Https)
         .expect("valid proxy line");
     let connector = make_tls_connector();
 

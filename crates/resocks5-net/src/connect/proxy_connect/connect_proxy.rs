@@ -141,11 +141,11 @@ pub async fn connect_proxy(
 /// use std::time::Duration;
 ///
 /// use resocks5_net::connect::{connect_proxy_once, parse_proxy_str};
-/// use resocks5_net::types::{IP, ProxyProtocol};
+/// use resocks5_net::types::ProxyProtocol;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// let proxy = parse_proxy_str("user:pass@203.0.113.7:1080", ProxyProtocol::Socks5, IP::V4)
+/// let proxy = parse_proxy_str("user:pass@203.0.113.7:1080", ProxyProtocol::Socks5)
 ///     .expect("valid proxy line");
 /// let stream = connect_proxy_once(
 ///     "example.com:80",

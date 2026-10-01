@@ -10,7 +10,7 @@ use std::time::Duration;
 use resocks5_net::connect::{connect_proxy, parse_proxy_str};
 use resocks5_net::pool::{PoolConfig, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::{ProxyProtocol, IP};
+use resocks5_net::types::ProxyProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     // Parse upstream lines: "[*]user:pass@host:port" (credentials optional).
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
-        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
+        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5).ok())
         .collect::<Vec<_>>();
 
     // Round-robin rotator + a pre-connect TCP pool (left disabled here).

@@ -1,10 +1,10 @@
 //! The full descriptor of a remote proxy: endpoint, credentials, and gate link.
 
 use std::fmt;
-use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use crate::types::{ProxyProtocol, IP};
+use crate::connect::{parse_proxy_str, ParseProxyError};
+use crate::types::ProxyProtocol;
 
 /// Placeholder printed by [`ProxyConfig`]'s [`Debug`](std::fmt::Debug) impl in
 /// place of any `user` or `password` value.
@@ -36,9 +36,6 @@ const REDACTED: &str = "<redacted>";
 pub struct ProxyConfig {
     /// Wire protocol spoken to this proxy.
     pub protocol: ProxyProtocol,
-    /// Address-family label of the entry (used for grouping/printing); not
-    /// used when connecting.
-    pub ip: IP,
     /// Proxy host (IP literal or domain), without IPv6 brackets.
     pub host: String,
     /// Proxy TCP port.
@@ -57,23 +54,16 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// New entry without credentials or gate. `ip` is derived from `host`:
-    /// [`IP::V6`] for an IPv6 literal, otherwise [`IP::V4`]. Surrounding
-    /// `[` `]` are stripped from `host`.
+    /// New entry without credentials or gate. Surrounding `[` `]` are
+    /// stripped from `host`.
     pub fn new(protocol: ProxyProtocol, host: impl Into<String>, port: u16) -> Self {
         let mut host = host.into();
         if host.len() >= 2 && host.starts_with('[') && host.ends_with(']') {
             host.pop();
             host.remove(0);
         }
-        let ip = if host.parse::<Ipv6Addr>().is_ok() {
-            IP::V6
-        } else {
-            IP::V4
-        };
         Self {
             protocol,
-            ip,
             host,
             port,
             user: None,
@@ -105,10 +95,17 @@ impl ProxyConfig {
         self
     }
 
-    /// Override the address-family label.
-    pub fn with_family(mut self, ip: IP) -> Self {
-        self.ip = ip;
-        self
+    /// Parse a `[*]user:pass@host:port` address into a [`ProxyConfig`],
+    /// delegating to `parse_proxy_str` (same grammar, same
+    /// [`ParseProxyError`] variants).
+    ///
+    /// The host may be a domain, an IPv4 literal, or an IPv6 literal
+    /// (bracketed, or bare with the trailing `:port` for backward
+    /// compatibility). A leading `*` marks the entry as a gate node; like
+    /// everywhere in the SDK it is only recorded in
+    /// [`is_gate`](ProxyConfig::is_gate) and never interpreted by dialing.
+    pub fn from_addr(protocol: ProxyProtocol, addr: &str) -> Result<Self, ParseProxyError> {
+        parse_proxy_str(addr, protocol)
     }
 
     /// Link this entry to the outer `gate` node dialed first.
@@ -128,7 +125,6 @@ impl fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyConfig")
             .field("protocol", &self.protocol)
-            .field("ip", &self.ip)
             .field("host", &self.host)
             .field("port", &self.port)
             .field("user", &self.user.as_ref().map(|_| REDACTED))
@@ -217,26 +213,33 @@ mod tests {
     fn protocol_shortcuts() {
         let c = ProxyConfig::socks5("example.com", 1080);
         assert_eq!(c.protocol, ProxyProtocol::Socks5);
-        assert_eq!(
-            (c.host.as_str(), c.port, c.ip),
-            ("example.com", 1080, IP::V4)
-        );
+        assert_eq!((c.host.as_str(), c.port), ("example.com", 1080));
         assert!(c.user.is_none() && c.password.is_none() && !c.is_gate && c.gate.is_none());
         assert_eq!(ProxyConfig::http("h", 8080).protocol, ProxyProtocol::Http);
         assert_eq!(ProxyConfig::https("h", 443).protocol, ProxyProtocol::Https);
     }
 
     #[test]
-    fn new_derives_family_and_strips_brackets() {
-        for host in ["::1", "[::1]", "2001:db8::1"] {
-            let c = ProxyConfig::new(ProxyProtocol::Socks5, host, 1);
-            assert_eq!(c.ip, IP::V6, "{host}");
-            assert!(!c.host.contains(['[', ']']), "{host}");
-        }
+    fn new_strips_brackets() {
+        let c = ProxyConfig::new(ProxyProtocol::Socks5, "[::1]", 1);
+        assert!(!c.host.contains(['[', ']']));
         assert_eq!(ProxyConfig::socks5("[::1]", 1).host, "::1");
-        for host in ["1.2.3.4", "example.com"] {
-            assert_eq!(ProxyConfig::socks5(host, 1).ip, IP::V4);
-        }
+        assert_eq!(ProxyConfig::socks5("1.2.3.4", 1).host, "1.2.3.4");
+    }
+
+    #[test]
+    fn from_addr_delegates_to_parse_proxy_str() {
+        let c = ProxyConfig::from_addr(ProxyProtocol::Https, "*u:p@[2001:db8::1]:443").unwrap();
+        assert_eq!(c.protocol, ProxyProtocol::Https);
+        assert!(c.is_gate);
+        assert_eq!(c.user.as_deref(), Some("u"));
+        assert_eq!(c.password.as_deref(), Some("p"));
+        assert_eq!(c.host, "2001:db8::1");
+        assert_eq!(c.port, 443);
+        assert_eq!(
+            ProxyConfig::from_addr(ProxyProtocol::Socks5, "no port here").unwrap_err(),
+            crate::connect::ParseProxyError::BadHostPort
+        );
     }
 
     #[test]
@@ -244,11 +247,9 @@ mod tests {
         let gate = ProxyConfig::socks5("gate.example", 1).as_gate();
         let c = ProxyConfig::socks5("1.2.3.4", 2)
             .with_auth("u", "p")
-            .with_family(IP::V6)
             .with_gate(gate);
         assert_eq!(c.user.as_deref(), Some("u"));
         assert_eq!(c.password.as_deref(), Some("p"));
-        assert_eq!(c.ip, IP::V6);
         let g = c.gate.as_ref().unwrap();
         assert_eq!(g.host, "gate.example");
         assert!(g.is_gate);

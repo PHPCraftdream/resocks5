@@ -11,7 +11,7 @@ use crate::logger::{self, ELog};
 use crate::server;
 use resocks5_net::connect::parse_proxy_str;
 use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::{ProxyConfig, ProxyProtocol, IP};
+use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
 use super::log_drain::{shutdown_log_drain, spawn_log_drain};
 
@@ -50,13 +50,8 @@ pub(crate) fn has_usable_route(has_v4_rotator: bool, has_v6_rotator: bool) -> bo
 /// dropped because it failed to parse. The warning names the list and the
 /// 1-based line number only — never the line's text, which can carry
 /// `user:pass` credentials.
-fn parse_proxy_list(
-    list_name: &str,
-    list: &[String],
-    proto: ProxyProtocol,
-    ip: IP,
-) -> Vec<ProxyConfig> {
-    let (parsed, failed) = parse_proxy_list_checked(list, proto, ip);
+fn parse_proxy_list(list_name: &str, list: &[String], proto: ProxyProtocol) -> Vec<ProxyConfig> {
+    let (parsed, failed) = parse_proxy_list_checked(list, proto);
     for line_no in &failed {
         println!("{}", skipped_line_message(list_name, *line_no));
     }
@@ -69,7 +64,6 @@ fn parse_proxy_list(
 pub(super) fn parse_proxy_list_checked(
     list: &[String],
     proto: ProxyProtocol,
-    ip: IP,
 ) -> (Vec<ProxyConfig>, Vec<usize>) {
     let mut parsed = Vec::with_capacity(list.len());
     let mut failed = Vec::new();
@@ -77,7 +71,7 @@ pub(super) fn parse_proxy_list_checked(
         if line.starts_with('#') {
             continue;
         }
-        match parse_proxy_str(line, proto, ip) {
+        match parse_proxy_str(line, proto) {
             Ok(config) => parsed.push(config),
             Err(_) => failed.push(idx + 1),
         }
@@ -197,33 +191,29 @@ pub(super) async fn run_server_inner() -> Result<()> {
 
     let pl = &configs.proxy_list;
     let mut all_v6: Vec<ProxyConfig> =
-        parse_proxy_list("socks5_v6", &pl.socks5_v6, ProxyProtocol::Socks5, IP::V6);
+        parse_proxy_list("socks5_v6", &pl.socks5_v6, ProxyProtocol::Socks5);
     all_v6.extend(parse_proxy_list(
         "http_v6",
         &pl.http_v6,
         ProxyProtocol::Http,
-        IP::V6,
     ));
     all_v6.extend(parse_proxy_list(
         "https_v6",
         &pl.https_v6,
         ProxyProtocol::Https,
-        IP::V6,
     ));
 
     let mut all_v4: Vec<ProxyConfig> =
-        parse_proxy_list("socks5_v4", &pl.socks5_v4, ProxyProtocol::Socks5, IP::V4);
+        parse_proxy_list("socks5_v4", &pl.socks5_v4, ProxyProtocol::Socks5);
     all_v4.extend(parse_proxy_list(
         "http_v4",
         &pl.http_v4,
         ProxyProtocol::Http,
-        IP::V4,
     ));
     all_v4.extend(parse_proxy_list(
         "https_v4",
         &pl.https_v4,
         ProxyProtocol::Https,
-        IP::V4,
     ));
 
     let (v6_proxies, v4_proxies, gate_proxies) = partition_proxy_groups(all_v6, all_v4);
@@ -246,7 +236,13 @@ pub(super) async fn run_server_inner() -> Result<()> {
 
     println!("gates:");
     for p in &gate_proxies {
-        println!("{:?}://{}:{} - {:?}", p.protocol, p.host, p.port, p.ip,);
+        println!(
+            "{:?}://{}:{} - {}",
+            p.protocol,
+            p.host,
+            p.port,
+            crate::server::connect::print_cfg::family_label(&p.host)
+        );
     }
 
     // Bounded log channel — under sudden bursts (e.g. cache_hits=true

@@ -30,7 +30,7 @@
     doc = "  driven by [`rating`]."
 )]
 //! - [`types`] — the shared proxy descriptors ([`types::ProxyConfig`],
-//!   [`types::ProxyProtocol`], [`types::IP`]).
+//!   [`types::ProxyProtocol`]).
 //! - [`error`] — the typed [`ConnectError`] returned by the public
 //!   connect/pool API, with [`Stage`] and timeout-kind discriminators.
 //!

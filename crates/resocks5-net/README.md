@@ -70,6 +70,13 @@ no authentication.
 
 ## Usage
 
+Upstream lines are `[*]user:pass@host:port` — credentials optional, a
+leading `*` marks a gate node. Parse one with
+`parse_proxy_str(line, protocol)` or the
+`ProxyConfig::from_addr(protocol, addr)` shorthand; `host` may be a
+domain, an IPv4 literal, or a bracketed (or bare) IPv6 literal, and the
+password may contain `:`.
+
 ```toml
 [dependencies]
 resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
@@ -83,14 +90,14 @@ use std::time::Duration;
 use resocks5_net::connect::{connect_proxy, parse_proxy_str};
 use resocks5_net::pool::{PoolConfig, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::{ProxyProtocol, IP};
+use resocks5_net::types::ProxyProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
-        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
+        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5).ok())
         .collect::<Vec<_>>();
 
     let rotator = ProxyRotator::new(proxies);

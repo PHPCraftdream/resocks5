@@ -49,10 +49,9 @@ pub(crate) async fn tcp_dial(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::IP as IPV;
 
     fn proxy(host: &str, port: u16) -> ProxyConfig {
-        ProxyConfig::socks5(host, port).with_family(IPV::V4)
+        ProxyConfig::socks5(host, port)
     }
 
     #[tokio::test]

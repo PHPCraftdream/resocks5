@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::logger::ELog;
 use resocks5_net::connect::parse_proxy_str;
-use resocks5_net::types::{ProxyConfig, ProxyProtocol, IP};
+use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
 use super::*;
 use crate::config::{User, UsersConfig};
@@ -61,7 +61,7 @@ fn skipped_line_diagnostic_identifies_line_without_credentials() {
         "not-a-proxy".to_string(),
         "bob:hunter2@[::1]:1080".to_string(),
     ];
-    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5, IP::V4);
+    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5);
     assert_eq!(parsed.len(), 2);
     assert_eq!(failed, vec![2]);
     let msg = skipped_line_message("socks5_v4", failed[0]);
@@ -84,7 +84,7 @@ fn skipped_line_diagnostic_identifies_line_without_credentials() {
 #[test]
 fn comment_lines_are_skipped_silently() {
     let list = vec!["# comment".to_string(), "1.2.3.4:1080".to_string()];
-    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5, IP::V4);
+    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5);
     assert_eq!(parsed.len(), 1);
     assert!(
         failed.is_empty(),
@@ -163,19 +163,19 @@ fn partition_proxy_groups_moves_plain_entries_without_cloning() {
 /// gates, with credentials moved intact.
 #[test]
 fn partition_proxy_groups_preserves_composition_and_order_on_proxy_config() {
-    let parse = |line: &str, ip: IP| {
-        parse_proxy_str(line, ProxyProtocol::Socks5, ip).expect("test proxy line must parse")
+    let parse = |line: &str| {
+        parse_proxy_str(line, ProxyProtocol::Socks5).expect("test proxy line must parse")
     };
     let all_v6 = vec![
-        parse("[2001:db8::1]:1080", IP::V6),
-        parse("*u1:p1@[2001:db8::2]:1080", IP::V6),
-        parse("[2001:db8::3]:1080", IP::V6),
+        parse("[2001:db8::1]:1080"),
+        parse("*u1:p1@[2001:db8::2]:1080"),
+        parse("[2001:db8::3]:1080"),
     ];
     let all_v4 = vec![
-        parse("10.0.0.1:1080", IP::V4),
-        parse("*u2:p2@10.0.0.2:1080", IP::V4),
-        parse("10.0.0.3:1080", IP::V4),
-        parse("*u3:p3@10.0.0.4:1080", IP::V4),
+        parse("10.0.0.1:1080"),
+        parse("*u2:p2@10.0.0.2:1080"),
+        parse("10.0.0.3:1080"),
+        parse("*u3:p3@10.0.0.4:1080"),
     ];
 
     let (v6, v4, gates) = partition_proxy_groups(all_v6, all_v4);
@@ -186,24 +186,18 @@ fn partition_proxy_groups_preserves_composition_and_order_on_proxy_config() {
         |group: &[ProxyConfig]| -> Vec<String> { group.iter().map(|p| p.host.clone()).collect() };
     assert_eq!(
         hosts(&v6),
-        hosts(&[
-            parse("[2001:db8::1]:1080", IP::V6),
-            parse("[2001:db8::3]:1080", IP::V6)
-        ])
+        hosts(&[parse("[2001:db8::1]:1080"), parse("[2001:db8::3]:1080")])
     );
     assert_eq!(
         hosts(&v4),
-        hosts(&[
-            parse("10.0.0.1:1080", IP::V4),
-            parse("10.0.0.3:1080", IP::V4)
-        ])
+        hosts(&[parse("10.0.0.1:1080"), parse("10.0.0.3:1080")])
     );
     assert_eq!(
         hosts(&gates),
         hosts(&[
-            parse("*u1:p1@[2001:db8::2]:1080", IP::V6),
-            parse("*u2:p2@10.0.0.2:1080", IP::V4),
-            parse("*u3:p3@10.0.0.4:1080", IP::V4)
+            parse("*u1:p1@[2001:db8::2]:1080"),
+            parse("*u2:p2@10.0.0.2:1080"),
+            parse("*u3:p3@10.0.0.4:1080")
         ])
     );
     assert!(gates.iter().all(|p| p.is_gate));
