@@ -32,7 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload cleanly, without failing the workflow, until a maintainer adds
   the `CARGO_REGISTRY_TOKEN` repo secret — previously there was no
   automated SDK publish step at all, only a manual `cargo publish` a
-  maintainer would have had to remember to run.
+  maintainer would have had to remember to run. The job supports both API
+  token (default) and crates.io Trusted Publishing (OIDC) authentication:
+  setting the repo variable `CRATES_IO_AUTH` to `oidc` switches the upload
+  to a short-lived token from `rust-lang/crates-io-auth-action`, with no
+  stored secret (see CONTRIBUTING.md, "crates.io credentials").
 - `resocks5-net`: **pool-free dial.** `connect::dial(proxy, host, port,
   &DialOptions, Option<&TlsConnector>)` connects and handshakes through one
   upstream with no `ProxyPool`, bounded by `connect_timeout`,

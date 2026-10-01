@@ -88,14 +88,35 @@ need to see what changed, why, and how you verified it.
    version requirement for a *sibling* crate, not this crate's own version.
 3. Commit, push, then push a `v<version>` tag. That single tag push
    triggers `.github/workflows/release.yml`: native archives + a GitHub
-   Release, a multi-arch Docker image to `ghcr.io`, and — once a
-   maintainer has added the `CARGO_REGISTRY_TOKEN` repo secret — a
-   `cargo publish` of `resocks5-net` to crates.io. `resocks5` itself
+   Release, a multi-arch Docker image to `ghcr.io`, and — once crates.io
+   credentials are configured (see below) — a `cargo publish` of
+   `resocks5-net` to crates.io. `resocks5` itself
    (the binary) is not published to crates.io yet: its own path
    dependency on `resocks5-net` now carries a version requirement, but
    nobody has decided whether `cargo install resocks5` should be a
    supported install path or whether native archives/Docker/git remain
    the only sanctioned channels.
+
+### crates.io credentials
+
+The `publish-sdk` job in `release.yml` always runs a packaging dry-run and
+uploads only when credentials exist. The mode is chosen by the repository
+variable `CRATES_IO_AUTH`:
+
+- **API token (default; unset variable).** Create a token at
+  <https://crates.io/settings/tokens> scoped to `publish-new` +
+  `publish-update`, store it as the `CARGO_REGISTRY_TOKEN` Actions secret,
+  push the tag. Required for the **first** release: a trusted publisher can
+  only be configured for a crate that already exists on crates.io.
+- **Trusted Publishing (OIDC).** After the first release, open the crate's
+  settings on crates.io → Trusted Publishing, add repository
+  `PHPCraftdream/resocks5`, workflow `release.yml`. Then set the Actions
+  variable `CRATES_IO_AUTH` to `oidc` and delete the `CARGO_REGISTRY_TOKEN`
+  secret. The job exchanges its GitHub identity for a short-lived token; no
+  long-lived secret remains.
+
+Without either, the tag still produces archives and the Docker image; the
+crates.io step logs a notice and is skipped.
 
 ## License
 

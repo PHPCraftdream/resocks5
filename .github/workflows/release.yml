@@ -122,15 +122,30 @@ jobs:
   # resocks5-net version — no separate SDK tag or trigger needed.
   #
   # The dry-run always runs (no secret needed — it's a plain packaging +
-  # build sanity check). The actual upload step skips cleanly (not a
-  # failure) when CARGO_REGISTRY_TOKEN isn't configured, so this job is a
-  # safe no-op on the upload side until a maintainer adds the secret: repo
-  # Settings → Secrets and variables → Actions → CARGO_REGISTRY_TOKEN, an
-  # API token from https://crates.io/settings/tokens scoped to
-  # publish-new + publish-update for resocks5-net.
+  # build sanity check). The upload supports two auth modes, picked by the
+  # repo VARIABLE `CRATES_IO_AUTH` (Settings → Secrets and variables →
+  # Actions → Variables):
+  #
+  #   unset / anything but "oidc"  →  API token (the default). Upload skips
+  #     cleanly (a notice, not a failure) until the CARGO_REGISTRY_TOKEN
+  #     secret exists: an API token from https://crates.io/settings/tokens
+  #     scoped to publish-new + publish-update. Needed for the FIRST
+  #     release — a crate must exist on crates.io before a trusted
+  #     publisher can be configured for it.
+  #   "oidc"  →  crates.io Trusted Publishing: no stored secret, the job
+  #     exchanges its GitHub OIDC identity for a short-lived token. One-time
+  #     setup on crates.io (crate settings → Trusted Publishing): repository
+  #     PHPCraftdream/resocks5, workflow release.yml. Then set the variable
+  #     to "oidc" and delete the CARGO_REGISTRY_TOKEN secret.
   publish-sdk:
     name: publish resocks5-net to crates.io
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level ones: read-only
+    # contents, plus the OIDC identity token for the trusted-publishing
+    # exchange (unused in token mode).
+    permissions:
+      contents: read
+      id-token: write
     # `secrets` isn't readable from an `if:` condition directly (GitHub
     # Actions restriction) — mirror it into `env` once at job level, where
     # `secrets` access is allowed, then branch on the `env` context instead.
@@ -144,10 +159,22 @@ jobs:
           key: publish-sdk
       - name: Dry-run (packaging + build sanity, no upload)
         run: cargo publish -p resocks5-net --locked --dry-run
-      - name: Publish
-        if: ${{ env.HAS_CARGO_REGISTRY_TOKEN == 'true' }}
+      - name: Publish (API token)
+        if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN == 'true' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p resocks5-net --locked
+      - name: Upload skipped (no credentials configured)
+        if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN != 'true' }}
+        run: echo "::notice::crates.io upload skipped - add the CARGO_REGISTRY_TOKEN secret, or set the CRATES_IO_AUTH variable to 'oidc' once a trusted publisher is configured."
+      - name: Authenticate to crates.io (trusted publishing)
+        id: crates-io-auth
+        if: ${{ vars.CRATES_IO_AUTH == 'oidc' }}
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish (trusted publishing)
+        if: ${{ vars.CRATES_IO_AUTH == 'oidc' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: cargo publish -p resocks5-net --locked
 
   # Multi-arch container image → ghcr.io/<owner>/resocks5.
