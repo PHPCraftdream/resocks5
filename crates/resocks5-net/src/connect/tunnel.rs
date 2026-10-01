@@ -11,8 +11,45 @@ use crate::progress::{confirmed_scope, FlushProgress};
 use tokio::io::{copy_bidirectional_with_sizes, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
+/// How a [`tunnel_with_timeouts`] transfer ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TunnelEnd {
+    /// Both directions reached EOF (half-close semantics preserved:
+    /// each direction finishes independently).
+    Eof,
+    /// The idle deadline broke the loop.
+    IdleTimeout,
+    /// The total-lifetime deadline broke the loop.
+    LifetimeTimeout,
+}
+
+/// Structured result of [`tunnel_with_timeouts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TunnelOutcome {
+    /// How the transfer ended.
+    pub end: TunnelEnd,
+    /// Bytes read from `a` and confirmed written into `b` by the
+    /// destination's `poll_write` — the client→upstream leg only.
+    pub a_to_b: u64,
+    /// Bytes read from `b` and confirmed written into `a` — the
+    /// upstream→client leg only.
+    pub b_to_a: u64,
+}
+
 /// Forward bytes until both directions reach EOF, a timeout fires, or I/O fails.
 /// Half-closes are propagated while the other direction continues to flow.
+///
+/// Returns a [`TunnelOutcome`] describing how the transfer ended and how
+/// many bytes each leg forwarded. The counters include only bytes
+/// forwarded through the tunnel itself — bytes moved by any earlier
+/// handshake or prelude phase before this function is called are not
+/// counted. `a_to_b` counts bytes confirmed written into `b` (the
+/// destination's `poll_write`), `b_to_a` the mirror image; both are
+/// valid on the timeout paths, and may undercount bytes accepted by an
+/// in-flight buffering wrapper that only reaches the wire during a
+/// later flush.
 ///
 /// `idle` measures time since the last successful read or write in either
 /// direction. Progress confirmed inside a wrapping TLS/buffering stack — a
@@ -33,7 +70,7 @@ pub async fn tunnel_with_timeouts<A, B>(
     b: B,
     idle: Duration,
     max_lifetime: Duration,
-) -> io::Result<()>
+) -> io::Result<TunnelOutcome>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -42,19 +79,25 @@ where
         epoch: Instant::now(),
         nanos: AtomicU64::new(0),
     };
+    let bytes = Bytes {
+        a_to_b: AtomicU64::new(0),
+        b_to_a: AtomicU64::new(0),
+    };
     let confirmed = FlushProgress::new();
     let mut a = Tracked {
         inner: a,
         activity: &activity,
         confirmed: &confirmed,
+        forwarded: &bytes.b_to_a,
     };
     let mut b = Tracked {
         inner: b,
         activity: &activity,
         confirmed: &confirmed,
+        forwarded: &bytes.a_to_b,
     };
     confirmed_scope(confirmed.clone(), async {
-        {
+        let end = {
             let transfer = copy_bidirectional_with_sizes(&mut a, &mut b, 16 * 1024, 16 * 1024);
             let lifetime = tokio::time::sleep(max_lifetime);
             let idle_timer = tokio::time::sleep(idle);
@@ -62,28 +105,45 @@ where
             loop {
                 tokio::select! {
                     biased;
-                    _ = &mut lifetime, if !max_lifetime.is_zero() => break,
+                    _ = &mut lifetime, if !max_lifetime.is_zero() => {
+                        break TunnelEnd::LifetimeTimeout;
+                    }
                     _ = &mut idle_timer, if !idle.is_zero() => {
                         let last = activity.epoch + Duration::from_nanos(activity.nanos.load(Ordering::Relaxed));
                         let deadline = last + idle;
                         if Instant::now() >= deadline {
-                            break;
+                            break TunnelEnd::IdleTimeout;
                         }
                         idle_timer.as_mut().reset(deadline);
                     }
-                    result = &mut transfer => return result.map(|_| ()),
+                    result = &mut transfer => {
+                        return result.map(|_| TunnelOutcome {
+                            end: TunnelEnd::Eof,
+                            a_to_b: bytes.a_to_b.load(Ordering::Relaxed),
+                            b_to_a: bytes.b_to_a.load(Ordering::Relaxed),
+                        });
+                    }
                 }
             }
-        }
+        };
         poll_fn(|cx| {
             let _ = Pin::new(&mut a.inner).poll_shutdown(cx);
             let _ = Pin::new(&mut b.inner).poll_shutdown(cx);
             Poll::Ready(())
         })
         .await;
-        Ok(())
+        Ok(TunnelOutcome {
+            end,
+            a_to_b: bytes.a_to_b.load(Ordering::Relaxed),
+            b_to_a: bytes.b_to_a.load(Ordering::Relaxed),
+        })
     })
     .await
+}
+
+struct Bytes {
+    a_to_b: AtomicU64,
+    b_to_a: AtomicU64,
 }
 
 struct Activity {
@@ -103,6 +163,8 @@ struct Tracked<'a, S> {
     inner: S,
     activity: &'a Activity,
     confirmed: &'a FlushProgress,
+    /// Bytes this (destination) side has confirmed written.
+    forwarded: &'a AtomicU64,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Tracked<'_, S> {
@@ -128,6 +190,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, S> {
     ) -> Poll<io::Result<usize>> {
         let confirmed_before = self.confirmed.total();
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &result {
+            if *n > 0 {
+                self.forwarded.fetch_add(*n as u64, Ordering::Relaxed);
+            }
+        }
         if matches!(result, Poll::Ready(Ok(n)) if n > 0)
             || self.confirmed.total() > confirmed_before
         {
@@ -967,5 +1034,110 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(&*log.lock().unwrap(), &payload[..6]);
+    }
+
+    /// EOF outcome carries the exact forwarded byte counts in both
+    /// directions: 5 bytes client→proxy, 5 bytes proxy→client.
+    #[tokio::test]
+    async fn eof_outcome_counts_exact_bytes_both_ways() {
+        let (mut client_outer, client_inner, mut proxy_outer, proxy_inner) = pair();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        ));
+
+        client_outer.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        proxy_outer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        proxy_outer.write_all(b"world").await.unwrap();
+        client_outer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"world");
+
+        drop(client_outer);
+        let _ = proxy_outer.read_to_end(&mut Vec::new()).await;
+        drop(proxy_outer);
+
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.end, TunnelEnd::Eof);
+        assert_eq!(outcome.a_to_b, 5);
+        assert_eq!(outcome.b_to_a, 5);
+    }
+
+    /// Idle timeout outcome with counters equal to the bytes forwarded
+    /// before the stall: 3 bytes client→proxy, none back.
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_outcome_counts_bytes_sent_before_stall() {
+        let (mut client_outer, client_inner, mut proxy_outer, proxy_inner) = pair();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        ));
+
+        client_outer.write_all(b"abc").await.unwrap();
+        let mut buf = [0u8; 3];
+        proxy_outer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"abc");
+
+        // Silence from here on: the idle deadline must fire.
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.end, TunnelEnd::IdleTimeout);
+        assert_eq!(outcome.a_to_b, 3);
+        assert_eq!(outcome.b_to_a, 0);
+
+        drop(client_outer);
+        drop(proxy_outer);
+    }
+
+    /// Lifetime timeout outcome on a quiet tunnel: zero counters.
+    #[tokio::test(start_paused = true)]
+    async fn lifetime_timeout_outcome_on_quiet_tunnel() {
+        let (client_outer, client_inner, proxy_outer, proxy_inner) = pair();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::from_secs(60),
+            Duration::from_millis(120),
+        ));
+
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.end, TunnelEnd::LifetimeTimeout);
+        assert_eq!(outcome.a_to_b, 0);
+        assert_eq!(outcome.b_to_a, 0);
+
+        drop(client_outer);
+        drop(proxy_outer);
+    }
+
+    /// Counters stay correct under half-close: the client leg forwards
+    /// its bytes and finishes via shutdown while the reverse leg ends on
+    /// EOF having forwarded nothing.
+    #[tokio::test]
+    async fn counters_correct_under_half_close() {
+        let (mut client_outer, client_inner, mut proxy_outer, proxy_inner) = pair();
+        let task = tokio::spawn(tunnel_with_timeouts(
+            client_inner,
+            proxy_inner,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        ));
+
+        client_outer.write_all(b"bye").await.unwrap();
+        drop(client_outer);
+
+        let mut got = Vec::new();
+        proxy_outer.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"bye");
+        drop(proxy_outer);
+
+        let outcome = task.await.unwrap().unwrap();
+        assert_eq!(outcome.end, TunnelEnd::Eof);
+        assert_eq!(outcome.a_to_b, 3);
+        assert_eq!(outcome.b_to_a, 0);
     }
 }
