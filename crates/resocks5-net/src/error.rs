@@ -49,6 +49,8 @@ pub enum TimeoutKind {
     HttpsTlsHandshake,
     /// HTTPS: the CONNECT exchange over the established TLS timed out.
     HttpsConnectHandshake,
+    /// The whole-call budget of a one-shot dial elapsed.
+    Total,
 }
 
 /// The typed error returned by every public connect/pool entry point.
@@ -176,6 +178,9 @@ impl fmt::Display for ConnectError {
                         after.as_secs(),
                         endpoint
                     )
+                }
+                TimeoutKind::Total => {
+                    write!(f, "total timeout ({}s) to {}", after.as_secs(), endpoint)
                 }
             },
             ConnectError::Io {
@@ -628,11 +633,6 @@ mod tests {
     #[tokio::test]
     async fn unparseable_target_yields_invalid_target() {
         let (mut client, mut upstream) = duplex(4096);
-        let peer = tokio::spawn(async move {
-            let mut greeting = [0u8; 3];
-            upstream.read_exact(&mut greeting).await.unwrap();
-            upstream.write_all(&[0x05, 0x00]).await.unwrap();
-        });
         let err = handshake_over_stream(&mut client, "no-port-target", None)
             .await
             .expect_err("invalid target must fail");
@@ -644,7 +644,11 @@ mod tests {
             err.to_string(),
             "[SOCKS5] Invalid target address format: no-port-target"
         );
-        peer.await.unwrap();
+        // Nothing reached the wire.
+        drop(client);
+        let mut rest = Vec::new();
+        upstream.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
     }
 
     #[tokio::test]

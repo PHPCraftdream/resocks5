@@ -31,10 +31,10 @@ pub async fn connect_http_proxy(
     let mut stream = pool.acquire(proxy).await?;
 
     let endpoint = upstream_endpoint(proxy);
-    let result = timeout(handshake_timeout, async {
-        write_connect_request(&mut stream, target_addr, proxy).await?;
-        read_connect_response_tcp(&mut stream).await
-    })
+    let result = timeout(
+        handshake_timeout,
+        http_connect_on_tcp(&mut stream, target_addr, proxy),
+    )
     .await;
 
     match result {
@@ -47,6 +47,19 @@ pub async fn connect_http_proxy(
             after: handshake_timeout,
         }),
     }
+}
+
+/// HTTP CONNECT core for a plain upstream socket: no deadline, no pool.
+/// Peeks to consume exactly the response head.
+///
+/// cancel-safe: NO — a cancelled handshake must close the stream.
+pub(crate) async fn http_connect_on_tcp(
+    stream: &mut UpstreamStream,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+) -> Result<(), ConnectError> {
+    write_connect_request(stream, target_addr, proxy).await?;
+    read_connect_response_tcp(stream).await
 }
 
 /// Perform the HTTP `CONNECT` handshake for one tunnel hop on an

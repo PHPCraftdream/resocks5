@@ -9,13 +9,49 @@ use crate::types::ProxyProtocol;
 
 /// Performs SOCKS5 handshake over an existing stream.
 ///
+/// Parses `target_addr` (`host:port`, IPv6 bracketed) and runs
+/// [`socks5_handshake`]; the stream contract there applies unchanged.
+///
 /// # Errors
 ///
 /// Returns [`ConnectError`] for I/O failures and every SOCKS5 protocol
-/// violation (method negotiation, auth, version, ATYP, target parsing).
+/// violation (method negotiation, auth, version, ATYP). An unparseable
+/// `target_addr` yields [`ConnectError::InvalidTarget`] before any byte
+/// is written.
 pub async fn handshake_over_stream<S>(
-    mut stream: S,
+    stream: S,
     target_addr: &str,
+    auth: Option<(&str, &str)>,
+) -> Result<S, ConnectError>
+where
+    S: AsyncRead + AsyncWriteExt + Unpin,
+{
+    let parsed = super::HostPort::parse(target_addr)
+        .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
+    socks5_handshake(stream, parsed.host, parsed.port, auth).await
+}
+
+/// SOCKS5 (RFC 1928) CONNECT handshake with optional RFC 1929
+/// username/password auth over an existing stream. `host` is unbracketed:
+/// an IPv4/IPv6 literal sends ATYP 1/4, anything else a domain (ATYP 3).
+///
+/// Takes the stream by value or as `&mut S`; every step is flushed. There
+/// is no deadline here: wrap the call in a timeout if one is needed.
+///
+/// On error or cancellation the stream is in an unspecified protocol
+/// state and must be dropped. On success it is positioned right after the
+/// CONNECT reply, ready for payload.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] for I/O failures and every SOCKS5 protocol
+/// violation (method negotiation, auth, version, ATYP, domain length).
+///
+/// cancel-safe: NO — a cancelled handshake must close the stream.
+pub async fn socks5_handshake<S>(
+    mut stream: S,
+    host: &str,
+    port: u16,
     auth: Option<(&str, &str)>,
 ) -> Result<S, ConnectError>
 where
@@ -70,10 +106,6 @@ where
         }
     }
 
-    let parsed = super::HostPort::parse(target_addr)
-        .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
-    let host = parsed.host;
-    let port = parsed.port;
     let (atyp, addr_bytes) = if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
         (0x01, ipv4.octets().to_vec())
     } else if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
@@ -322,5 +354,59 @@ mod tests {
         .unwrap();
         assert_eq!(head, [0x05, 0x01, 0x00, 0x01]);
         assert_eq!(addr, vec![0x01, 1, 2, 3, 4, 0x01, 0xBB]);
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use tokio::io::duplex;
+
+    use super::{handshake_over_stream, socks5_handshake};
+
+    async fn wire(use_core: bool, auth: Option<(&str, &str)>) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let has_auth = auth.is_some();
+        let (mut client, mut server) = duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 3];
+            server.read_exact(&mut buf).await.unwrap();
+            seen.extend_from_slice(&buf);
+            if has_auth {
+                server.write_all(&[0x05, 0x02]).await.unwrap();
+                let mut a = [0u8; 3 + 4 + 4];
+                server.read_exact(&mut a).await.unwrap();
+                seen.extend_from_slice(&a);
+                server.write_all(&[0x01, 0x00]).await.unwrap();
+            } else {
+                server.write_all(&[0x05, 0x00]).await.unwrap();
+            }
+            // 4 head + 1 len + 11 domain + 2 port
+            let mut req = [0u8; 18];
+            server.read_exact(&mut req).await.unwrap();
+            seen.extend_from_slice(&req);
+            server
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            seen
+        });
+        if use_core {
+            socks5_handshake(&mut client, "example.com", 443, auth)
+                .await
+                .unwrap();
+        } else {
+            handshake_over_stream(&mut client, "example.com:443", auth)
+                .await
+                .unwrap();
+        }
+        peer.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn core_and_wrapper_emit_identical_bytes() {
+        assert_eq!(wire(true, None).await, wire(false, None).await);
+        let auth = Some(("user", "pass"));
+        assert_eq!(wire(true, auth).await, wire(false, auth).await);
     }
 }

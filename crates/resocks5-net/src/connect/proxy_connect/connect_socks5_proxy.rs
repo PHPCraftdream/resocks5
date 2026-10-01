@@ -10,6 +10,14 @@ use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
 use crate::types::ProxyConfig;
 
+/// Credentials of `proxy` for the SOCKS5 sub-negotiation, if both are set.
+pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Option<(&str, &str)> {
+    match (&proxy.user, &proxy.password) {
+        (Some(user), Some(password)) => Some((user.as_str(), password.as_str())),
+        _ => None,
+    }
+}
+
 /// Establishes a connection to the target through a SOCKS5 proxy.
 ///
 /// `handshake_timeout` caps the time we wait on the SOCKS5 protocol
@@ -29,15 +37,9 @@ pub async fn connect_socks5_proxy(
 ) -> Result<UpstreamStream, ConnectError> {
     let stream = pool.acquire(proxy).await?;
 
-    let auth = if let (Some(ref user), Some(ref password)) = (&proxy.user, &proxy.password) {
-        Some((user.as_str(), password.as_str()))
-    } else {
-        None
-    };
-
     match timeout(
         handshake_timeout,
-        handshake_over_stream(stream, target_addr, auth),
+        handshake_over_stream(stream, target_addr, socks5_auth(proxy)),
     )
     .await
     {

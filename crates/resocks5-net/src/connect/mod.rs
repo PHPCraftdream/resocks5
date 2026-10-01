@@ -15,6 +15,7 @@
 //! everything stays reachable under the flat `connect::` paths
 //! re-exported below, so external callers are unaffected.
 
+pub mod dial;
 mod proxy_connect;
 pub(crate) mod tcp_dial;
 mod tls;
@@ -40,7 +41,8 @@ pub use connect_http_proxy::http_connect_handshake;
 pub use connect_proxy::connect_proxy;
 pub use connect_proxy::connect_proxy_once;
 pub use connect_socks5_proxy::connect_socks5_proxy;
-pub use handshake_over_stream::handshake_over_stream;
+pub use dial::{dial, DialOptions};
+pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};
 pub use host_port::HostPort;
 pub use parse_proxy_str::{parse_proxy_str, ParseProxyError};
 pub use recover_host::{parse_http_host, parse_sni};

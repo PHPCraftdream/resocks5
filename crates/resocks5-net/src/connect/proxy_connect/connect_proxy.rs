@@ -5,11 +5,13 @@ use std::time::Duration;
 #[cfg(feature = "tls")]
 pub use tokio_rustls::TlsConnector;
 
+use crate::connect::dial::{dial, DialOptions};
+use crate::connect::host_port::HostPort;
 #[cfg(feature = "tls")]
 use crate::connect::upstream_tls::connect_https_proxy;
 use crate::connect::{connect_http_proxy, connect_socks5_proxy};
 use crate::error::ConnectError;
-use crate::pool::{AnyUpstream, PoolConfig, ProxyPool};
+use crate::pool::{AnyUpstream, ProxyPool};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Lean-build placeholder that occupies the `tls_connector` parameter slot
@@ -101,32 +103,27 @@ pub async fn connect_proxy(
     }
 }
 
-/// Connect to `target_addr` through a single upstream `proxy` without ever
-/// constructing a [`ProxyPool`] — the one-shot counterpart of
-/// [`connect_proxy`].
+/// Connect to `target_addr` through a single upstream `proxy` without a
+/// connection pool — the one-shot counterpart of [`connect_proxy`].
 ///
 /// Prefer this over [`connect_proxy`] when calls are independent: a one-off
 /// tunnel, a script dialing through exactly one upstream, or any consumer
-/// with no rotation and no interest in warm-socket reuse. It delegates to
-/// the same per-protocol handshakes (SOCKS5, HTTP CONNECT, HTTPS — the
-/// last behind the crate's `tls` feature), returns the same [`AnyUpstream`]
-/// variants, and fails with the same errors; only the pool plumbing differs.
+/// with no rotation and no interest in warm-socket reuse. It is a
+/// string-target wrapper over [`dial`](crate::connect::dial::dial), returns
+/// the same [`AnyUpstream`] variants, and fails with the same errors.
 ///
-/// The cost is per call: every invocation pays a fresh TCP handshake to the
-/// proxy — nothing is pre-warmed or reused across calls — and a throwaway,
-/// internally constructed *disabled* [`ProxyPool`] (one that spawns no
-/// background tasks and never serves a warm socket) is built and dropped
-/// each time. With no shared pool there is also no shared per-upstream
-/// concurrency cap; cap your own fan-out if you call this concurrently
-/// against the same proxy.
+/// Every call pays a fresh TCP handshake to the proxy — nothing is
+/// pre-warmed or reused. With no shared pool there is also no shared
+/// per-upstream concurrency cap; cap your own fan-out if you call this
+/// concurrently against the same proxy.
 ///
 /// `connect_timeout` bounds the TCP dial to the proxy; `handshake_timeout`
 /// bounds the protocol exchange on top of it.
 ///
 /// # Errors
 ///
-/// Returns [`ConnectError`] under the same conditions as
-/// [`connect_proxy`] — this is a thin wrapper over it.
+/// [`ConnectError::InvalidTarget`] when `target_addr` is not `host:port`;
+/// otherwise the errors of [`dial`](crate::connect::dial::dial).
 ///
 /// # Example
 ///
@@ -162,14 +159,12 @@ pub async fn connect_proxy_once(
     handshake_timeout: Duration,
     tls_connector: Option<&TlsConnector>,
 ) -> Result<AnyUpstream, ConnectError> {
-    // Throwaway disabled pool: `PoolConfig::default()` has `enabled =
-    // false`, so no refill task is spawned and no warm socket is ever
-    // served — `acquire` falls straight through to a fresh
-    // `TcpStream::connect` bounded by `connect_timeout`. The pool lives
-    // for this one call and one `acquire`, so its per-upstream cap can
-    // never bind.
-    let pool = ProxyPool::new(PoolConfig::default(), connect_timeout, 1);
-    connect_proxy(target_addr, proxy, &pool, handshake_timeout, tls_connector).await
+    let target = HostPort::parse(target_addr)
+        .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
+    let opts = DialOptions::new()
+        .with_connect_timeout(connect_timeout)
+        .with_handshake_timeout(handshake_timeout);
+    dial(proxy, target.host, target.port, &opts, tls_connector).await
 }
 
 #[cfg(test)]

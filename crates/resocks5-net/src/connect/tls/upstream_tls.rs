@@ -40,6 +40,19 @@ pub async fn connect_https_proxy(
     tls_connector: &TlsConnector,
 ) -> Result<TlsStream<ProgressReportingWriter<UpstreamStream>>, ConnectError> {
     let stream = pool.acquire(proxy).await?;
+    https_on_stream(stream, target_addr, proxy, handshake_timeout, tls_connector).await
+}
+
+/// HTTPS core on an already-connected proxy socket: TLS to the proxy
+/// (`proxy.host` as server name), then HTTP CONNECT over it, both under
+/// one `handshake_timeout` budget. No pool; on error the stream is dropped.
+pub(crate) async fn https_on_stream(
+    stream: UpstreamStream,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    handshake_timeout: Duration,
+    tls_connector: &TlsConnector,
+) -> Result<TlsStream<ProgressReportingWriter<UpstreamStream>>, ConnectError> {
     let endpoint = upstream_endpoint(proxy);
 
     let server_name =

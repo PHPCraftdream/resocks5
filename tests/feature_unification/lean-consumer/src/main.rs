@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use resocks5_net::connect::connect_proxy::TlsConnector;
-use resocks5_net::connect::{connect_proxy, connect_proxy_once, parse_proxy_str};
+use resocks5_net::connect::{connect_proxy, connect_proxy_once, dial, parse_proxy_str, DialOptions};
 use resocks5_net::pool::{PoolConfig, ProxyPool};
 use resocks5_net::types::{IP, ProxyProtocol};
 
@@ -35,9 +35,13 @@ fn main() {
     );
     let pooled = connect_proxy("example.com:443", &proxy, &pool, Duration::from_secs(1), None);
 
+    let opts = DialOptions::new();
+    let dialed = dial(&proxy, "example.com", 443, &opts, None);
+
     // Never polled: this fixture proves compilation, not connectivity.
     drop(once);
     drop(pooled);
+    drop(dialed);
     let _ = named_connector_slot();
     println!("lean-consumer: compiled OK (lean dependency, no tls of its own)");
 }
