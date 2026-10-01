@@ -63,7 +63,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 
-use crate::error::{ConnectError, Stage, TimeoutKind};
+use crate::connect::tcp_dial::tcp_dial;
+use crate::error::ConnectError;
 use crate::pool::PoolConfig;
 use crate::types::ProxyConfig;
 
@@ -306,45 +307,17 @@ impl ProxyPool {
         if let Some(pw) = self.checkout_prewarmed(proxy) {
             return Ok(UpstreamStream {
                 stream: pw.stream,
-                _permit: pw.permit,
+                _permit: Some(pw.permit),
                 extra_permits: Vec::new(),
             });
         }
 
-        // Step 2: fresh connect under the cap. The diagnostic endpoint
-        // string is formatted only on the failure paths, and the dial
-        // address is passed as `(host, port)` so IP literals are parsed
-        // directly: `ProxyConfig.host` is stored WITHOUT IPv6 brackets,
-        // so `format!("{}:{}", host, port)` mangles an IPv6 literal
-        // like `::1` into `::1:1080`, which fails `SocketAddr` parsing
-        // and falls into the blocking system resolver.
+        // Step 2: fresh connect under the cap.
         let permit = self.reserve_permit(proxy)?;
-        let stream = match timeout(
-            self.connect_timeout,
-            TcpStream::connect((proxy.host.as_str(), proxy.port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(ConnectError::Io {
-                    stage: Stage::Connect,
-                    endpoint: Some(upstream_endpoint(proxy)),
-                    source: e,
-                });
-            }
-            Err(_) => {
-                return Err(ConnectError::Timeout {
-                    stage: Stage::Connect,
-                    kind: TimeoutKind::PoolConnect,
-                    endpoint: upstream_endpoint(proxy),
-                    after: self.connect_timeout,
-                });
-            }
-        };
+        let stream = tcp_dial(proxy, self.connect_timeout).await?;
         Ok(UpstreamStream {
             stream,
-            _permit: permit,
+            _permit: Some(permit),
             extra_permits: Vec::new(),
         })
     }
@@ -391,7 +364,7 @@ impl ProxyPool {
     pub fn checkout(&self, proxy: &ProxyConfig) -> Option<UpstreamStream> {
         self.checkout_prewarmed(proxy).map(|pw| UpstreamStream {
             stream: pw.stream,
-            _permit: pw.permit,
+            _permit: Some(pw.permit),
             extra_permits: Vec::new(),
         })
     }

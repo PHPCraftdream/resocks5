@@ -16,6 +16,7 @@
 //! re-exported below, so external callers are unaffected.
 
 mod proxy_connect;
+pub(crate) mod tcp_dial;
 mod tls;
 pub mod tunnel;
 mod util;

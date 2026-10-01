@@ -914,3 +914,31 @@ async fn forget_with_outstanding_permit_does_not_panic_and_permit_releases() {
     );
     drop(fresh);
 }
+
+#[tokio::test]
+async fn from_tcp_round_trips_and_holds_no_permit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (listener, port) = ephemeral_listener().await;
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let mut s = UpstreamStream::from_tcp(tcp);
+    assert!(s._permit.is_none() && s.extra_permits.is_empty());
+    assert!(format!("{s:?}").contains("UpstreamStream"));
+    s.set_nodelay(true).unwrap();
+    s.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    peer.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    peer.write_all(b"pong").await.unwrap();
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"pong");
+
+    // attach_permit still holds its slot until drop.
+    let proxy = make_proxy("127.0.0.1", port);
+    let pool = ProxyPool::new(pool_cfg(1), Duration::from_secs(2), 1);
+    s.attach_permit(pool.reserve_permit(&proxy).unwrap());
+    assert!(pool.reserve_permit(&proxy).is_err());
+    drop(s);
+    assert!(pool.reserve_permit(&proxy).is_ok());
+}

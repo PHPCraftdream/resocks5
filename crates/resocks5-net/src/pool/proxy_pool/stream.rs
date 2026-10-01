@@ -19,11 +19,23 @@ pub struct UpstreamStream {
     pub(super) stream: TcpStream,
     /// Kept private so callers can't shuffle permits between tunnels;
     /// `attach_permit` is the only way to add one.
-    pub(super) _permit: OwnedSemaphorePermit,
+    /// `None` for streams built by `from_tcp` (no pool).
+    pub(super) _permit: Option<OwnedSemaphorePermit>,
     pub(super) extra_permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl UpstreamStream {
+    /// Wrap a plain socket without a pool: holds no cap permit (cap
+    /// accounting is the caller's business); `attach_permit` still works.
+    #[must_use]
+    pub fn from_tcp(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            _permit: None,
+            extra_permits: Vec::new(),
+        }
+    }
+
     /// Direct access to the underlying socket for `&self`-only ops
     /// like `set_nodelay`, `set_keepalive`. Hidden behind a method so
     /// callers can't accidentally clone-out the TcpStream and bypass
