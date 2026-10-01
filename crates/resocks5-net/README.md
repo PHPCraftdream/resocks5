@@ -66,7 +66,7 @@ no authentication.
   `rating`): the sand-rating model and the weighted rotator that drives
   upstream selection. Connector/pool-only consumers can opt out for a
   smaller public API and less to compile. Unlike `tls` and `serde` this
-  removes no dependency — both modules are `std` + `anyhow` only.
+  removes no dependency — both modules are `std` only.
 
 ## Usage
 
@@ -118,11 +118,48 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Top-level modules: `connect`, `pool`, `rating`, `rotator`, `types`.
+### Without a pool
 
-A working version of this example lives at
-[`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs)
-and is built by CI, so the README never drifts from the API.
+`dial` connects through one upstream with no `ProxyPool` (this is what
+`default-features = false` leaves you with). Cap accounting is then up to
+the caller.
+
+```rust,no_run
+use std::time::Duration;
+
+use resocks5_net::connect::{dial, DialOptions};
+use resocks5_net::types::ProxyConfig;
+
+# async fn run() -> Result<(), resocks5_net::ConnectError> {
+let proxy = ProxyConfig::socks5("198.51.100.7", 1080).with_auth("user", "pass");
+let opts = DialOptions::new().with_total_timeout(Duration::from_secs(20));
+// Last argument: `None` unless the upstream is HTTPS (then a `TlsConnector`).
+let stream = dial(&proxy, "example.com", 80, &opts, None).await?;
+# drop(stream);
+# Ok(())
+# }
+```
+
+### Errors
+
+Connect and pool calls return `resocks5_net::ConnectError`
+(`#[non_exhaustive]`): match on `Timeout { stage, .. }`, `ProxyRejected`,
+`AuthFailed`, `MethodUnsupported`, `Protocol`, `InvalidTarget`,
+`TlsFeatureMissing`, `Io` (the `io::Error` is reachable via `source()`)
+and, with `pool`, `AtCapacity` — no message parsing needed.
+
+`ProxyConfig` is built with `ProxyConfig::socks5/http/https(..)` plus
+`with_auth` / `with_gate`. Its `gate` field is the outer gate node and is
+**not** interpreted by `connect_proxy` / `dial`: chaining through a gate
+is assembled by the application.
+
+Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
+`error`, `pool` (`pool` feature), `progress`, `rating`, `rotator`, `types`.
+
+A working version of the pooled example lives at
+[`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).
+CI compiles that file, so it tracks the API; the Markdown blocks above are
+not extracted.
 
 ## Status
 

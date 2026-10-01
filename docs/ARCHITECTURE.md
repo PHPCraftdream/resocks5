@@ -27,12 +27,12 @@ client TCP                                          target host
    ▼
 ┌───────────────────────────────────────────────┐
 │ 1. Protocol detect                            │   first byte: 0x05 → SOCKS5
-│    (server/handle_client.rs)                  │   first byte: ASCII alpha → HTTP CONNECT
+│    (server/handle/)                           │   first byte: ASCII alpha → HTTP CONNECT
 └────────────────────┬──────────────────────────┘
                      ▼
 ┌───────────────────────────────────────────────┐
 │ 2. Authenticate                               │   Argon2id verify + verify-cache (HMAC of
-│    (auth/state.rs, both handlers)             │   server_secret ⨁ name ⨁ password) for
+│    (auth/state/, both handlers)               │   server_secret ⨁ name ⨁ password) for
 │                                               │   O(1) re-auth without re-Argon2
 └────────────────────┬──────────────────────────┘
                      │
@@ -161,7 +161,7 @@ not an open one.
 
 ## The TCP pool and `AtCapacity`
 
-`crates/resocks5-net/src/pool/proxy_pool.rs` keeps two things per upstream
+`crates/resocks5-net/src/pool/proxy_pool/mod.rs` keeps two things per upstream
 `(host, port)`:
 
 1. A bounded queue of pre-warmed TCP sockets (master switch `pool.enabled`).
@@ -181,7 +181,7 @@ would punish its own healthy upstreams during traffic spikes.
 A proxy entry with a leading `*` in `proxy_list.ktav` is a **gate** —
 `resocks5` will tunnel through the gate first, then issue a second
 SOCKS5/CONNECT handshake to the real upstream over that tunnel. The
-combinatorics (`gates × inner`) are walked in `server/establish_connection.rs`,
+combinatorics (`gates × inner`) are walked in `server/connect/establish_connection/`,
 and the sticky cache stores the `(target → (gate, inner))` pair so the
 chain reuses on subsequent calls.
 
@@ -217,22 +217,22 @@ Effective against per-segment DPI scanners that try to read SNI from a
 single packet. Not effective against stateful DPI with full-stream
 reassembly — fragmentation alone is no silver bullet.
 
-Implementation: `crates/resocks5-net/src/connect/tls_fragment.rs`.
+Implementation: `crates/resocks5-net/src/connect/tls/tls_fragment/mod.rs`.
 
 ## Safety nets — every place a tunnel can stall
 
 | Defense | Knob | Lives in |
 |---|---|---|
-| Connect timeout to upstream | `network.connect_timeout_sec` | `pool/proxy_pool.rs` |
-| SOCKS5 / CONNECT handshake timeout | `network.handshake_timeout_sec` | `establish_connection.rs` |
-| Per-upstream concurrency cap | `network.max_per_upstream` | `pool/proxy_pool.rs` (Semaphore) |
+| Connect timeout to upstream | `network.connect_timeout_sec` | `pool/proxy_pool/mod.rs` |
+| SOCKS5 / CONNECT handshake timeout | `network.handshake_timeout_sec` | `establish_connection/` |
+| Per-upstream concurrency cap | `network.max_per_upstream` | `pool/proxy_pool/mod.rs` (Semaphore) |
 | Tunnel idle timeout | `network.tunnel_idle_timeout_sec` | `connect/tunnel.rs` |
 | Tunnel hard lifetime | `network.tunnel_max_lifetime_sec` | `connect/tunnel.rs` |
-| TCP keepalive on both legs | `network.tcp_keepalive_sec` | `connect/tcp_keepalive.rs` |
+| TCP keepalive on both legs | `network.tcp_keepalive_sec` | `connect/util/tcp_keepalive.rs` |
 | Client-side protocol budget | `network.client_protocol_timeout_sec` | both handlers |
 | Max in-flight clients (global) | `network.max_concurrent_clients` | `server/run_server.rs` |
 | Max in-flight direct (bypass) | `network.max_concurrent_direct` | `server/run_server.rs` |
-| Max upstream attempts per request | `network.max_upstream_attempts` | `establish_connection.rs` |
+| Max upstream attempts per request | `network.max_upstream_attempts` | `establish_connection/` |
 
 Every one of these exists because of a real production failure mode.
 Defaults are picked conservatively; `resocks5 config` documents each one.
@@ -303,11 +303,11 @@ generated files are pure values.
    everything.
 2. `crates/resocks5/src/server/run_server.rs` — accept loop, listener,
    permits.
-3. `crates/resocks5/src/server/establish_connection.rs` — the heart of
+3. `crates/resocks5/src/server/connect/establish_connection/` — the heart of
    upstream selection (sticky cache, gates, sand-rated rotator,
    `should_record_failure`).
 4. `crates/resocks5-net/src/rating/` — the math of sand-rating.
-5. `crates/resocks5-net/src/pool/proxy_pool.rs` — the pool and
+5. `crates/resocks5-net/src/pool/proxy_pool/mod.rs` — the pool and
    `AtCapacity`.
 
 Everything else hangs off these five.

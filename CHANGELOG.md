@@ -16,9 +16,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `CARGO_REGISTRY_TOKEN` repo secret — previously there was no
   automated SDK publish step at all, only a manual `cargo publish` a
   maintainer would have had to remember to run.
+- `resocks5-net`: **pool-free dial.** `connect::dial(proxy, host, port,
+  &DialOptions, Option<&TlsConnector>)` connects and handshakes through one
+  upstream with no `ProxyPool`, bounded by `connect_timeout`,
+  `handshake_timeout` and an optional `total_timeout` (`ConnectError::Timeout`
+  with `Stage::Connect` / `Handshake` / `Total`). The TLS slot is a normal
+  parameter of one fixed type in every build (no `cfg` on a parameter).
+  `connect_proxy_once` is now built on it. The SOCKS5 / HTTP CONNECT / HTTPS
+  handshakes are exposed as pool-free cores (`socks5_handshake`,
+  `http_connect_handshake`) shared by `dial` and the pool-taking
+  connectors, with no duplicated protocol logic.
+- `resocks5-net`: **`ConnectError`** — typed errors for every connect and
+  pool call (`Timeout { stage, .. }`, `Io` with the `io::Error` in the
+  `source()` chain, `ProxyRejected`, `AuthFailed`, `MethodUnsupported`,
+  `Protocol`, `InvalidTarget`, `TlsFeatureMissing`, `Tls`, `AtCapacity`),
+  `#[non_exhaustive]`. The hand-written `Display` keeps the previous message
+  text and `[SOCKS5]` / `[HTTP]` / `[HTTPS]` prefixes, so logs are unchanged.
+- `resocks5-net`: **`pool` cargo feature** (default on) gating `ProxyPool`,
+  `PoolConfig`, `AtCapacity` and the pool-taking connectors; `dashmap` and
+  `crossbeam-queue` are now optional. `--no-default-features` pulls in no
+  `dashmap`, `crossbeam` or `rustls` (CI checks the dependency graph).
+  `AnyUpstream`, `UpstreamStream`, `BoxedUpstream` and `AsyncReadWrite` moved
+  to `connect` and are always available (still re-exported from `pool`).
+  `UpstreamStream::from_tcp` wraps a plain socket without a cap permit.
+- `resocks5-net`: **`ProxyConfig` constructors** — `new`, `socks5`, `http`,
+  `https`, `with_auth`, `with_family`, `with_gate`, `as_gate`; the address
+  family label `ip` is derived from the host.
+- `resocks5-net`: fallible `ProxyRotator::try_new` / `try_with_policy` /
+  `try_with_cache_limits` and `Ratings::try_new` (`RotatorError`,
+  `RatingError`): an empty upstream list or an invalid `RatingPolicy` is an
+  error instead of a later panic or silent NaN weights.
+- `resocks5-net`: `ProxyPool::forget` removes one endpoint (spares, cap, and
+  refill task); `ProxyPool::checkout` now keeps the cap permit
+  (`Option<UpstreamStream>`), the old bare-socket behaviour is the explicit
+  `checkout_unguarded`.
+- `resocks5-net`: `tunnel_with_timeouts` returns `TunnelOutcome { end:
+  TunnelEnd, a_to_b, b_to_a }` (EOF / idle / lifetime plus forwarded bytes,
+  also on timeout paths).
+- `resocks5-net`: public custom progress instrumentation —
+  `FlushProgress::record`, `FlushProgress::current()`,
+  `FlushProgress::report_confirmed()` let a third-party buffering/TLS
+  wrapper feed `send_possibly_fragmented` and `tunnel_with_timeouts`.
 
 ### Changed
 
+- **Breaking** (`resocks5-net`, not yet published): `ProxyConfig` is
+  `#[non_exhaustive]` — build it with the constructors above;
+  `parse_proxy_str` returns `Result<ProxyConfig, ParseProxyError>` (`Empty`,
+  `Comment`, `BadHostPort`, `BadGate`) instead of `Option`. The `ip` and
+  `gate` docs are corrected: `ip` is only a family label, `gate` is the outer
+  gate node and is not interpreted by `connect_proxy` / `dial`.
+- **Breaking** (`resocks5-net`): connect and pool entry points
+  (`connect_proxy`, `connect_proxy_once`, `connect_http_proxy`,
+  `connect_socks5_proxy`, `connect_https_proxy`, `http_connect_handshake`,
+  `handshake_over_stream`, `ProxyPool::acquire` / `reserve_permit`) return
+  `Result<_, ConnectError>`; `send_possibly_fragmented` returns
+  `io::Result<SendProgress>`; `RatingPolicy::validate` returns
+  `RatingError`. `anyhow` is no longer part of the library's public API and
+  is a dev-dependency only. `handshake_over_stream` parses the target before
+  writing the greeting, so an invalid target sends nothing.
 - `ktav` 0.6.4 → 0.8.0 (`[workspace.dependencies]` requirement raised from
   `0.6.0` to `0.8.0`; `ktav` is used only by the `resocks5` binary, not
   `resocks5-net`). No source changes were needed; the full `resocks5` test

@@ -262,7 +262,7 @@ async fn stall_at_connect_is_connect_stage() {
     match &err {
         ConnectError::Timeout {
             stage: Stage::Connect,
-            kind: TimeoutKind::PoolConnect,
+            kind: TimeoutKind::TcpConnect,
             endpoint,
             ..
         } => assert_eq!(endpoint, "203.0.113.1:1080"),

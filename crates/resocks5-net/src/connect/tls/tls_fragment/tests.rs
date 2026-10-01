@@ -728,8 +728,7 @@ async fn zero_byte_poll_write_is_write_zero_error() {
     let err = write_progress_bounded(&mut w, b"payload", Duration::from_secs(1))
         .await
         .unwrap_err();
-    let io_err = err.downcast_ref::<std::io::Error>().expect("io error");
-    assert_eq!(io_err.kind(), std::io::ErrorKind::WriteZero);
+    assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
 }
 
 /// The raw transport for the P2-03 write-phase doubles: accepts at

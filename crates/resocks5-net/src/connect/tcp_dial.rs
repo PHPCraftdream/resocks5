@@ -39,7 +39,7 @@ pub(crate) async fn tcp_dial(
         }),
         Err(_) => Err(ConnectError::Timeout {
             stage: Stage::Connect,
-            kind: TimeoutKind::PoolConnect,
+            kind: TimeoutKind::TcpConnect,
             endpoint: endpoint(),
             after: connect_timeout,
         }),
@@ -96,7 +96,7 @@ mod tests {
         match &err {
             ConnectError::Timeout {
                 stage: Stage::Connect,
-                kind: TimeoutKind::PoolConnect,
+                kind: TimeoutKind::TcpConnect,
                 endpoint,
                 after,
             } => {

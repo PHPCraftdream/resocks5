@@ -136,7 +136,7 @@ pub async fn send_possibly_fragmented<W>(
     data: &[u8],
     cfg: &FragmentSpec,
     idle: Duration,
-) -> anyhow::Result<SendProgress>
+) -> std::io::Result<SendProgress>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -181,7 +181,7 @@ async fn write_progress_bounded<W>(
     writer: &mut W,
     buf: &[u8],
     idle: Duration,
-) -> anyhow::Result<SendProgress>
+) -> std::io::Result<SendProgress>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -205,8 +205,7 @@ where
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write whole buffer",
-                )
-                .into());
+                ));
             }
             written += n;
         }
@@ -244,7 +243,7 @@ async fn write_bounded_by_confirmed_progress<W: AsyncWriteExt + Unpin>(
     buf: &[u8],
     idle: Duration,
     progress: &FlushProgress,
-) -> anyhow::Result<Option<usize>> {
+) -> std::io::Result<Option<usize>> {
     let mut write = std::pin::pin!(writer.write(buf));
     loop {
         let confirmed_before = progress.total();
@@ -285,7 +284,7 @@ async fn flush_bounded_by_confirmed_progress<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     idle: Duration,
     progress: &FlushProgress,
-) -> anyhow::Result<SendProgress> {
+) -> std::io::Result<SendProgress> {
     let mut flush = std::pin::pin!(writer.flush());
     loop {
         let confirmed_before = progress.total();

@@ -63,7 +63,6 @@ required-features = ["rotator", "pool"]
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
-anyhow.workspace = true
 serde = { workspace = true, optional = true }
 base64.workspace = true
 socket2.workspace = true
@@ -74,4 +73,5 @@ dashmap = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
 
 [dev-dependencies]
+anyhow.workspace = true
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

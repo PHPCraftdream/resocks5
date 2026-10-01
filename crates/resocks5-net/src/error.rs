@@ -40,8 +40,8 @@ pub enum Stage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TimeoutKind {
-    /// TCP connect to the upstream timed out in the pool.
-    PoolConnect,
+    /// TCP connect to the upstream timed out.
+    TcpConnect,
     /// SOCKS5 handshake timeout.
     Socks5Handshake,
     /// HTTP CONNECT handshake timeout.
@@ -146,7 +146,7 @@ impl fmt::Display for ConnectError {
                 endpoint,
                 after,
             } => match kind {
-                TimeoutKind::PoolConnect => {
+                TimeoutKind::TcpConnect => {
                     write!(f, "connect timeout ({}s) to {}", after.as_secs(), endpoint)
                 }
                 TimeoutKind::Socks5Handshake => {
@@ -400,7 +400,7 @@ mod tests {
             &err,
             ConnectError::Timeout {
                 stage: Stage::Connect,
-                kind: TimeoutKind::PoolConnect,
+                kind: TimeoutKind::TcpConnect,
                 ..
             }
         ));

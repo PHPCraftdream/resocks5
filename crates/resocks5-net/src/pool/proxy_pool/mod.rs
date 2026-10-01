@@ -292,7 +292,7 @@ impl ProxyPool {
     ///
     /// Returns [`ConnectError::AtCapacity`] when the cap is hit, and
     /// [`ConnectError::Io`] / [`ConnectError::Timeout`]
-    /// (`TimeoutKind::PoolConnect`) when the fresh TCP connect fails.
+    /// (`TimeoutKind::TcpConnect`) when the fresh TCP connect fails.
     pub async fn acquire(&self, proxy: &ProxyConfig) -> Result<UpstreamStream, ConnectError> {
         // Step 1: pre-warmed socket — its permit comes with it.
         if let Some(pw) = self.checkout_prewarmed(proxy) {
