@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `resocks5`: handler errors that are only a peer dropping the connection
+  (connection reset / aborted / broken pipe — Windows os error 10053/10054,
+  Unix ECONNRESET/ECONNABORTED/EPIPE) are no longer logged by default; they
+  made up almost all of a long-running log. The new `log.client_disconnects`
+  flag (default `false`) brings them back for verbose diagnostics. Every
+  other handler error is still governed by `log.connection_errors`.
 - Dependency: `socket2` 0.5 → 0.6 (a non-optional `resocks5-net` dependency
   used by TCP keepalive). Current `tokio` releases already depend on
   `socket2` 0.6, so a consumer's build no longer carries two copies. The

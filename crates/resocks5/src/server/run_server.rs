@@ -22,6 +22,19 @@ use resocks5_net::rotator::ProxyRotator;
 /// shutdown feel hung.
 const SHUTDOWN_DRAIN_SEC: u64 = 30;
 
+/// True when the handler failed only because a peer dropped the
+/// connection (reset / aborted / broken pipe — Windows os error
+/// 10054/10053, Unix ECONNRESET/ECONNABORTED/EPIPE). Looks through the
+/// whole error chain, so typed `ConnectError::Io` wrappers count too.
+fn is_peer_disconnect(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| matches!(io.kind(), ConnectionReset | ConnectionAborted | BrokenPipe))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     auth: Arc<AuthState>,
@@ -191,9 +204,15 @@ pub async fn run_server(
                     )
                     .await
                     {
-                        logger_clone.connection_error(
-                            || format!("Error handling connection: {}", e),
-                        );
+                        if is_peer_disconnect(&e) {
+                            logger_clone.client_disconnect(
+                                || format!("Error handling connection: {}", e),
+                            );
+                        } else {
+                            logger_clone.connection_error(
+                                || format!("Error handling connection: {}", e),
+                            );
+                        }
                     }
                 });
             }
@@ -280,6 +299,40 @@ mod tests {
     use super::*;
     use crate::logger::{ELog, LogConfig};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn peer_disconnect_is_recognised_through_the_error_chain() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+        ] {
+            assert!(is_peer_disconnect(&anyhow::Error::new(Error::from(kind))));
+            let wrapped = anyhow::Error::new(Error::from(kind)).context("while tunnelling");
+            assert!(is_peer_disconnect(&wrapped), "{kind:?} behind context");
+            let typed = anyhow::Error::new(resocks5_net::ConnectError::Io {
+                stage: resocks5_net::Stage::Handshake,
+                endpoint: None,
+                source: Error::from(kind),
+            });
+            assert!(is_peer_disconnect(&typed), "{kind:?} behind ConnectError");
+        }
+    }
+
+    #[test]
+    fn other_errors_are_not_peer_disconnects() {
+        use std::io::{Error, ErrorKind};
+        assert!(!is_peer_disconnect(&anyhow::anyhow!("auth failed")));
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(!is_peer_disconnect(&anyhow::Error::new(Error::from(kind))));
+        }
+    }
 
     fn panic_reporting_logger() -> (Arc<Logger>, mpsc::Receiver<ELog>) {
         let (tx, rx) = mpsc::channel::<ELog>(4);

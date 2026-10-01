@@ -83,6 +83,11 @@ log: { ... }                    (per-event flags; defaults shown below)
     log.connection_errors: bool   (default true)
         Errors from per-client handlers — auth failures, malformed
         clients, half-broken handshakes.
+    log.client_disconnects: bool  (default false)
+        Handler errors that are only a peer dropping the connection
+        (connection reset / aborted / broken pipe — Windows os error
+        10053/10054). Routine on a busy proxy, so off by default;
+        enable for verbose diagnostics.
     log.attempts: bool            (default false)
         One structured line per upstream connect+handshake attempt,
         with outcome (ok/fail), duration in ms, target, proxy, gate,

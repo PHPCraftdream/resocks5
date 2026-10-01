@@ -33,6 +33,13 @@ pub struct LogConfig {
     /// half-broken handshakes. Useful for debugging. Defaults on.
     #[serde(default = "default_true")]
     pub connection_errors: bool,
+    /// Handler errors that are just a peer dropping the connection
+    /// (connection reset / aborted / broken pipe, e.g. Windows os error
+    /// 10053/10054). Routine on a busy proxy — browsers abandon sockets
+    /// all the time — so they are not logged by default; enable for
+    /// verbose diagnostics.
+    #[serde(default)]
+    pub client_disconnects: bool,
     /// One line per upstream connect+handshake attempt — success or
     /// failure, with duration. High volume on a busy server; enable
     /// temporarily to diagnose which upstreams are slow/dead.
@@ -54,6 +61,7 @@ impl Default for LogConfig {
             proxy_failures: true,
             banned_targets: true,
             connection_errors: true,
+            client_disconnects: false,
             attempts: false,
         }
     }

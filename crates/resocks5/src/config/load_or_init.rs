@@ -285,6 +285,7 @@ mod tests {
             "proxy_failures:",
             "banned_targets:",
             "connection_errors:",
+            "client_disconnects:",
             // PoolConfig
             "enabled:",
             "spare_per_proxy:",

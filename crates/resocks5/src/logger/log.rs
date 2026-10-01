@@ -84,6 +84,12 @@ impl Logger {
         }
     }
 
+    pub fn client_disconnect(&self, msg: impl FnOnce() -> String) {
+        if self.cfg.client_disconnects {
+            self.send(msg, ELog::Error);
+        }
+    }
+
     pub fn attempt(&self, msg: impl FnOnce() -> String) {
         if self.cfg.attempts {
             self.send(msg, ELog::Log);
@@ -109,6 +115,7 @@ mod tests {
             proxy_failures: false,
             banned_targets: false,
             connection_errors: false,
+            client_disconnects: false,
             attempts: false,
         }
     }
@@ -122,6 +129,7 @@ mod tests {
             proxy_failures: true,
             banned_targets: true,
             connection_errors: true,
+            client_disconnects: true,
             attempts: true,
         }
     }
@@ -182,6 +190,32 @@ mod tests {
             !called.get(),
             "connection_errors off → closure must not run"
         );
+    }
+
+    #[test]
+    fn client_disconnects_are_off_by_default_and_gated_by_their_flag() {
+        assert!(!LogConfig::default().client_disconnects);
+
+        let (tx, mut rx) = mpsc::channel::<ELog>(4);
+        let log = Logger::new(tx, LogConfig::default());
+        let called = Cell::new(false);
+        log.client_disconnect(|| {
+            called.set(true);
+            "reset".to_string()
+        });
+        assert!(!called.get(), "default config → closure must not run");
+        assert!(rx.try_recv().is_err());
+
+        let (tx, mut rx) = mpsc::channel::<ELog>(4);
+        let log = Logger::new(
+            tx,
+            LogConfig {
+                client_disconnects: true,
+                ..LogConfig::default()
+            },
+        );
+        log.client_disconnect(|| "reset".to_string());
+        assert!(matches!(rx.try_recv(), Ok(ELog::Error(m)) if m == "reset"));
     }
 
     #[tokio::test]
