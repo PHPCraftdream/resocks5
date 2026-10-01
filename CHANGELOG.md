@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An HTTPS upstream yields the same typed error as `dial` without a
   connector (`TlsFeatureMissing` without the `tls` feature, a `Tls` error
   with it); use `dial` with a `TlsConnector` there.
-- CI: `release.yml` gains a `publish-sdk` job that publishes
-  `resocks5-net` to crates.io on every `v*` tag push (after a
+- CI: `release.yml` gains a `publish-crates` job that publishes
+  `resocks5-net` and then the `resocks5` binary (`cargo install
+  resocks5`) to crates.io on every `v*` tag push; a manual run with
+  `only_app` publishes just the binary (after a
   packaging/build dry-run that always runs regardless). Skips the actual
   upload cleanly, without failing the workflow, until a maintainer adds
   the `CARGO_REGISTRY_TOKEN` repo secret — previously there was no
