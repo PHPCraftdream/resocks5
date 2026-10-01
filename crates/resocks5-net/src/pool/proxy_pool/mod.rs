@@ -69,10 +69,9 @@ use crate::pool::PoolConfig;
 use crate::types::ProxyConfig;
 
 mod error;
-mod stream;
 
+pub use crate::connect::UpstreamStream;
 pub use error::AtCapacity;
-pub use stream::UpstreamStream;
 
 #[cfg(test)]
 mod tests;
@@ -103,14 +102,6 @@ struct ProxySpares {
 /// and don't affect socket reuse, and the per-account/per-IP quota
 /// that the semaphore defends is keyed the same way.
 type ProxyKey = (String, u16);
-
-/// `host:port` for log messages — upstream credentials (both user
-/// and password) are intentionally NOT included, since the username
-/// half of a SOCKS5 cred is itself sensitive enough to keep out of
-/// log files, shell scrollback, and shipped diagnostics.
-pub(crate) fn upstream_endpoint(proxy: &ProxyConfig) -> String {
-    format!("{}:{}", proxy.host, proxy.port)
-}
 
 /// Non-blocking liveness probe for a queued spare.
 ///

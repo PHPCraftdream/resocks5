@@ -1,14 +1,13 @@
 //! Compile-time fixture, half A: a downstream crate that depends on
-//! resocks5-net with `default-features = false` and calls the universal
-//! entry points. This source must compile unchanged whether or not some
+//! resocks5-net with `default-features = false` and calls the pool-free
+//! entry points (`dial`, `connect_proxy_once`). This source must compile unchanged whether or not some
 //! other crate in the same build graph turns resocks5-net's `tls` on —
 //! that is the feature-unification guarantee under test.
 
 use std::time::Duration;
 
 use resocks5_net::connect::connect_proxy::TlsConnector;
-use resocks5_net::connect::{connect_proxy, connect_proxy_once, dial, parse_proxy_str, DialOptions};
-use resocks5_net::pool::{PoolConfig, ProxyPool};
+use resocks5_net::connect::{connect_proxy_once, dial, parse_proxy_str, AnyUpstream, DialOptions};
 use resocks5_net::types::{IP, ProxyProtocol};
 
 /// A real lean consumer may NAME the parameter type, not just pass an
@@ -22,7 +21,6 @@ fn named_connector_slot() -> Option<&'static TlsConnector> {
 fn main() {
     let proxy = parse_proxy_str("user:pass@198.51.100.7:1080", ProxyProtocol::Socks5, IP::V4)
         .expect("valid proxy line");
-    let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(1), 1);
 
     // The trailing `None` slot exists under every feature combination;
     // arity must never depend on what cargo unified into this build.
@@ -33,15 +31,17 @@ fn main() {
         Duration::from_secs(1),
         None,
     );
-    let pooled = connect_proxy("example.com:443", &proxy, &pool, Duration::from_secs(1), None);
 
+    // Pool-free: no `ProxyPool`/`PoolConfig` is named, so this source builds
+    // without the `pool` feature and must still build when unification
+    // turns it on.
     let opts = DialOptions::new();
     let dialed = dial(&proxy, "example.com", 443, &opts, None);
+    let _: Option<AnyUpstream> = None;
 
     // Never polled: this fixture proves compilation, not connectivity.
     drop(once);
-    drop(pooled);
     drop(dialed);
     let _ = named_connector_slot();
-    println!("lean-consumer: compiled OK (lean dependency, no tls of its own)");
+    println!("lean-consumer: compiled OK (lean dependency, no tls/pool of its own)");
 }

@@ -8,7 +8,7 @@ What's inside:
 
 - **Upstream connectors** for SOCKS5, HTTP CONNECT, and HTTPS (TLS-wrapped
   CONNECT) proxies.
-- **Pre-connect TCP pool** that keeps warm sockets to each upstream, plus a
+- **Pre-connect TCP pool** (`pool` feature) that keeps warm sockets to each upstream, plus a
   per-upstream concurrency cap that respects provider-side per-account
   connection quotas.
 - **Sand-rating model** — each upstream has a failure accumulator that
@@ -24,6 +24,16 @@ no authentication.
 
 ## Features
 
+- `pool` (**enabled by default**): the pre-connect TCP pool (`ProxyPool`,
+  `PoolConfig`, `AtCapacity`, `ConnectError::AtCapacity`) and the
+  pool-taking connectors (`connect_proxy`, `connect_http_proxy`,
+  `connect_socks5_proxy`, and with `tls` also `connect_https_proxy`); it is
+  the only user of `dashmap` and `crossbeam-queue`. Without it you still
+  get the pool-free `dial` / `connect_proxy_once`, the protocol cores,
+  `AnyUpstream` / `UpstreamStream`, the tunnel, ClientHello fragmentation
+  and the rating / rotator modules, with neither dependency in the graph.
+  `AnyUpstream`, `UpstreamStream`, `BoxedUpstream` and `AsyncReadWrite`
+  live in `connect` and are also re-exported from `pool`.
 - `tls` (**enabled by default**): HTTPS (TLS-wrapped CONNECT) upstreams,
   the Mozilla-root-store default connector (`connect::make_tls_connector`),
   and the `AnyUpstream::Tls` variant, backed by `rustls`, `tokio-rustls`
@@ -40,14 +50,15 @@ no authentication.
   upstream fails fast with an error naming the missing feature — never a
   silent plaintext fallback. TLS ClientHello fragmentation stays available
   without the feature: it fragments raw bytes and links none of the TLS
-  stack. The trailing `tls_connector` argument of `connect_proxy`/
+  stack. The trailing `tls_connector` argument of `connect_proxy` (needs `pool`)/
   `connect_proxy_once` is present in every build — lean builds included —
   and takes `None` for SOCKS5/HTTP upstreams, so one call site compiles no
   matter which features other crates in the same build enable; in a
   `default-features = false` build its type is an unconstructible
   placeholder, making `None` the only possible value.
 - `serde` (**enabled by default**): the `Serialize`/`Deserialize` derives on
-  `pool::PoolConfig`, the crate's only serde touchpoint. Consumers that
+  `pool::PoolConfig`, the crate's only serde touchpoint (a no-op without
+  `pool`). Consumers that
   build their own config plumbing opt out with `default-features = false`
   and drop serde and its proc-macro compile chain; the struct itself —
   `Debug`, `Clone`, `Default`, hand-construction — is unchanged.

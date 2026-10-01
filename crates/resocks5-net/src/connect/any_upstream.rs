@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tokio_rustls::client::TlsStream;
 
-use crate::pool::proxy_pool::UpstreamStream;
+use crate::connect::stream::UpstreamStream;
 use crate::progress::ProgressReportingWriter;
 
 /// Object-safe stream trait for the gate-tunnel path: the async halves

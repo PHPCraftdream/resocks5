@@ -9,9 +9,11 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::connect::connect_http_proxy::http_connect_handshake;
+use crate::connect::tcp_dial::upstream_endpoint;
+use crate::connect::UpstreamStream;
 use crate::error::{ConnectError, Stage, TimeoutKind};
-use crate::pool::proxy_pool::upstream_endpoint;
-use crate::pool::{ProxyPool, UpstreamStream};
+#[cfg(feature = "pool")]
+use crate::pool::ProxyPool;
 use crate::progress::ProgressReportingWriter;
 use crate::types::ProxyConfig;
 
@@ -32,6 +34,7 @@ use crate::types::ProxyConfig;
 /// Returns [`ConnectError`] when acquiring a socket fails, the TLS
 /// handshake fails or times out (`TimeoutKind::HttpsTlsHandshake`), the
 /// CONNECT exchange fails or times out (`TimeoutKind::HttpsConnectHandshake`).
+#[cfg(feature = "pool")]
 pub async fn connect_https_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
@@ -153,8 +156,7 @@ pub(crate) async fn https_on_stream(
 /// To avoid it, install a provider once at process startup (the example
 /// below), or use [`make_tls_connector_with_provider`] to hand one in
 /// directly, or pass your own already-configured `TlsConnector` to
-/// [`connect_proxy`](crate::connect::connect_proxy::connect_proxy) /
-/// [`connect_https_proxy`] — the connector argument those entry points
+/// `connect_proxy` / `connect_https_proxy` (both need the `pool` feature) — the connector argument those entry points
 /// take is the original explicit-configuration escape hatch and bypasses
 /// provider resolution entirely.
 ///
@@ -221,7 +223,7 @@ fn root_cert_store() -> rustls::RootCertStore {
     rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "pool"))]
 mod tests {
     //! End-to-end acceptance tests for the HTTPS upstream path: a real TLS
     //! server (tokio-rustls `TlsAcceptor`) over a real TCP loopback socket,
@@ -262,7 +264,8 @@ mod tests {
     use crate::connect::connect_proxy::connect_proxy;
     use crate::connect::tls_fragment::{send_possibly_fragmented, FragmentSpec, SendProgress};
     use crate::connect::tunnel::tunnel_with_timeouts;
-    use crate::pool::{AnyUpstream, PoolConfig};
+    use crate::connect::AnyUpstream;
+    use crate::pool::PoolConfig;
 
     /// Throwaway test PKI (DER, EC P-256), generated for these tests and    /// Throwaway test PKI (DER, EC P-256), generated for these tests and
     /// committed as constants so they need no external files. It protects

@@ -1,9 +1,10 @@
 //! Upstream connectors and stream plumbing.
 //!
-//! The top-level entry point is `connect_proxy`, which dispatches on the
-//! proxy's [`ProxyProtocol`](crate::types::ProxyProtocol) to the right
-//! handshake. The lower-level pieces — per-protocol handshakes, a
-//! bidirectional tunneller, TCP keepalive, proxy-string parsing, a default
+//! The pool-free entry points are [`dial`](dial::dial) and
+//! [`connect_proxy_once`]. With the `pool` feature, `connect_proxy` is the
+//! pool-taking dispatcher on the proxy's
+//! [`ProxyProtocol`](crate::types::ProxyProtocol). The lower-level pieces —
+//! per-protocol handshakes, a bidirectional tunneller, TCP keepalive, proxy-string parsing, a default
 //! TLS connector, and ClientHello fragmentation — live in the submodules
 //! and are re-exported here for direct use.
 //!
@@ -15,17 +16,21 @@
 //! everything stays reachable under the flat `connect::` paths
 //! re-exported below, so external callers are unaffected.
 
+pub(crate) mod any_upstream;
 pub mod dial;
 mod proxy_connect;
+pub(crate) mod stream;
 pub(crate) mod tcp_dial;
 mod tls;
 pub mod tunnel;
 mod util;
 
 pub use crate::error::ConnectError;
+pub use any_upstream::{AnyUpstream, AsyncReadWrite, BoxedUpstream};
 pub use proxy_connect::connect_http_proxy;
 pub use proxy_connect::connect_proxy;
 pub use proxy_connect::connect_socks5_proxy;
+pub use stream::UpstreamStream;
 pub use tls::tls_fragment;
 pub use tls::tls_records;
 #[cfg(feature = "tls")]
@@ -36,10 +41,13 @@ pub use util::parse_proxy_str;
 pub use util::recover_host;
 pub use util::tcp_keepalive;
 
+#[cfg(feature = "pool")]
 pub use connect_http_proxy::connect_http_proxy;
 pub use connect_http_proxy::http_connect_handshake;
+#[cfg(feature = "pool")]
 pub use connect_proxy::connect_proxy;
 pub use connect_proxy::connect_proxy_once;
+#[cfg(feature = "pool")]
 pub use connect_socks5_proxy::connect_socks5_proxy;
 pub use dial::{dial, DialOptions};
 pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};

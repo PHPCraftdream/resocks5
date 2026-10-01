@@ -1,4 +1,5 @@
-//! Protocol-agnostic entry point that dispatches to the per-protocol connector.
+//! Protocol-agnostic entry points: the pool-free `connect_proxy_once` and,
+//! with the `pool` feature, the pool-taking `connect_proxy` dispatcher.
 
 use std::time::Duration;
 
@@ -7,19 +8,24 @@ pub use tokio_rustls::TlsConnector;
 
 use crate::connect::dial::{dial, DialOptions};
 use crate::connect::host_port::HostPort;
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "pool", feature = "tls"))]
 use crate::connect::upstream_tls::connect_https_proxy;
+use crate::connect::AnyUpstream;
+#[cfg(feature = "pool")]
 use crate::connect::{connect_http_proxy, connect_socks5_proxy};
 use crate::error::ConnectError;
-use crate::pool::{AnyUpstream, ProxyPool};
-use crate::types::{ProxyConfig, ProxyProtocol};
+#[cfg(feature = "pool")]
+use crate::pool::ProxyPool;
+use crate::types::ProxyConfig;
+#[cfg(feature = "pool")]
+use crate::types::ProxyProtocol;
 
 /// Lean-build placeholder that occupies the `tls_connector` parameter slot
-/// of [`connect_proxy`] and [`connect_proxy_once`] when resocks5-net is
+/// of `connect_proxy` and [`connect_proxy_once`] when resocks5-net is
 /// compiled without the `tls` feature.
 ///
-/// These entry points take a trailing `Option<&TlsConnector>` under *every*
-/// feature combination. Cargo unifies features across a whole dependency
+/// These entry points (`connect_proxy` needs the `pool` feature) take a
+/// trailing `Option<&TlsConnector>` under *every* feature combination. Cargo unifies features across a whole dependency
 /// graph, so a consumer compiled against the lean
 /// (`default-features = false`) signature must keep compiling unchanged
 /// when some other crate in the same final binary turns `tls` on; an
@@ -62,6 +68,7 @@ pub struct TlsConnector {
 /// Returns [`ConnectError`] describing the failure: pool acquisition,
 /// protocol handshake, proxy rejection, cap exhaustion, or a missing
 /// TLS connector / `tls` feature for HTTPS upstreams.
+#[cfg(feature = "pool")]
 pub async fn connect_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
@@ -104,9 +111,9 @@ pub async fn connect_proxy(
 }
 
 /// Connect to `target_addr` through a single upstream `proxy` without a
-/// connection pool — the one-shot counterpart of [`connect_proxy`].
+/// connection pool — the one-shot counterpart of `connect_proxy`.
 ///
-/// Prefer this over [`connect_proxy`] when calls are independent: a one-off
+/// Prefer this over `connect_proxy` when calls are independent: a one-off
 /// tunnel, a script dialing through exactly one upstream, or any consumer
 /// with no rotation and no interest in warm-socket reuse. It is a
 /// string-target wrapper over [`dial`](crate::connect::dial::dial), returns

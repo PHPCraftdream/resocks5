@@ -18,7 +18,17 @@ categories = ["network-programming"]
 # stay SOCKS5/HTTP-only; an HTTPS upstream requested then is a runtime
 # error naming the missing feature, never a silent plaintext fallback.
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
-# Serde derives on `pool::PoolConfig` — the crate's only serde touchpoint.
+# The pre-connect TCP pool (`pool` module): `ProxyPool`, `PoolConfig`,
+# `AtCapacity`, the pool-taking connectors (`connect_proxy`,
+# `connect_http_proxy`, `connect_socks5_proxy`, and with `tls` also
+# `connect_https_proxy`) and `ConnectError::AtCapacity`. It is the only
+# user of `dashmap` and `crossbeam-queue`. Without it `dial`,
+# `connect_proxy_once`, the protocol cores, `AnyUpstream`/`UpstreamStream`,
+# tunnelling, fragmentation, rating and the rotator remain available.
+# Features are additive: items appear when it is on, nothing changes shape.
+pool = ["dep:dashmap", "dep:crossbeam-queue"]
+# Serde derives on `pool::PoolConfig` — the crate's only serde touchpoint,
+# so without `pool` this feature is a no-op (it still compiles).
 # The `dep:` form keeps serde from leaking an implicit feature name.
 # Builds without it drop serde and its proc-macro compile chain entirely;
 # the struct is unchanged apart from the derives (still `Debug`, `Clone`,
@@ -33,7 +43,7 @@ rating = []
 # per-target sticky cache, driven by the rating model. Implies `rating`.
 rotator = ["rating"]
 # Today's behaviour for anyone who does not opt out.
-default = ["tls", "serde", "rating", "rotator"]
+default = ["pool", "tls", "serde", "rating", "rotator"]
 # Test-only instrumentation for cross-crate test observability: exposes
 # the rotator's `pick_order_calls()` diagnostic counter. The counter
 # lives inside the rotator, so the feature implies `rotator`. Dependents
@@ -43,12 +53,13 @@ default = ["tls", "serde", "rating", "rotator"]
 # to nothing.
 test-instrumentation = ["rotator"]
 
-# The README-mirrored example rotates through `ProxyRotator`, so it is
-# only built when the rotator is compiled in; cargo skips the target
+# The README-mirrored example rotates through `ProxyRotator` and dials via
+# the pool, so it is only built when the rotator and pool are compiled in;
+# cargo skips the target
 # otherwise, keeping lean `--no-default-features` builds example-clean.
 [[example]]
 name = "connect_through_proxy"
-required-features = ["rotator"]
+required-features = ["rotator", "pool"]
 
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
@@ -59,8 +70,8 @@ socket2.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
-dashmap.workspace = true
-crossbeam-queue.workspace = true
+dashmap = { workspace = true, optional = true }
+crossbeam-queue = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

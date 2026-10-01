@@ -1,13 +1,21 @@
 //! SOCKS5 (RFC 1928) upstream connector with optional RFC 1929 auth.
 
+#[cfg(feature = "pool")]
 use std::time::Duration;
 
+#[cfg(feature = "pool")]
 use tokio::time::timeout;
 
+#[cfg(feature = "pool")]
 use crate::connect::handshake_over_stream;
+#[cfg(feature = "pool")]
+use crate::connect::tcp_dial::upstream_endpoint;
+#[cfg(feature = "pool")]
+use crate::connect::UpstreamStream;
+#[cfg(feature = "pool")]
 use crate::error::{ConnectError, Stage, TimeoutKind};
-use crate::pool::proxy_pool::upstream_endpoint;
-use crate::pool::{ProxyPool, UpstreamStream};
+#[cfg(feature = "pool")]
+use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
 
 /// Credentials of `proxy` for the SOCKS5 sub-negotiation, if both are set.
@@ -29,6 +37,7 @@ pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Option<(&str, &str)> {
 /// Returns [`ConnectError`] when acquiring a socket or running the
 /// SOCKS5 handshake fails, or when the handshake budget expires
 /// (`TimeoutKind::Socks5Handshake`).
+#[cfg(feature = "pool")]
 pub async fn connect_socks5_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,

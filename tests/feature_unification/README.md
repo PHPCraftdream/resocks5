@@ -3,16 +3,18 @@
 Two downstream crates share one cargo graph and depend on this repo's
 `resocks5-net` by path:
 
-- `lean-consumer` — `default-features = false`; calls `connect_proxy` and
-  `connect_proxy_once` with the universal call shape (trailing `None`), and
+- `lean-consumer` — `default-features = false` (no `tls`, no `pool`); calls
+  the pool-free `dial` and `connect_proxy_once` with the universal call
+  shape (trailing `None`), never names `ProxyPool`/`PoolConfig`, and
   additionally names the parameter type itself
   (`use resocks5_net::connect::connect_proxy::TlsConnector;` +
   `Option<&'static TlsConnector>`).
-- `tls-consumer` — default features (`tls` on); passes a real connector
-  from `make_tls_connector` for an HTTPS upstream.
+- `tls-consumer` — default features (`tls` and `pool` on); passes a real
+  connector from `make_tls_connector` for an HTTPS upstream, and also calls
+  the pool-taking `connect_proxy` with a `ProxyPool`.
 
 Cargo unifies features per build graph, so the single workspace build
-below compiles `resocks5-net` ONCE with `tls` on — and `lean-consumer`'s
+below compiles `resocks5-net` ONCE with `tls` and `pool` on — and `lean-consumer`'s
 source must still compile against it unchanged. That is exactly the
 failure mode from review P2-01, where `#[cfg(feature = "tls")]` on the
 `tls_connector` parameter changed the entry points' arity and broke lean
@@ -30,7 +32,7 @@ crates' `main` functions never dial anything.
 ## Commands (from this directory)
 
     cargo build --workspace          # both consumers TOGETHER — unification bites here
-    cargo build -p lean-consumer     # lean consumer alone (no tls in graph)
+    cargo build -p lean-consumer     # lean consumer alone (no tls, no pool in graph)
     cargo build -p tls-consumer     # tls consumer alone
 
 All three must succeed with zero changes to `lean-consumer/src/main.rs`.

@@ -7,8 +7,11 @@
 //!   HTTPS (TLS-wrapped CONNECT) proxies, plus stream plumbing: bidirectional
 //!   tunnelling, TCP keepalive, proxy-string parsing, and TLS ClientHello
 //!   fragmentation for DPI evasion.
-//! - [`pool`] — a pre-connect TCP pool that keeps warm sockets to each
-//!   upstream, plus a per-upstream concurrency cap.
+#![cfg_attr(
+    feature = "pool",
+    doc = "- [`pool`] — a pre-connect TCP pool that keeps warm sockets to each",
+    doc = "  upstream, plus a per-upstream concurrency cap (the default `pool` feature)."
+)]
 //! - [`progress`] — confirmed-write-progress plumbing: the
 //!   [`FlushProgress`](progress::FlushProgress) counter sink and the
 //!   [`ProgressReportingWriter`](progress::ProgressReportingWriter)
@@ -43,6 +46,7 @@ pub use error::{ConnectError, Stage, TimeoutKind};
 
 pub mod connect;
 pub mod error;
+#[cfg(feature = "pool")]
 pub mod pool;
 pub mod progress;
 #[cfg(feature = "rating")]

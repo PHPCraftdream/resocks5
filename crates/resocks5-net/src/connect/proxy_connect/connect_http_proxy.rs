@@ -1,15 +1,22 @@
 //! HTTP `CONNECT` upstream connector.
 
 use std::fmt::Write as _;
+#[cfg(feature = "pool")]
 use std::time::Duration;
 
 use base64::{engine::general_purpose, Engine as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(feature = "pool")]
 use tokio::time::timeout;
 
-use crate::error::{ConnectError, Stage, TimeoutKind};
-use crate::pool::proxy_pool::upstream_endpoint;
-use crate::pool::{ProxyPool, UpstreamStream};
+#[cfg(feature = "pool")]
+use crate::connect::tcp_dial::upstream_endpoint;
+use crate::connect::UpstreamStream;
+use crate::error::ConnectError;
+#[cfg(feature = "pool")]
+use crate::error::{Stage, TimeoutKind};
+#[cfg(feature = "pool")]
+use crate::pool::ProxyPool;
 use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Establish a tunnel to `target_addr` through an HTTP CONNECT proxy.
@@ -22,6 +29,7 @@ use crate::types::{ProxyConfig, ProxyProtocol};
 /// Returns [`ConnectError`] when acquiring a socket from the pool, writing
 /// the CONNECT request, or reading the proxy's response fails, or when the
 /// handshake budget expires (`TimeoutKind::HttpHandshake`).
+#[cfg(feature = "pool")]
 pub async fn connect_http_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
@@ -231,6 +239,8 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "pool"))]
+    use std::time::Duration;
     use tokio::io::duplex;
 
     fn proxy() -> ProxyConfig {
@@ -279,6 +289,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn tcp_connector_preserves_coalesced_payload() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

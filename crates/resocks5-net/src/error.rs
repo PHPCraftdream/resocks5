@@ -1,7 +1,7 @@
 //! Typed errors for the public connect / pool API.
 //!
 //! [`ConnectError`] replaces the unstructured `anyhow::Error` that the
-//! upstream connectors and [`ProxyPool`](crate::pool::ProxyPool) used to
+//! upstream connectors and `ProxyPool` used to
 //! return, so callers can match on *why* a connect failed (timeout stage,
 //! proxy rejection code, cap hit, ...) instead of parsing message text.
 //!
@@ -17,7 +17,8 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use crate::pool::proxy_pool::AtCapacity;
+#[cfg(feature = "pool")]
+use crate::pool::AtCapacity;
 use crate::types::ProxyProtocol;
 
 /// Which phase of a connect attempt failed.
@@ -132,6 +133,7 @@ pub enum ConnectError {
     },
     /// The per-upstream concurrency cap was hit — our own load, not an
     /// upstream fault.
+    #[cfg(feature = "pool")]
     AtCapacity(AtCapacity),
 }
 
@@ -241,6 +243,7 @@ impl fmt::Display for ConnectError {
             ),
             #[cfg(feature = "tls")]
             ConnectError::Tls { message, .. } => write!(f, "{}", message),
+            #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
         }
     }
@@ -276,13 +279,17 @@ mod tests {
     //! loopback stub can produce the error, plus Display pins on the
     //! legacy message text.
 
+    #[cfg(feature = "pool")]
     use std::time::Duration;
 
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-    use super::{ConnectError, Stage, TimeoutKind};
+    use super::ConnectError;
+    #[cfg(feature = "pool")]
+    use super::{Stage, TimeoutKind};
     use crate::connect::connect_http_proxy::http_connect_handshake;
     use crate::connect::handshake_over_stream::handshake_over_stream;
+    #[cfg(feature = "pool")]
     use crate::pool::{PoolConfig, ProxyPool};
     use crate::types::{ProxyConfig, ProxyProtocol, IP};
 
@@ -299,6 +306,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pool")]
     fn socks5_proxy_config(host: &str, port: u16) -> ProxyConfig {
         ProxyConfig {
             protocol: ProxyProtocol::Socks5,
@@ -312,6 +320,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pool")]
     /// SOCKS5 stub that swallows the greeting, replies with
     /// `method_reply` (method selection or auth status), then sends
     /// `connect_reply` (consumed as the CONNECT response). Returns the
@@ -338,6 +347,7 @@ mod tests {
         (addr.ip().to_string(), addr.port())
     }
 
+    #[cfg(feature = "pool")]
     async fn handshake_error(
         target: &str,
         method_reply: &'static [u8],
@@ -357,6 +367,7 @@ mod tests {
 
     /// Same as [`handshake_error`] but the proxy config carries
     /// credentials, so the client asks for username/password auth.
+    #[cfg(feature = "pool")]
     async fn authed_handshake_error(
         target: &str,
         method_reply: &'static [u8],
@@ -376,6 +387,7 @@ mod tests {
         .expect_err("stub reply must fail the handshake")
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn pool_connect_timeout_yields_typed_timeout() {
         let pool = ProxyPool::new(PoolConfig::default(), Duration::from_millis(100), 1);
@@ -400,6 +412,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn socks5_handshake_timeout_yields_typed_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -440,6 +453,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn io_error_keeps_source_chain_and_legacy_prefix() {
         // A broadcast address fails the TCP connect() call itself,
@@ -475,6 +489,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn socks5_rejected_connect_yields_proxy_rejected() {
         let err = handshake_error(
@@ -537,6 +552,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn auth_failure_yields_typed_auth_failed() {
         let err = authed_handshake_error("1.2.3.4:443", &[0x05, 0x02], &[0x01, 0x2a]).await;
@@ -550,6 +566,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn method_unsupported_yields_typed_variant_both_flavors() {
         // Proxy refuses username/password auth.
@@ -587,6 +604,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn protocol_violations_yield_typed_protocol() {
         // Bad version in the CONNECT response header.
@@ -651,6 +669,7 @@ mod tests {
         assert!(rest.is_empty());
     }
 
+    #[cfg(feature = "pool")]
     #[tokio::test]
     async fn pool_at_capacity_yields_typed_variant() {
         let pool = ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1);
@@ -663,6 +682,7 @@ mod tests {
         assert_eq!(err.to_string(), "upstream cap reached for 203.0.113.1:1080");
     }
 
+    #[cfg(feature = "pool")]
     #[cfg(feature = "tls")]
     #[tokio::test]
     async fn https_without_connector_yields_tls_variant_with_legacy_text() {
@@ -691,6 +711,7 @@ mod tests {
         assert_eq!(err.to_string(), "HTTPS upstream requires TLS connector");
     }
 
+    #[cfg(feature = "pool")]
     #[cfg(not(feature = "tls"))]
     #[tokio::test]
     async fn https_in_lean_build_yields_tls_feature_missing() {

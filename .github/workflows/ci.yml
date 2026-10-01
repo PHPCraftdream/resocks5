@@ -70,7 +70,7 @@ jobs:
       - run: cargo doc --no-deps --workspace --locked
 
   # The workspace jobs above never compile resocks5-net with a feature off:
-  # the binary enables tls/serde/rating/rotator in [dependencies] (and
+  # the binary enables pool/tls/serde/rating/rotator in [dependencies] (and
   # test-instrumentation in [dev-dependencies] for its test builds), and cargo
   # unifies features across a workspace build. This matrix pins the library's
   # feature combinations directly on `-p resocks5-net`, which cannot see the
@@ -109,8 +109,12 @@ jobs:
         include:
           - name: lean
             args: --no-default-features
+          - name: pool
+            args: --no-default-features --features pool
           - name: tls
             args: --no-default-features --features tls
+          - name: pool-tls
+            args: --no-default-features --features pool,tls
           - name: serde
             args: --no-default-features --features serde
           - name: rating
@@ -144,6 +148,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p resocks5-net --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo clippy -p resocks5-net --no-default-features --features pool --all-targets --locked -- -D warnings
+      # The lean dependency graph must stay free of the pool's and TLS's crates.
+      - name: lean graph has no dashmap/crossbeam/rustls
+        run: |
+          tree=$(cargo tree -p resocks5-net --no-default-features -e normal --locked)
+          echo "$tree"
+          if echo "$tree" | grep -E 'dashmap|crossbeam|rustls'; then
+            echo "lean graph leaked a gated dependency" >&2
+            exit 1
+          fi
 
   # Lean docs for the library: the `doc` job always builds with every feature
   # on, but gated items break intra-doc links exactly when the feature is
@@ -158,3 +172,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc -p resocks5-net --no-default-features --no-deps --locked
+      - run: cargo doc -p resocks5-net --no-default-features --features pool --no-deps --locked

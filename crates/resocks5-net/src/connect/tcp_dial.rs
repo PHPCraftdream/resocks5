@@ -6,6 +6,15 @@ use tokio::time::timeout;
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::ProxyConfig;
 
+/// `host:port` for log messages — upstream credentials (both user
+/// and password) are intentionally NOT included, since the username
+/// half of a SOCKS5 cred is itself sensitive enough to keep out of
+/// log files, shell scrollback, and shipped diagnostics.
+#[cfg(any(feature = "pool", feature = "tls"))]
+pub(crate) fn upstream_endpoint(proxy: &ProxyConfig) -> String {
+    format!("{}:{}", proxy.host, proxy.port)
+}
+
 /// Plain TCP dial to the proxy under `connect_timeout`.
 ///
 /// The address is passed as `(host, port)`: `ProxyConfig.host` has no

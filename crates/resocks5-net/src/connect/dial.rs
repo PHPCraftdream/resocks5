@@ -10,8 +10,8 @@ use crate::connect::connect_socks5_proxy::socks5_auth;
 use crate::connect::handshake_over_stream::socks5_handshake;
 use crate::connect::host_port::HostPort;
 use crate::connect::tcp_dial::tcp_dial;
+use crate::connect::{AnyUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
-use crate::pool::{AnyUpstream, UpstreamStream};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Time budgets for [`dial`].
@@ -77,12 +77,12 @@ impl DialOptions {
 /// `tls_connector`.
 ///
 /// The `tls_connector` slot exists under every feature combination, with
-/// the same type as in [`connect_proxy`](crate::connect::connect_proxy::connect_proxy):
+/// the same type as in `connect_proxy`:
 /// without the `tls` feature it is a placeholder that can only be `None`.
 ///
 /// There is no pool, so no warm sockets and no per-upstream concurrency
 /// cap: permit/cap accounting is the caller's business (see
-/// [`UpstreamStream::attach_permit`](crate::pool::UpstreamStream::attach_permit)).
+/// [`UpstreamStream::attach_permit`](crate::connect::UpstreamStream::attach_permit)).
 ///
 /// # Errors
 ///

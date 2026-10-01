@@ -17,10 +17,15 @@
 //! still worth roughly one RTT (10–50 ms typical) per client request
 //! to a remote proxy.
 
-pub mod any_upstream;
 pub mod pool_config;
 pub mod proxy_pool;
 
-pub use any_upstream::{AnyUpstream, BoxedUpstream};
+/// Stream types now live in [`connect`](crate::connect); kept here at
+/// their historical path.
+pub mod any_upstream {
+    pub use crate::connect::{AnyUpstream, AsyncReadWrite, BoxedUpstream};
+}
+
+pub use crate::connect::{AnyUpstream, AsyncReadWrite, BoxedUpstream, UpstreamStream};
 pub use pool_config::PoolConfig;
-pub use proxy_pool::{AtCapacity, ProxyPool, UpstreamStream};
+pub use proxy_pool::{AtCapacity, ProxyPool};

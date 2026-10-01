@@ -16,12 +16,12 @@ use tokio::sync::OwnedSemaphorePermit;
 /// freed the moment forwarding ends.
 #[derive(Debug)]
 pub struct UpstreamStream {
-    pub(super) stream: TcpStream,
+    pub(crate) stream: TcpStream,
     /// Kept private so callers can't shuffle permits between tunnels;
     /// `attach_permit` is the only way to add one.
     /// `None` for streams built by `from_tcp` (no pool).
-    pub(super) _permit: Option<OwnedSemaphorePermit>,
-    pub(super) extra_permits: Vec<OwnedSemaphorePermit>,
+    pub(crate) _permit: Option<OwnedSemaphorePermit>,
+    pub(crate) extra_permits: Vec<OwnedSemaphorePermit>,
 }
 
 impl UpstreamStream {
