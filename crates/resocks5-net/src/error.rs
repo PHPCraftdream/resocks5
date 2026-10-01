@@ -61,9 +61,16 @@ pub enum TimeoutKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProtocolViolation {
-    /// The first byte of a SOCKS5 reply was not `0x05`.
+    /// The first byte of a SOCKS5 reply (method selection or CONNECT)
+    /// was not `0x05`.
     Socks5BadVersion {
         /// The version byte the proxy sent.
+        got: u8,
+    },
+    /// The first byte of an RFC 1929 username/password reply was not
+    /// `0x01`.
+    Socks5BadAuthVersion {
+        /// The sub-negotiation version byte the proxy sent.
         got: u8,
     },
     /// The ATYP byte of a SOCKS5 CONNECT reply was not 1/3/4.
@@ -98,6 +105,9 @@ impl fmt::Display for ProtocolViolation {
         match self {
             ProtocolViolation::Socks5BadVersion { .. } => {
                 write!(f, "[SOCKS5] Invalid proxy response version")
+            }
+            ProtocolViolation::Socks5BadAuthVersion { .. } => {
+                write!(f, "[SOCKS5] Invalid authentication response version")
             }
             ProtocolViolation::Socks5UnknownAddressType { .. } => {
                 write!(f, "[SOCKS5] Unknown address type in response")
@@ -158,7 +168,8 @@ pub enum ConnectError {
         /// The rejection code when the peer produced one (SOCKS5 REP;
         /// HTTP status digit-triple when well-formed — may be `None`
         /// for a malformed status line). `u16` because HTTP status
-        /// codes (e.g. 403) exceed the `u8` of a SOCKS5 REP.
+        /// codes (e.g. 403) exceed the `u8` of a SOCKS5 REP. For SOCKS5,
+        /// `socks5_rep_description` names the code.
         code: Option<u16>,
         /// The raw status line for HTTP (`response`), empty for SOCKS5.
         response: String,
@@ -314,6 +325,26 @@ impl fmt::Display for ConnectError {
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
         }
+    }
+}
+
+/// Human-readable meaning of a SOCKS5 reply code (`REP`, RFC 1928 §6),
+/// as found in [`ConnectError::ProxyRejected`]'s `code`.
+///
+/// Codes outside the RFC table (and anything above `u8::MAX`) map to
+/// `"unassigned"`.
+pub fn socks5_rep_description(code: u16) -> &'static str {
+    match code {
+        0x00 => "succeeded",
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "unassigned",
     }
 }
 
@@ -705,6 +736,68 @@ mod tests {
             "got: {err:?}"
         );
         assert_eq!(err.to_string(), "[SOCKS5] Unknown address type in response");
+    }
+
+    #[cfg(feature = "pool")]
+    #[tokio::test]
+    async fn non_socks5_greeting_reply_is_bad_version_not_method_unsupported() {
+        // No-auth greeting answered by something that is not SOCKS5.
+        let err = handshake_error("1.2.3.4:443", &[0x04, 0x00], &[]).await;
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
+            ),
+            "got: {err:?}"
+        );
+
+        // Same on the username/password greeting.
+        let err = authed_handshake_error("1.2.3.4:443", &[0x48, 0x54], &[]).await;
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 0x48 })
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "pool")]
+    #[tokio::test]
+    async fn bad_auth_subnegotiation_version_is_protocol_not_auth_failed() {
+        let err = authed_handshake_error("1.2.3.4:443", &[0x05, 0x02], &[0x05, 0x00]).await;
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 5 })
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "[SOCKS5] Invalid authentication response version"
+        );
+    }
+
+    #[test]
+    fn socks5_rep_descriptions_follow_rfc_1928() {
+        let expected = [
+            (0, "succeeded"),
+            (1, "general SOCKS server failure"),
+            (2, "connection not allowed by ruleset"),
+            (3, "network unreachable"),
+            (4, "host unreachable"),
+            (5, "connection refused"),
+            (6, "TTL expired"),
+            (7, "command not supported"),
+            (8, "address type not supported"),
+            (9, "unassigned"),
+            (0xff, "unassigned"),
+            (0x1ff, "unassigned"),
+        ];
+        for (code, text) in expected {
+            assert_eq!(super::socks5_rep_description(code), text, "REP {code:#x}");
+        }
     }
 
     #[tokio::test]

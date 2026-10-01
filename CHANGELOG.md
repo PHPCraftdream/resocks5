@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `resocks5-net`: `socks5_rep_description(code)` — the RFC 1928 §6 meaning
+  of a SOCKS5 reply code, for `ConnectError::ProxyRejected { code, .. }`
+  (unknown codes give `"unassigned"`).
 - `resocks5-net`: `connect::dial_plain(proxy, host, port, &DialOptions)` —
   a convenience entry point identical to
   `dial(proxy, host, port, opts, None)` for the common SOCKS5 / HTTP
@@ -69,12 +72,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking** (`resocks5-net`, not yet published): `ConnectError::Protocol`
   now carries a structured `ProtocolViolation` (`Socks5BadVersion { got }`,
-  `Socks5UnknownAddressType { got }`, `Socks5DomainTooLong { len }`,
+  `Socks5BadAuthVersion { got }`, `Socks5UnknownAddressType { got }`,
+  `Socks5DomainTooLong { len }`,
   `Socks5CredentialsTooLong { username_len, password_len }`,
   `HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
   exposing the offending byte or length; `Display` still prints the exact
-  legacy message text, so logs are unchanged. `ProtocolViolation` is
-  re-exported from the crate root.
+  legacy message text. `ProtocolViolation` is re-exported from the crate
+  root. A SOCKS5 greeting answered with a non-`0x05` version byte (or an
+  RFC 1929 reply with a non-`0x01` version) is now reported as
+  `Protocol(Socks5BadVersion / Socks5BadAuthVersion)` instead of being
+  folded into `MethodUnsupported` / `AuthFailed`, so a non-SOCKS5 peer is
+  distinguishable from a SOCKS5 proxy that refused the method; the log
+  line for that case changes accordingly.
 - **Breaking** (`resocks5-net`, not yet published): the address-family label
   `ip` is removed from the SDK. `ProxyConfig.ip`, `ProxyConfig::with_family`
   and the public `types::IP` enum are gone (dialing only ever used

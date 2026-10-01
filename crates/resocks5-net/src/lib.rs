@@ -43,7 +43,7 @@
 // isn't noisy — only `cargo doc` surfaces it.
 #![warn(missing_docs)]
 
-pub use error::{ConnectError, ProtocolViolation, Stage, TimeoutKind};
+pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
 
 pub mod connect;
 pub mod error;

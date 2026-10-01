@@ -62,7 +62,12 @@ where
         stream.flush().await?;
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
-        if response[0] != 0x05 || response[1] != 0x02 {
+        if response[0] != 0x05 {
+            return Err(ConnectError::Protocol(
+                ProtocolViolation::Socks5BadVersion { got: response[0] },
+            ));
+        }
+        if response[1] != 0x02 {
             return Err(ConnectError::MethodUnsupported {
                 got: response[1],
                 with_auth: true,
@@ -91,7 +96,12 @@ where
 
         let mut auth_resp = [0u8; 2];
         stream.read_exact(&mut auth_resp).await?;
-        if auth_resp[0] != 0x01 || auth_resp[1] != 0x00 {
+        if auth_resp[0] != 0x01 {
+            return Err(ConnectError::Protocol(
+                ProtocolViolation::Socks5BadAuthVersion { got: auth_resp[0] },
+            ));
+        }
+        if auth_resp[1] != 0x00 {
             return Err(ConnectError::AuthFailed {
                 status: auth_resp[1],
             });
@@ -101,7 +111,12 @@ where
         stream.flush().await?;
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
-        if response[0] != 0x05 || response[1] != 0x00 {
+        if response[0] != 0x05 {
+            return Err(ConnectError::Protocol(
+                ProtocolViolation::Socks5BadVersion { got: response[0] },
+            ));
+        }
+        if response[1] != 0x00 {
             return Err(ConnectError::MethodUnsupported {
                 got: response[1],
                 with_auth: false,

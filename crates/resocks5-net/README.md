@@ -163,7 +163,11 @@ and, with `pool`, `AtCapacity` — no message parsing needed.
 `Socks5DomainTooLong { len }`, `Socks5CredentialsTooLong`,
 `HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
 with the offending byte or length; its `Display` still prints the
-legacy message text.
+legacy message text. A peer that answers the greeting with a
+non-SOCKS5 version byte is `Protocol(Socks5BadVersion { got })`, not
+`MethodUnsupported`. For `ProxyRejected { code, .. }` on SOCKS5,
+`resocks5_net::socks5_rep_description(code)` gives the RFC 1928 reply
+meaning.
 
 `ProxyConfig` is built with `ProxyConfig::socks5/http/https(..)` plus
 `with_auth` / `with_gate`. Its `gate` field is the outer gate node and is
