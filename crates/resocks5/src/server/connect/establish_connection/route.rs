@@ -6,10 +6,24 @@ use std::sync::Arc;
 
 /// Returns `false` for cap-hit errors (semaphore full) — those are
 /// our own load, not an upstream fault, and must NOT feed the sand
-/// model's failure signal.
+/// model's failure signal. Matches both the bare
+/// [`AtCapacity`](resocks5_net::pool::AtCapacity) sentinel (legacy
+/// call sites) and the typed
+/// [`ConnectError::AtCapacity`](resocks5_net::ConnectError::AtCapacity)
+/// wrapper the pool API now returns.
 pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<resocks5_net::pool::AtCapacity>()
-        .is_none()
+    if err
+        .downcast_ref::<resocks5_net::pool::AtCapacity>()
+        .is_some()
+    {
+        return false;
+    }
+    if let Some(e) = err.downcast_ref::<resocks5_net::ConnectError>() {
+        if matches!(e, resocks5_net::ConnectError::AtCapacity(_)) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Which stage of a gate tunnel failed. Attached to `use_gate` errors

@@ -28,6 +28,8 @@
 )]
 //! - [`types`] — the shared proxy descriptors ([`types::ProxyConfig`],
 //!   [`types::ProxyProtocol`], [`types::IP`]).
+//! - [`error`] — the typed [`ConnectError`] returned by the public
+//!   connect/pool API, with [`Stage`] and timeout-kind discriminators.
 //!
 //! The crate carries no application concerns — no config-file format, no
 //! logging sink, no authentication. Those live in the `resocks5` binary.
@@ -37,7 +39,10 @@
 // isn't noisy — only `cargo doc` surfaces it.
 #![warn(missing_docs)]
 
+pub use error::{ConnectError, Stage, TimeoutKind};
+
 pub mod connect;
+pub mod error;
 pub mod pool;
 pub mod progress;
 #[cfg(feature = "rating")]

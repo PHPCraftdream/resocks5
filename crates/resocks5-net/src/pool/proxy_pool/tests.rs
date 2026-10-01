@@ -95,7 +95,7 @@ async fn acquire_succeeds_below_cap_and_fails_fast_at_cap() {
     let b = pool.acquire(&proxy).await.expect("second acquire");
     let err = pool.acquire(&proxy).await.expect_err("third must fail");
     assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
+        matches!(err, ConnectError::AtCapacity(_)),
         "unexpected error: {}",
         err
     );
@@ -167,7 +167,7 @@ async fn cap_hit_produces_at_capacity_error() {
     let _hold = pool.acquire(&proxy).await.unwrap();
     let err = pool.acquire(&proxy).await.expect_err("should be at cap");
     assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
+        matches!(err, ConnectError::AtCapacity(_)),
         "expected AtCapacity, got: {}",
         err
     );
@@ -194,7 +194,7 @@ fn reserve_permit_enforces_cap_and_releases_on_drop() {
     let b = pool.reserve_permit(&proxy).expect("second reserve");
     let err = pool.reserve_permit(&proxy).expect_err("cap is 2");
     assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
+        matches!(err, ConnectError::AtCapacity(_)),
         "expected AtCapacity, got: {}",
         err
     );
@@ -503,7 +503,7 @@ async fn spares_and_active_share_one_cap() {
     // Queue empty + semaphore exhausted → fail fast with AtCapacity.
     let err = pool.acquire(&proxy).await.expect_err("6th acquire");
     assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
+        matches!(err, ConnectError::AtCapacity(_)),
         "expected AtCapacity, got: {}",
         err
     );

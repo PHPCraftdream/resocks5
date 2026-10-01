@@ -4,12 +4,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use tokio::time::{timeout_at, Instant};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::connect::connect_http_proxy::http_connect_handshake;
+use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
 use crate::progress::ProgressReportingWriter;
@@ -26,18 +26,29 @@ use crate::types::ProxyConfig;
 /// enclosing confirmed-progress scope (idle-bounded sends, tunnel activity
 /// tracking). The TLS and CONNECT handshakes themselves run outside any
 /// such scope, where the wrapper is a pure pass-through.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] when acquiring a socket fails, the TLS
+/// handshake fails or times out (`TimeoutKind::HttpsTlsHandshake`), the
+/// CONNECT exchange fails or times out (`TimeoutKind::HttpsConnectHandshake`).
 pub async fn connect_https_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
     tls_connector: &TlsConnector,
-) -> anyhow::Result<TlsStream<ProgressReportingWriter<UpstreamStream>>> {
+) -> Result<TlsStream<ProgressReportingWriter<UpstreamStream>>, ConnectError> {
     let stream = pool.acquire(proxy).await?;
     let endpoint = upstream_endpoint(proxy);
 
-    let server_name = rustls::pki_types::ServerName::try_from(proxy.host.clone())
-        .map_err(|_| anyhow!("[HTTPS] invalid server name: {}", proxy.host))?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(proxy.host.clone()).map_err(|_| {
+            ConnectError::Tls {
+                message: format!("[HTTPS] invalid server name: {}", proxy.host),
+                source: None,
+            }
+        })?;
 
     let deadline = Instant::now() + handshake_timeout;
     let mut tls_stream = match timeout_at(
@@ -48,14 +59,18 @@ pub async fn connect_https_proxy(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return Err(anyhow!("[HTTPS] TLS handshake to {}: {}", endpoint, e));
+            return Err(ConnectError::Tls {
+                message: format!("[HTTPS] TLS handshake to {}: {}", endpoint, e),
+                source: Some(e),
+            });
         }
         Err(_) => {
-            return Err(anyhow!(
-                "[HTTPS] TLS handshake timeout ({}s) to {}",
-                handshake_timeout.as_secs(),
-                endpoint
-            ));
+            return Err(ConnectError::Timeout {
+                stage: Stage::Handshake,
+                kind: TimeoutKind::HttpsTlsHandshake,
+                endpoint,
+                after: handshake_timeout,
+            });
         }
     };
 
@@ -68,11 +83,12 @@ pub async fn connect_https_proxy(
     match result {
         Ok(Ok(())) => Ok(tls_stream),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow!(
-            "[HTTPS] CONNECT handshake timeout ({}s) to {}",
-            handshake_timeout.as_secs(),
-            endpoint
-        )),
+        Err(_) => Err(ConnectError::Timeout {
+            stage: Stage::Handshake,
+            kind: TimeoutKind::HttpsConnectHandshake,
+            endpoint,
+            after: handshake_timeout,
+        }),
     }
 }
 

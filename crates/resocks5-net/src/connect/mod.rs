@@ -20,6 +20,7 @@ mod tls;
 pub mod tunnel;
 mod util;
 
+pub use crate::error::ConnectError;
 pub use proxy_connect::connect_http_proxy;
 pub use proxy_connect::connect_proxy;
 pub use proxy_connect::connect_socks5_proxy;

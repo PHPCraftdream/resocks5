@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use resocks5_net::pool::AtCapacity;
+use resocks5_net::ConnectError;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -39,6 +40,18 @@ fn route_membership_matches_composites_but_distinguishes_accounts_and_gates() {
     let mut dead = HashSet::new();
     dead.insert(UpstreamKey(composite));
     assert!(dead.contains(&UpstreamKey(Arc::new((*proxy).clone()))));
+}
+
+/// Extract the `AtCapacity` payload from either the legacy bare sentinel
+/// or the typed `ConnectError::AtCapacity` wrapper the pool API returns.
+fn at_capacity_of(err: &anyhow::Error) -> Option<AtCapacity> {
+    if let Some(cap) = err.downcast_ref::<AtCapacity>() {
+        return Some(cap.clone());
+    }
+    match err.downcast_ref::<ConnectError>() {
+        Some(ConnectError::AtCapacity(cap)) => Some(cap.clone()),
+        _ => None,
+    }
 }
 
 #[test]
@@ -90,9 +103,16 @@ async fn gate_capacity_error_retains_its_type() {
     .err()
     .expect("gate at capacity must reject the connection");
     assert!(!should_record_failure(&error));
-    assert!(error
-        .downcast_ref::<resocks5_net::pool::AtCapacity>()
-        .is_some());
+    // Strengthened for the typed error: the gate path now surfaces the
+    // cap hit as `ConnectError::AtCapacity`.
+    assert!(
+        matches!(
+            error.downcast_ref::<ConnectError>(),
+            Some(ConnectError::AtCapacity(_))
+        ),
+        "gate capacity failure must be a typed ConnectError::AtCapacity, got: {}",
+        error
+    );
 }
 
 /// Minimal no-auth SOCKS5 stub: answers method negotiation and
@@ -202,13 +222,10 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
         None,
     )
     .await
+    .map_err(anyhow::Error::new)
     .err()
     .expect("direct path must hit the cap");
-    assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
-        "unexpected error: {}",
-        err
-    );
+    assert!(at_capacity_of(&err).is_some(), "unexpected error: {}", err);
     assert!(!should_record_failure(&err));
 
     let err = use_gate(
@@ -222,11 +239,7 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
     .await
     .err()
     .expect("gate path must hit the cap");
-    assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
-        "unexpected error: {}",
-        err
-    );
+    assert!(at_capacity_of(&err).is_some(), "unexpected error: {}", err);
     assert!(!should_record_failure(&err));
 
     // A freed slot is path-agnostic: the tunnel takes it, the
@@ -251,8 +264,9 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
             None,
         )
         .await
+        .map_err(anyhow::Error::new)
         .err()
-        .and_then(|e| e.downcast_ref::<AtCapacity>().cloned())
+        .and_then(|e| at_capacity_of(&e))
         .is_some(),
         "direct path still at cap"
     );
@@ -285,15 +299,17 @@ async fn failed_reservation_releases_gate_permit_and_target_is_identifiable() {
         .await
         .err()
         .expect("saturated upstream must fail");
-        let cap = err
-            .downcast_ref::<AtCapacity>()
-            .cloned()
-            .unwrap_or_else(|| panic!("expected AtCapacity, got: {}", err));
+        let cap =
+            at_capacity_of(&err).unwrap_or_else(|| panic!("expected AtCapacity, got: {}", err));
         assert_eq!(
             (cap.host.as_str(), cap.port),
             (&*saturated.host, saturated.port)
         );
-        assert!(!should_record_failure(&anyhow::Error::from(cap)));
+        assert!(!should_record_failure(&anyhow::Error::new(cap.clone())));
+        // Strengthened: the typed wrapper must ALSO be exempt.
+        assert!(!should_record_failure(&anyhow::Error::new(
+            ConnectError::AtCapacity(cap.clone())
+        )));
     }
 
     // The gate never leaked a permit: a tunnel to a healthy
@@ -475,7 +491,10 @@ async fn inner_capacity_failure_classifies_gate_to_proxy_and_stays_noop() {
     .err()
     .expect("saturated upstream must fail");
     assert!(
-        err.downcast_ref::<AtCapacity>().is_some(),
+        matches!(
+            err.downcast_ref::<ConnectError>(),
+            Some(ConnectError::AtCapacity(_))
+        ) || err.downcast_ref::<AtCapacity>().is_some(),
         "AtCapacity must stay downcastable through the stage marker, got: {}",
         err
     );

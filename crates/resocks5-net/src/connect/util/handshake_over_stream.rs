@@ -2,15 +2,22 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use anyhow::anyhow;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+use crate::error::ConnectError;
+use crate::types::ProxyProtocol;
+
 /// Performs SOCKS5 handshake over an existing stream.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] for I/O failures and every SOCKS5 protocol
+/// violation (method negotiation, auth, version, ATYP, target parsing).
 pub async fn handshake_over_stream<S>(
     mut stream: S,
     target_addr: &str,
     auth: Option<(&str, &str)>,
-) -> anyhow::Result<S>
+) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
@@ -20,16 +27,18 @@ where
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
         if response[0] != 0x05 || response[1] != 0x02 {
-            return Err(anyhow!(
-                "[SOCKS5] Proxy does not support username/password authentication (received: {:02x})",
-                response[1]
-            ));
+            return Err(ConnectError::MethodUnsupported {
+                got: response[1],
+                with_auth: true,
+            });
         }
 
         let uname = username.as_bytes();
         let passwd = password.as_bytes();
         if uname.len() > 255 || passwd.len() > 255 {
-            return Err(anyhow!("[SOCKS5] Username or password too long"));
+            return Err(ConnectError::Protocol(
+                "[SOCKS5] Username or password too long",
+            ));
         }
 
         let mut auth_req = Vec::with_capacity(3 + uname.len() + passwd.len());
@@ -44,10 +53,9 @@ where
         let mut auth_resp = [0u8; 2];
         stream.read_exact(&mut auth_resp).await?;
         if auth_resp[0] != 0x01 || auth_resp[1] != 0x00 {
-            return Err(anyhow!(
-                "[SOCKS5] Authentication failed (status {:02x})",
-                auth_resp[1]
-            ));
+            return Err(ConnectError::AuthFailed {
+                status: auth_resp[1],
+            });
         }
     } else {
         stream.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -55,15 +63,15 @@ where
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
         if response[0] != 0x05 || response[1] != 0x00 {
-            return Err(anyhow!(
-                "[SOCKS5] Proxy does not support no-authentication method (received: {:02x})",
-                response[1]
-            ));
+            return Err(ConnectError::MethodUnsupported {
+                got: response[1],
+                with_auth: false,
+            });
         }
     }
 
     let parsed = super::HostPort::parse(target_addr)
-        .ok_or_else(|| anyhow!("[SOCKS5] Invalid target address format: {}", target_addr))?;
+        .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
     let host = parsed.host;
     let port = parsed.port;
     let (atyp, addr_bytes) = if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
@@ -73,7 +81,7 @@ where
     } else {
         let domain = host.as_bytes();
         if domain.len() > 255 {
-            return Err(anyhow!("[SOCKS5] Domain name too long"));
+            return Err(ConnectError::Protocol("[SOCKS5] Domain name too long"));
         }
         let mut v = vec![domain.len() as u8];
         v.extend_from_slice(domain);
@@ -88,13 +96,16 @@ where
     let mut resp_header = [0u8; 4];
     stream.read_exact(&mut resp_header).await?;
     if resp_header[0] != 0x05 {
-        return Err(anyhow!("[SOCKS5] Invalid proxy response version"));
+        return Err(ConnectError::Protocol(
+            "[SOCKS5] Invalid proxy response version",
+        ));
     }
     if resp_header[1] != 0x00 {
-        return Err(anyhow!(
-            "[SOCKS5] CONNECT request error, error code: {:02x}",
-            resp_header[1]
-        ));
+        return Err(ConnectError::ProxyRejected {
+            protocol: ProxyProtocol::Socks5,
+            code: Some(u16::from(resp_header[1])),
+            response: String::new(),
+        });
     }
     match resp_header[3] {
         0x01 => {
@@ -109,7 +120,11 @@ where
         0x04 => {
             stream.read_exact(&mut [0u8; 18]).await?;
         }
-        _ => return Err(anyhow!("[SOCKS5] Unknown address type in response")),
+        _ => {
+            return Err(ConnectError::Protocol(
+                "[SOCKS5] Unknown address type in response",
+            ))
+        }
     }
     Ok(stream)
 }

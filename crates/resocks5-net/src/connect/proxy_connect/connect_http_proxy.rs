@@ -3,25 +3,31 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine as _};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
+use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
-use crate::types::ProxyConfig;
+use crate::types::{ProxyConfig, ProxyProtocol};
 
 /// Establish a tunnel to `target_addr` through an HTTP CONNECT proxy.
 ///
 /// `handshake_timeout` bounds the wait for the proxy's `200` response; a
 /// proxy that accepts the TCP but never answers CONNECT is treated as dead.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] when acquiring a socket from the pool, writing
+/// the CONNECT request, or reading the proxy's response fails, or when the
+/// handshake budget expires (`TimeoutKind::HttpHandshake`).
 pub async fn connect_http_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
-) -> anyhow::Result<UpstreamStream> {
+) -> Result<UpstreamStream, ConnectError> {
     let mut stream = pool.acquire(proxy).await?;
 
     let endpoint = upstream_endpoint(proxy);
@@ -34,11 +40,12 @@ pub async fn connect_http_proxy(
     match result {
         Ok(Ok(())) => Ok(stream),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow!(
-            "[HTTP] handshake timeout ({}s) to {}",
-            handshake_timeout.as_secs(),
-            endpoint
-        )),
+        Err(_) => Err(ConnectError::Timeout {
+            stage: Stage::Handshake,
+            kind: TimeoutKind::HttpHandshake,
+            endpoint,
+            after: handshake_timeout,
+        }),
     }
 }
 
@@ -49,12 +56,17 @@ pub async fn connect_http_proxy(
 /// HTTP hop over any stream (plain, TLS, or TLS-in-TLS), not just
 /// [`UpstreamStream`].
 ///
+/// # Errors
+///
+/// Returns [`ConnectError`] when the request cannot be written, the
+/// response cannot be read/parsed, or the proxy rejects the CONNECT.
+///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
 pub async fn http_connect_handshake<S>(
     stream: &mut S,
     target_addr: &str,
     proxy: &ProxyConfig,
-) -> anyhow::Result<()>
+) -> Result<(), ConnectError>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -85,7 +97,7 @@ async fn write_connect_request<S>(
     stream: &mut S,
     target_addr: &str,
     proxy: &ProxyConfig,
-) -> anyhow::Result<()>
+) -> Result<(), ConnectError>
 where
     S: AsyncWriteExt + Unpin,
 {
@@ -93,7 +105,7 @@ where
         .bytes()
         .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
     {
-        return Err(anyhow!("[HTTP] invalid CONNECT target"));
+        return Err(ConnectError::Protocol("[HTTP] invalid CONNECT target"));
     }
     let mut req = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
@@ -102,7 +114,7 @@ where
 
     if let (Some(user), Some(pass)) = (&proxy.user, &proxy.password) {
         let creds = general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
-        write!(req, "Proxy-Authorization: Basic {}\r\n", creds)?;
+        write!(req, "Proxy-Authorization: Basic {}\r\n", creds).expect("String write cannot fail");
     }
 
     req.push_str("\r\n");
@@ -112,7 +124,7 @@ where
 }
 
 /// cancel-safe: NO — cancellation must discard the partially read stream.
-async fn read_connect_response_tcp(stream: &mut UpstreamStream) -> anyhow::Result<()> {
+async fn read_connect_response_tcp(stream: &mut UpstreamStream) -> Result<(), ConnectError> {
     let mut head = ResponseHead::new();
     loop {
         let filled = head.filled;
@@ -146,18 +158,20 @@ impl ResponseHead {
         }
     }
 
-    fn remaining(&self) -> anyhow::Result<usize> {
+    fn remaining(&self) -> Result<usize, ConnectError> {
         let remaining = self.buf.len() - self.total;
         if remaining == 0 {
-            return Err(anyhow!("[HTTP] upstream proxy response too large"));
+            return Err(ConnectError::Protocol(
+                "[HTTP] upstream proxy response too large",
+            ));
         }
         Ok(remaining)
     }
 
-    fn advance(&mut self, n: usize) -> anyhow::Result<bool> {
+    fn advance(&mut self, n: usize) -> Result<bool, ConnectError> {
         if n == 0 {
-            return Err(anyhow!(
-                "[HTTP] upstream proxy closed before completing response"
+            return Err(ConnectError::Protocol(
+                "[HTTP] upstream proxy closed before completing response",
             ));
         }
         self.filled += n;
@@ -180,10 +194,19 @@ impl ResponseHead {
             self.filled = 0;
             return Ok(false);
         }
-        Err(anyhow!(
-            "[HTTP] upstream proxy rejected CONNECT: {}",
-            String::from_utf8_lossy(first_line)
-        ))
+        Err(ConnectError::ProxyRejected {
+            protocol: ProxyProtocol::Http,
+            code: valid
+                .then(|| {
+                    first_line[9..12]
+                        .iter()
+                        .fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0'))
+                        .try_into()
+                        .ok()
+                })
+                .flatten(),
+            response: String::from_utf8_lossy(first_line).into_owned(),
+        })
     }
 }
 

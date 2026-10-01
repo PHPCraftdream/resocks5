@@ -8,6 +8,7 @@ pub use tokio_rustls::TlsConnector;
 #[cfg(feature = "tls")]
 use crate::connect::upstream_tls::connect_https_proxy;
 use crate::connect::{connect_http_proxy, connect_socks5_proxy};
+use crate::error::ConnectError;
 use crate::pool::{AnyUpstream, PoolConfig, ProxyPool};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
@@ -53,13 +54,19 @@ pub struct TlsConnector {
     not(feature = "tls"),
     doc = "HTTPS (TLS-wrapped CONNECT) needs the crate's `tls` feature (on by default). Built without it, an HTTPS upstream is rejected with an error naming the missing feature — never a silent plaintext fallback."
 )]
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] describing the failure: pool acquisition,
+/// protocol handshake, proxy rejection, cap exhaustion, or a missing
+/// TLS connector / `tls` feature for HTTPS upstreams.
 pub async fn connect_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
     tls_connector: Option<&TlsConnector>,
-) -> anyhow::Result<AnyUpstream> {
+) -> Result<AnyUpstream, ConnectError> {
     match proxy.protocol {
         ProxyProtocol::Socks5 => {
             let s = connect_socks5_proxy(target_addr, proxy, pool, handshake_timeout).await?;
@@ -72,8 +79,10 @@ pub async fn connect_proxy(
         ProxyProtocol::Https => {
             #[cfg(feature = "tls")]
             {
-                let connector = tls_connector
-                    .ok_or_else(|| anyhow::anyhow!("HTTPS upstream requires TLS connector"))?;
+                let connector = tls_connector.ok_or_else(|| ConnectError::Tls {
+                    message: "HTTPS upstream requires TLS connector".to_string(),
+                    source: None,
+                })?;
                 let s = connect_https_proxy(target_addr, proxy, pool, handshake_timeout, connector)
                     .await?;
                 Ok(AnyUpstream::Tls(Box::new(s)))
@@ -84,12 +93,9 @@ pub async fn connect_proxy(
                 // feature unification; there is nothing to plug in without
                 // the `tls` feature.
                 let _ = tls_connector;
-                Err(anyhow::anyhow!(
-                    "HTTPS upstream to {} requested, but resocks5-net was built without the \
-                     `tls` feature; enable it (`features = [\"tls\"]`, on by default) to dial \
-                     TLS-wrapped CONNECT upstreams — refusing to fall back to plaintext",
-                    proxy.host
-                ))
+                Err(ConnectError::TlsFeatureMissing {
+                    host: proxy.host.clone(),
+                })
             }
         }
     }
@@ -116,6 +122,11 @@ pub async fn connect_proxy(
 ///
 /// `connect_timeout` bounds the TCP dial to the proxy; `handshake_timeout`
 /// bounds the protocol exchange on top of it.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] under the same conditions as
+/// [`connect_proxy`] — this is a thin wrapper over it.
 ///
 /// # Example
 ///
@@ -150,7 +161,7 @@ pub async fn connect_proxy_once(
     connect_timeout: Duration,
     handshake_timeout: Duration,
     tls_connector: Option<&TlsConnector>,
-) -> anyhow::Result<AnyUpstream> {
+) -> Result<AnyUpstream, ConnectError> {
     // Throwaway disabled pool: `PoolConfig::default()` has `enabled =
     // false`, so no refill task is spawned and no warm socket is ever
     // served — `acquire` falls straight through to a fresh

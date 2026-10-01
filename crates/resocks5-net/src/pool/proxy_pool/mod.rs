@@ -57,13 +57,13 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
 use crossbeam_queue::ArrayQueue;
 use dashmap::DashMap;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 
+use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::pool::PoolConfig;
 use crate::types::ProxyConfig;
 
@@ -248,7 +248,16 @@ impl ProxyPool {
     /// as long as the connection it accounts is alive —
     /// [`UpstreamStream::attach_permit`] is the intended way for
     /// tunneled hops.
-    pub fn reserve_permit(&self, proxy: &ProxyConfig) -> anyhow::Result<OwnedSemaphorePermit> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectError::AtCapacity`] when the endpoint's cap is
+    /// already fully consumed by live connections and no spare's permit
+    /// can be reclaimed.
+    pub fn reserve_permit(
+        &self,
+        proxy: &ProxyConfig,
+    ) -> Result<OwnedSemaphorePermit, ConnectError> {
         let sem = self.upstream_semaphore(&proxy.host, proxy.port);
         if let Ok(permit) = sem.clone().try_acquire_owned() {
             return Ok(permit);
@@ -263,7 +272,7 @@ impl ProxyPool {
         }
         // A concurrent checkout may have released an expired spare's slot.
         sem.try_acquire_owned().map_err(|_| {
-            anyhow::Error::new(AtCapacity {
+            ConnectError::AtCapacity(AtCapacity {
                 host: proxy.host.clone(),
                 port: proxy.port,
             })
@@ -286,7 +295,13 @@ impl ProxyPool {
     ///
     /// Returns `UpstreamStream` so the permit lives exactly as long as
     /// the socket and the slot is released on drop.
-    pub async fn acquire(&self, proxy: &ProxyConfig) -> anyhow::Result<UpstreamStream> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectError::AtCapacity`] when the cap is hit, and
+    /// [`ConnectError::Io`] / [`ConnectError::Timeout`]
+    /// (`TimeoutKind::PoolConnect`) when the fresh TCP connect fails.
+    pub async fn acquire(&self, proxy: &ProxyConfig) -> Result<UpstreamStream, ConnectError> {
         // Step 1: pre-warmed socket — its permit comes with it.
         if let Some(pw) = self.checkout_prewarmed(proxy) {
             return Ok(UpstreamStream {
@@ -312,14 +327,19 @@ impl ProxyPool {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                return Err(anyhow!("connect to {}: {}", upstream_endpoint(proxy), e));
+                return Err(ConnectError::Io {
+                    stage: Stage::Connect,
+                    endpoint: Some(upstream_endpoint(proxy)),
+                    source: e,
+                });
             }
             Err(_) => {
-                return Err(anyhow!(
-                    "connect timeout ({}s) to {}",
-                    self.connect_timeout.as_secs(),
-                    upstream_endpoint(proxy)
-                ));
+                return Err(ConnectError::Timeout {
+                    stage: Stage::Connect,
+                    kind: TimeoutKind::PoolConnect,
+                    endpoint: upstream_endpoint(proxy),
+                    after: self.connect_timeout,
+                });
             }
         };
         Ok(UpstreamStream {

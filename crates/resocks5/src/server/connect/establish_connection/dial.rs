@@ -47,7 +47,7 @@ pub(super) async fn tunnel_hop(
             .await
             {
                 Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Err(e),
+                Ok(Err(e)) => Err(e.into()),
                 Err(_) => Err(anyhow!(
                     "[SOCKS5] handshake timeout ({}s) for target {}",
                     handshake_timeout.as_secs(),
@@ -64,7 +64,7 @@ pub(super) async fn tunnel_hop(
             .await
             {
                 Ok(Ok(())) => Ok(stream),
-                Ok(Err(e)) => Err(e),
+                Ok(Err(e)) => Err(e.into()),
                 Err(_) => Err(anyhow!(
                     "[HTTP] handshake timeout ({}s) to target {}",
                     handshake_timeout.as_secs(),
@@ -113,7 +113,7 @@ pub(super) async fn use_gate(
     let mut gate_stream = pool
         .acquire(gate_config)
         .await
-        .map_err(|e| e.context(GateStage::GateConnect))
+        .map_err(|e| anyhow::Error::new(e).context(GateStage::GateConnect))
         .with_context(|| format!("Failed to connect to gate {}", print_cfg(gate_config)))?;
     // The tunnel holds a live connection to `proxy_config` THROUGH the
     // gate, so it must consume `max_per_upstream` exactly like a
@@ -125,7 +125,7 @@ pub(super) async fn use_gate(
     // here the `?` drops `gate_stream`, releasing the gate's permit.
     gate_stream.attach_permit(
         pool.reserve_permit(proxy_config)
-            .map_err(|e| e.context(GateStage::GateToProxy))
+            .map_err(|e| anyhow::Error::new(e).context(GateStage::GateToProxy))
             .with_context(|| format!("Failed to reserve permit for {}", print_cfg(proxy_config)))?,
     );
     let stream = tunnel_hop(
@@ -199,6 +199,7 @@ async fn try_proxy(
             tls_connector,
         )
         .await
+        .map_err(anyhow::Error::new)
     }
 }
 
@@ -456,6 +457,7 @@ pub async fn establish_connection(
                 tls_connector,
             )
             .await
+            .map_err(anyhow::Error::new)
             {
                 Ok(stream) => {
                     let ms = t0.elapsed().as_millis();

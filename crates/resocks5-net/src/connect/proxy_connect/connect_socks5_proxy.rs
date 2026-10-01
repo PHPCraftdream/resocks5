@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use anyhow::anyhow;
 use tokio::time::timeout;
 
 use crate::connect::handshake_over_stream;
+use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::pool::proxy_pool::upstream_endpoint;
 use crate::pool::{ProxyPool, UpstreamStream};
 use crate::types::ProxyConfig;
@@ -15,12 +15,18 @@ use crate::types::ProxyConfig;
 /// `handshake_timeout` caps the time we wait on the SOCKS5 protocol
 /// exchange itself; a proxy that accepts our TCP but never finishes
 /// the handshake is treated as dead.
+///
+/// # Errors
+///
+/// Returns [`ConnectError`] when acquiring a socket or running the
+/// SOCKS5 handshake fails, or when the handshake budget expires
+/// (`TimeoutKind::Socks5Handshake`).
 pub async fn connect_socks5_proxy(
     target_addr: &str,
     proxy: &ProxyConfig,
     pool: &ProxyPool,
     handshake_timeout: Duration,
-) -> anyhow::Result<UpstreamStream> {
+) -> Result<UpstreamStream, ConnectError> {
     let stream = pool.acquire(proxy).await?;
 
     let auth = if let (Some(ref user), Some(ref password)) = (&proxy.user, &proxy.password) {
@@ -37,10 +43,11 @@ pub async fn connect_socks5_proxy(
     {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow!(
-            "[SOCKS5] handshake timeout ({}s) to {}",
-            handshake_timeout.as_secs(),
-            upstream_endpoint(proxy)
-        )),
+        Err(_) => Err(ConnectError::Timeout {
+            stage: Stage::Handshake,
+            kind: TimeoutKind::Socks5Handshake,
+            endpoint: upstream_endpoint(proxy),
+            after: handshake_timeout,
+        }),
     }
 }
