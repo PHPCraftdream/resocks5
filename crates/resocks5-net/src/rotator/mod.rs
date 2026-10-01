@@ -17,8 +17,40 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::rating::{RatingPolicy, Ratings};
+use crate::rating::{RatingError, RatingPolicy, Ratings};
 use crate::types::ProxyConfig;
+
+/// Error returned when a [`ProxyRotator`] cannot be constructed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RotatorError {
+    /// The upstream list was empty. [`ProxyRotator::get_next`] would
+    /// divide by zero, so empty rotators are rejected at construction.
+    Empty,
+    /// The [`RatingPolicy`] failed validation; the string describes the
+    /// offending knob. Wrapped from [`RatingError::InvalidPolicy`].
+    InvalidPolicy(String),
+}
+
+impl std::fmt::Display for RotatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RotatorError::Empty => {
+                write!(f, "cannot build a ProxyRotator from an empty upstream list")
+            }
+            RotatorError::InvalidPolicy(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for RotatorError {}
+
+impl From<RatingError> for RotatorError {
+    fn from(e: RatingError) -> Self {
+        match e {
+            RatingError::InvalidPolicy(msg) => RotatorError::InvalidPolicy(msg),
+        }
+    }
+}
 
 /// True when `a` and `b` refer to the same real-world upstream rating
 /// slot: endpoint, protocol, and account all match. `gate` is
@@ -192,13 +224,46 @@ pub struct ProxyRotator {
 
 impl ProxyRotator {
     /// Construct a rotator with the default [`RatingPolicy`].
+    ///
+    /// # Panics
+    /// Panics when `proxies` is empty ([`RotatorError::Empty`]) or the
+    /// default policy is invalid — see [`ProxyRotator::try_new`] for the
+    /// fallible twin.
     pub fn new(proxies: Vec<ProxyConfig>) -> Self {
-        Self::with_policy(proxies, RatingPolicy::default())
+        Self::try_new(proxies).expect("ProxyRotator::new: invalid arguments")
+    }
+
+    /// Fallibly construct a rotator with the default [`RatingPolicy`].
+    ///
+    /// # Errors
+    /// Returns [`RotatorError::Empty`] when `proxies` is empty.
+    pub fn try_new(proxies: Vec<ProxyConfig>) -> Result<Self, RotatorError> {
+        Self::try_with_policy(proxies, RatingPolicy::default())
     }
 
     /// Construct a rotator with a custom [`RatingPolicy`].
+    ///
+    /// # Panics
+    /// Panics when `proxies` is empty ([`RotatorError::Empty`]) or
+    /// `policy` fails [`RatingPolicy::validate`]
+    /// ([`RotatorError::InvalidPolicy`]) — see
+    /// [`ProxyRotator::try_with_policy`] for the fallible twin.
     pub fn with_policy(proxies: Vec<ProxyConfig>, policy: RatingPolicy) -> Self {
-        Self::with_cache_limits(
+        Self::try_with_policy(proxies, policy)
+            .expect("ProxyRotator::with_policy: invalid arguments")
+    }
+
+    /// Fallibly construct a rotator with a custom [`RatingPolicy`].
+    ///
+    /// # Errors
+    /// Returns [`RotatorError::Empty`] when `proxies` is empty, or
+    /// [`RotatorError::InvalidPolicy`] when `policy` fails
+    /// [`RatingPolicy::validate`].
+    pub fn try_with_policy(
+        proxies: Vec<ProxyConfig>,
+        policy: RatingPolicy,
+    ) -> Result<Self, RotatorError> {
+        Self::try_with_cache_limits(
             proxies,
             policy,
             DEFAULT_STICKY_CACHE_MAX_ENTRIES,
@@ -213,12 +278,49 @@ impl ProxyRotator {
     /// disables the sticky cache entirely. `ttl` is the entry lifetime —
     /// `0` expires entries immediately. A full cache reclaims an expired
     /// entry first, otherwise evicting the least-recently-used entry.
+    ///
+    /// # Panics
+    /// Panics when `proxies` is empty ([`RotatorError::Empty`]) or
+    /// `policy` fails [`RatingPolicy::validate`]
+    /// ([`RotatorError::InvalidPolicy`]) — see
+    /// [`ProxyRotator::try_with_cache_limits`] for the fallible twin.
     pub fn with_cache_limits(
         proxies: Vec<ProxyConfig>,
         policy: RatingPolicy,
         max_entries: usize,
         ttl: Duration,
     ) -> Self {
+        Self::try_with_cache_limits(proxies, policy, max_entries, ttl)
+            .expect("ProxyRotator::with_cache_limits: invalid arguments")
+    }
+
+    /// Fallibly construct a rotator with a custom [`RatingPolicy`] and
+    /// explicit sticky-cache limits.
+    ///
+    /// `max_entries` is the hard cap on cached target entries — `0`
+    /// disables the sticky cache entirely. `ttl` is the entry lifetime —
+    /// `0` expires entries immediately. A full cache reclaims an expired
+    /// entry first, otherwise evicting the least-recently-used entry.
+    ///
+    /// # Errors
+    /// Returns [`RotatorError::Empty`] when `proxies` is empty, or
+    /// [`RotatorError::InvalidPolicy`] when `policy` fails
+    /// [`RatingPolicy::validate`].
+    ///
+    /// # Invariants
+    /// On `Ok`, the rotator holds at least one upstream: `get_next`,
+    /// `pick_order` and `Ratings::pick` are therefore infallible and
+    /// never panic (modulo `Ratings::pick`'s documented empty-set
+    /// panic, unreachable here).
+    pub fn try_with_cache_limits(
+        proxies: Vec<ProxyConfig>,
+        policy: RatingPolicy,
+        max_entries: usize,
+        ttl: Duration,
+    ) -> Result<Self, RotatorError> {
+        if proxies.is_empty() {
+            return Err(RotatorError::Empty);
+        }
         let n = proxies.len();
         let identity_hasher = RandomState::new();
         let mut by_identity = HashMap::<_, Vec<usize>>::with_capacity(n);
@@ -235,16 +337,17 @@ impl ProxyRotator {
                 bucket.push(index);
             }
         }
-        Self {
+        let ratings = Ratings::try_new(n, policy)?;
+        Ok(Self {
             proxies: proxies.into_iter().map(Arc::new).collect(),
             identity_hasher,
             by_identity,
             index: AtomicUsize::new(0),
             sticky: Mutex::new(StickyCache::new(max_entries, ttl)),
-            ratings: Ratings::new(n, policy),
+            ratings,
             #[cfg(feature = "test-instrumentation")]
             pick_order_calls: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Insert (or replace) the cache entry for `addr`. Takes ownership
@@ -276,6 +379,9 @@ impl ProxyRotator {
     /// Round-robin next proxy (fetch-and-increment, modulo length).
     ///
     /// Returns a cheap refcount clone of the chosen [`ProxyConfig`].
+    ///
+    /// Infallible: construction rejects empty lists, so `len() >= 1`
+    /// always holds and the modulo never divides by zero.
     pub fn get_next(&self) -> Arc<ProxyConfig> {
         let i = self.index.fetch_add(1, Ordering::Relaxed) % self.proxies.len();
         self.proxies[i].clone()
@@ -788,5 +894,86 @@ mod tests {
             "unrelated upstream must be untouched, got {}",
             w[1]
         );
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+
+    fn make_proxy(host: &str, port: u16) -> ProxyConfig {
+        ProxyConfig {
+            protocol: crate::types::ProxyProtocol::Socks5,
+            ip: crate::types::IP::V4,
+            host: host.to_string(),
+            port,
+            user: None,
+            password: None,
+            is_gate: false,
+            gate: None,
+        }
+    }
+
+    #[test]
+    fn try_new_rejects_empty_list() {
+        assert!(matches!(
+            ProxyRotator::try_new(vec![]),
+            Err(RotatorError::Empty)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "ProxyRotator::new: invalid arguments")]
+    fn new_panics_on_empty_list() {
+        let _ = ProxyRotator::new(vec![]);
+    }
+
+    #[test]
+    fn try_with_policy_rejects_invalid_policy() {
+        let proxies = vec![make_proxy("h", 1000)];
+        let policy = RatingPolicy {
+            sand_max: 0.0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ProxyRotator::try_with_policy(proxies, policy),
+            Err(RotatorError::InvalidPolicy(msg)) if msg.contains("sand_max")
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "ProxyRotator::with_policy: invalid arguments")]
+    fn with_policy_panics_on_invalid_policy() {
+        let proxies = vec![make_proxy("h", 1000)];
+        let policy = RatingPolicy {
+            sand_max: 0.0,
+            ..Default::default()
+        };
+        let _ = ProxyRotator::with_policy(proxies, policy);
+    }
+
+    #[test]
+    fn try_with_cache_limits_rejects_nan_policy() {
+        let proxies = vec![make_proxy("h", 1000)];
+        let policy = RatingPolicy {
+            half_life_sec: f64::NAN,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ProxyRotator::try_with_cache_limits(proxies, policy, 8, Duration::from_secs(60)),
+            Err(RotatorError::InvalidPolicy(_))
+        ));
+    }
+
+    #[test]
+    fn valid_policy_still_constructs_and_get_next_is_infallible() {
+        let proxies = vec![make_proxy("h", 1000), make_proxy("h", 1001)];
+        let r = ProxyRotator::new(proxies);
+        assert_eq!(r.len(), 2);
+        // Non-empty invariant: round-robin over both slots, twice around.
+        let first = r.get_next();
+        assert!(r.get_next().port != first.port || r.len() == 1);
+        let _ = r.get_next();
+        let _ = r.get_next();
     }
 }

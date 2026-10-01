@@ -264,37 +264,36 @@ pub(super) async fn run_server_inner() -> Result<()> {
         min_weight: cfg_main.network.sand_min_weight,
         success_factor: cfg_main.network.sand_success_factor,
     };
-
-    rating_policy.validate().map_err(|e| {
+    // The rotator constructor validates the rating policy itself; an
+    // invalid `network` section surfaces here with the same
+    // user-facing message the standalone validate() call used to give.
+    let map_cfg_err = |e: resocks5_net::rotator::RotatorError| {
         anyhow::anyhow!(
             "invalid sand rating configuration in `{}` (network section): {e}",
             crate::config::MAIN_PATH
         )
-    })?;
+    };
 
     let v6_rotator = if !v6_proxies.is_empty() {
-        Some(Arc::new(ProxyRotator::with_policy(
-            v6_proxies,
-            rating_policy,
-        )))
+        Some(Arc::new(
+            ProxyRotator::try_with_policy(v6_proxies, rating_policy).map_err(map_cfg_err)?,
+        ))
     } else {
         None
     };
 
     let gate_rotator = if !gate_proxies.is_empty() {
-        Some(Arc::new(ProxyRotator::with_policy(
-            gate_proxies,
-            rating_policy,
-        )))
+        Some(Arc::new(
+            ProxyRotator::try_with_policy(gate_proxies, rating_policy).map_err(map_cfg_err)?,
+        ))
     } else {
         None
     };
 
     let v4_rotator = if !v4_proxies.is_empty() {
-        Some(Arc::new(ProxyRotator::with_policy(
-            v4_proxies,
-            rating_policy,
-        )))
+        Some(Arc::new(
+            ProxyRotator::try_with_policy(v4_proxies, rating_policy).map_err(map_cfg_err)?,
+        ))
     } else {
         None
     };

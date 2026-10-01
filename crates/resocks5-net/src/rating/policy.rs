@@ -1,6 +1,22 @@
 //! Tuning knobs for the sand-rating model ([`RatingPolicy`]).
 
-use anyhow::anyhow;
+/// Error returned when a [`RatingPolicy`] fails validation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RatingError {
+    /// The policy's knobs are outside the ranges the sand model's maths
+    /// requires. The string describes the offending field and why.
+    InvalidPolicy(String),
+}
+
+impl std::fmt::Display for RatingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RatingError::InvalidPolicy(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for RatingError {}
 
 /// Tunable knobs that control the exponential-decay sand model.
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +72,7 @@ impl RatingPolicy {
     /// `sand_max` (fully saturated) must all be finite — e.g. a subnormal
     /// `min_weight` passes every per-field check yet overflows
     /// `1.0 / min_weight`.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), RatingError> {
         for (name, value) in [
             ("half_life_sec", self.half_life_sec),
             ("fail_penalty", self.fail_penalty),
@@ -65,61 +81,63 @@ impl RatingPolicy {
             ("success_factor", self.success_factor),
         ] {
             if !value.is_finite() {
-                return Err(anyhow!("rating policy: {name} must be finite, got {value}"));
+                return Err(RatingError::InvalidPolicy(format!(
+                    "rating policy: {name} must be finite, got {value}"
+                )));
             }
         }
         if self.half_life_sec <= 0.0 {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: half_life_sec must be > 0, got {}; it is the decay \
                  timescale (tau = half_life_sec / ln 2), and zero or negative values \
                  yield inf/NaN sand levels",
                 self.half_life_sec
-            ));
+            )));
         }
         if !self.tau().is_finite() {
-            return Err(anyhow!(
-                "rating policy: half_life_sec / ln 2 must be finite"
+            return Err(RatingError::InvalidPolicy(
+                "rating policy: half_life_sec / ln 2 must be finite".to_string(),
             ));
         }
         if self.sand_max <= 0.0 {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: sand_max must be > 0, got {}; it is the denominator of \
                  k() = ln(1/min_weight) / sand_max, so 0 makes k() infinite and the \
                  weight of every fresh upstream undefined",
                 self.sand_max
-            ));
+            )));
         }
         if self.min_weight <= 0.0 || self.min_weight > 1.0 {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: min_weight must be in (0, 1], got {}; k() takes \
                  ln(1/min_weight), so values <= 0 give NaN, and values > 1 make k() \
                  negative so a fully-saturated upstream would be boosted above weight 1",
                 self.min_weight
-            ));
+            )));
         }
         if self.min_weight < f64::MIN_POSITIVE {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: min_weight must be >= f64::MIN_POSITIVE (2.225e-308, \
                  the smallest positive normal f64), got {}; smaller subnormal values can \
                  overflow 1/min_weight to infinity, which makes k() infinite and a fresh \
                  upstream's weight exp(-k * 0) undefined (NaN)",
                 self.min_weight
-            ));
+            )));
         }
         if !(0.0..=1.0).contains(&self.success_factor) {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: success_factor must be in [0, 1], got {}; success \
                  multiplies the remaining sand by it, so < 0 produces negative sand and \
                  weight > 1, and > 1 makes success increase sand",
                 self.success_factor
-            ));
+            )));
         }
         if self.fail_penalty < 0.0 {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: fail_penalty must be >= 0, got {}; it is the sand added \
                  per failure, and a negative value produces negative sand and weight > 1",
                 self.fail_penalty
-            ));
+            )));
         }
         // Derived-value checks: the fields above are individually in
         // range, but the quantities the sand model computes from them
@@ -127,34 +145,29 @@ impl RatingPolicy {
         // `Sand::weight` evaluates (see sand.rs).
         let k = self.k();
         if !k.is_finite() {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: k() = ln(1/min_weight) / sand_max must be finite, got {}; \
                  min_weight = {} and sand_max = {} are individually in range but their \
                  combination overflows the division, and a non-finite k makes a fresh \
                  upstream's weight exp(-k * 0) undefined (NaN)",
-                k,
-                self.min_weight,
-                self.sand_max
-            ));
+                k, self.min_weight, self.sand_max
+            )));
         }
         let fresh_weight = (-k * 0.0).exp();
         if !fresh_weight.is_finite() {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: a fresh upstream's weight exp(-k * 0) must be finite, \
                  got {}; k = {} is non-finite for this min_weight/sand_max combination",
-                fresh_weight,
-                k
-            ));
+                fresh_weight, k
+            )));
         }
         let saturated_weight = (-k * self.sand_max).exp();
         if !saturated_weight.is_finite() {
-            return Err(anyhow!(
+            return Err(RatingError::InvalidPolicy(format!(
                 "rating policy: a fully-saturated upstream's weight exp(-k * sand_max) \
                  must be finite, got {}; k = {}, sand_max = {}",
-                saturated_weight,
-                k,
-                self.sand_max
-            ));
+                saturated_weight, k, self.sand_max
+            )));
         }
         Ok(())
     }

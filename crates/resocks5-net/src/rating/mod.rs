@@ -12,7 +12,7 @@ pub mod rng;
 pub mod sand;
 pub mod select;
 
-pub use policy::RatingPolicy;
+pub use policy::{RatingError, RatingPolicy};
 pub use rng::SmallRng;
 pub use sand::Sand;
 
@@ -33,15 +33,30 @@ pub struct Ratings {
 
 impl Ratings {
     /// Create `n` fresh upstreams, all starting at weight 1.0.
+    ///
+    /// # Panics
+    /// Panics when `policy` fails [`RatingPolicy::validate`] — invalid
+    /// knobs would silently produce `inf`/`NaN` weights during
+    /// selection. See [`Ratings::try_new`] for the fallible twin.
     pub fn new(n: usize, policy: RatingPolicy) -> Self {
+        Self::try_new(n, policy).expect("Ratings::new: invalid policy")
+    }
+
+    /// Fallibly create `n` fresh upstreams, all starting at weight 1.0.
+    ///
+    /// # Errors
+    /// Returns [`RatingError::InvalidPolicy`] when `policy` fails
+    /// [`RatingPolicy::validate`].
+    pub fn try_new(n: usize, policy: RatingPolicy) -> Result<Self, RatingError> {
+        policy.validate()?;
         let now = Instant::now();
-        Self {
+        Ok(Self {
             policy,
             inner: Mutex::new(Inner {
                 cells: (0..n).map(|_| Sand::new(now)).collect(),
                 rng: SmallRng::from_os(),
             }),
-        }
+        })
     }
 
     /// The policy these ratings were constructed with.
@@ -231,5 +246,37 @@ mod tests {
             "weight[0] should stay above min_weight (0.05), got {}",
             w[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+
+    #[test]
+    fn new_rejects_invalid_policy() {
+        let p = RatingPolicy {
+            sand_max: 0.0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Ratings::try_new(2, p),
+            Err(RatingError::InvalidPolicy(msg)) if msg.contains("sand_max")
+        ));
+    }
+
+    #[test]
+    fn new_accepts_default_policy() {
+        assert!(Ratings::try_new(3, RatingPolicy::default()).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "Ratings::new: invalid policy")]
+    fn new_panics_on_invalid_policy() {
+        let p = RatingPolicy {
+            sand_max: 0.0,
+            ..Default::default()
+        };
+        let _ = Ratings::new(2, p);
     }
 }
