@@ -154,9 +154,16 @@ let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 
 Connect and pool calls return `resocks5_net::ConnectError`
 (`#[non_exhaustive]`): match on `Timeout { stage, .. }`, `ProxyRejected`,
-`AuthFailed`, `MethodUnsupported`, `Protocol`, `InvalidTarget`,
+`AuthFailed`, `MethodUnsupported`, `Protocol(ProtocolViolation)`,
+`InvalidTarget`,
 `TlsFeatureMissing`, `Io` (the `io::Error` is reachable via `source()`)
 and, with `pool`, `AtCapacity` — no message parsing needed.
+`Protocol` carries a structured `ProtocolViolation` (e.g.
+`Socks5BadVersion { got }`, `Socks5UnknownAddressType { got }`,
+`Socks5DomainTooLong { len }`, `Socks5CredentialsTooLong`,
+`HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
+with the offending byte or length; its `Display` still prints the
+legacy message text.
 
 `ProxyConfig` is built with `ProxyConfig::socks5/http/https(..)` plus
 `with_auth` / `with_gate`. Its `gate` field is the outer gate node and is

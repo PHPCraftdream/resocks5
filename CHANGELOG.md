@@ -67,6 +67,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking** (`resocks5-net`, not yet published): `ConnectError::Protocol`
+  now carries a structured `ProtocolViolation` (`Socks5BadVersion { got }`,
+  `Socks5UnknownAddressType { got }`, `Socks5DomainTooLong { len }`,
+  `Socks5CredentialsTooLong { username_len, password_len }`,
+  `HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
+  exposing the offending byte or length; `Display` still prints the exact
+  legacy message text, so logs are unchanged. `ProtocolViolation` is
+  re-exported from the crate root.
 - **Breaking** (`resocks5-net`, not yet published): the address-family label
   `ip` is removed from the SDK. `ProxyConfig.ip`, `ProxyConfig::with_family`
   and the public `types::IP` enum are gone (dialing only ever used

@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use crate::error::ConnectError;
+use crate::error::{ConnectError, ProtocolViolation};
 use crate::types::ProxyProtocol;
 
 /// Performs SOCKS5 handshake over an existing stream.
@@ -73,7 +73,10 @@ where
         let passwd = password.as_bytes();
         if uname.len() > 255 || passwd.len() > 255 {
             return Err(ConnectError::Protocol(
-                "[SOCKS5] Username or password too long",
+                ProtocolViolation::Socks5CredentialsTooLong {
+                    username_len: uname.len(),
+                    password_len: passwd.len(),
+                },
             ));
         }
 
@@ -113,7 +116,9 @@ where
     } else {
         let domain = host.as_bytes();
         if domain.len() > 255 {
-            return Err(ConnectError::Protocol("[SOCKS5] Domain name too long"));
+            return Err(ConnectError::Protocol(
+                ProtocolViolation::Socks5DomainTooLong { len: domain.len() },
+            ));
         }
         let mut v = vec![domain.len() as u8];
         v.extend_from_slice(domain);
@@ -129,7 +134,9 @@ where
     stream.read_exact(&mut resp_header).await?;
     if resp_header[0] != 0x05 {
         return Err(ConnectError::Protocol(
-            "[SOCKS5] Invalid proxy response version",
+            ProtocolViolation::Socks5BadVersion {
+                got: resp_header[0],
+            },
         ));
     }
     if resp_header[1] != 0x00 {
@@ -154,7 +161,9 @@ where
         }
         _ => {
             return Err(ConnectError::Protocol(
-                "[SOCKS5] Unknown address type in response",
+                ProtocolViolation::Socks5UnknownAddressType {
+                    got: resp_header[3],
+                },
             ))
         }
     }

@@ -12,7 +12,7 @@ use tokio::time::timeout;
 #[cfg(feature = "pool")]
 use crate::connect::tcp_dial::upstream_endpoint;
 use crate::connect::UpstreamStream;
-use crate::error::ConnectError;
+use crate::error::{ConnectError, ProtocolViolation};
 #[cfg(feature = "pool")]
 use crate::error::{Stage, TimeoutKind};
 #[cfg(feature = "pool")]
@@ -126,7 +126,9 @@ where
         .bytes()
         .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
     {
-        return Err(ConnectError::Protocol("[HTTP] invalid CONNECT target"));
+        return Err(ConnectError::Protocol(
+            ProtocolViolation::HttpInvalidConnectTarget,
+        ));
     }
     let mut req = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
@@ -183,7 +185,7 @@ impl ResponseHead {
         let remaining = self.buf.len() - self.total;
         if remaining == 0 {
             return Err(ConnectError::Protocol(
-                "[HTTP] upstream proxy response too large",
+                ProtocolViolation::HttpResponseTooLarge,
             ));
         }
         Ok(remaining)
@@ -191,9 +193,7 @@ impl ResponseHead {
 
     fn advance(&mut self, n: usize) -> Result<bool, ConnectError> {
         if n == 0 {
-            return Err(ConnectError::Protocol(
-                "[HTTP] upstream proxy closed before completing response",
-            ));
+            return Err(ConnectError::Protocol(ProtocolViolation::HttpClosedEarly));
         }
         self.filled += n;
         self.total += n;

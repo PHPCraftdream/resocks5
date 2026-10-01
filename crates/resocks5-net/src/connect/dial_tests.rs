@@ -7,6 +7,8 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+use crate::error::ProtocolViolation;
+
 const GUARD: Duration = Duration::from_secs(10);
 
 async fn bind() -> (TcpListener, u16) {
@@ -237,7 +239,13 @@ async fn socks5_bad_version_is_protocol() {
     let _stub = socks5_stub(l, None, 0x04, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let err = dial_err(&proxy, "1.2.3.4", 80, &opts()).await;
-    assert!(matches!(err, ConnectError::Protocol(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
+        ),
+        "{err:?}"
+    );
     assert_eq!(err.to_string(), "[SOCKS5] Invalid proxy response version");
 }
 

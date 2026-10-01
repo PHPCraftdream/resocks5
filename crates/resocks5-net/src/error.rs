@@ -54,6 +54,73 @@ pub enum TimeoutKind {
     Total,
 }
 
+/// The concrete SOCKS5 / HTTP CONNECT protocol violation behind
+/// [`ConnectError::Protocol`]. `Display` reproduces the exact legacy
+/// message text; the offending byte / length stays reachable via the
+/// variant fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProtocolViolation {
+    /// The first byte of a SOCKS5 reply was not `0x05`.
+    Socks5BadVersion {
+        /// The version byte the proxy sent.
+        got: u8,
+    },
+    /// The ATYP byte of a SOCKS5 CONNECT reply was not 1/3/4.
+    Socks5UnknownAddressType {
+        /// The ATYP byte the proxy sent.
+        got: u8,
+    },
+    /// The domain part of the target exceeded the 255-byte SOCKS5 limit.
+    Socks5DomainTooLong {
+        /// Domain length in bytes.
+        len: usize,
+    },
+    /// SOCKS5 username/password credentials exceeded the 255-byte
+    /// per-field RFC 1929 limit.
+    Socks5CredentialsTooLong {
+        /// Username length in bytes.
+        username_len: usize,
+        /// Password length in bytes.
+        password_len: usize,
+    },
+    /// The HTTP CONNECT target contained control or whitespace bytes.
+    HttpInvalidConnectTarget,
+    /// The HTTP CONNECT response headers exceeded the 4 KiB buffer.
+    HttpResponseTooLarge,
+    /// The upstream closed the connection before the HTTP CONNECT
+    /// response headers completed.
+    HttpClosedEarly,
+}
+
+impl fmt::Display for ProtocolViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolViolation::Socks5BadVersion { .. } => {
+                write!(f, "[SOCKS5] Invalid proxy response version")
+            }
+            ProtocolViolation::Socks5UnknownAddressType { .. } => {
+                write!(f, "[SOCKS5] Unknown address type in response")
+            }
+            ProtocolViolation::Socks5DomainTooLong { .. } => {
+                write!(f, "[SOCKS5] Domain name too long")
+            }
+            ProtocolViolation::Socks5CredentialsTooLong { .. } => {
+                write!(f, "[SOCKS5] Username or password too long")
+            }
+            ProtocolViolation::HttpInvalidConnectTarget => {
+                write!(f, "[HTTP] invalid CONNECT target")
+            }
+            ProtocolViolation::HttpResponseTooLarge => {
+                write!(f, "[HTTP] upstream proxy response too large")
+            }
+            ProtocolViolation::HttpClosedEarly => {
+                write!(f, "[HTTP] upstream proxy closed before completing response")
+            }
+        }
+    }
+}
+
 /// The typed error returned by every public connect/pool entry point.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -109,10 +176,11 @@ pub enum ConnectError {
         /// no-auth (`false`) — the two legacy messages differ.
         with_auth: bool,
     },
-    /// Protocol violation with a static description (bad version,
-    /// unknown ATYP, domain too long, malformed HTTP response, ...).
-    /// Holds the full legacy message.
-    Protocol(&'static str),
+    /// Protocol violation with the offending detail carried in a
+    /// [`ProtocolViolation`] variant (bad version, unknown ATYP, domain
+    /// too long, malformed HTTP response, ...). `Display` still prints
+    /// the exact legacy message.
+    Protocol(ProtocolViolation),
     /// The target address could not be parsed into a SOCKS5 request.
     InvalidTarget(String),
     /// An HTTPS upstream was requested but the crate was built without
@@ -230,7 +298,7 @@ impl fmt::Display for ConnectError {
                     )
                 }
             }
-            ConnectError::Protocol(message) => write!(f, "{}", message),
+            ConnectError::Protocol(violation) => write!(f, "{}", violation),
             ConnectError::InvalidTarget(target) => {
                 write!(f, "[SOCKS5] Invalid target address format: {}", target)
             }
@@ -285,6 +353,7 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     use super::ConnectError;
+    use super::ProtocolViolation;
     #[cfg(feature = "pool")]
     use super::{Stage, TimeoutKind};
     use crate::connect::connect_http_proxy::http_connect_handshake;
@@ -612,7 +681,13 @@ mod tests {
             &[0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
         )
         .await;
-        assert!(matches!(&err, ConnectError::Protocol(_)), "got: {err:?}");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
+            ),
+            "got: {err:?}"
+        );
         assert_eq!(err.to_string(), "[SOCKS5] Invalid proxy response version");
 
         // Unknown ATYP in the CONNECT response.
@@ -622,7 +697,13 @@ mod tests {
             &[0x05, 0x00, 0x00, 0x07, 0, 0, 0, 0, 0, 0],
         )
         .await;
-        assert!(matches!(&err, ConnectError::Protocol(_)), "got: {err:?}");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5UnknownAddressType { got: 7 })
+            ),
+            "got: {err:?}"
+        );
         assert_eq!(err.to_string(), "[SOCKS5] Unknown address type in response");
     }
 
@@ -641,8 +722,122 @@ mod tests {
         let err = handshake_over_stream(&mut client, &target, None)
             .await
             .expect_err("oversized domain must fail");
-        assert!(matches!(&err, ConnectError::Protocol(_)));
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5DomainTooLong { len: 300 })
+            ),
+            "got: {err:?}"
+        );
         assert_eq!(err.to_string(), "[SOCKS5] Domain name too long");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_credentials_yield_typed_protocol_with_lengths() {
+        let (mut client, mut upstream) = duplex(8192);
+        let peer = tokio::spawn(async move {
+            let mut greeting = [0u8; 3];
+            upstream.read_exact(&mut greeting).await.unwrap();
+            upstream.write_all(&[0x05, 0x02]).await.unwrap();
+        });
+        let long = "u".repeat(256);
+        let err = handshake_over_stream(&mut client, "1.2.3.4:443", Some((&long, "p")))
+            .await
+            .expect_err("oversized credentials must fail");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong {
+                    username_len: 256,
+                    password_len: 1
+                })
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(err.to_string(), "[SOCKS5] Username or password too long");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_invalid_connect_target_yields_typed_protocol() {
+        let (mut client, mut upstream) = duplex(4096);
+        let proxy = http_proxy_config("proxy.example", 8080);
+        let err = http_connect_handshake(&mut client, "bad target:443", &proxy)
+            .await
+            .expect_err("control characters must reject");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::HttpInvalidConnectTarget)
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(err.to_string(), "[HTTP] invalid CONNECT target");
+        drop(client);
+        let mut rest = Vec::new();
+        upstream.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_too_large_response_yields_typed_protocol() {
+        let (mut client, mut upstream) = duplex(16384);
+        let peer = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                upstream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            // 4096 bytes with no header terminator must overflow the head.
+            let junk = vec![b'a'; 4096];
+            upstream.write_all(&junk).await.unwrap();
+            upstream.write_all(&junk).await.unwrap();
+        });
+        let proxy = http_proxy_config("proxy.example", 8080);
+        let err = http_connect_handshake(&mut client, "example.com:443", &proxy)
+            .await
+            .expect_err("oversized response must fail");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::HttpResponseTooLarge)
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(err.to_string(), "[HTTP] upstream proxy response too large");
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_closed_early_yields_typed_protocol() {
+        let (mut client, mut upstream) = duplex(4096);
+        let peer = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                upstream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            upstream.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+            drop(upstream);
+        });
+        let proxy = http_proxy_config("proxy.example", 8080);
+        let err = http_connect_handshake(&mut client, "example.com:443", &proxy)
+            .await
+            .expect_err("early close must fail");
+        assert!(
+            matches!(
+                &err,
+                ConnectError::Protocol(ProtocolViolation::HttpClosedEarly)
+            ),
+            "got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "[HTTP] upstream proxy closed before completing response"
+        );
         peer.await.unwrap();
     }
 
