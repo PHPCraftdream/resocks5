@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automated SDK publish step at all, only a manual `cargo publish` a
   maintainer would have had to remember to run.
 
+### Changed
+
+- `ktav` 0.6.4 → 0.8.0 (`[workspace.dependencies]` requirement raised from
+  `0.6.0` to `0.8.0`; `ktav` is used only by the `resocks5` binary, not
+  `resocks5-net`). No source changes were needed; the full `resocks5` test
+  suite (config load/init, users-file round-trips), `clippy -D warnings`
+  and `cargo deny check advisories` pass unchanged.
+
 ### Security
 
 - **`ktav` was pinned at the yanked 0.6.1** (yanked 2026-09-16, cause not
