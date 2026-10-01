@@ -41,7 +41,7 @@ pub use connect_proxy::connect_proxy_once;
 pub use connect_socks5_proxy::connect_socks5_proxy;
 pub use handshake_over_stream::handshake_over_stream;
 pub use host_port::HostPort;
-pub use parse_proxy_str::parse_proxy_str;
+pub use parse_proxy_str::{parse_proxy_str, ParseProxyError};
 pub use recover_host::{parse_http_host, parse_sni};
 pub use tls_fragment::{send_possibly_fragmented, FragmentSpec};
 #[cfg(feature = "tls")]

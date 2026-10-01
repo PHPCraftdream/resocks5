@@ -78,8 +78,8 @@ pub(super) fn parse_proxy_list_checked(
             continue;
         }
         match parse_proxy_str(line, proto, ip) {
-            Some(config) => parsed.push(config),
-            None => failed.push(idx + 1),
+            Ok(config) => parsed.push(config),
+            Err(_) => failed.push(idx + 1),
         }
     }
     (parsed, failed)

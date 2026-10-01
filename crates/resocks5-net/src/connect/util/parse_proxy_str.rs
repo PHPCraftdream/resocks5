@@ -1,7 +1,36 @@
 //! Parser for the `[*]user:pass@host:port` upstream-list line format.
 
+use std::fmt;
+
 use super::HostPort;
 use crate::types::{ProxyConfig, ProxyProtocol, IP};
+
+/// Why [`parse_proxy_str`] rejected a line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseProxyError {
+    /// The line is blank.
+    Empty,
+    /// The line is a `#` comment.
+    Comment,
+    /// Malformed `host:port` or credentials part.
+    BadHostPort,
+    /// Malformed gate marker: a `*` with no target, or a repeated `*`.
+    BadGate,
+}
+
+impl fmt::Display for ParseProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "empty proxy line",
+            Self::Comment => "comment line",
+            Self::BadHostPort => "malformed host, port or credentials",
+            Self::BadGate => "malformed gate marker",
+        })
+    }
+}
+
+impl std::error::Error for ParseProxyError {}
 
 /// Parse a single proxy-list line into a [`ProxyConfig`].
 ///
@@ -10,15 +39,26 @@ use crate::types::{ProxyConfig, ProxyProtocol, IP};
 /// (`[2001:db8::1]:1080`); a bare IPv6 literal followed by the port
 /// (`2001:db8::1:443`) is also accepted for backward compatibility. The
 /// password may contain `:` — only the first colon separates user and
-/// password. Lines beginning with `#` and anything that fails to parse
-/// return `None`. `protocol` and `ip` are supplied by the caller because
-/// the line itself carries no protocol or address-family info.
-pub fn parse_proxy_str(conn_str: &str, protocol: ProxyProtocol, ip: IP) -> Option<ProxyConfig> {
+/// password. Blank lines, `#` comments and anything that fails to parse
+/// yield a [`ParseProxyError`]. `protocol` and `ip` are supplied by the
+/// caller because the line itself carries no protocol or address-family
+/// info.
+pub fn parse_proxy_str(
+    conn_str: &str,
+    protocol: ProxyProtocol,
+    ip: IP,
+) -> Result<ProxyConfig, ParseProxyError> {
+    if conn_str.trim().is_empty() {
+        return Err(ParseProxyError::Empty);
+    }
     if conn_str.starts_with('#') {
-        return None;
+        return Err(ParseProxyError::Comment);
     }
 
     let (is_gate, conn_str) = if let Some(rest) = conn_str.strip_prefix('*') {
+        if rest.is_empty() || rest.starts_with('*') {
+            return Err(ParseProxyError::BadGate);
+        }
         (true, rest)
     } else {
         (false, conn_str)
@@ -27,7 +67,7 @@ pub fn parse_proxy_str(conn_str: &str, protocol: ProxyProtocol, ip: IP) -> Optio
     let (creds, host_port) = match conn_str.split_once('@') {
         // A second '@' cannot occur in a valid host or IPv6 literal.
         Some((creds, rest)) if !rest.contains('@') => (Some(creds), rest),
-        Some(_) => return None,
+        Some(_) => return Err(ParseProxyError::BadHostPort),
         None => (None, conn_str),
     };
 
@@ -35,31 +75,26 @@ pub fn parse_proxy_str(conn_str: &str, protocol: ProxyProtocol, ip: IP) -> Optio
     // FIRST colon.
     let (user, password) = match creds {
         Some(creds) => {
-            let (user, password) = creds.split_once(':')?;
+            let (user, password) = creds.split_once(':').ok_or(ParseProxyError::BadHostPort)?;
             (Some(user.to_string()), Some(password.to_string()))
         }
         None => (None, None),
     };
 
-    let HostPort { host, port } = HostPort::parse(host_port)?;
+    let HostPort { host, port } = HostPort::parse(host_port).ok_or(ParseProxyError::BadHostPort)?;
 
-    Some(ProxyConfig {
-        protocol,
-        ip,
-        user,
-        password,
-        host: host.to_string(),
-        port,
-        is_gate,
-        gate: None,
-    })
+    let mut cfg = ProxyConfig::new(protocol, host, port).with_family(ip);
+    cfg.user = user;
+    cfg.password = password;
+    cfg.is_gate = is_gate;
+    Ok(cfg)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::types::{ProxyProtocol, IP};
 
-    use super::parse_proxy_str;
+    use super::{parse_proxy_str, ParseProxyError};
 
     #[test]
     fn bracketed_ipv6() {
@@ -135,7 +170,6 @@ mod tests {
     #[test]
     fn rejections() {
         for s in [
-            "# comment",
             "host",
             "[::1]",
             "user@host:80",
@@ -145,10 +179,31 @@ mod tests {
             ":1080",
             "host:",
         ] {
-            assert!(
-                parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).is_none(),
-                "expected None for {s:?}"
+            assert_eq!(
+                parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).unwrap_err(),
+                ParseProxyError::BadHostPort,
+                "expected BadHostPort for {s:?}"
             );
         }
+    }
+
+    #[test]
+    fn error_variants() {
+        let parse = |s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).unwrap_err();
+        assert_eq!(parse(""), ParseProxyError::Empty);
+        assert_eq!(parse("   "), ParseProxyError::Empty);
+        assert_eq!(parse("# comment"), ParseProxyError::Comment);
+        assert_eq!(parse("*"), ParseProxyError::BadGate);
+        assert_eq!(parse("**1.2.3.4:1"), ParseProxyError::BadGate);
+        assert_eq!(parse("host"), ParseProxyError::BadHostPort);
+        assert!(!ParseProxyError::BadGate.to_string().is_empty());
+    }
+
+    #[test]
+    fn family_label_from_caller() {
+        let cfg = parse_proxy_str("[::1]:1", ProxyProtocol::Socks5, IP::V4).unwrap();
+        assert_eq!(cfg.ip, IP::V4);
+        let cfg = parse_proxy_str("1.2.3.4:1", ProxyProtocol::Socks5, IP::V6).unwrap();
+        assert_eq!(cfg.ip, IP::V6);
     }
 }

@@ -79,16 +79,7 @@ fn should_record_failure_returns_true_for_generic_error() {
 async fn gate_capacity_error_retains_its_type() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let gate = ProxyConfig {
-        protocol: resocks5_net::types::ProxyProtocol::Socks5,
-        ip: resocks5_net::types::IP::V4,
-        host: address.ip().to_string(),
-        port: address.port(),
-        user: None,
-        password: None,
-        is_gate: true,
-        gate: None,
-    };
+    let gate = ProxyConfig::socks5(address.ip().to_string(), address.port()).as_gate();
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 1);
     let _busy = pool.acquire(&gate).await.unwrap();
     let error = use_gate(
@@ -170,15 +161,11 @@ pub(super) async fn spawn_socks5_stub() -> SocketAddr {
 }
 
 pub(super) fn socks5_config(addr: SocketAddr, is_gate: bool) -> ProxyConfig {
-    ProxyConfig {
-        protocol: resocks5_net::types::ProxyProtocol::Socks5,
-        ip: resocks5_net::types::IP::V4,
-        host: addr.ip().to_string(),
-        port: addr.port(),
-        user: None,
-        password: None,
-        is_gate,
-        gate: None,
+    let cfg = ProxyConfig::socks5(addr.ip().to_string(), addr.port());
+    if is_gate {
+        cfg.as_gate()
+    } else {
+        cfg
     }
 }
 

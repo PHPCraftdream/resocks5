@@ -79,7 +79,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn main() -> anyhow::Result<()> {
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
-        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4))
+        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
         .collect::<Vec<_>>();
 
     let rotator = ProxyRotator::new(proxies);

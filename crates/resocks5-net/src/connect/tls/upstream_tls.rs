@@ -250,7 +250,6 @@ mod tests {
     use crate::connect::tls_fragment::{send_possibly_fragmented, FragmentSpec, SendProgress};
     use crate::connect::tunnel::tunnel_with_timeouts;
     use crate::pool::{AnyUpstream, PoolConfig};
-    use crate::types::{ProxyProtocol, IP};
 
     /// Throwaway test PKI (DER, EC P-256), generated for these tests and    /// Throwaway test PKI (DER, EC P-256), generated for these tests and
     /// committed as constants so they need no external files. It protects
@@ -399,16 +398,7 @@ mod tests {
             Duration::from_secs(5),
             4,
         );
-        let proxy = ProxyConfig {
-            protocol: ProxyProtocol::Https,
-            ip: IP::V4,
-            host: "127.0.0.1".into(),
-            port,
-            user: None,
-            password: None,
-            is_gate: false,
-            gate: None,
-        };
+        let proxy = ProxyConfig::https("127.0.0.1", port);
 
         let upstream = connect_proxy(
             "example.org:443",

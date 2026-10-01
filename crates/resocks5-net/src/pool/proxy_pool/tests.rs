@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{ProxyProtocol, IP as IPV};
+use crate::types::IP as IPV;
 
 #[tokio::test]
 async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
@@ -53,16 +53,7 @@ async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
 }
 
 fn make_proxy(host: &str, port: u16) -> ProxyConfig {
-    ProxyConfig {
-        protocol: ProxyProtocol::Socks5,
-        ip: IPV::V4,
-        host: host.to_string(),
-        port,
-        user: None,
-        password: None,
-        is_gate: false,
-        gate: None,
-    }
+    ProxyConfig::socks5(host, port).with_family(IPV::V4)
 }
 
 /// Bind a listener on a free local port and immediately accept-

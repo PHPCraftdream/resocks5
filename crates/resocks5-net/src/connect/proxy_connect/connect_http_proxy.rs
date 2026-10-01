@@ -217,20 +217,11 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ProxyProtocol, IP};
+
     use tokio::io::duplex;
 
     fn proxy() -> ProxyConfig {
-        ProxyConfig {
-            protocol: ProxyProtocol::Http,
-            ip: IP::V4,
-            host: "localhost".into(),
-            port: 8080,
-            user: None,
-            password: None,
-            is_gate: false,
-            gate: None,
-        }
+        ProxyConfig::http("localhost", 8080)
     }
 
     #[tokio::test(start_paused = true)]

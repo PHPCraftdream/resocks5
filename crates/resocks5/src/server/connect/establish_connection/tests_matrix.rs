@@ -411,15 +411,11 @@ pub(super) async fn spawn_draining_stub(
 }
 
 pub(super) fn stub_config(addr: SocketAddr, protocol: ProxyProtocol, is_gate: bool) -> ProxyConfig {
-    ProxyConfig {
-        protocol,
-        ip: resocks5_net::types::IP::V4,
-        host: "localhost".to_string(),
-        port: addr.port(),
-        user: None,
-        password: None,
-        is_gate,
-        gate: None,
+    let cfg = ProxyConfig::new(protocol, "localhost", addr.port());
+    if is_gate {
+        cfg.as_gate()
+    } else {
+        cfg
     }
 }
 

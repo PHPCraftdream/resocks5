@@ -459,16 +459,7 @@ mod tests {
     use crate::types::{ProxyProtocol, IP as IPV};
 
     fn make_proxy(host: &str, port: u16) -> ProxyConfig {
-        ProxyConfig {
-            protocol: ProxyProtocol::Socks5,
-            ip: IPV::V4,
-            host: host.to_string(),
-            port,
-            user: None,
-            password: None,
-            is_gate: false,
-            gate: None,
-        }
+        ProxyConfig::socks5(host, port).with_family(IPV::V4)
     }
 
     #[test]

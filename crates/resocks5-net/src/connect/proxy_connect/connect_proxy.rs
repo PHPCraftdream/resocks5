@@ -180,23 +180,14 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::connect_proxy_once;
-    use crate::types::{ProxyConfig, ProxyProtocol, IP};
+    use crate::types::{ProxyConfig, ProxyProtocol};
 
     /// Loopback listener on an ephemeral port plus a `ProxyConfig`
     /// pointing at it, so the client dials a real local socket.
     async fn loopback_proxy(protocol: ProxyProtocol) -> (TcpListener, ProxyConfig) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let config = ProxyConfig {
-            protocol,
-            ip: IP::V4,
-            host: addr.ip().to_string(),
-            port: addr.port(),
-            user: None,
-            password: None,
-            is_gate: false,
-            gate: None,
-        };
+        let config = ProxyConfig::new(protocol, addr.ip().to_string(), addr.port());
         (listener, config)
     }
 

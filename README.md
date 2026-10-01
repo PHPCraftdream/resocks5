@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
     // Parse upstream lines: "[*]user:pass@host:port" (credentials optional).
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
-        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4))
+        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
         .collect::<Vec<_>>();
 
     // Weighted-random rotator (sand-rating uses defaults from RatingPolicy)

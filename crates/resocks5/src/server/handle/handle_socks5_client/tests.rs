@@ -407,16 +407,7 @@ async fn serve_stub_client(
 }
 
 fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
-    resocks5_net::types::ProxyConfig {
-        protocol: resocks5_net::types::ProxyProtocol::Socks5,
-        ip: resocks5_net::types::IP::V4,
-        host: "127.0.0.1".to_string(),
-        port: addr.port(),
-        user: None,
-        password: None,
-        is_gate: false,
-        gate: None,
-    }
+    resocks5_net::types::ProxyConfig::socks5("127.0.0.1", addr.port())
 }
 
 /// Build a minimal but well-formed TLS ClientHello carrying a single
