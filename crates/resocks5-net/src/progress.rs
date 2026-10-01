@@ -10,6 +10,20 @@
 //!   the current task, installed with `confirmed_scope`;
 //! - [`ProgressReportingWriter`] — an `AsyncWrite` wrapper that reports
 //!   every accepted byte into the enclosing scope.
+//!
+//! # Custom writer stacks
+//!
+//! A third-party wrapper (its own TLS layer, compression, buffering)
+//! participates with the public API alone, no crate-private items:
+//! inside its `poll_write`/`poll_flush`, once bytes are confirmed to
+//! have left the wrapper toward the real transport, call
+//! [`FlushProgress::report_confirmed`] (or `try_with`-style
+//! [`FlushProgress::current`] first if it wants to check whether any
+//! scope is active at all). The bounded helpers
+//! (`send_possibly_fragmented`, the bounded flush in the TLS fragment
+//! path, `tunnel_with_timeouts`) install the ambient scope themselves,
+//! so a wrapper nested under them is picked up automatically. See the
+//! example on [`FlushProgress`].
 
 use std::future::Future;
 use std::io;
@@ -24,11 +38,77 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// that buffers.
 ///
 /// This is an instrumentation sink, not a synchronization primitive:
-/// only a successful `poll_write` of `n > 0` bytes by a
-/// [`ProgressReportingWriter`] advances the counter. A bare task wake or
-/// an unresolved `Pending` never moves it, so "the counter advanced"
-/// always means "real bytes were handed to the transport underneath".
-/// `total()` is monotonic.
+/// only bytes CONFIRMED to have left a writer stack toward the real
+/// transport advance the counter. A bare task wake or an unresolved
+/// `Pending` never moves it, so "the counter advanced" always means
+/// "real bytes were handed to the transport underneath". `total()` is
+/// monotonic.
+///
+/// # Reporting from a custom wrapper
+///
+/// A writer stack that buffers below its own layer reports progress
+/// through the ambient scope — the one the bounded helpers install —
+/// using [`FlushProgress::report_confirmed`]:
+///
+/// ```
+/// use std::pin::Pin;
+/// use std::task::{Context, Poll};
+/// use resocks5_net::progress::FlushProgress;
+///
+/// /// A buffering look-alike: accepts whole writes into a queue and
+/// /// drains it to the inner transport on flush. Every piece the
+/// /// inner transport ACCEPTS is confirmed progress and is reported.
+/// struct MyBuffer<W> {
+///     pending: std::collections::VecDeque<u8>,
+///     inner: W,
+/// }
+///
+/// impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite
+///     for MyBuffer<W>
+/// {
+///     fn poll_write(
+///         mut self: Pin<&mut Self>,
+///         _cx: &mut Context<'_>,
+///         buf: &[u8],
+///     ) -> Poll<std::io::Result<usize>> {
+///         self.pending.extend(buf.iter().copied());
+///         Poll::Ready(Ok(buf.len()))
+///     }
+///
+///     fn poll_flush(
+///         mut self: Pin<&mut Self>,
+///         cx: &mut Context<'_>,
+///     ) -> Poll<std::io::Result<()>> {
+///         // Drain as much as the transport accepts right now ...
+///         while !self.pending.is_empty() {
+///             let MyBuffer { pending, inner } = &mut *self;
+///             let contiguous = pending.make_contiguous();
+///             let written = match Pin::new(inner).poll_write(cx, contiguous) {
+///                 Poll::Ready(Ok(n)) => n,
+///                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+///                 Poll::Pending => return Poll::Pending,
+///             };
+///             self.pending.drain(..written);
+///             // ... and report ONLY those accepted bytes. Bare
+///             // wakeups and Pending are NOT progress — reporting
+///             // them would falsely renew the bounded helpers'
+///             // idle windows and defeat the stall detection.
+///             FlushProgress::report_confirmed(written as u64);
+///         }
+///         Pin::new(&mut self.inner).poll_flush(cx)
+///     }
+///
+///     fn poll_shutdown(
+///         mut self: Pin<&mut Self>,
+///         cx: &mut Context<'_>,
+///     ) -> Poll<std::io::Result<()>> {
+///         self.poll_flush(cx)
+///     }
+/// }
+///
+/// // Outside any bounded helper's scope, reporting is a silent no-op:
+/// FlushProgress::report_confirmed(64);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct FlushProgress {
     counter: Arc<AtomicU64>,
@@ -48,13 +128,46 @@ impl FlushProgress {
         self.counter.load(Ordering::Relaxed)
     }
 
-    fn record(&self, n: usize) {
+    /// Reports `n` bytes confirmed to have reached the real transport
+    /// underneath the reporting layer.
+    ///
+    /// Contract: call this ONLY for bytes that verifiably left the
+    /// reporting wrapper toward the transport (the transport accepted
+    /// them via `poll_write`). A bare task wake, an unresolved
+    /// `Pending`, or a zero-byte result is NOT progress and must not
+    /// be reported — [`record`](Self::record)(0) is a no-op, and any
+    /// other inflation falsely renews the bounded helpers' idle
+    /// windows, defeating their stall detection.
+    pub fn record(&self, n: u64) {
         if n == 0 {
             return;
         }
-        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        self.counter.fetch_add(n, Ordering::Relaxed);
         #[cfg(feature = "test-instrumentation")]
-        CONFIRMED_WRITE_PROGRESS_TOTAL.fetch_add(n as u64, Ordering::Relaxed);
+        CONFIRMED_WRITE_PROGRESS_TOTAL.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The ambient confirmed-progress sink of the current task, if the
+    /// code being polled runs underneath one of the crate's bounded
+    /// helpers (`send_possibly_fragmented`, the bounded flush in the
+    /// TLS fragment path, `tunnel_with_timeouts`).
+    ///
+    /// Custom writer wrappers use this (or the shortcut
+    /// [`FlushProgress::report_confirmed`]) to report confirmed bytes
+    /// without the sink being threaded through their constructors.
+    /// Returns `None` outside any scope; reporting into `None` is a
+    /// silent no-op either way.
+    pub fn current() -> Option<Self> {
+        CONFIRMED_WRITE_PROGRESS.try_with(|p| p.clone()).ok()
+    }
+
+    /// Reports `n` confirmed bytes into the ambient scope of the
+    /// current task, if any; a silent no-op outside one.
+    ///
+    /// Same contract as [`FlushProgress::record`]: only bytes the
+    /// transport underneath actually accepted; zero is a no-op.
+    pub fn report_confirmed(n: u64) {
+        let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(n));
     }
 }
 
@@ -83,7 +196,8 @@ pub(crate) fn confirmed_scope<F: Future>(
 }
 
 /// `AsyncWrite` wrapper that reports every successful write of `n > 0`
-/// bytes into the enclosing `CONFIRMED_WRITE_PROGRESS` scope, if any.
+/// bytes into the enclosing `CONFIRMED_WRITE_PROGRESS` scope, if any —
+/// via the public [`FlushProgress::report_confirmed`] API.
 ///
 /// Meant to sit BELOW a buffering/TLS layer, around the raw transport:
 /// wrap the socket, wrap the buffering layer on top. Outside a
@@ -120,7 +234,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
-            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
+            FlushProgress::report_confirmed(*n as u64);
         }
         result
     }
@@ -132,7 +246,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressReportingWriter<W> {
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Ok(n)) = &result {
-            let _ = CONFIRMED_WRITE_PROGRESS.try_with(|p| p.record(*n));
+            FlushProgress::report_confirmed(*n as u64);
         }
         result
     }
