@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol replies use the request's encoder. Routing, gate accounting, recovery,
   logging and forwarding budgets stay application-owned. The deadline now anchors
   at listener acceptance rather than when the spawned handler first runs.
+- Application handlers borrow the request's destination and authenticated identity
+  instead of allocating duplicate strings on every connection.
 - Preserved delimiter-inclusive 16KiB HTTP headers, unused obs-text, existing Basic
   and SOCKS method policy, permissive legacy framing, and lossless binary pipeline.
   Anonymous identity is never substituted with an empty authenticated username for

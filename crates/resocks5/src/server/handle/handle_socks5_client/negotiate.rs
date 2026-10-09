@@ -35,28 +35,24 @@ pub async fn handle_socks5_client(
     direct_limiter: &Arc<Semaphore>,
     client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    let target_addr = req.target().to_owned();
-    let client_user = req.username().map(str::to_owned);
+    let pipeline = req.take_pipeline();
+    let target_addr = req.target();
+    let client_user = req.username();
 
     // If the authenticated user has direct=true, bypass the pool and
     // connect straight to the target. Anonymous clients NEVER take the
     // direct path.
-    let is_direct = client_user
-        .as_deref()
-        .map(|u| auth.is_direct(u))
-        .unwrap_or(false);
+    let is_direct = client_user.is_some_and(|user| auth.is_direct(user));
 
     // Acquire a direct-limiter permit when taking the bypass path.
     // Held until this function returns so it covers the full tunnel
     // lifetime. `None` for the pool path.
     let _direct_permit = if is_direct {
-        let user_owned = client_user
-            .as_deref()
-            .expect("is_direct implies a named user");
+        let user_owned = client_user.expect("is_direct implies a named user");
         match direct_limiter.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                let target_addr_c = target_addr.clone();
+                let target_addr_c = target_addr.to_owned();
                 let user_c = user_owned.to_string();
                 let cap = network.max_concurrent_direct;
                 logger.connection_error(move || {
@@ -80,11 +76,11 @@ pub async fn handle_socks5_client(
     // Host) and address the upstream by that domain. See
     // `recover_host_from_payload` in NetworkConfig for the rationale.
     if !is_direct && network.recover_host_from_payload {
-        if let Some(port) = ipv4_literal_port(&target_addr) {
+        if let Some(port) = ipv4_literal_port(target_addr) {
             return recover_and_tunnel(
                 client_stream,
                 &req,
-                &target_addr,
+                target_addr,
                 port,
                 gate_rotator,
                 v6_rotator,
@@ -94,7 +90,7 @@ pub async fn handle_socks5_client(
                 pool,
                 frag,
                 network,
-                client_user.as_deref(),
+                client_user,
                 tls_connector,
                 client_deadline,
             )
@@ -103,15 +99,13 @@ pub async fn handle_socks5_client(
     }
 
     let proxy_stream = if is_direct {
-        let user_owned = client_user
-            .as_deref()
-            .expect("is_direct implies a named user");
-        match crate::server::establish_direct(&target_addr, banned, logger, network, user_owned)
+        let user_owned = client_user.expect("is_direct implies a named user");
+        match crate::server::establish_direct(target_addr, banned, logger, network, user_owned)
             .await
         {
             Ok(s) => s,
             Err(e) => {
-                let rep = if banned.is_match(&target_addr) {
+                let rep = if banned.is_match(target_addr) {
                     Reply::Forbidden
                 } else {
                     Reply::UpstreamUnavailable
@@ -122,7 +116,7 @@ pub async fn handle_socks5_client(
         }
     } else {
         match server::establish_connection(
-            &target_addr,
+            target_addr,
             gate_rotator,
             v6_rotator,
             v4_rotator,
@@ -130,14 +124,14 @@ pub async fn handle_socks5_client(
             banned,
             pool,
             network,
-            client_user.as_deref(),
+            client_user,
             tls_connector,
         )
         .await
         {
             Ok(s) => s,
             Err(e) => {
-                let rep = if banned.is_match(&target_addr) {
+                let rep = if banned.is_match(target_addr) {
                     Reply::Forbidden
                 } else {
                     Reply::UpstreamUnavailable
@@ -163,14 +157,7 @@ pub async fn handle_socks5_client(
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
     }
-    server::forward_tunnel(
-        client_stream,
-        proxy_stream,
-        req.take_pipeline(),
-        frag,
-        network,
-    )
-    .await
+    server::forward_tunnel(client_stream, proxy_stream, pipeline, frag, network).await
 }
 
 /// If `target` is `IPv4:port`, return the port substring; otherwise
