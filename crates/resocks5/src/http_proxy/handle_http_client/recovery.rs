@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use regex::RegexSet;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -17,6 +17,7 @@ use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
+use resocks5_net::server::{IncomingRequest, Reply};
 
 /// If `target` is `IPv4:port`, return the port substring; otherwise
 /// `None`. Recovery applies only to bare IPv4 literals (domains already
@@ -51,6 +52,7 @@ pub(super) fn ipv4_literal_port(target: &str) -> Option<&str> {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_and_tunnel_http(
     mut client_stream: TcpStream,
+    req: &IncomingRequest,
     target: &str,
     port: &str,
     pipelined: Vec<u8>,
@@ -84,9 +86,7 @@ pub(super) async fn recover_and_tunnel_http(
         async {
             // Early 200 so the client sends its first application
             // record.
-            client_stream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?;
+            req.reply(&mut client_stream, Reply::Established).await?;
             Ok::<_, anyhow::Error>(
                 peek_recovery(
                     &mut client_stream,
@@ -113,10 +113,12 @@ pub(super) async fn recover_and_tunnel_http(
         Ok(Ok(peeked)) => peeked,
         Ok(Err(e)) => return Err(e),
         Err(budget) => {
-            return Err(anyhow!(
-                "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
-                budget.as_secs(),
-                ctag,
+            return Err(anyhow::Error::new(resocks5_net::server::ServerError::Deadline).context(
+                format!(
+                    "client sent no payload within the remaining {}s of the client-protocol budget — recovery peek timeout{}",
+                    budget.as_secs(),
+                    ctag,
+                ),
             ))
         }
     };

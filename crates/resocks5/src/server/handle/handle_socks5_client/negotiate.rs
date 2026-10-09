@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use regex::RegexSet;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
@@ -13,17 +11,17 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
-use crate::server::handle_client::run_phase_in_client_budget;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
+use resocks5_net::server::{IncomingRequest, Reply};
 
-use super::handshake::socks5_handshake;
 use super::recover::recover_and_tunnel;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_socks5_client(
     mut client_stream: TcpStream,
+    mut req: IncomingRequest,
     auth: &Arc<AuthState>,
     gate_rotator: &Option<Arc<ProxyRotator>>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
@@ -37,31 +35,9 @@ pub async fn handle_socks5_client(
     direct_limiter: &Arc<Semaphore>,
     client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    // ── Phase 1: client-side SOCKS5 handshake ───────────────────────
-    // Greeting + method selection + (optional) RFC 1929 auth + CONNECT
-    // request, all under a single deadline — the accept-anchored one
-    // handed down by the dispatcher. Slowloris-style clients
-    // that hold the TCP open but never finish the protocol exit here
-    // instead of pinning the task indefinitely.
-    // The dispatcher already spent part of the accept-anchored budget
-    // on protocol detection; only the remainder is ours to spend.
-    let (target_addr, client_user) = match run_phase_in_client_budget(
-        client_deadline,
-        socks5_handshake(&mut client_stream, auth),
-    )
-    .await
-    {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => return Err(e),
-        Err(budget) => {
-            return Err(anyhow!(
-                "client SOCKS5 handshake timed out with only {}s left of the client-protocol budget",
-                budget.as_secs()
-            ));
-        }
-    };
+    let target_addr = req.target().to_owned();
+    let client_user = req.username().map(str::to_owned);
 
-    // ── Phase 2: upstream connect (no client-protocol timeout) ──────
     // If the authenticated user has direct=true, bypass the pool and
     // connect straight to the target. Anonymous clients NEVER take the
     // direct path.
@@ -89,9 +65,7 @@ pub async fn handle_socks5_client(
                         cap, user_c, target_addr_c
                     )
                 });
-                let _ = client_stream
-                    .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                let _ = req.reply(&mut client_stream, Reply::Overloaded).await;
                 return Ok(());
             }
         }
@@ -109,6 +83,7 @@ pub async fn handle_socks5_client(
         if let Some(port) = ipv4_literal_port(&target_addr) {
             return recover_and_tunnel(
                 client_stream,
+                &req,
                 &target_addr,
                 port,
                 gate_rotator,
@@ -137,13 +112,11 @@ pub async fn handle_socks5_client(
             Ok(s) => s,
             Err(e) => {
                 let rep = if banned.is_match(&target_addr) {
-                    0x02
+                    Reply::Forbidden
                 } else {
-                    0x04
+                    Reply::UpstreamUnavailable
                 };
-                let _ = client_stream
-                    .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                let _ = req.reply(&mut client_stream, rep).await;
                 return Err(e);
             }
         }
@@ -165,21 +138,17 @@ pub async fn handle_socks5_client(
             Ok(s) => s,
             Err(e) => {
                 let rep = if banned.is_match(&target_addr) {
-                    0x02
+                    Reply::Forbidden
                 } else {
-                    0x04
+                    Reply::UpstreamUnavailable
                 };
-                let _ = client_stream
-                    .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                let _ = req.reply(&mut client_stream, rep).await;
                 return Err(e);
             }
         }
     };
 
-    client_stream
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    req.reply(&mut client_stream, Reply::Established).await?;
 
     // ── Phase 3: forwarding ─────────────────────────────────────────
     // Aggressive keepalive on both legs of the tunnel so kernels on
@@ -194,7 +163,14 @@ pub async fn handle_socks5_client(
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
     }
-    server::forward_tunnel(client_stream, proxy_stream, Vec::new(), frag, network).await
+    server::forward_tunnel(
+        client_stream,
+        proxy_stream,
+        req.take_pipeline(),
+        frag,
+        network,
+    )
+    .await
 }
 
 /// If `target` is `IPv4:port`, return the port substring; otherwise

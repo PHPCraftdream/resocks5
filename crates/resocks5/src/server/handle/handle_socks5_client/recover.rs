@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use regex::RegexSet;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -17,6 +16,7 @@ use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
+use resocks5_net::server::{IncomingRequest, Reply};
 
 /// Recovery path: the client asked for a bare IPv4 and recovery is on.
 ///
@@ -42,6 +42,7 @@ use resocks5_net::rotator::ProxyRotator;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_and_tunnel(
     mut client_stream: TcpStream,
+    req: &IncomingRequest,
     target_addr: &str,
     port: &str,
     gate_rotator: &Option<Arc<ProxyRotator>>,
@@ -75,9 +76,7 @@ pub(super) async fn recover_and_tunnel(
             // Early SOCKS5 success reply — required so the client
             // sends its ClientHello / HTTP request, which carries the
             // name we need.
-            client_stream
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await?;
+            req.reply(&mut client_stream, Reply::Established).await?;
             // Peek under the client-protocol deadline (slowloris
             // guard: a client that completes CONNECT but never speaks
             // must not pin the slot). The grace window inside
@@ -109,10 +108,12 @@ pub(super) async fn recover_and_tunnel(
         Ok(Ok(peeked)) => peeked,
         Ok(Err(e)) => return Err(e),
         Err(budget) => {
-            return Err(anyhow!(
-                "client sent no payload within the remaining {}s of the client-protocol budget ? recovery peek timeout{}",
-                budget.as_secs(),
-                ctag,
+            return Err(anyhow::Error::new(resocks5_net::server::ServerError::Deadline).context(
+                format!(
+                    "client sent no payload within the remaining {}s of the client-protocol budget — recovery peek timeout{}",
+                    budget.as_secs(),
+                    ctag,
+                ),
             ))
         }
     };

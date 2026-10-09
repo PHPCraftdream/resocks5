@@ -2,235 +2,6 @@ use super::*;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn parse_request(request: &[u8]) -> (Result<ConnectRequest>, Vec<u8>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = async {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let auth = Arc::new(
-            AuthState::build(
-                &crate::config::AuthConfig {
-                    allow_anonymous: true,
-                },
-                &crate::config::UsersConfig { users: Vec::new() },
-                "unused-users.ktav",
-            )
-            .unwrap(),
-        );
-        parse_http_connect(&mut stream, &auth).await
-    };
-    let client = async {
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        stream.write_all(request).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        response
-    };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(server, client)
-    })
-    .await
-    .unwrap()
-}
-
-#[tokio::test]
-async fn unsupported_auth_does_not_expose_credentials() {
-    let (result, response) = parse_request(
-        b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Bearer private-token\r\n\r\n",
-    )
-    .await;
-    let error = result
-        .err()
-        .expect("unsupported auth must fail")
-        .to_string();
-    assert!(!error.contains("private-token"));
-    assert!(response.starts_with(b"HTTP/1.1 407 "));
-}
-
-#[tokio::test]
-async fn header_limit_includes_the_terminating_delimiter() {
-    let mut request = b"CONNECT example.com:443 HTTP/1.1\r\nX-Pad: ".to_vec();
-    request.resize(MAX_HEADER_BYTES - 4, b'a');
-    request.extend_from_slice(b"\r\n\r\n");
-    assert!(parse_request(&request).await.0.is_ok());
-    request.insert(MAX_HEADER_BYTES - 4, b'a');
-    let (result, response) = parse_request(&request).await;
-    assert!(result.is_err());
-    assert!(response.starts_with(b"HTTP/1.1 431 "));
-}
-
-#[tokio::test]
-async fn invalid_connect_port_is_rejected_with_400_without_dialing() {
-    // parse_http_connect is called directly — no pool, rotator, or
-    // upstream exists in this test, so a 400 here provably happens
-    // before any upstream attempt or rating change.
-    for target in [
-        "example.com:notaport",
-        "example.com:",
-        "example.com:99999",
-        "example.com:65536",
-        "example.com:-1",
-        ":443",
-        "[::1]",
-    ] {
-        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        let (result, response) = parse_request(request.as_bytes()).await;
-        let error = result
-            .err()
-            .unwrap_or_else(|| panic!("target {target:?} must be rejected"));
-        assert!(
-            !error.to_string().contains("upstream"),
-            "target {target:?} must not be classified as an upstream failure: {error}"
-        );
-        assert!(
-            response.starts_with(b"HTTP/1.1 400 "),
-            "target {target:?} must get 400, got {response:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn control_bytes_in_connect_target_are_rejected_with_400_without_dialing() {
-    // parse_http_connect is called directly — no pool, rotator, or
-    // upstream exists in this test, so a 400 here provably happens
-    // before any upstream attempt or rating change.
-    for target in [
-        "exa\x00mple.com:443", // NUL
-        "exa\x01mple.com:443", // SOH
-        "exa\x7Fmple.com:443", // DEL
-        "exa\nmple.com:443",   // smuggled lone LF
-    ] {
-        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        let (result, response) = parse_request(request.as_bytes()).await;
-        let error = result
-            .err()
-            .unwrap_or_else(|| panic!("target {target:?} must be rejected"));
-        assert!(
-            !error.to_string().contains("upstream"),
-            "target {target:?} must not be classified as an upstream failure: {error}"
-        );
-        assert!(
-            response.starts_with(b"HTTP/1.1 400 "),
-            "target {target:?} must get 400, got {response:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn valid_connect_authorities_still_parse() {
-    for target in [
-        "example.com:443",
-        "1.2.3.4:443",
-        "[2001:db8::1]:443",
-        "2001:db8::1:443",
-    ] {
-        let request = format!("CONNECT {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
-        let (result, _) = parse_request(request.as_bytes()).await;
-        assert!(result.is_ok(), "target {target:?} must still parse");
-    }
-}
-
-#[tokio::test]
-async fn opaque_byte_in_unused_header_does_not_break_connect() {
-    // obs-text 0xE9 inside a header the proxy never reads (RFC 9110
-    // §5.5) must not fail the parse of an otherwise-valid CONNECT.
-    let request =
-        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\nX-Opaque: \xE9\r\n\r\n".to_vec();
-    let (result, response) = parse_request(&request).await;
-    let req = result.expect("obs-text in an unused header must not fail the parse");
-    assert_eq!(req.target, "example.com:443");
-    assert!(
-        response.is_empty(),
-        "no error response expected on success, got {response:?}"
-    );
-}
-
-#[tokio::test]
-async fn non_utf8_proxy_authorization_value_is_rejected_with_407() {
-    let (result, response) = parse_request(
-        b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic \xE9\r\n\r\n",
-    )
-    .await;
-    assert!(result.is_err());
-    assert!(response.starts_with(b"HTTP/1.1 407 "));
-}
-
-#[tokio::test]
-async fn non_utf8_request_line_is_rejected_with_400() {
-    let (result, response) =
-        parse_request(b"CONNECT ex\xE9ample.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
-    assert!(result.is_err());
-    assert!(response.starts_with(b"HTTP/1.1 400 "));
-}
-
-#[test]
-fn byte_lines_yields_the_old_collect_semantics_without_the_table() {
-    fn old_lines(mut rest: &[u8]) -> Vec<&[u8]> {
-        let mut lines = Vec::new();
-        while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
-            lines.push(&rest[..pos]);
-            rest = &rest[pos + 2..];
-        }
-        lines.push(rest);
-        lines
-    }
-
-    let buffers: [&[u8]; 6] = [
-        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com",
-        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n",
-        b"\r\nFAST-OPEN-CLIENTHELLO",
-        b"single line without terminator",
-        b"",
-        b"first\r\n\r\nthird",
-    ];
-    for buf in buffers {
-        let mut expected = old_lines(buf);
-        // The ONLY difference from the old collect: an empty block
-        // and a CRLF-terminated block yield no trailing empty line
-        // (the old loop pushed one; downstream skipped/rejected it
-        // either way).
-        if expected.last().is_some_and(|last| last.is_empty()) {
-            expected.pop();
-        }
-        assert_eq!(
-            ByteLines { rest: buf }.collect::<Vec<&[u8]>>(),
-            expected,
-            "byte-lines mismatch for buffer {buf:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn thousands_of_header_lines_are_still_fully_scanned() {
-    // ~4000 short filler headers fit under the 16 KiB header limit;
-    // Proxy-Authorization is the LAST line, so the scan must reach
-    // the end of the block without materializing a line table.
-    let mut request = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
-    request.extend_from_slice(&b"X:\r\n".repeat(4000));
-
-    let mut with_auth = request.clone();
-    with_auth.extend_from_slice(b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n");
-    let (result, response) = parse_request(&with_auth).await;
-    assert!(
-        result.is_err(),
-        "creds with no users configured must be rejected: {response:?}"
-    );
-    assert!(
-        response.starts_with(b"HTTP/1.1 407 "),
-        "Proxy-Authorization on the last line must still be found, got {response:?}"
-    );
-
-    request.extend_from_slice(b"\r\n");
-    let (result, response) = parse_request(&request).await;
-    let req = result.expect("filler headers alone must parse");
-    assert_eq!(req.target, "example.com:443");
-    assert!(
-        response.is_empty(),
-        "no error response expected on success, got {response:?}"
-    );
-}
-
 // ── Recovery-path tests ─────────────────────────────────────────
 //
 // Mirror of the SOCKS5 recovery tests: exercise
@@ -403,8 +174,10 @@ async fn recovery_recovers_sni_from_truncated_pipelined_hello() {
     let hello = client_hello_with_sni("recovered.example");
     let rest = hello[5..].to_vec();
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel_http(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             hello[..5].to_vec(), // truncated pipelined prefix
@@ -477,8 +250,10 @@ async fn recovery_recovers_http_host_across_segmented_reads() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel_http(
             server,
+            &req,
             "203.0.113.9:80",
             "80",
             Vec::new(),
@@ -557,8 +332,10 @@ async fn server_first_upstream_banner_is_relayed_without_recovery() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel_http(
             server,
+            &req,
             "203.0.113.9:22",
             "22",
             Vec::new(),
@@ -643,8 +420,10 @@ async fn undecidable_pipelined_payload_falls_back_to_ip_promptly() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel_http(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             b"\x00\x01\x02".to_vec(),
@@ -723,8 +502,10 @@ async fn expired_deadline_with_pipelined_payload_never_starts_recovery() {
     let hello = client_hello_with_sni("pipelined.example");
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel_http(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             hello,
@@ -776,21 +557,262 @@ async fn expired_deadline_with_pipelined_payload_never_starts_recovery() {
     );
 }
 
-// ── R8-08: the Basic challenge declares its credential charset ──
-
 #[tokio::test]
-async fn proxy_auth_challenge_declares_utf8_charset() {
-    // A 407-triggering request (unsupported auth scheme): the
-    // credential decoder hard-requires UTF-8, so the challenge must
-    // say so (RFC 7617 §2.1 — charset after realm).
-    let (_, response) = parse_request(
-        b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Bearer token\r\n\r\n",
-    )
-    .await;
-    assert!(response.starts_with(b"HTTP/1.1 407 "));
-    let text = String::from_utf8_lossy(&response);
-    assert!(
-        text.contains("Proxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\""),
-        "the 407 challenge must declare charset=UTF-8, got: {text:?}"
+async fn handle_client_hands_partial_http_pipeline_to_recovery_losslessly() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = Arc::new(
+            AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: true,
+                },
+                &crate::config::UsersConfig { users: Vec::new() },
+                "unused-handoff",
+            )
+            .unwrap(),
+        );
+        let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+            upstream_addr,
+        )])));
+        let no_rotator = None;
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        ));
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let network = Arc::new(NetworkConfig {
+            client_protocol_timeout_sec: 5,
+            handshake_timeout_sec: 2,
+            ..Default::default()
+        });
+        let direct_limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let hello = client_hello_with_sni("handoff.example");
+        let expected = hello.clone();
+        let mut request = b"CONNECT 203.0.113.9:443 HTTP/1.1\r\n\r\n".to_vec();
+        request.extend_from_slice(&hello[..5]);
+        assert!(request.len() < 1024);
+        let (frame_sent_tx, frame_sent_rx) = tokio::sync::oneshot::channel();
+        let (upstream_seen_tx, upstream_seen_rx) = tokio::sync::oneshot::channel();
+        let upstream = async {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let mut greeting = [0; 2];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; usize::from(greeting[1])];
+            socket.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0));
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header, [5, 1, 0, 3]);
+            let len = socket.read_u8().await.unwrap();
+            let mut domain = vec![0; usize::from(len)];
+            socket.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"handoff.example");
+            assert_eq!(socket.read_u16().await.unwrap(), 443);
+            socket
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut payload = Vec::new();
+            socket.read_to_end(&mut payload).await.unwrap();
+            assert_eq!(
+                payload, expected,
+                "prefix must be forwarded exactly once before segmented remainder"
+            );
+            socket.shutdown().await.unwrap();
+            upstream_seen_tx.send(()).unwrap();
+        };
+        let host = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let deadline =
+                Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
+            frame_sent_rx.await.unwrap();
+            // Do not poll the parser until the entire header and partial hello
+            // share the receive queue. Peek preserves every byte; the outer
+            // timeout bounds this yield-only loop without timing sleeps.
+            let mut queued = vec![0; request.len()];
+            loop {
+                let n = socket.peek(&mut queued).await.unwrap();
+                assert_ne!(n, 0, "peer closed before queuing the pipeline");
+                if n == request.len() {
+                    assert_eq!(queued, request);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            crate::server::handle_client(
+                socket,
+                &auth,
+                &no_rotator,
+                &no_rotator,
+                &v4,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                &direct_limiter,
+                deadline,
+            )
+            .await
+            .unwrap();
+        };
+        let peer = async {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(&request).await.unwrap();
+            frame_sent_tx.send(()).unwrap();
+            let expected_reply = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+            let mut reply = vec![0; expected_reply.len()];
+            socket.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, expected_reply);
+            // The reply synchronizes the first segment before the remaining hello.
+            socket.write_all(&hello[5..]).await.unwrap();
+            socket.shutdown().await.unwrap();
+            let mut extra = Vec::new();
+            socket.read_to_end(&mut extra).await.unwrap();
+            assert!(
+                extra.is_empty(),
+                "no second protocol reply after early success"
+            );
+            upstream_seen_rx.await.unwrap();
+        };
+        tokio::join!(upstream, host, peer);
+    })
+    .await
+    .expect("finite application handoff");
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumption() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "resocks5-delayed-init-{}-{}.ktav",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    assert!(!path.exists());
+    let auth = Arc::new(
+        AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous: false,
+            },
+            &crate::config::UsersConfig {
+                users: vec![crate::config::User {
+                    name: "bob".into(),
+                    hash: "init".into(),
+                    is_enabled: true,
+                    direct: false,
+                }],
+            },
+            path.to_string_lossy().into_owned(),
+        )
+        .unwrap(),
     );
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let v4 = Some(Arc::new(ProxyRotator::new(vec![socks5_upstream_config(
+        upstream_listener.local_addr().unwrap(),
+    )])));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    // Duplicate the accepted OS socket solely in this test. Both handles see the
+    // same receive queue; keeping an observer alive proves the handler did not read.
+    let original = socket.into_std().unwrap();
+    let observer = original.try_clone().unwrap();
+    let socket = TcpStream::from_std(original).unwrap();
+    let mut observer = TcpStream::from_std(observer).unwrap();
+    let frame = b"CONNECT 203.0.113.9:443 HTTP/1.1\r\nProxy-Authorization: Basic Ym9iOnB3\r\n\r\n";
+    peer.write_all(frame).await.unwrap();
+    let mut first = [0; 1];
+    observer.peek(&mut first).await.unwrap();
+    assert_eq!(first, [b'C']);
+    // Deliberately defer entry, without a sleep or a production observation seam.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let logger = test_logger();
+    let banned = Arc::new(regex::RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(1),
+        1,
+    ));
+    let frag = Arc::new(TlsFragmentConfig::default());
+    let network = Arc::new(NetworkConfig::default());
+    let direct_limiter = Arc::new(tokio::sync::Semaphore::new(1));
+    let no_rotator = None;
+    let error = crate::server::handle_client(
+        socket,
+        &auth,
+        &no_rotator,
+        &no_rotator,
+        &v4,
+        &logger,
+        &banned,
+        &pool,
+        &frag,
+        &network,
+        None,
+        &direct_limiter,
+        deadline,
+    )
+    .await
+    .expect_err("expired accept deadline");
+    assert!(matches!(
+        error.downcast_ref::<resocks5_net::server::ServerError>(),
+        Some(resocks5_net::server::ServerError::Deadline)
+    ));
+    let mut untouched = vec![0; frame.len()];
+    tokio::time::timeout(Duration::from_secs(1), observer.read_exact(&mut untouched))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched, frame);
+    assert!(
+        !path.exists(),
+        "expired handler must not claim/persist credentials"
+    );
+    let upstream = upstream_listener.into_std().unwrap();
+    assert!(
+        matches!(upstream.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    drop(observer);
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.is_empty(),
+        "expired handler must send no protocol reply"
+    );
+}
+
+/// Parse a real request to obtain the recovery reply capability.
+async fn recovery_request() -> IncomingRequest {
+    let (mut peer, mut stream) = tokio::io::duplex(128);
+    peer.write_all(b"CONNECT 203.0.113.9:443 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    resocks5_net::server::accept(
+        &mut stream,
+        &resocks5_net::server::ServerOptions::new(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            true,
+            false,
+        ),
+        |_| async { false },
+    )
+    .await
+    .unwrap()
 }

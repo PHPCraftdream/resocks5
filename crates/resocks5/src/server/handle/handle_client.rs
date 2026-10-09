@@ -22,7 +22,7 @@ use resocks5_net::rotator::ProxyRotator;
 ///
 /// The budget is ONE absolute deadline anchored when the connection is
 /// accepted (see `handle_client`); every client-facing stage — the
-/// protocol-detection peek, the SOCKS5/HTTP handshake, and the
+/// protocol detection, the SOCKS5/HTTP handshake, and the
 /// recovery peek — spends only its remainder, never a fresh
 /// full-length timer. After the deadline has passed this returns
 /// `Duration::ZERO`, which makes the stage's `timeout` fire
@@ -70,17 +70,13 @@ where
     }
 }
 
-/// Single accept-loop dispatcher: peeks the first byte without
-/// consuming it and routes the client to the SOCKS5 or HTTP CONNECT
-/// handler. This is what lets one listening port serve both protocols
-/// transparently — SOCKS5 always opens with `0x05` (greeting version),
-/// HTTP always opens with an ASCII method letter, so a single byte is
-/// enough to tell them apart with zero ambiguity. It computes the
-/// accept-anchored client-protocol deadline and threads it down into
-/// the selected protocol handler.
+/// Parse/authenticate once under the listener-supplied accept deadline, then route egress.
+///
+/// cancel-safe: NO — owns the client stream and closes it on failure/cancellation;
+/// admitted authentication persistence may finish after its waiter is dropped.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
-    client_stream: TcpStream,
+    mut client_stream: TcpStream,
     auth: &Arc<AuthState>,
     gate_rotator: &Option<Arc<ProxyRotator>>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
@@ -92,43 +88,31 @@ pub async fn handle_client(
     network: &Arc<NetworkConfig>,
     tls_connector: Option<&TlsConnector>,
     direct_limiter: &Arc<Semaphore>,
+    client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    // Slowloris guard on protocol-detection: a client that completes
-    // TCP connect but never sends the first byte would otherwise
-    // freeze this task indefinitely (until TCP keepalive eventually
-    // kills the socket, ~60-90 s). We bound it explicitly so the
-    // global `max_concurrent_clients` slot is freed promptly. It is
-    // the first slice of the single accept-anchored
-    // `client_protocol_timeout_sec` deadline; whatever it leaves is
-    // all the selected protocol handler gets.
-    //
-    // The client-protocol budget starts ONCE, here — as close to the
-    // accept in run_server's loop as the dispatcher interface allows —
-    // and every downstream client-facing stage (peek, SOCKS5/HTTP
-    // handshake, recovery) draws from this single absolute deadline.
-    let client_deadline = Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
     #[cfg(test)]
     stage_probe::emit("client_handler_started");
-    let peek_budget = remaining_client_budget(client_deadline);
-    let mut peek_buf = [0u8; 1];
-    let n = match timeout(peek_budget, client_stream.peek(&mut peek_buf)).await {
-        Ok(res) => res?,
-        Err(_) => {
-            return Err(anyhow!(
-                "client did not send any byte within the remaining {}s of the client-protocol budget — protocol-detect timeout",
-                peek_budget.as_secs()
-            ));
-        }
-    };
-    if n == 0 {
-        return Err(anyhow!("client closed before sending any data"));
-    }
-    match peek_buf[0] {
-        0x05 => {
-            #[cfg(test)]
-            stage_probe::emit("socks5_handshake_entered");
+    let options = resocks5_net::server::ServerOptions::new(
+        client_deadline,
+        auth.allow_anonymous,
+        !auth.is_empty(),
+    );
+    let auth_state = auth.clone();
+    let req = resocks5_net::server::accept(
+        &mut client_stream,
+        &options,
+        move |credentials| async move {
+            auth_state
+                .verify_async(credentials.username(), credentials.password())
+                .await
+        },
+    )
+    .await?;
+    match req.protocol() {
+        resocks5_net::server::Protocol::Socks5 => {
             handle_socks5_client(
                 client_stream,
+                req,
                 auth,
                 gate_rotator,
                 v6_rotator,
@@ -144,9 +128,10 @@ pub async fn handle_client(
             )
             .await
         }
-        b if b.is_ascii_alphabetic() => {
+        resocks5_net::server::Protocol::Http => {
             handle_http_client(
                 client_stream,
+                req,
                 auth,
                 gate_rotator,
                 v6_rotator,
@@ -162,17 +147,14 @@ pub async fn handle_client(
             )
             .await
         }
-        other => Err(anyhow!(
-            "unrecognised first byte {:#04x} — neither SOCKS5 (0x05) nor an HTTP method",
-            other
-        )),
+        other => Err(anyhow!("unsupported inbound protocol: {other:?}")),
     }
 }
 
 /// Test-only observation seam for the paused-clock deadline tests in
-/// [`tests`]: a process-global sink production code can notify from the
-/// exact points a test must observe — the client-protocol deadline being
-/// anchored, and the dispatcher routing into the SOCKS5 handler. Compiles
+/// [`tests`]: a process-global sink reports only `client_handler_started`,
+/// immediately before the handler spends the listener-supplied deadline.
+/// It does not report deadline anchoring or protocol routing. Compiles
 /// to nothing outside `#[cfg(test)]` builds. Global, but per-instance
 /// safe: each test installs its OWN channel (overwriting any stale sink)
 /// while holding the test module's `STAGE_PROBE_SLOT` mutex, so no two
@@ -370,6 +352,8 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let server = l.accept().await.unwrap().0;
 
+        let client_deadline =
+            Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let task = tokio::spawn(async move {
             handle_client(
                 server,
@@ -384,33 +368,26 @@ mod tests {
                 &network,
                 None,
                 &direct_limiter,
+                client_deadline,
             )
             .await
         });
 
-        // Wait until the freshly spawned handler has really anchored its
-        // accept-anchored deadline (the event is emitted right after the
-        // anchor, before the peek); tokio auto-advance does not poll
-        // newly spawned tasks during `advance`.
+        // Wait until the handler begins spending the supplied deadline.
+        // advance does not poll newly spawned tasks.
         wait_for_stage_event(&mut stage_rx, "client_handler_started").await;
 
         let t0 = tokio::time::Instant::now();
         // Eat 90% of the budget in protocol detection: the first byte only
         // arrives when ~100 ms of the 1 s budget is left.
         tokio::time::advance(Duration::from_millis(900)).await;
-        client.write_all(&[0x05]).await.unwrap();
-        // The handler must consume the greeting byte and route into the
-        // SOCKS5 handshake BEFORE the final virtual-time wait: once the
-        // peek has observed the byte its deadline timer is gone, so the
-        // only timer left is the handshake deadline the test wants to
-        // measure. Waiting for the event also guarantees the runtime
-        // never parks with the byte still in flight, which is what let
-        // paused-clock auto-advance fire the WRONG stage's timeout.
-        wait_for_stage_event(&mut stage_rx, "socks5_handshake_entered").await;
-        // A real SOCKS5 greeting continues with NMETHODS + methods; the
-        // client now stays silent. Under the shared deadline the handshake
-        // stage gets only ~100 ms; a fresh per-stage budget would let it
-        // stall until t=1.9 s.
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        // Observe the method reply on the wire before allowing virtual time
+        // to auto-advance: this proves parsing began, without a parser seam.
+        let mut method = [0; 2];
+        park_free_read_exact(&client, &mut method).await;
+        assert_eq!(method, [5, 0]);
+        // Method selection completed; CONNECT now stalls with only ~100ms left.
 
         let result = tokio::time::timeout(Duration::from_secs(30), task)
             .await
@@ -418,10 +395,10 @@ mod tests {
             .unwrap();
         let elapsed = t0.elapsed();
         let err = result.expect_err("the stalled handshake must fail");
-        assert!(
-            err.to_string().contains("handshake timed out"),
-            "must fail in the handshake stage, got: {err}"
-        );
+        assert!(matches!(
+            err.downcast_ref::<resocks5_net::server::ServerError>(),
+            Some(resocks5_net::server::ServerError::Deadline)
+        ));
         assert!(
             elapsed >= Duration::from_millis(900),
             "the peek must have consumed ~900 ms first, elapsed {elapsed:?}"
@@ -466,6 +443,8 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let server = l.accept().await.unwrap().0;
 
+        let client_deadline =
+            Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
         let task = tokio::spawn(async move {
             handle_client(
                 server,
@@ -480,14 +459,13 @@ mod tests {
                 &network,
                 None,
                 &direct_limiter,
+                client_deadline,
             )
             .await
         });
 
-        // Wait until the freshly spawned handler has really anchored its
-        // accept-anchored deadline (the event is emitted right after the
-        // anchor, before the peek); tokio auto-advance does not poll
-        // newly spawned tasks during `advance`.
+        // Wait until the handler begins spending the supplied deadline.
+        // advance does not poll newly spawned tasks.
         wait_for_stage_event(&mut stage_rx, "client_handler_started").await;
 
         let t0 = tokio::time::Instant::now();
@@ -525,11 +503,11 @@ mod tests {
             .expect("handler must terminate at the shared deadline")
             .unwrap();
         let elapsed = t0.elapsed();
-        let err = result.expect_err("the stalled recovery must fail");
-        assert!(
-            err.to_string().contains("recovery peek timeout"),
-            "must fail in the recovery stage, got: {err}"
-        );
+        let error = result.expect_err("the stalled recovery must fail");
+        assert!(matches!(
+            error.downcast_ref::<resocks5_net::server::ServerError>(),
+            Some(resocks5_net::server::ServerError::Deadline)
+        ));
         assert!(
             elapsed >= Duration::from_millis(1500),
             "peek + handshake must have consumed ~1.5 s first, elapsed {elapsed:?}"
@@ -667,5 +645,88 @@ mod tests {
         res.expect("a live deadline must run the phase")
             .expect("the ready phase must succeed");
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn anonymous_http_never_uses_empty_username_direct_privilege() {
+        let auth = Arc::new(
+            AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: true,
+                },
+                &crate::config::UsersConfig {
+                    users: vec![crate::config::User {
+                        name: String::new(),
+                        hash: "init".into(),
+                        is_enabled: true,
+                        direct: true,
+                    }],
+                },
+                "unused-empty-user",
+            )
+            .unwrap(),
+        );
+        assert!(
+            auth.is_direct(""),
+            "regression requires a privileged empty-name account"
+        );
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::new(["^blocked[.]invalid:443$"]).unwrap());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(1),
+            1,
+        ));
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let network = Arc::new(NetworkConfig::default());
+        // If anonymous identity is incorrectly replaced with "", the direct cap
+        // branch sends 503 before checking the ban. Correct pool policy sends 403.
+        let direct_limiter = Arc::new(Semaphore::new(0));
+        let no_rotator = None;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let error = handle_client(
+                stream,
+                &auth,
+                &no_rotator,
+                &no_rotator,
+                &no_rotator,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                &direct_limiter,
+                deadline,
+            )
+            .await
+            .expect_err("banned anonymous target must fail");
+            assert!(error.to_string().contains("Banned target address"));
+            assert_eq!(direct_limiter.available_permits(), 0);
+        };
+        let peer = async {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket
+                .write_all(b"CONNECT blocked.invalid:443 HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut socket, &mut response)
+                .await
+                .unwrap();
+            assert_eq!(
+                response,
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            );
+        };
+        timeout(Duration::from_secs(8), async {
+            tokio::join!(host, peer);
+        })
+        .await
+        .unwrap();
     }
 }

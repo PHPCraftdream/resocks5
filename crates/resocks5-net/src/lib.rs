@@ -35,8 +35,10 @@
 //!   connect/pool API, with [`Stage`] and timeout-kind discriminators and
 //!   the structured [`ProtocolViolation`] behind `ConnectError::Protocol`.
 //!
-//! The crate carries no application concerns — no config-file format, no
-//! logging sink, no authentication. Those live in the `resocks5` binary.
+//! - [`server`] — inbound SOCKS5/HTTP CONNECT framing with host-supplied authentication.
+//!
+//! The crate carries no application concerns — no config-file format, logging
+//! sink, or authentication storage. Those live in the `resocks5` binary.
 
 // Every public item carries rustdoc. Enforced in CI by the `doc` job
 // (RUSTDOCFLAGS=-D warnings). Kept at `warn` here so a local `cargo build`
@@ -54,4 +56,5 @@ pub mod progress;
 pub mod rating;
 #[cfg(feature = "rotator")]
 pub mod rotator;
+pub mod server;
 pub mod types;

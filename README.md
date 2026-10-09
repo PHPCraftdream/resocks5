@@ -269,9 +269,9 @@ https_v4: [ user:pass@198.51.100.30:443 ]
 ## Use as a library
 
 The networking core is published as a separate crate,
-[`resocks5-net`](crates/resocks5-net) — upstream connectors, the TCP pool,
-the sand-rating model, the weighted-random rotator, and TLS fragmentation,
-with no application concerns (no config-file format, no logger, no auth).
+[`resocks5-net`](crates/resocks5-net) — inbound smart-port framing, upstream
+connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credential
+storage, logging and routing policy stay in the host application.
 Add it as a git dependency:
 
 ```toml
@@ -333,7 +333,40 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 The library entry point is [`resocks5_net`](crates/resocks5-net/src/lib.rs);
-the top-level modules are `connect`, `pool`, `rating`, `rotator`, and `types`.
+the top-level modules include `server`, `connect`, `error`, `progress`, `pool`,
+`rating`, `rotator`, and `types`.
+
+### Embed a SOCKS5 + HTTP CONNECT listener
+
+The unconditional `resocks5_net::server` module works without default features:
+
+```rust
+let options = resocks5_net::server::ServerOptions::new(accept_deadline, false, true);
+let mut req = resocks5_net::server::accept(&mut client, &options, move |credentials| async move {
+    host_auth.verify_async(credentials.username(), credentials.password()).await
+}).await?;
+// Host-owned destination policy and real egress connection happen here.
+// Only after egress is ready:
+req.reply(&mut client, resocks5_net::server::Reply::Established).await?;
+let prefix = req.take_pipeline(); // send exactly once before relaying unread bytes
+```
+
+The snippet's stream, deadline, authentication state and egress are supplied by the
+host, not fabricated by the parser. See the [complete API contracts and usage](crates/resocks5-net/README.md#inbound-server-api)
+and the [finite local-egress example](crates/resocks5-net/examples/serve_local.rs).
+The example requires a separately running local echo target, actually dials it,
+and accepts two clients on one smart port; it sends success only after that dial.
+
+`accept` returns an unresolved destination, verified username (`None` for anonymous)
+and owned pipeline bytes. It bounds detection/auth/framing with one absolute Tokio
+deadline; the application anchors this at listener acceptance before task spawning.
+HTTP headers are byte-parsed, accept unused obs-text, and have a delimiter-inclusive
+16KiB cap independent of tunneled payload size. On cancellation/error discard the
+stream; admitted authentication persistence can still finish. Routing, gates,
+SNI/Host recovery, logs and egress/tunnel budgets remain host-owned. After early
+recovery success, failure closes the tunnel instead of sending a second reply.
+External authentication and Tor egress can use the same closure-based API; future
+local-path consumers keep version `0.2.0`, with no Tor-project edits in this change.
 
 ## User management
 

@@ -1,4 +1,3 @@
-pub(crate) mod handshake;
 pub(crate) mod negotiate;
 pub(crate) mod recover;
 #[cfg(test)]

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net::server`: unconditional SOCKS5/HTTP CONNECT detection and inbound
+  framing with owned, Debug-redacted credentials and closure authentication (no
+  public authentication trait). Returns unresolved targets, verified usernames and
+  owned pipeline bytes; typed non-exhaustive errors and semantic host replies.
+  One host-supplied absolute deadline has an expired-entry pre-poll guard.
+  GeneralFailure preserves SOCKS REP 1 for embedding hosts while sending HTTP 502.
+- Finite `serve_local` example: two clients share one listener, authenticate through
+  the host callback, and relay to an explicit separately running local echo target
+  over a real TCP connection. Success follows dial; buffered payload is sent once.
+
+### Changed
+
+- Both application paths now use the shared library parser once at dispatch;
+  protocol replies use the request's encoder. Routing, gate accounting, recovery,
+  logging and forwarding budgets stay application-owned. The deadline now anchors
+  at listener acceptance rather than when the spawned handler first runs.
+- Preserved delimiter-inclusive 16KiB HTTP headers, unused obs-text, existing Basic
+  and SOCKS method policy, permissive legacy framing, and lossless binary pipeline.
+  Anonymous identity is never substituted with an empty authenticated username for
+  direct routing. Cancellation remains terminal; admitted auth persistence can
+  complete afterward. Parser deadline diagnostics use the typed library error.
+- Parser-only regressions moved into library coverage; application persistence and
+  recovery regressions remain. Versions, MSRV and dependency pins are unchanged.
+
 ## [0.2.0] - 2026-10-01
 
 ### Added

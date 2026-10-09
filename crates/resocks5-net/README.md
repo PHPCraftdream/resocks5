@@ -6,6 +6,8 @@ built on, factored out as a self-contained library.
 
 What's inside:
 
+- **Inbound smart-port framing** (`server`, always available): SOCKS5/HTTP
+  CONNECT detection, closure authentication, unresolved requests and replies.
 - **Upstream connectors** for SOCKS5, HTTP CONNECT, and HTTPS (TLS-wrapped
   CONNECT) proxies.
 - **Pre-connect TCP pool** (`pool` feature) that keeps warm sockets to each upstream, plus a
@@ -19,8 +21,8 @@ What's inside:
   degrades to uniform random selection instead of locking out.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
 
-No application concerns leak in: no config-file format, no logger,
-no authentication.
+No application concerns leak in: no config-file format, logger, credential
+storage, or egress policy. Inbound authentication is supplied by the host closure.
 
 ## Features
 
@@ -68,6 +70,77 @@ no authentication.
   upstream selection. Connector/pool-only consumers can opt out for a
   smaller public API and less to compile. Unlike `tls` and `serde` this
   removes no dependency — both modules are `std` only.
+
+## Inbound server API
+
+`server` is unconditional, including `default-features = false`; it requires no
+pool, TLS, serde, rating, or rotator feature. `accept` borrows any
+`AsyncRead + AsyncWrite + Unpin` stream and invokes an owned-credentials
+`FnOnce(Credentials) -> Future<Output = bool>` at most once. No public auth trait.
+
+```rust
+use std::time::Duration;
+use resocks5_net::server::{accept, Reply, ServerOptions};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time::{timeout, Instant}};
+
+async fn serve(mut client: TcpStream) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5); // anchor at accept in the host
+    let options = ServerOptions::new(deadline, false, true);
+    let mut req = accept(&mut client, &options, |credentials| async move {
+        // Demo only: substitute the host's bounded credential verifier.
+        credentials.username() == "demo" && credentials.password() == "demo"
+    }).await?;
+    // Apply destination policy before dialing: this sample permits one local target.
+    if req.target() != "127.0.0.1:20084" {
+        req.reply(&mut client, Reply::Forbidden).await?;
+        return Ok(());
+    }
+    let mut egress = match timeout(Duration::from_secs(5), TcpStream::connect(req.target())).await {
+        Ok(Ok(stream)) => stream,
+        _ => { req.reply(&mut client, Reply::UpstreamUnavailable).await?; return Ok(()); }
+    };
+    req.reply(&mut client, Reply::Established).await?; // only after a real dial
+    timeout(Duration::from_secs(5), egress.write_all(&req.take_pipeline())).await??;
+    resocks5_net::connect::tunnel::tunnel_with_timeouts(
+        client, egress, Duration::from_secs(5), Duration::from_secs(15),
+    ).await?;
+    Ok(())
+}
+```
+
+The host must additionally bound response writes/admission; the finite
+[`serve_local` example](examples/serve_local.rs) bounds the whole client operation,
+requires explicit loopback listener/echo-target arguments, and serves exactly two
+clients on one port. The echo service is separate: the example performs a real TCP
+dial, never manufactures egress or substitutes an echo stream.
+
+Contracts:
+- One supplied absolute Tokio deadline covers detection, framing and authentication;
+  expired entry is rejected before polling. No DNS or egress occurs in `accept`.
+- `target()` stays unresolved. HTTP authority spelling is preserved; SOCKS IPs are
+  canonical. Validation reuses `HostPort` (including legacy bare IPv6 and port zero).
+- `username()` is `Some` only after verification; anonymous is `None`. Verified empty
+  HTTP usernames stay `Some("")`; routing privileges are exclusively host policy.
+- SOCKS prefers username/password if offered and enabled, otherwise anonymous when
+  offered and enabled. HTTP verifies supplied Basic credentials even if anonymous
+  access is allowed; supplied credentials fail when no password capability exists.
+- HTTP request line and headers are limited to 16KiB **including** `\r\n\r\n`.
+  Unused headers remain bytes and accept obs-text. Basic credentials require UTF-8;
+  only the first auth header is used. Existing permissive `HTTP/` version parsing and
+  ignored SOCKS RSV are retained, not advertised as strict RFC validation.
+- `take_pipeline()` transfers exact owned HTTP over-read bytes once; remaining bytes
+  stay on the stream. SOCKS consumes exactly its frame. Forward the prefix before
+  reading/relaying further data. Failure or cancellation during a partial write is
+  terminal, never a reason to replay the prefix.
+- `reply` maps Established/Forbidden/UpstreamUnavailable/GeneralFailure/Overloaded
+  to protocol-specific outcomes. GeneralFailure uses SOCKS REP 1 / HTTP 502,
+  distinct from admission overload (HTTP 503). Parsing never sends tunnel success.
+  Hosts doing early-success recovery must not send another protocol reply afterward.
+- On error, timeout, or cancellation discard the stream and any buffered wrapper.
+  Authentication side effects (such as admitted blocking password persistence) may
+  finish after cancellation; the host retains its own admission permits accordingly.
+  Credentials' Debug is redacted; transport encryption is not supplied here.
+
 
 ## Usage
 
@@ -175,7 +248,7 @@ meaning.
 is assembled by the application.
 
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
-`error`, `pool` (`pool` feature), `progress`, `rating`, `rotator`, `types`.
+`error`, `server`, `pool` (`pool` feature), `progress`, `rating`, `rotator`, `types`.
 
 A working version of the pooled example lives at
 [`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).

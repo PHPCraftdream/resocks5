@@ -148,6 +148,9 @@ pub async fn run_server(
                     }
                 };
 
+                let client_deadline = tokio::time::Instant::now()
+                    + Duration::from_secs(network.client_protocol_timeout_sec);
+
                 // TCP_NODELAY on the accepted client — SOCKS5/HTTP
                 // handshake is ~5 tiny writes; Nagle would add ~40 ms
                 // each. Free latency win.
@@ -201,6 +204,7 @@ pub async fn run_server(
                         &network_clone,
                         tls_clone.as_deref(),
                         &direct_limiter_clone,
+                        client_deadline,
                     )
                     .await
                     {

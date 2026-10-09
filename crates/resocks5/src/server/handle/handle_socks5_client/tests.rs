@@ -4,8 +4,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::handshake::socks5_handshake;
-
 #[tokio::test]
 async fn recovery_limit_preserves_the_unread_tail() {
     let mut seed = b"GET / HTTP/1.1\r\nX-Pad: ".to_vec();
@@ -26,108 +24,23 @@ async fn recovery_limit_preserves_the_unread_tail() {
     assert_eq!(tail, b"\r\nHost: example.com\r\n\r\nbody");
 }
 
-fn test_auth() -> Arc<crate::auth::AuthState> {
-    Arc::new(
-        crate::auth::AuthState::build(
-            &crate::config::AuthConfig {
-                allow_anonymous: true,
-            },
-            &crate::config::UsersConfig { users: Vec::new() },
-            "unused",
-        )
-        .unwrap(),
-    )
-}
-
-/// Server side of the handshake test: accept one connection, run
-/// `socks5_handshake` on it, and return `(target_addr, authed_user)`.
+/// Exercise real application claim/persistence through the library auth closure.
 async fn serve_one(
     listener: TcpListener,
     auth: Arc<crate::auth::AuthState>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let (mut server, _) = listener.accept().await?;
-    socks5_handshake(&mut server, &auth).await
-}
-
-#[tokio::test]
-async fn ipv6_target_is_bracketed() {
-    let auth = test_auth();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-    client
-        .write_all(&[
-            0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01, 0xBB,
-        ])
-        .await
-        .unwrap();
-
-    let (target_addr, authed_user) = tokio::time::timeout(Duration::from_secs(5), async {
-        (server.await.unwrap().unwrap(), ())
+    let (mut stream, _) = listener.accept().await?;
+    let options = resocks5_net::server::ServerOptions::new(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        auth.allow_anonymous,
+        !auth.is_empty(),
+    );
+    let req = resocks5_net::server::accept(&mut stream, &options, move |credentials| async move {
+        auth.verify_async(credentials.username(), credentials.password())
+            .await
     })
-    .await
-    .expect("timed out")
-    .0;
-    assert_eq!(target_addr, "[::1]:443");
-    assert_eq!(authed_user, None);
-}
-
-#[tokio::test]
-async fn ipv4_target_unchanged() {
-    let auth = test_auth();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
-        .await
-        .unwrap();
-
-    let (target_addr, _) = tokio::time::timeout(Duration::from_secs(5), async {
-        (server.await.unwrap().unwrap(), ())
-    })
-    .await
-    .expect("timed out")
-    .0;
-    assert_eq!(target_addr, "1.2.3.4:443");
-}
-
-#[tokio::test]
-async fn domain_target_unchanged() {
-    let auth = test_auth();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x03, 11])
-        .await
-        .unwrap();
-    client.write_all(b"example.com").await.unwrap();
-    client.write_all(&[0x01, 0xBB]).await.unwrap();
-
-    let (target_addr, _) = tokio::time::timeout(Duration::from_secs(5), async {
-        (server.await.unwrap().unwrap(), ())
-    })
-    .await
-    .expect("timed out")
-    .0;
-    assert_eq!(target_addr, "example.com:443");
+    .await?;
+    Ok((req.target().to_owned(), req.username().map(str::to_owned)))
 }
 
 // ── RFC 1929 zero-length-field tests (R5-07) ────────────────────
@@ -485,8 +398,10 @@ async fn recovery_recovers_sni_across_segmented_reads() {
 
     let hello = client_hello_with_sni("recovered.example");
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             &gate,
@@ -566,8 +481,10 @@ async fn server_first_upstream_banner_is_relayed_without_recovery() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel(
             server,
+            &req,
             "203.0.113.9:22",
             "22",
             &gate,
@@ -654,8 +571,10 @@ async fn undecidable_client_payload_falls_back_to_ip_promptly() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             &gate,
@@ -727,8 +646,10 @@ async fn client_closed_before_payload_ends_cleanly() {
     let server = l.accept().await.unwrap().0;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             &gate,
@@ -809,8 +730,10 @@ async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let task = tokio::spawn(async move {
+        let req = recovery_request().await;
         recover_and_tunnel(
             server,
+            &req,
             "203.0.113.9:443",
             "443",
             &gate,
@@ -862,58 +785,20 @@ async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
     );
 }
 
-// ── R8-03: DOMAINNAME validation happens before any dial ────────
-
-/// Drive `socks5_handshake` directly — no pool, rotator, or
-/// upstream exists in this test beyond the handshake itself, so a
-/// rejection here provably happens before any upstream attempt or
-/// rating change. Asserts the client-facing SOCKS5 failure reply
-/// and that the error text is input validation, not an upstream
-/// failure.
-async fn connect_domain_expect_rejection(domain: &[u8], port: [u8; 2]) {
-    let auth = test_auth();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x00]);
-
-    let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
-    req.extend_from_slice(domain);
-    req.extend_from_slice(&port);
-    client.write_all(&req).await.unwrap();
-
-    // rep=0x04 (host unreachable), BND.ADDR 0.0.0.0, BND.PORT 0.
-    let mut reply = [0u8; 10];
-    client.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply, [0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-
-    let result = tokio::time::timeout(Duration::from_secs(5), server)
+async fn recovery_request() -> resocks5_net::server::IncomingRequest {
+    let (mut peer, mut stream) = tokio::io::duplex(128);
+    peer.write_all(&[5, 1, 0, 5, 1, 0, 1, 203, 0, 113, 9, 1, 187])
         .await
-        .expect("timed out")
         .unwrap();
-    let error = result.expect_err("handshake must reject the domain");
-    assert!(
-        !error.to_string().contains("upstream"),
-        "rejection must be input validation, not an upstream failure: {error}"
-    );
-}
-
-#[tokio::test]
-async fn zero_length_domain_connect_is_rejected_with_client_error() {
-    connect_domain_expect_rejection(b"", [0x01, 0xBB]).await;
-}
-
-#[tokio::test]
-async fn nul_byte_domain_connect_is_rejected_with_client_error() {
-    connect_domain_expect_rejection(b"exa\x00mple.com", [0x01, 0xBB]).await;
-}
-
-#[tokio::test]
-async fn colon_in_domain_connect_is_rejected_with_client_error() {
-    connect_domain_expect_rejection(b"exa:mple.com", [0x01, 0xBB]).await;
+    resocks5_net::server::accept(
+        &mut stream,
+        &resocks5_net::server::ServerOptions::new(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            true,
+            false,
+        ),
+        |_| async { false },
+    )
+    .await
+    .unwrap()
 }
