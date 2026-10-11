@@ -126,7 +126,7 @@ impl IncomingRequest {
     pub fn take_pipeline(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pipeline)
     }
-    /// Write the host's tunnel outcome. Call once, before forwarding payload.
+    /// Write and flush the host's tunnel outcome. Call once, before forwarding payload.
     /// Never send another protocol reply after early success.
     ///
     /// cancel-safe: NO — a partial reply is terminal; discard the stream on
@@ -149,7 +149,8 @@ impl IncomingRequest {
             (Protocol::Http, Reply::GeneralFailure) => http_error(502),
             (Protocol::Http, Reply::Overloaded) => http_error(503),
         };
-        stream.write_all(bytes).await.map_err(ServerError::Io)
+        stream.write_all(bytes).await?;
+        stream.flush().await.map_err(ServerError::Io)
     }
 }
 
@@ -204,6 +205,8 @@ impl From<io::Error> for ServerError {
 /// HTTP verifies supplied credentials even when anonymous access is allowed;
 /// supplied credentials fail when password capability is disabled.
 /// No DNS, egress, final success reply, or application routing occurs here.
+/// Completed handshake and error replies are flushed within the same absolute
+/// deadline before reading the next frame or returning.
 ///
 /// cancel-safe: NO — partial reads/writes and owned prefixes cannot be resumed.
 /// On timeout, error, or cancellation the host MUST discard the stream, including
@@ -278,9 +281,11 @@ where
         0
     } else {
         stream.write_all(&[5, 255]).await?;
+        stream.flush().await?;
         return Err(ServerError::Authentication(format!("No mutually supported SOCKS5 auth method (server: anonymous={}, user/pass={}; client offered {} method(s))", options.anonymous, options.password, methods.len())));
     };
     stream.write_all(&[5, chosen]).await?;
+    stream.flush().await?;
     let username = if chosen == 2 {
         let mut header = [0; 2];
         stream.read_exact(&mut header).await?;
@@ -324,12 +329,14 @@ where
         })
         .await
         {
-            let _ = stream.write_all(AUTH_FAILURE).await;
+            stream.write_all(AUTH_FAILURE).await?;
+            stream.flush().await?;
             return Err(ServerError::Authentication(format!(
                 "Auth failed for user '{identity}'"
             )));
         }
         stream.write_all(&[1, 0]).await?;
+        stream.flush().await?;
         Some(identity)
     } else {
         None
@@ -342,6 +349,9 @@ where
         ));
     }
     if header[1] != 1 {
+        // RFC 1928 section 6: command not supported, unspecified IPv4 bind address.
+        stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+        stream.flush().await?;
         return Err(ServerError::Protocol(
             "Only CONNECT commands are supported".into(),
         ));
@@ -374,14 +384,20 @@ where
                     .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
                 || HostPort::parse(&target).is_none()
             {
-                let _ = stream.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                stream.write_all(&[5, 4, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+                stream.flush().await?;
                 return Err(ServerError::Protocol(format!(
                     "Invalid DOMAINNAME in CONNECT request: {domain:?}"
                 )));
             }
             target
         }
-        atyp => return Err(ServerError::Protocol(format!("Unknown ATYP: {atyp:02x}"))),
+        atyp => {
+            // RFC 1928 section 6: address type not supported.
+            stream.write_all(&[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            stream.flush().await?;
+            return Err(ServerError::Protocol(format!("Unknown ATYP: {atyp:02x}")));
+        }
     };
     Ok(IncomingRequest {
         protocol: Protocol::Socks5,
@@ -395,7 +411,8 @@ async fn auth_fail<T, S: AsyncWrite + Unpin>(
     stream: &mut S,
     message: &str,
 ) -> Result<T, ServerError> {
-    let _ = stream.write_all(AUTH_FAILURE).await;
+    stream.write_all(AUTH_FAILURE).await?;
+    stream.flush().await?;
     Err(ServerError::Authentication(message.into()))
 }
 
@@ -417,7 +434,8 @@ async fn http_fail<T, S: AsyncWrite + Unpin>(
     status: u16,
     error: ServerError,
 ) -> Result<T, ServerError> {
-    let _ = stream.write_all(http_error(status)).await;
+    stream.write_all(http_error(status)).await?;
+    stream.flush().await?;
     Err(error)
 }
 

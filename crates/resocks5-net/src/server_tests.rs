@@ -1,10 +1,12 @@
 use super::*;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, BufWriter, DuplexStream, ReadBuf};
 
 // Independent boundary oracle: changing the production limit must fail these tests.
 const EXPECT_HEADER_LIMIT: usize = 16_384;
@@ -202,57 +204,65 @@ async fn basic_uses_first_header_first_colon_and_redacts_credentials() {
 
 #[tokio::test]
 async fn malformed_targets_frames_and_legacy_rsv_behavior() {
-    for target in [
-        ":443", "h:", "h:65536", "h:-1", "[h]:443", "[::1]", "a\0b:443", "a\nb:443",
-    ] {
-        let bytes = format!("CONNECT {target} HTTP/1.1\r\n\r\n");
-        let (result, reply, calls) = parse(bytes.as_bytes(), true, false, true).await;
-        assert!(matches!(result, Err(ServerError::Protocol(_))));
-        assert_eq!(reply, EXPECT_HTTP_400);
-        assert_eq!(calls, 0);
-    }
-    for target in ["h:0", "[::1]:443", "2001:db8::1:443", "not-a-dns-name!:443"] {
-        let bytes = format!("CONNECT {target} HTTP/x\r\n\r\n");
+    timeout(Duration::from_secs(10), async {
+        for target in [
+            ":443", "h:", "h:65536", "h:-1", "[h]:443", "[::1]", "a\0b:443", "a\nb:443",
+        ] {
+            let bytes = format!("CONNECT {target} HTTP/1.1\r\n\r\n");
+            let (result, reply, calls) = parse(bytes.as_bytes(), true, false, true).await;
+            assert!(matches!(result, Err(ServerError::Protocol(_))));
+            assert_eq!(reply, EXPECT_HTTP_400);
+            assert_eq!(calls, 0);
+        }
+        for target in ["h:0", "[::1]:443", "2001:db8::1:443", "not-a-dns-name!:443"] {
+            let bytes = format!("CONNECT {target} HTTP/x\r\n\r\n");
+            assert_eq!(
+                parse(bytes.as_bytes(), true, false, true)
+                    .await
+                    .0
+                    .unwrap()
+                    .target(),
+                target
+            );
+        }
+        for domain in [b"".as_slice(), b"a\0b", b"a:b", b"a b"] {
+            let (result, reply, _) = parse(&socks_request(domain), true, false, true).await;
+            assert!(matches!(result, Err(ServerError::Protocol(_))));
+            assert_eq!(reply, [5, 0, 5, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
+        }
+        for (header, expected) in [
+            ([4, 1, 0, 1], vec![5, 0]),
+            ([5, 2, 0, 1], vec![5, 0, 5, 7, 0, 1, 0, 0, 0, 0, 0, 0]),
+            ([5, 1, 0, 9], vec![5, 0, 5, 8, 0, 1, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let mut bytes = vec![5, 1, 0];
+            bytes.extend_from_slice(&header);
+            let (result, reply, _) = parse(&bytes, true, false, true).await;
+            assert!(matches!(result, Err(ServerError::Protocol(_))));
+            assert_eq!(reply, expected);
+        }
+        let mut bytes = socks_request(b"h");
+        bytes[5] = 99;
+        assert!(parse(&bytes, true, false, true).await.0.is_ok());
+        assert!(matches!(
+            parse(&[5, 1, 0, 5], true, false, true).await.0,
+            Err(ServerError::Io(_))
+        ));
+        assert!(matches!(
+            parse(&[0xff], true, false, true).await.0,
+            Err(ServerError::Protocol(_))
+        ));
+        assert!(matches!(
+            parse(&[], true, false, true).await.0,
+            Err(ServerError::Closed)
+        ));
         assert_eq!(
-            parse(bytes.as_bytes(), true, false, true)
-                .await
-                .0
-                .unwrap()
-                .target(),
-            target
+            parse(b"GET h:1 HTTP/x\r\n\r\n", true, false, true).await.1,
+            EXPECT_HTTP_501
         );
-    }
-    for domain in [b"".as_slice(), b"a\0b", b"a:b", b"a b"] {
-        let (result, reply, _) = parse(&socks_request(domain), true, false, true).await;
-        assert!(matches!(result, Err(ServerError::Protocol(_))));
-        assert_eq!(reply, [5, 0, 5, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
-    }
-    for header in [[4, 1, 0, 1], [5, 2, 0, 1], [5, 1, 0, 9]] {
-        let mut bytes = vec![5, 1, 0];
-        bytes.extend_from_slice(&header);
-        let (result, reply, _) = parse(&bytes, true, false, true).await;
-        assert!(matches!(result, Err(ServerError::Protocol(_))));
-        assert_eq!(reply, [5, 0]);
-    }
-    let mut bytes = socks_request(b"h");
-    bytes[5] = 99;
-    assert!(parse(&bytes, true, false, true).await.0.is_ok());
-    assert!(matches!(
-        parse(&[5, 1, 0, 5], true, false, true).await.0,
-        Err(ServerError::Io(_))
-    ));
-    assert!(matches!(
-        parse(&[0xff], true, false, true).await.0,
-        Err(ServerError::Protocol(_))
-    ));
-    assert!(matches!(
-        parse(&[], true, false, true).await.0,
-        Err(ServerError::Closed)
-    ));
-    assert_eq!(
-        parse(b"GET h:1 HTTP/x\r\n\r\n", true, false, true).await.1,
-        EXPECT_HTTP_501
-    );
+    })
+    .await
+    .expect("bounded malformed framing table");
 }
 
 #[tokio::test]
@@ -456,46 +466,592 @@ fn public_future_is_send() {
 
 #[tokio::test]
 async fn host_replies_map_to_existing_wire_codes() {
-    for socks in [false, true] {
-        for reply in [
-            Reply::Established,
-            Reply::Forbidden,
-            Reply::UpstreamUnavailable,
-            Reply::GeneralFailure,
-            Reply::Overloaded,
-        ] {
-            let bytes = if socks {
-                socks_request(b"h")
-            } else {
-                b"CONNECT h:443 HTTP/x\r\n\r\n".to_vec()
-            };
-            let req = parse(&bytes, true, false, true).await.0.unwrap();
-            let (mut peer, mut stream) = duplex(1024);
-            req.reply(&mut stream, reply).await.unwrap();
-            drop(stream);
-            let mut response = Vec::new();
-            peer.read_to_end(&mut response).await.unwrap();
-            let code = match reply {
-                Reply::Established => 0,
-                Reply::Forbidden => 2,
-                Reply::UpstreamUnavailable => 4,
-                Reply::GeneralFailure => 1,
-                Reply::Overloaded => 1,
-            };
-            if socks {
-                assert_eq!(response, [5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
-            } else {
-                let expected = match reply {
-                    Reply::Established => b"HTTP/1.1 200 Connection Established\r\n\r\n".as_slice(),
-                    Reply::Forbidden => EXPECT_HTTP_403,
-                    Reply::UpstreamUnavailable => EXPECT_HTTP_502,
-                    Reply::GeneralFailure => EXPECT_HTTP_502,
-                    Reply::Overloaded => EXPECT_HTTP_503,
+    timeout(Duration::from_secs(10), async {
+        for socks in [false, true] {
+            for (reply, code, http) in [
+                (
+                    Reply::Established,
+                    0,
+                    b"HTTP/1.1 200 Connection Established\r\n\r\n".as_slice(),
+                ),
+                (Reply::Forbidden, 2, EXPECT_HTTP_403),
+                (Reply::UpstreamUnavailable, 4, EXPECT_HTTP_502),
+                (Reply::GeneralFailure, 1, EXPECT_HTTP_502),
+                (Reply::Overloaded, 1, EXPECT_HTTP_503),
+            ] {
+                let bytes = if socks {
+                    socks_request(b"h")
+                } else {
+                    b"CONNECT h:443 HTTP/x\r\n\r\n".to_vec()
                 };
+                let req = parse(&bytes, true, false, true).await.0.unwrap();
+                let (mut peer, stream) = duplex(1024);
+                let mut stream = BufWriter::new(stream);
+                let socks_reply = [5, code, 0, 1, 0, 0, 0, 0, 0, 0];
+                let expected = if socks { socks_reply.as_slice() } else { http };
+                let mut response = vec![0; expected.len()];
+                let (result, read) = tokio::join!(
+                    req.reply(&mut stream, reply),
+                    peer.read_exact(&mut response),
+                );
+                result.unwrap();
+                read.unwrap();
                 assert_eq!(response, expected);
+                assert!(stream.buffer().is_empty());
+                // No host extra-write, manual flush, shutdown or drop made this visible.
+                drop(stream);
+                let mut trailing = Vec::new();
+                peer.read_to_end(&mut trailing).await.unwrap();
+                assert!(trailing.is_empty());
             }
         }
+    })
+    .await
+    .expect("bounded buffered final replies");
+}
+
+#[tokio::test]
+async fn buffered_socks_peer_waits_for_each_handshake_reply() {
+    timeout(Duration::from_secs(10), async {
+        for password in [false, true] {
+            let (mut peer, stream) = duplex(64);
+            let mut stream = BufWriter::new(stream);
+            let opts = options(!password, password);
+            let client = async {
+                let method = if password { 2 } else { 0 };
+                for byte in [5, 1, method] {
+                    peer.write_all(&[byte]).await.unwrap();
+                }
+                let mut response = [0; 2];
+                peer.read_exact(&mut response).await.unwrap();
+                assert_eq!(response, [5, method]);
+                if password {
+                    peer.write_all(&[1, 1, b'u', 1, b'p']).await.unwrap();
+                    peer.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response, [1, 0]);
+                }
+                peer.write_all(&socks_request(b"h")[3..]).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(accept(&mut stream, &opts, |_| async { true }), client);
+            let req = result.unwrap();
+            assert_eq!(req.target(), "h:443");
+            assert_eq!(req.username(), password.then_some("u"));
+            assert!(stream.buffer().is_empty());
+        }
+    })
+    .await
+    .expect("bounded staged buffered handshake");
+}
+
+/// cancel-safe: NO — enclosing safety timeout drops both in-place futures and
+/// disposable streams. No spawned tasks, manual flush, shutdown or early drop.
+async fn buffered_failure(
+    bytes: &[u8],
+    anonymous: bool,
+    password: bool,
+    verified: bool,
+    expected: &[u8],
+) -> (ServerError, usize) {
+    let (mut peer, stream) = duplex(64 * 1024);
+    let mut stream = BufWriter::new(stream);
+    peer.write_all(bytes).await.unwrap();
+    let calls = AtomicUsize::new(0);
+    let opts = options(anonymous, password);
+    let mut response = vec![0; expected.len()];
+    let (result, read) = tokio::join!(
+        accept(&mut stream, &opts, |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            verified
+        }),
+        peer.read_exact(&mut response),
+    );
+    read.unwrap();
+    assert_eq!(response, expected);
+    assert!(stream.buffer().is_empty());
+    (result.unwrap_err(), calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn buffered_socks_failure_replies_are_visible_before_drop() {
+    timeout(Duration::from_secs(10), async {
+        for greeting in [vec![5, 0], vec![5, 1, 99]] {
+            let (error, calls) = buffered_failure(&greeting, true, true, true, &[5, 255]).await;
+            assert!(matches!(error, ServerError::Authentication(_)));
+            assert_eq!(calls, 0);
+        }
+        for (frame, verified, expected_calls) in [
+            (vec![1, 0], true, 0),
+            (vec![1, 1, b'u', 0], true, 0),
+            (vec![1, 1, 255, 1, b'p'], true, 0),
+            (vec![1, 1, b'u', 1, 255], true, 0),
+            (vec![1, 1, b'u', 1, b'p'], false, 1),
+        ] {
+            let mut bytes = vec![5, 1, 2];
+            bytes.extend(frame);
+            let (error, calls) =
+                buffered_failure(&bytes, false, true, verified, &[5, 2, 1, 1]).await;
+            assert!(matches!(error, ServerError::Authentication(_)));
+            assert_eq!(calls, expected_calls);
+        }
+        for domain in [b"".as_slice(), b"a\0b", b"a:b", b"a b"] {
+            let (error, calls) = buffered_failure(
+                &socks_request(domain),
+                true,
+                false,
+                true,
+                &[5, 0, 5, 4, 0, 1, 0, 0, 0, 0, 0, 0],
+            )
+            .await;
+            assert!(matches!(error, ServerError::Protocol(_)));
+            assert_eq!(calls, 0);
+        }
+    })
+    .await
+    .expect("bounded buffered SOCKS failures");
+}
+
+#[tokio::test]
+async fn buffered_canonical_refusals_after_both_auth_methods_are_terminal() {
+    timeout(Duration::from_secs(10), async {
+        for password in [false, true] {
+            for (header, expected) in [
+                ([5, 2, 0, 1], [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]),
+                ([5, 3, 0, 1], [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]),
+                ([5, 1, 0, 9], [5, 8, 0, 1, 0, 0, 0, 0, 0, 0]),
+            ] {
+                let (mut peer, stream) = duplex(1024);
+                let mut stream = BufWriter::new(stream);
+                let opts = options(!password, password);
+                let calls = AtomicUsize::new(0);
+                let client = async {
+                    let method = if password { 2 } else { 0 };
+                    peer.write_all(&[5, 1, method]).await.unwrap();
+                    let mut response = [0; 2];
+                    peer.read_exact(&mut response).await.unwrap();
+                    assert_eq!(response, [5, method]);
+                    if password {
+                        peer.write_all(&[1, 1, b'u', 1, b'p']).await.unwrap();
+                        peer.read_exact(&mut response).await.unwrap();
+                        assert_eq!(response, [1, 0]);
+                    }
+                    let mut bytes = header.to_vec();
+                    // A later valid request cannot rescue the rejected frame.
+                    bytes.extend_from_slice(&socks_request(b"later")[3..]);
+                    peer.write_all(&bytes).await.unwrap();
+                    let mut refusal = [0; 10];
+                    peer.read_exact(&mut refusal).await.unwrap();
+                    assert_eq!(refusal, expected);
+                };
+                let (result, ()) = tokio::join!(
+                    accept(&mut stream, &opts, |_| async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }),
+                    client,
+                );
+                assert!(matches!(result, Err(ServerError::Protocol(_))));
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(password));
+                assert!(stream.buffer().is_empty());
+                drop(stream); // Terminal: never retry accept.
+                let mut extra = Vec::new();
+                peer.read_to_end(&mut extra).await.unwrap();
+                assert!(extra.is_empty());
+            }
+        }
+    })
+    .await
+    .expect("bounded canonical refusals, including partial-frame mutations");
+}
+
+#[tokio::test]
+async fn buffered_wrong_versions_remain_terminal_without_failure_reply() {
+    timeout(Duration::from_secs(10), async {
+        for (bytes, password, expected) in [
+            (vec![5, 1, 0, 4, 1, 0, 1], false, &[5, 0][..]),
+            (vec![5, 1, 2, 2, 1], true, &[5, 2][..]),
+            (
+                vec![5, 1, 2, 1, 1, b'u', 1, b'p', 4, 1, 0, 1],
+                true,
+                &[5, 2, 1, 0][..],
+            ),
+        ] {
+            let (mut peer, inner) = duplex(1024);
+            let mut stream = BufWriter::new(inner);
+            peer.write_all(&bytes).await.unwrap();
+            let opts = options(!password, password);
+            let mut response = vec![0; expected.len()];
+            let (result, read) = tokio::join!(
+                accept(&mut stream, &opts, |_| async { true }),
+                peer.read_exact(&mut response),
+            );
+            assert!(matches!(
+                result,
+                Err(ServerError::Protocol(_) | ServerError::Authentication(_))
+            ));
+            read.unwrap();
+            assert_eq!(response, expected);
+            assert!(stream.buffer().is_empty());
+            drop(stream);
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        }
+    })
+    .await
+    .expect("bounded wrong-version no-response contract");
+}
+
+#[tokio::test]
+async fn buffered_http_failure_paths_are_visible_before_drop() {
+    timeout(Duration::from_secs(10), async {
+        for (bytes, anonymous, password, verified, expected, calls) in [
+            (
+                b"CONNECT \xff:1 HTTP/x\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_400,
+                0,
+            ),
+            (
+                b"CONNECT h:1 broken\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_400,
+                0,
+            ),
+            (
+                b"GET h:1 HTTP/x\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_501,
+                0,
+            ),
+            (
+                b"CONNECT a\0b:1 HTTP/x\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_400,
+                0,
+            ),
+            (
+                b"CONNECT :1 HTTP/x\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_400,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: \xff\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Bearer token\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic !!!\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic /w==\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dQ==\r\n\r\n".as_slice(),
+                true,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
+                true,
+                false,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
+                true,
+                true,
+                false,
+                EXPECT_HTTP_407,
+                1,
+            ),
+            (
+                b"CONNECT h:1 HTTP/x\r\n\r\n".as_slice(),
+                false,
+                true,
+                true,
+                EXPECT_HTTP_407,
+                0,
+            ),
+        ] {
+            let (error, actual_calls) =
+                buffered_failure(bytes, anonymous, password, verified, expected).await;
+            assert!(matches!(
+                error,
+                ServerError::Protocol(_) | ServerError::Authentication(_)
+            ));
+            assert_eq!(actual_calls, calls);
+        }
+        for delimiter in [false, true] {
+            let mut bytes = b"CONNECT h:1 HTTP/x\r\nX: ".to_vec();
+            bytes.resize(EXPECT_HEADER_LIMIT - 3, b'a');
+            if delimiter {
+                bytes.extend_from_slice(b"\r\n\r\n");
+            } else {
+                bytes.extend_from_slice(b"aaaa");
+            }
+            let (error, calls) = buffered_failure(&bytes, true, true, true, EXPECT_HTTP_431).await;
+            assert!(matches!(error, ServerError::HeaderTooLarge));
+            assert_eq!(calls, 0);
+        }
+    })
+    .await
+    .expect("bounded buffered HTTP failures");
+}
+
+// Transport fault injection only: wire visibility is tested with real BufWriter above.
+struct FlushFault {
+    inner: DuplexStream,
+    writes: Vec<u8>,
+    write_calls: usize,
+    flush_calls: usize,
+    fault_at: usize,
+    fail_write: bool,
+    stall: bool,
+    first_flush_delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl AsyncRead for FlushFault {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
+}
+
+impl AsyncWrite for FlushFault {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.write_calls += 1;
+        if self.fail_write && self.write_calls == self.fault_at {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected write failure",
+            )));
+        }
+        self.writes.extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(delay) = &mut self.first_flush_delay {
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.first_flush_delay = None;
+        }
+        // Count completed flushes once; the fault remains persistent on repoll.
+        if !self.fail_write && self.flush_calls + 1 == self.fault_at {
+            if self.stall {
+                // Permanently stalled by design; the owning timeout is the wake source.
+                return Poll::Pending;
+            }
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected flush failure",
+            )));
+        }
+        self.flush_calls += 1;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn flush_fault(inner: DuplexStream, fault_at: usize, fail_write: bool, stall: bool) -> FlushFault {
+    FlushFault {
+        inner,
+        writes: Vec::new(),
+        write_calls: 0,
+        flush_calls: 0,
+        fault_at,
+        fail_write,
+        stall,
+        first_flush_delay: None,
+    }
+}
+
+#[tokio::test]
+async fn reply_write_and_flush_errors_propagate_without_replay() {
+    timeout(Duration::from_secs(10), async {
+        for fail_write in [false, true] {
+            for (bytes, anonymous, password, verified, fault_at) in [
+                (vec![5, 1, 0], true, false, true, 1),
+                (vec![5, 0], true, true, true, 1),
+                (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, true, 2),
+                (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, false, 2),
+                (vec![5, 1, 2, 1, 0], false, true, true, 2),
+                (socks_request(b"a b"), true, false, true, 2),
+                (vec![5, 1, 0, 5, 2, 0, 1], true, false, true, 2),
+                (vec![5, 1, 0, 5, 1, 0, 9], true, false, true, 2),
+                (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, true, 1),
+                (b"CONNECT h:1 HTTP/x\r\n\r\n".to_vec(), false, true, true, 1),
+            ] {
+                let (mut peer, inner) = duplex(1024);
+                peer.write_all(&bytes).await.unwrap();
+                let mut stream = flush_fault(inner, fault_at, fail_write, false);
+                let result = accept(&mut stream, &options(anonymous, password), |_| async { verified }).await;
+                assert!(matches!(result, Err(ServerError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe));
+                assert_eq!(stream.write_calls, fault_at);
+                assert_eq!(stream.flush_calls, fault_at - 1);
+                drop(stream); // No replay after transport failure.
+            }
+            for protocol in [Protocol::Socks5, Protocol::Http] {
+                for reply in [Reply::Established, Reply::Forbidden, Reply::UpstreamUnavailable, Reply::GeneralFailure, Reply::Overloaded] {
+                    let req = IncomingRequest {
+                        protocol, target: "h:1".into(), username: None, pipeline: Vec::new(),
+                    };
+                    let (_peer, inner) = duplex(64);
+                    let mut stream = flush_fault(inner, 1, fail_write, false);
+                    let result = req.reply(&mut stream, reply).await;
+                    assert!(matches!(result, Err(ServerError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe));
+                    assert_eq!(stream.write_calls, 1);
+                    assert_eq!(stream.flush_calls, 0);
+                }
+            }
+        }
+    }).await.expect("bounded reply transport faults");
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_handshake_and_error_flushes_share_absolute_deadline() {
+    timeout(Duration::from_secs(10), async {
+        for (bytes, anonymous, password, verified, fault_at) in [
+            (vec![5, 1, 0], true, false, true, 1),
+            (vec![5, 0], true, true, true, 1),
+            (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, true, 2),
+            (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, false, 2),
+            (vec![5, 1, 2, 1, 0], false, true, true, 2),
+            (socks_request(b"a b"), true, false, true, 2),
+            (vec![5, 1, 0, 5, 2, 0, 1], true, false, true, 2),
+            (vec![5, 1, 0, 5, 1, 0, 9], true, false, true, 2),
+            (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, true, 1),
+        ] {
+            let (mut peer, inner) = duplex(1024);
+            peer.write_all(&bytes).await.unwrap();
+            let mut stream = flush_fault(inner, fault_at, false, true);
+            let start = Instant::now();
+            if fault_at == 2 {
+                stream.first_flush_delay =
+                    Some(Box::pin(tokio::time::sleep(Duration::from_millis(900))));
+            }
+            let opts = ServerOptions::new(start + Duration::from_secs(1), anonymous, password);
+            let result = accept(&mut stream, &opts, |_| async { verified }).await;
+            assert!(matches!(result, Err(ServerError::Deadline)));
+            assert_eq!(start.elapsed(), Duration::from_secs(1));
+            assert_eq!(stream.write_calls, fault_at);
+            assert_eq!(stream.flush_calls, fault_at - 1);
+            drop(stream);
+        }
+    })
+    .await
+    .expect("bounded absolute flush deadlines");
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_cancellation_during_accept_flush_is_terminal() {
+    timeout(Duration::from_secs(10), async {
+        let (mut peer, inner) = duplex(64);
+        peer.write_all(&[5, 1, 0, 5, 1, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        let mut stream = flush_fault(inner, 1, false, true);
+        let calls = AtomicUsize::new(0);
+        let opts = options(true, false);
+        let result = timeout(
+            Duration::from_secs(1),
+            accept(&mut stream, &opts, |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                true
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(stream.writes, [5, 0]);
+        assert_eq!(stream.write_calls, 1);
+        assert_eq!(stream.flush_calls, 0);
+        drop(stream); // The queued valid CONNECT is never parsed after cancellation.
+    })
+    .await
+    .expect("bounded external accept cancellation");
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_budget_cancels_final_flush_without_replay() {
+    timeout(Duration::from_secs(10), async {
+        for protocol in [Protocol::Socks5, Protocol::Http] {
+            let req = IncomingRequest {
+                protocol,
+                target: "h:1".into(),
+                username: None,
+                pipeline: Vec::new(),
+            };
+            let (_peer, inner) = duplex(64);
+            let mut stream = flush_fault(inner, 1, false, true);
+            let start = Instant::now();
+            let result = timeout(
+                Duration::from_secs(2),
+                req.reply(&mut stream, Reply::Established),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(start.elapsed(), Duration::from_secs(2));
+            assert_eq!(stream.write_calls, 1);
+            assert_eq!(stream.flush_calls, 0);
+            let expected = match protocol {
+                Protocol::Socks5 => &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0][..],
+                Protocol::Http => &b"HTTP/1.1 200 Connection Established\r\n\r\n"[..],
+            };
+            assert_eq!(stream.writes, expected);
+            drop(stream); // Host owns the budget and terminal disposal; never retry.
+        }
+    })
+    .await
+    .expect("bounded host final-reply cancellation");
 }
 
 // Migrated parser-only application regressions: framing stays in the library.

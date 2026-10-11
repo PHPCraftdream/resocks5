@@ -24,6 +24,9 @@ async fn recovery_limit_preserves_the_unread_tail() {
     assert_eq!(tail, b"\r\nHost: example.com\r\n\r\nbody");
 }
 
+// Claim tests check credentials and persistence, not wall-clock KDF throughput.
+const CLAIM_TEST_BUDGET: Duration = Duration::from_secs(30);
+
 /// Exercise real application claim/persistence through the library auth closure.
 async fn serve_one(
     listener: TcpListener,
@@ -31,7 +34,7 @@ async fn serve_one(
 ) -> anyhow::Result<(String, Option<String>)> {
     let (mut stream, _) = listener.accept().await?;
     let options = resocks5_net::server::ServerOptions::new(
-        tokio::time::Instant::now() + Duration::from_secs(5),
+        tokio::time::Instant::now() + CLAIM_TEST_BUDGET,
         auth.allow_anonymous,
         !auth.is_empty(),
     );
@@ -109,7 +112,7 @@ async fn zero_length_field_rejected_then_valid_claim(auth_frame: &[u8]) {
     assert_eq!(reply, [0x01, 0x01]);
     drop(client);
 
-    let result = tokio::time::timeout(Duration::from_secs(5), server)
+    let result = tokio::time::timeout(CLAIM_TEST_BUDGET, server)
         .await
         .expect("timed out")
         .unwrap();
@@ -141,11 +144,10 @@ async fn zero_length_field_rejected_then_valid_claim(auth_frame: &[u8]) {
         .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
         .await
         .unwrap();
-    let (target_addr, authed_user) = tokio::time::timeout(Duration::from_secs(5), async {
-        server.await.unwrap().unwrap()
-    })
-    .await
-    .expect("timed out");
+    let (target_addr, authed_user) =
+        tokio::time::timeout(CLAIM_TEST_BUDGET, async { server.await.unwrap().unwrap() })
+            .await
+            .expect("timed out");
     assert_eq!(target_addr, "1.2.3.4:443");
     assert_eq!(authed_user.as_deref(), Some("bob"));
 
@@ -184,18 +186,20 @@ async fn short_password_claims_via_socks5(password: &[u8]) {
     frame.extend_from_slice(password);
     client.write_all(&frame).await.unwrap();
     let mut reply = [0u8; 2];
-    client.read_exact(&mut reply).await.unwrap();
+    if let Err(error) = client.read_exact(&mut reply).await {
+        let outcome = server.await.expect("claim server task panicked");
+        panic!("authentication reply failed: {error}; claim server returned {outcome:?}");
+    }
     assert_eq!(reply, [0x01, 0x00]);
 
     client
         .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
         .await
         .unwrap();
-    let (target_addr, authed_user) = tokio::time::timeout(Duration::from_secs(5), async {
-        server.await.unwrap().unwrap()
-    })
-    .await
-    .expect("timed out");
+    let (target_addr, authed_user) =
+        tokio::time::timeout(CLAIM_TEST_BUDGET, async { server.await.unwrap().unwrap() })
+            .await
+            .expect("timed out");
     assert_eq!(target_addr, "1.2.3.4:443");
     assert_eq!(authed_user.as_deref(), Some("bob"));
 

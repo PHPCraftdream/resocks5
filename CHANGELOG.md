@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- SDK inbound replies now use `write_all` followed by `flush`, including method
+  selection, password success/failure, unsupported methods, HTTP failures, domain
+  rejection and every public SOCKS5/HTTP final outcome. Transport failures propagate
+  as `ServerError::Io` rather than being hidden by authentication/protocol errors.
+  Handshake/error flushes remain within the original absolute accept deadline;
+  public final-reply write/flush budgets remain host-owned. Error, timeout and
+  cancellation are terminal: discard buffered wrappers, never replay partial replies.
+- Unsupported SOCKS5 commands (including BIND and UDP ASSOCIATE) now flush canonical
+  `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]` refusals; unknown ATYP flushes
+  `[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]` before a protocol error, after either auth method.
+  Wrong versions retain the terminal no-response contract. Buffered-duplex regressions
+  cover staged peers, failure visibility before drop and final outcomes without a
+  host flush; stalled-flush fixtures cover I/O propagation, deadlines and cancellation.
+
 - Both application paths now use the shared library parser once at dispatch;
   protocol replies use the request's encoder. Routing, gate accounting, recovery,
   logging and forwarding budgets stay application-owned. The deadline now anchors

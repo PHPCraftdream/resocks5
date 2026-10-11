@@ -115,8 +115,9 @@ clients on one port. The echo service is separate: the example performs a real T
 dial, never manufactures egress or substitutes an echo stream.
 
 Contracts:
-- One supplied absolute Tokio deadline covers detection, framing and authentication;
-  expired entry is rejected before polling. No DNS or egress occurs in `accept`.
+- One supplied absolute Tokio deadline covers detection, framing, authentication,
+  and flushing every handshake/error reply; expired entry is rejected before polling.
+  No DNS or egress occurs in `accept`. The deadline never renews on read/write progress.
 - `target()` stays unresolved. HTTP authority spelling is preserved; SOCKS IPs are
   canonical. Validation reuses `HostPort` (including legacy bare IPv6 and port zero).
 - `username()` is `Some` only after verification; anonymous is `None`. Verified empty
@@ -136,7 +137,20 @@ Contracts:
   to protocol-specific outcomes. GeneralFailure uses SOCKS REP 1 / HTTP 502,
   distinct from admission overload (HTTP 503). Parsing never sends tunnel success.
   Hosts doing early-success recovery must not send another protocol reply afterward.
-- On error, timeout, or cancellation discard the stream and any buffered wrapper.
+  Every completed protocol response uses `write_all` followed by `flush`, including
+  method selection, password success/failure, refusals and public final replies.
+  Buffered streams therefore need no extra host write, manual flush or shutdown to
+  expose a completed reply. Flush/write errors propagate as `ServerError::Io`.
+  Final `reply` writes and flushes have no implicit SDK timeout: the host owns their
+  response budget, separately from the absolute `accept` deadline.
+- After method selection and any successful password authentication, unsupported
+  commands (including BIND and UDP ASSOCIATE) receive exactly
+  `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]`; unknown ATYP receives exactly
+  `[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]`. Both are flushed before a terminal protocol
+  error. Wrong request/auth versions retain the terminal no-failure-response contract.
+- On error, timeout, or cancellation discard the stream and any buffered wrapper;
+  never retry parsing or replay a partial reply, even if a write completed but its
+  flush did not. Successful flushing is not a peer acknowledgement.
   Authentication side effects (such as admitted blocking password persistence) may
   finish after cancellation; the host retains its own admission permits accordingly.
   Credentials' Debug is redacted; transport encryption is not supplied here.
