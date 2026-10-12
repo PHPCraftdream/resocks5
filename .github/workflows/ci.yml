@@ -37,6 +37,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Code-structure rule: at most 1000 lines per Rust file and at most 7 entries
+  # per directory. Files and directories that were already over are recorded
+  # with their size in the scripts' BASELINE (a ratchet that can only shrink).
+  structure:
+    name: structure (1000 lines, 7 entries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh .github/scripts/check-line-limit.sh
+      - run: sh .github/scripts/check-dir-entries.sh
+
   # Machine-verifies the `rust-version` declared in the workspace manifest.
   # Runs on ubuntu AND windows because some deps gate code behind cfg(windows)
   # (e.g. rpassword's let-chain backend) — a ubuntu-only check would miss it.

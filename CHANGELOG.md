@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Code-structure rule in CI (`structure` job): at most 1000 lines per Rust file
+  and at most 7 entries per directory (`.github/scripts/check-line-limit.sh`,
+  `.github/scripts/check-dir-entries.sh`). The five files and four directories
+  already over the limit are recorded with their current size as a ratchet that
+  can only shrink, so nothing new breaks while they are split.
+
 - `resocks5-net::server`: unconditional SOCKS5/HTTP CONNECT detection and inbound
   framing with owned, Debug-redacted credentials and closure authentication (no
   public authentication trait). Returns unresolved targets, verified usernames and

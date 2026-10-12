@@ -43,6 +43,18 @@ Notes:
 - `fmt --check` means run `cargo fmt --all` before committing. If it's
   already clean, the CI step is a no-op.
 
+### Code structure (the `structure` CI job)
+
+- A Rust file has at most **1000 lines**
+  (`sh .github/scripts/check-line-limit.sh`).
+- A directory has at most **7 entries**, files and sub-directories together
+  (`sh .github/scripts/check-dir-entries.sh`; counts what git tracks).
+
+Files and directories that were already over the limit when the rule was
+introduced are listed in the scripts' `BASELINE` with their current size. They
+may not grow, no new ones may appear, and an entry is lowered or deleted as the
+file or directory is split.
+
 ## Repository layout
 
 A Cargo workspace with two crates:
