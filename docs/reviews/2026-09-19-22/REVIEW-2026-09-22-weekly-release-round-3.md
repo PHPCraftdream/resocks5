@@ -53,7 +53,7 @@ P2: нет подтверждённых открытых находок в пр�
 
 - Статус: закрыт; confidence высокая, исходники и downstream compilation.
 - Evidence: `eb7aa6e`,
-  [connect_proxy.rs:6](../crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L6)
+  [connect_proxy.rs:6](../../../crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L6)
   — `pub use tokio_rustls::TlsConnector`; lean placeholder остаётся
   публичным на строке 30. Обе функции сохраняют один trailing TLS slot.
 - `tests/feature_unification/lean-consumer/src/main.rs:9,18` теперь
@@ -70,7 +70,7 @@ P2: нет подтверждённых открытых находок в пр�
 
 - Статус: закрыт; confidence высокая, runtime tests на настоящем BufStream.
 - Evidence: `aebadbf`,
-  [handshake_over_stream.rs:19](../crates/resocks5-net/src/connect/util/handshake_over_stream.rs#L19),
+  [handshake_over_stream.rs:19](../../../crates/resocks5-net/src/connect/util/handshake_over_stream.rs#L19),
   строки 42, 54, 87: `flush().await?` стоит после greeting в обеих ветках,
   после auth request и после CONNECT. Ошибка flush возвращается вызывающему.
 - Все восемь helper tests прошли с default features, без default features
@@ -129,7 +129,7 @@ P2: нет подтверждённых открытых находок в пр�
   для того же аккаунта. Независимый общий cap в два claims сохраняется:
   старый P1 с неограниченным накоплением blocking jobs не переоткрывается.
 - Evidence: `bb73240`,
-  [verify.rs:73](../crates/resocks5/src/auth/state/verify.rs#L73):
+  [verify.rs:73](../../../crates/resocks5/src/auth/state/verify.rs#L73):
   `_gate_guard` принадлежит async frame. В closure строк 86–89 переезжает
   `claim_slots` permit, но не guard. `claim.rs::claim_commit` публикует
   hash после persistence. После отмены future guard уже уничтожен, а
@@ -158,7 +158,7 @@ P2: нет подтверждённых открытых находок в пр�
 - Evidence: `rating/policy.rs:10` и
   `crates/resocks5/src/config/main/network_config.rs:110` обещают pure
   round-robin. Но `Ratings::on_failure/on_success` лишь перестают менять
-  sand, а [Ratings::pick_order:114](../crates/resocks5-net/src/rating/mod.rs#L114)
+  sand, а [Ratings::pick_order:114](../../../crates/resocks5-net/src/rating/mod.rs#L114)
   всегда строит random keys и сортирует их. Приложение вызывает именно
   `pick_order` в `dial.rs:337,353,437`; отдельный `ProxyRotator::get_next`
   с modulo counter этим настройкам не подключён.
@@ -425,7 +425,7 @@ lean rustdoc. Это полезная постоянная защита. При 
 ## Фиксация результата
 
 Единственный новый tracked-файл:
-`docs/REVIEW-2026-09-22-weekly-release-round-3.md`.
+`docs/reviews/REVIEW-2026-09-22-weekly-release-round-3.md`.
 
 Перед коммитом проверены `git diff --check`, `git diff --stat`,
 `git status --short` и staged file set. Коммит содержит только

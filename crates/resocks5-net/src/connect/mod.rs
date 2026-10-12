@@ -17,10 +17,12 @@
 //! everything stays reachable under the flat `connect::` paths
 //! re-exported below, so external callers are unaffected.
 
+#[path = "util/any_upstream.rs"]
 pub(crate) mod any_upstream;
 pub mod dial;
 mod proxy_connect;
 pub(crate) mod stream;
+#[path = "dial/tcp_dial.rs"]
 pub(crate) mod tcp_dial;
 mod tls;
 pub mod tunnel;

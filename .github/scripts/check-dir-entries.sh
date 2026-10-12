@@ -8,7 +8,9 @@
 # folder is checked as soon as its files are added.
 #
 # BASELINE lists directories that were already over the limit when this check
-# was introduced, as "<entries> <path>" (the repository root is "."). It is a
+# was introduced, as "<entries> <path>" (the repository root is "."). The other
+# original violators (docs, crates/resocks5-net/src and its connect/) were
+# split in the QLT-04 restructuring and removed from the baseline. It is a
 # ratchet: a directory outside the baseline going over the limit, or a
 # baseline directory growing past its recorded size, fails the check, so the
 # baseline can only shrink. Split a directory, then lower or delete its entry.
@@ -19,9 +21,6 @@ MAX_ENTRIES=7
 
 BASELINE="
 19 .
-13 docs
-10 crates/resocks5-net/src/connect
-10 crates/resocks5-net/src
 "
 
 status=0

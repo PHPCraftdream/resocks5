@@ -241,5 +241,4 @@ async fn dial_inner(
 }
 
 #[cfg(test)]
-#[path = "dial_tests.rs"]
 mod tests;

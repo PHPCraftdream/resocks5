@@ -380,11 +380,11 @@ rustls 0.23.40, serde 1.0.228, anyhow 1.0.103, ktav 0.6.1.
 ## Фиксация отчёта
 
 Единственный изменённый tracked-файл:
-docs/REVIEW-2026-09-21-weekly-release.md.
+docs/reviews/REVIEW-2026-09-21-weekly-release.md.
 
 Коммит отчёта определяется без неоднозначности:
 
-    git log -1 --format=%H -- docs/REVIEW-2026-09-21-weekly-release.md
+    git log -1 --format=%H -- docs/reviews/REVIEW-2026-09-21-weekly-release.md
 
 Первая редакция отчёта закоммичена как
 b65af77215b6c276ca5082458b707fdf704691af; текущая редакция дополнительно

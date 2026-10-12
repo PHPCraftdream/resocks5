@@ -678,5 +678,4 @@ where
 }
 
 #[cfg(test)]
-#[path = "server_tests.rs"]
 mod tests;

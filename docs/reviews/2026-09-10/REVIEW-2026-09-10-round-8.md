@@ -43,7 +43,7 @@ rustls 0.23.40. Прочитана реализация `ktav::to_file` закр
 
 **R8-01 — P1 — Защита users-файла не распространяется на мигрируемые upstream-пароли.**
 
-[load_or_init_proxy_list](../crates/resocks5/src/config/load_or_init.rs#L56)
+[load_or_init_proxy_list](../../../crates/resocks5/src/config/load_or_init.rs#L56)
 читает прежние `socks5_ipv4_list.txt` / `socks5_ipv6_list.txt`, включая строки
 `user:pass@host:port`, затем записывает `resocks5.proxy_list.ktav` через
 `ktav::to_file`. В ktav 0.6.1 `src/lib.rs:147–150` это сериализация в строку
@@ -59,9 +59,9 @@ rustls 0.23.40. Прочитана реализация `ktav::to_file` закр
 он получает чтение новых credentials. Старый защищённый файл при этом
 остаётся нетронутым, что не защищает уже созданную копию.
 
-[SECURITY.md](../SECURITY.md#L95) прямо относит upstream credentials к
+[SECURITY.md](../../../SECURITY.md#L95) прямо относит upstream credentials к
 секретам в `.ktav` и запрещает их общедоступное чтение. Для users-файла уже
-существует [приватный writer](../crates/resocks5/src/config/users_file.rs#L561),
+существует [приватный writer](../../../crates/resocks5/src/config/users_file.rs#L561),
 но этот путь его обходит. Это отдельный файл и отдельный путь от ранее
 исправлявшегося R2-14. Конкретное расширение прав на Windows здесь не утверждается.
 
@@ -73,8 +73,8 @@ rustls 0.23.40. Прочитана реализация `ktav::to_file` закр
 
 **R8-02 — P2 — Первоначальная запись двух конфигураций остаётся неатомарной.**
 
-В [load_or_init_main](../crates/resocks5/src/config/load_or_init.rs#L31)
-и [load_or_init_proxy_list](../crates/resocks5/src/config/load_or_init.rs#L56)
+В [load_or_init_main](../../../crates/resocks5/src/config/load_or_init.rs#L31)
+и [load_or_init_proxy_list](../../../crates/resocks5/src/config/load_or_init.rs#L56)
 после `exists()` выполняется прямой `ktav::to_file` по окончательному имени.
 Нет повторной проверки под межпроцессной блокировкой и нет атомарной
 публикации подготовленного документа. Используемый `fs::write` создаёт файл
@@ -92,7 +92,7 @@ rustls 0.23.40. Прочитана реализация `ktav::to_file` закр
 
 Есть и гонка проверки отсутствия: процесс, ранее увидевший `exists() == false`,
 позднее может затереть уже созданный другим процессом файл. Для
-[users-файла](../crates/resocks5/src/config/load_or_init.rs#L92) такой класс
+[users-файла](../../../crates/resocks5/src/config/load_or_init.rs#L92) такой класс
 ошибок закрыт блокировкой, повторной проверкой и атомарной записью; остальные
 две конфигурации этой защитой не пользуются. Параллельные CLI users-команды
 тоже проходят эти ветки первоначальной инициализации.
@@ -106,17 +106,17 @@ rustls 0.23.40. Прочитана реализация `ktav::to_file` закр
 
 **R8-03 — P2 — SOCKS5 CONNECT не проверяет допустимость доменного назначения до dial.**
 
-[Ветка ATYP=0x03](../crates/resocks5/src/server/handle_socks5_client.rs#L530)
+[Ветка ATYP=0x03](../../../crates/resocks5/src/server/handle_socks5_client.rs#L530)
 принимает любую длину из одного байта, включая ноль, и проверяет у домена
 только UTF-8. После согласования метода пакет CONNECT
 `05 01 00 03 00 01 BB` превращается в target `:443`: длина домена равна нулю,
 порт равен 443. Домен с NUL тоже остаётся допустимой Rust-строкой.
 
 Для обычного SOCKS5-upstream сначала выполняется
-[pool.acquire](../crates/resocks5-net/src/connect/connect_socks5_proxy.rs#L24),
+[pool.acquire](../../../crates/resocks5-net/src/connect/connect_socks5_proxy.rs#L24),
 потом greeting/auth, и лишь затем
-[HostPort::parse](../crates/resocks5-net/src/connect/handshake_over_stream.rs#L62)
-отвергает `:443`. [Учёт ошибки](../crates/resocks5/src/server/establish_connection.rs#L655)
+[HostPort::parse](../../../crates/resocks5-net/src/connect/handshake_over_stream.rs#L62)
+отвергает `:443`. [Учёт ошибки](../../../crates/resocks5/src/server/establish_connection.rs#L655)
 штрафует исправный upstream и продолжает маршрутные попытки. В случае
 управляющих байтов HTTP-upstream аналогично отвергает target уже после acquire.
 При разрешённом anonymous credentials для этого не нужны; иначе условие —
@@ -136,12 +136,12 @@ upstream и изменения рейтинга. Исправленная HTTP-�
 
 **R8-04 — P2 — Успешная установка длинного пароля делает SOCKS5-вход невозможным.**
 
-[read_new_password](../crates/resocks5/src/cli/run_user_command.rs#L269)
+[read_new_password](../../../crates/resocks5/src/cli/run_user_command.rs#L269)
 проверяет только непустоту и совпадение двух вводов. `add` и `set-password`
 сохраняют hash пароля длиннее 255 байтов и сообщают успех. Верхняя граница
 из RFC 1929 уже проверяется у
-[имени пользователя](../crates/resocks5/src/cli/run_user_command.rs#L297),
-но не у пароля. [try_claim_init](../crates/resocks5/src/auth/state.rs#L204)
+[имени пользователя](../../../crates/resocks5/src/cli/run_user_command.rs#L297),
+но не у пароля. [try_claim_init](../../../crates/resocks5/src/auth/state.rs#L204)
 также проверяет только пустую строку, поэтому тот же пароль можно закрепить
 за init-пользователем через HTTP.
 
@@ -163,7 +163,7 @@ SOCKS5-предел до hash/persistence; если длинные пароли 
 
 **R8-05 — P3 — Межпроцессный users-lock охватывает ещё и вывод результата в stdout.**
 
-[commit_op_to](../crates/resocks5/src/cli/run_user_command.rs#L180) получает
+[commit_op_to](../../../crates/resocks5/src/cli/run_user_command.rs#L180) получает
 `UsersFileLock`, читает свежую конфигурацию, применяет изменение и выполняет
 `write_atomic`. Затем, ещё до уничтожения lock guard, вызывается `report(op)`
 с синхронными `println!`.
@@ -182,7 +182,7 @@ SOCKS5-предел до hash/persistence; если длинные пароли 
 
 **R8-06 — P3 — Работа с пользователями зависит от неиспользуемых main/proxy-list.**
 
-[run_user_command](../crates/resocks5/src/cli/run_user_command.rs#L58)
+[run_user_command](../../../crates/resocks5/src/cli/run_user_command.rs#L58)
 вызывает общий `load_or_init`, который последовательно читает main,
 proxy-list и users. После этого CLI использует только `configs.users`.
 Таким образом, даже `users list` читает и разбирает весь список upstream,
@@ -203,9 +203,9 @@ users-файлу. Причина отказа относится к другой
 
 **R8-07 — P3 — Подготовка ротаторов копирует строки обычных прокси перед удалением оригиналов.**
 
-В [run_server_inner](../crates/resocks5/src/main.rs#L262) обычные v4/v6-прокси
+В [run_server_inner](../../../crates/resocks5/src/main.rs#L262) обычные v4/v6-прокси
 получаются через `iter().filter(...).cloned().collect()`. Для
-[ProxyConfig](../crates/resocks5-net/src/types/proxy_config.rs#L13) Clone
+[ProxyConfig](../../../crates/resocks5-net/src/types/proxy_config.rs#L13) Clone
 копирует String-поля host и присутствующие credentials. Сразу после этого
 `all_v6` и `all_v4` потребляются через `into_iter`, из них выбираются только
 gates, а исходные обычные записи уничтожаются.
@@ -223,9 +223,9 @@ gates, а исходные обычные записи уничтожаются.
 
 **R8-08 — P3 — UTF-8 для HTTP Basic не объявляется клиенту.**
 
-Ответ [407](../crates/resocks5/src/http_proxy/handle_http_client.rs#L31)
+Ответ [407](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L31)
 содержит только `Proxy-Authenticate: Basic realm="resocks5"`. При этом
-[декодер credentials](../crates/resocks5/src/http_proxy/handle_http_client.rs#L579)
+[декодер credentials](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L579)
 жёстко требует UTF-8. CLI не ограничивает имя и пароль ASCII.
 
 По RFC кодировка Basic без charset не определена однозначно; клиент может

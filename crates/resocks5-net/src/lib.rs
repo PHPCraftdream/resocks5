@@ -50,11 +50,15 @@ pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, 
 pub mod connect;
 pub mod error;
 #[cfg(feature = "pool")]
+#[path = "session/pool/mod.rs"]
 pub mod pool;
+#[path = "session/progress.rs"]
 pub mod progress;
 #[cfg(feature = "rating")]
+#[path = "session/rating/mod.rs"]
 pub mod rating;
 #[cfg(feature = "rotator")]
+#[path = "session/rotator/mod.rs"]
 pub mod rotator;
 pub mod server;
 pub mod types;

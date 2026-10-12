@@ -4,23 +4,16 @@
 # check-dir-entries.sh (at most 7 entries per directory) it is the project's
 # code-structure rule: small files, small folders.
 #
-# BASELINE lists files that were already over the limit when this check was
-# introduced, as "<lines> <path>". It is a ratchet: a file outside the baseline
-# going over the limit, or a baseline file growing past its recorded size,
-# fails the check, so the baseline can only shrink. Split a file, then lower or
-# delete its entry.
+# BASELINE is empty: all original violators were split in the QLT-04
+# restructuring, so no tracked .rs file exceeds the limit. It is still a
+# ratchet: any file going over the limit fails the check, so the baseline can
+# only shrink. Split a file, then lower or delete its entry.
 
 set -u
 
 MAX_LINES=1000
 
-BASELINE="
-2191 crates/resocks5/src/auth/state/tests.rs
-1188 crates/resocks5-net/src/server_tests.rs
-1143 crates/resocks5-net/src/connect/tunnel.rs
-1060 crates/resocks5-net/src/connect/tls/tls_fragment/tests.rs
-1035 crates/resocks5-net/src/error.rs
-"
+BASELINE=""
 
 status=0
 

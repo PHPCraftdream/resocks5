@@ -91,7 +91,7 @@ const DRIP_DELAY: Duration = Duration::from_millis(40);
 /// call accepts a whole fragment and returns `Ready` even
 /// mid-congestion (tokio-rustls' `(n, would_block) → Ready(n)`): these
 /// tests deliberately never depend on the write-phase Pending
-/// accounting that P2-03 owns — see docs/REVIEW-2026-09-21-weekly-release.md.
+/// accounting that P2-03 owns — see docs/reviews/REVIEW-2026-09-21-weekly-release.md.
 const FRAGMENT: usize = 60 * 1024;
 /// Positives: the repo's established 1.5 MiB — large enough to
 /// congest any supported loopback, quick enough to drain.

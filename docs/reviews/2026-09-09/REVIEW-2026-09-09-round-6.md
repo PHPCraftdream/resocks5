@@ -20,11 +20,11 @@ argon2 0.5.3, serde 1.0.228, ktav 0.6.1. Поведение таймера со�
 с исходниками закреплённого Tokio, а не только с актуальной документацией.
 
 Сверенные гарантии: единый бюджет клиентских фаз и простой без движения байтов
-([NetworkConfig](../crates/resocks5/src/config/network_config.rs#L38)),
+([NetworkConfig](../../../crates/resocks5/src/config/network_config.rs#L38)),
 сохранение победителя первого входа
-([AuthState](../crates/resocks5/src/auth/state.rs#L198)), штраф рейтинга за
-действительный отказ upstream ([README](../README.md#L223)), ограничения
-ресурсов и обращение с недоверенным вводом ([SECURITY](../SECURITY.md#L47)).
+([AuthState](../../../crates/resocks5/src/auth/state.rs#L198)), штраф рейтинга за
+действительный отказ upstream ([README](../../../README.md#L223)), ограничения
+ресурсов и обращение с недоверенным вводом ([SECURITY](../../../SECURITY.md#L47)).
 
 **9 замечаний этого раунда: 4 P2 и 5 P3. Все открыты.** R6-02–R6-04 уточняют
 неполностью устранённые границы прежних замечаний. Прежняя полная сортировка
@@ -52,11 +52,11 @@ P0/P1 в проверенном объёме не обнаружены. Ссыл
 
 **R6-01 — P2 — Повторная проверка init находится до claim mutex.**
 
-В [try_claim_init](../crates/resocks5/src/auth/state.rs#L228) hash проверяется
+В [try_claim_init](../../../crates/resocks5/src/auth/state.rs#L228) hash проверяется
 под коротким read guard, затем строится снимок, и только после этого берётся
-[claim_lock](../crates/resocks5/src/auth/state.rs#L258). После ожидания mutex
+[claim_lock](../../../crates/resocks5/src/auth/state.rs#L258). После ожидания mutex
 проверка `users[idx].hash != INIT_HASH` больше не повторяется. При
-[ClaimPersist::Failed](../crates/resocks5/src/auth/state.rs#L293) hash безусловно
+[ClaimPersist::Failed](../../../crates/resocks5/src/auth/state.rs#L293) hash безусловно
 заменяется на `"init"`, хотя этот вызов перед persistence вообще не публиковал
 свой временный hash.
 
@@ -84,7 +84,7 @@ P0/P1 в проверенном объёме не обнаружены. Ссыл
 
 **R6-02 — P2 — Idle ограничивает целый write_all внутри chunk, а не отсутствие прогресса.**
 
-[write_progress_bounded](../crates/resocks5-net/src/connect/tls_fragment.rs#L155)
+[write_progress_bounded](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L155)
 оборачивает `write_all(buf)` вместе с `flush()` в один `timeout(idle, ...)`.
 Перенос таймера внутрь цикла исправляет длинную отправку множества мгновенно
 записываемых chunks, но не случай частичных записей одного chunk. Успешные
@@ -93,13 +93,13 @@ P0/P1 в проверенном объёме не обнаружены. Ссыл
 Расчётный сценарий: chunk 64 байта, idle 1 с, writer под обратным давлением
 принимает по 8 байтов каждые 200 мс. Между успешными записями нет секундного
 простоя, однако весь chunk требует больше секунды и helper возвращает
-`Stalled`. [forward_tunnel](../crates/resocks5/src/server/forward_tunnel.rs#L65)
+`Stalled`. [forward_tunnel](../../../crates/resocks5/src/server/forward_tunnel.rs#L65)
 после этого закрывает потоки. Сценарий требует частичных write; мгновенно
 записываемые однобайтные chunks из нового теста его не покрывают.
 
 Есть и обратное расхождение с
-[настройкой idle](../crates/resocks5/src/config/network_config.rs#L86):
-`delay_ms` ожидается [вне таймера](../crates/resocks5-net/src/connect/tls_fragment.rs#L141),
+[настройкой idle](../../../crates/resocks5/src/config/network_config.rs#L86):
+`delay_ms` ожидается [вне таймера](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L141),
 поэтому даже пауза длиннее idle не считается простоем. Новая документация
 helper объявляет такое исключение, а описание пользовательской настройки его не содержит.
 
@@ -112,12 +112,12 @@ helper объявляет такое исключение, а описание �
 
 **R6-03 — P2 — timeout(Duration::ZERO, operation) сначала запускает operation.**
 
-[remaining_client_budget](../crates/resocks5/src/server/handle_client.rs#L19)
+[remaining_client_budget](../../../crates/resocks5/src/server/handle_client.rs#L19)
 возвращает ноль после истечения срока. Комментарий и NetworkConfig обещают,
 что следующая фаза немедленно завершится таймаутом. Однако обработчики просто
 оборачивают фазу в `timeout` с этим нулём:
-[SOCKS5](../crates/resocks5/src/server/handle_socks5_client.rs#L47),
-[HTTP](../crates/resocks5/src/http_proxy/handle_http_client.rs#L95).
+[SOCKS5](../../../crates/resocks5/src/server/handle_socks5_client.rs#L47),
+[HTTP](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L95).
 
 В Tokio 1.43.1 `time/timeout.rs::Timeout::poll` сначала вызывает `value.poll`,
 возвращает `Ok` при `Ready` и только при `Pending` опрашивает таймер. Поэтому
@@ -127,7 +127,7 @@ helper объявляет такое исключение, а описание �
 Фаза с уже буферизованным запросом может успешно закончиться после своего
 deadline. Даже если она вернёт `Pending`, её первый poll уже может выполнить
 побочные действия: прочитать данные, ответить клиенту или вызвать
-[verify_async](../crates/resocks5/src/auth/state.rs#L140), который допускает
+[verify_async](../../../crates/resocks5/src/auth/state.rs#L140), который допускает
 работу в `spawn_blocking`. Последующая отмена ожидания не отменит начатый claim.
 Это отдельный случай от допустимого завершения ранее допущенной проверки
 после отмены: здесь новую фазу запускают уже с истёкшим сроком.
@@ -136,14 +136,14 @@ deadline. Даже если она вернёт `Pending`, её первый pol
 неистёкшего срока использовать общий абсолютный deadline; один переход на
 `timeout_at` сам по себе не меняет порядок первого poll. Критерий исправления:
 готовая операция с истёкшим сроком не запускается и не производит побочных
-действий. [Новый тест](../crates/resocks5/src/server/handle_client.rs#L369)
+действий. [Новый тест](../../../crates/resocks5/src/server/handle_client.rs#L369)
 проверяет только `pending()`, поэтому не различает эти два поведения.
 
 **R6-04 — P2 — HostPort проверяет разбиение адреса, но не допустимость байтов HTTP target.**
 
-Входной [parse_http_connect](../crates/resocks5/src/http_proxy/handle_http_client.rs#L496)
+Входной [parse_http_connect](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L496)
 теперь вызывает `HostPort::parse`, что устраняет прежние неверные порты.
-Но [HostPort](../crates/resocks5-net/src/connect/host_port.rs#L45) для доменного
+Но [HostPort](../../../crates/resocks5-net/src/connect/host_port.rs#L45) для доменного
 host проверяет только непустоту и отсутствие неподдерживаемого двоеточия.
 Управляющие байты он не отвергает; `from_utf8` request line тоже принимает NUL.
 
@@ -151,10 +151,10 @@ host проверяет только непустоту и отсутствие 
 `CONNECT exa\x00mple.com:443 HTTP/1.1\r\n\r\n` проходит входной разбор
 (здесь `\x00` обозначает один NUL). После разрешённого anonymous или успешной
 аутентификации обычный маршрут вызывает
-[pool.acquire](../crates/resocks5-net/src/connect/connect_http_proxy.rs#L25).
-Лишь затем [write_connect_request](../crates/resocks5-net/src/connect/connect_http_proxy.rs#L92)
+[pool.acquire](../../../crates/resocks5-net/src/connect/connect_http_proxy.rs#L25).
+Лишь затем [write_connect_request](../../../crates/resocks5-net/src/connect/connect_http_proxy.rs#L92)
 классифицирует этот target как недопустимый и возвращает ошибку.
-[establish_connection](../crates/resocks5/src/server/establish_connection.rs#L655)
+[establish_connection](../../../crates/resocks5/src/server/establish_connection.rs#L655)
 записывает её как failure исправного HTTP-upstream и продолжает попытки.
 
 Клиентская ошибка опять расходует подключения и портит рейтинг, хотя могла
@@ -166,10 +166,10 @@ host проверяет только непустоту и отсутствие 
 
 **R6-05 — P3 — Редкий fallback заставляет каждый claim копировать весь список пользователей.**
 
-В [try_claim_init](../crates/resocks5/src/auth/state.rs#L247) до получения
+В [try_claim_init](../../../crates/resocks5/src/auth/state.rs#L247) до получения
 `claim_lock` безусловно клонируется весь `Vec<User>`, включая принадлежащие
 пользователям строки name/hash. Этот снимок нужен только ветке
-[отсутствующего файла](../crates/resocks5/src/auth/state.rs#L331), где затем
+[отсутствующего файла](../../../crates/resocks5/src/auth/state.rs#L331), где затем
 выполняется ещё один `fallback_users.to_vec()`.
 
 В обычном случае users-файл существует: persistence читает и изменяет его,
@@ -187,7 +187,7 @@ claim и повторной проверки состояния. При пере
 
 **R6-06 — P3 — Разбор HTTP по байтам не требует вектора всех строк.**
 
-[Новый парсер](../crates/resocks5/src/http_proxy/handle_http_client.rs#L461)
+[Новый парсер](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L461)
 сначала накапливает `Vec<&[u8]>` для всех строк, затем разбирает первую строку
 и один раз ищет Proxy-Authorization. Раньше строки перечислялись итератором
 без отдельной таблицы. Исправление obs-text требует разбора по байтам, но
@@ -208,7 +208,7 @@ payload, лимит размера и поддержку opaque-значений
 
 **R6-07 — P3 — Задержки в новых тестах не подтверждают наступление нужной фазы.**
 
-[anchor_first_poll](../crates/resocks5/src/server/handle_client.rs#L175)
+[anchor_first_poll](../../../crates/resocks5/src/server/handle_client.rs#L175)
 выполняет 50 `yield_now` с реальными `thread::sleep(1 ms)`. Затем deadline-тесты
 соединяют paused Tokio clock с реальным TCP и предполагают, что данные
 перевели обработчик именно в handshake/recovery до следующего срабатывания
@@ -218,9 +218,9 @@ Paused clock автоматически продвигается к следую
 Это поведение есть в Tokio 1.43.1 и описано в
 [документации pause](https://docs.rs/tokio/latest/tokio/time/fn.pause.html#auto-advance).
 
-В [тесте users-lock](../crates/resocks5/src/auth/state.rs#L1030) подтверждается
+В [тесте users-lock](../../../crates/resocks5/src/auth/state.rs#L1030) подтверждается
 захват файлового lock, но вход T1 в persistence заменён
-[sleep(300 ms)](../crates/resocks5/src/auth/state.rs#L1053). Lock отпускается
+[sleep(300 ms)](../../../crates/resocks5/src/auth/state.rs#L1053). Lock отпускается
 по трёхсекундному таймеру, а результат другого входа оценивается по 1500 мс
 реального времени. Если T1 ещё не дошёл до своей критической секции, старый
 код может пройти проверку: Alice и проверка sentinel успеют завершиться
@@ -237,7 +237,7 @@ sleep/yield и скоростью Argon2 на конкретной машине.
 
 **R6-08 — P3 — Тест запрета лишних построений проверяет только количество попыток.**
 
-[budget_exhausted_by_cache_failure_makes_no_further_attempts](../crates/resocks5/src/server/establish_connection.rs#L1255)
+[budget_exhausted_by_cache_failure_makes_no_further_attempts](../../../crates/resocks5/src/server/establish_connection.rs#L1255)
 проверяет текст `All 1 upstream attempts` и отсутствие новой sticky-привязки.
 Оба свойства уже обеспечивал код до `f6019c9`: внутренние проверки бюджета
 запрещали дальнейший dial, но порядок gates/proxies строился до этих проверок.
@@ -254,10 +254,10 @@ sleep/yield и скоростью Argon2 на конкретной машине.
 
 **R6-09 — P3 — Тест ограниченного teardown не вызывает production-wrapper.**
 
-[runtime_teardown_is_bounded_with_a_stuck_blocking_write](../crates/resocks5/src/main.rs#L764)
+[runtime_teardown_is_bounded_with_a_stuck_blocking_write](../../../crates/resocks5/src/main.rs#L764)
 создаёт собственный runtime, запускает parked blocking-операцию и напрямую
 вызывает `runtime.shutdown_timeout(500 ms)`. Производственная функция
-[run_server](../crates/resocks5/src/main.rs#L173), её catch_unwind и её выбор
+[run_server](../../../crates/resocks5/src/main.rs#L173), её catch_unwind и её выбор
 способа завершения runtime тестом не вызываются.
 
 Возврат production-кода к неограниченному `Runtime::drop` не меняет ни одной
