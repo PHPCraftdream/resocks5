@@ -740,6 +740,10 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
     assert_eq!(first, [b'C']);
     // Deliberately defer entry, without a sleep or a production observation seam.
     tokio::time::advance(Duration::from_secs(2)).await;
+    // Real sockets below: a paused clock auto-advances whenever the runtime is
+    // idle, so a late kernel event (FIN delivery on macOS) would trip the
+    // timeouts. The deadline is already expired; wall-clock time is enough.
+    tokio::time::resume();
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::empty());
     let pool = Arc::new(ProxyPool::new(
@@ -773,7 +777,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
         Some(resocks5_net::server::ServerError::Deadline)
     ));
     let mut untouched = vec![0; frame.len()];
-    tokio::time::timeout(Duration::from_secs(1), observer.read_exact(&mut untouched))
+    tokio::time::timeout(Duration::from_secs(5), observer.read_exact(&mut untouched))
         .await
         .unwrap()
         .unwrap();
@@ -788,7 +792,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
     );
     drop(observer);
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut response))
+    tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut response))
         .await
         .unwrap()
         .unwrap();
