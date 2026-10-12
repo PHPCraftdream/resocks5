@@ -150,7 +150,9 @@ build Rust — but no `cmake` is needed.
 cargo build --release
 # → target/release/resocks5[.exe]
 
-# …or install the binary onto your PATH:
+# …or install the binary onto your PATH (from crates.io, since 0.3.0):
+cargo install resocks5
+# …or from a checkout:
 cargo install --path crates/resocks5
 # …or straight from git:
 cargo install --git https://github.com/PHPCraftdream/resocks5 resocks5
@@ -272,11 +274,13 @@ The networking core is published as a separate crate,
 [`resocks5-net`](crates/resocks5-net) — inbound smart-port framing, upstream
 connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credential
 storage, logging and routing policy stay in the host application.
-Add it as a git dependency:
+Add it from crates.io (the inbound `server` module needs 0.3 or newer), or as a
+git dependency to follow unreleased changes:
 
 ```toml
 [dependencies]
-resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
+resocks5-net = "0.3"
+# resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -365,8 +369,9 @@ HTTP headers are byte-parsed, accept unused obs-text, and have a delimiter-inclu
 stream; admitted authentication persistence can still finish. Routing, gates,
 SNI/Host recovery, logs and egress/tunnel budgets remain host-owned. After early
 recovery success, failure closes the tunnel instead of sending a second reply.
-External authentication and Tor egress can use the same closure-based API; future
-local-path consumers keep version `0.2.0`, with no Tor-project edits in this change.
+External authentication and Tor egress can use the same closure-based API; the Tor
+proxy [tor-socks5](https://github.com/PHPCraftdream/tor-socks5) embeds its listener
+this way.
 
 ## User management
 

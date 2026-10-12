@@ -7,53 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
+Adds the reusable inbound server API (`resocks5_net::server`) that the Tor-based
+sibling project builds on, and makes every reply the proxy sends reach the client
+reliably.
+
 ### Added
 
-- Code-structure rule in CI (`structure` job): at most 1000 lines per Rust file
-  and at most 7 entries per directory (`.github/scripts/check-line-limit.sh`,
-  `.github/scripts/check-dir-entries.sh`). The five files and four directories
-  already over the limit are recorded with their current size as a ratchet that
-  can only shrink, so nothing new breaks while they are split.
-
-- `resocks5-net::server`: unconditional SOCKS5/HTTP CONNECT detection and inbound
+- `resocks5-net::server`: unconditional SOCKS5 / HTTP CONNECT detection and inbound
   framing with owned, Debug-redacted credentials and closure authentication (no
-  public authentication trait). Returns unresolved targets, verified usernames and
-  owned pipeline bytes; typed non-exhaustive errors and semantic host replies.
-  One host-supplied absolute deadline has an expired-entry pre-poll guard.
-  GeneralFailure preserves SOCKS REP 1 for embedding hosts while sending HTTP 502.
+  public authentication trait). `accept` returns the unresolved target, the
+  verified username and the owned pipeline bytes; errors are typed and
+  `#[non_exhaustive]`, and replies are semantic (`Reply::Established` and the
+  failure variants). One host-supplied absolute deadline bounds detection,
+  authentication and framing, with a guard against an already-expired entry.
+  `GeneralFailure` keeps SOCKS REP 1 for embedding hosts and sends HTTP 502.
+  Usage and contracts: [`crates/resocks5-net/README.md`](crates/resocks5-net/README.md#inbound-server-api).
 - Finite `serve_local` example: two clients share one listener, authenticate through
-  the host callback, and relay to an explicit separately running local echo target
-  over a real TCP connection. Success follows dial; buffered payload is sent once.
+  the host callback and relay to an explicit, separately running local echo target
+  over a real TCP connection. Success is sent after the dial; buffered payload is
+  forwarded once.
+- Code-structure rule in CI (`structure` job): at most 1000 lines per Rust file and
+  at most 7 entries per directory (`.github/scripts/check-line-limit.sh`,
+  `.github/scripts/check-dir-entries.sh`). Offenders are recorded as a ratchet that
+  can only shrink; none are left.
+- CI: the release workflow now publishes the `resocks5` binary crate
+  (`cargo install resocks5`) after `resocks5-net`; a manual run with `only_app`
+  publishes just the binary for a version whose SDK is already on crates.io.
 
 ### Changed
 
-- SDK inbound replies now use `write_all` followed by `flush`, including method
-  selection, password success/failure, unsupported methods, HTTP failures, domain
-  rejection and every public SOCKS5/HTTP final outcome. Transport failures propagate
-  as `ServerError::Io` rather than being hidden by authentication/protocol errors.
-  Handshake/error flushes remain within the original absolute accept deadline;
-  public final-reply write/flush budgets remain host-owned. Error, timeout and
-  cancellation are terminal: discard buffered wrappers, never replay partial replies.
-- Unsupported SOCKS5 commands (including BIND and UDP ASSOCIATE) now flush canonical
-  `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]` refusals; unknown ATYP flushes
-  `[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]` before a protocol error, after either auth method.
-  Wrong versions retain the terminal no-response contract. Buffered-duplex regressions
-  cover staged peers, failure visibility before drop and final outcomes without a
-  host flush; stalled-flush fixtures cover I/O propagation, deadlines and cancellation.
-
-- Both application paths now use the shared library parser once at dispatch;
-  protocol replies use the request's encoder. Routing, gate accounting, recovery,
-  logging and forwarding budgets stay application-owned. The deadline now anchors
-  at listener acceptance rather than when the spawned handler first runs.
-- Application handlers borrow the request's destination and authenticated identity
+- **Every inbound reply is written and flushed.** SDK replies use `write_all`
+  followed by `flush`: method selection, password success and failure, unsupported
+  methods, HTTP failures, domain rejection and each public SOCKS5 / HTTP final
+  outcome. A transport failure surfaces as `ServerError::Io` instead of being hidden
+  by an authentication or protocol error. Handshake and error flushes stay within the
+  original accept deadline; the final-reply write budget remains the host's. Error,
+  timeout and cancellation are terminal: buffered wrappers are discarded and a
+  partial reply is never replayed.
+- Both application paths (SOCKS5 and HTTP CONNECT) call the shared library parser
+  once at dispatch, and protocol replies use the request's encoder. Routing, gate
+  accounting, recovery, logging and forwarding budgets stay in the application. The
+  accept deadline is anchored when the listener accepts the connection, not when the
+  spawned handler first runs.
+- Handlers borrow the destination and authenticated identity of the parsed request
   instead of allocating duplicate strings on every connection.
-- Preserved delimiter-inclusive 16KiB HTTP headers, unused obs-text, existing Basic
-  and SOCKS method policy, permissive legacy framing, and lossless binary pipeline.
-  Anonymous identity is never substituted with an empty authenticated username for
-  direct routing. Cancellation remains terminal; admitted auth persistence can
-  complete afterward. Parser deadline diagnostics use the typed library error.
-- Parser-only regressions moved into library coverage; application persistence and
-  recovery regressions remain. Versions, MSRV and dependency pins are unchanged.
+- Source files and directories were regrouped to satisfy the new structure rule;
+  modules keep their names and paths, behaviour is unchanged.
+- Unchanged by design: the delimiter-inclusive 16 KiB HTTP header cap, unused
+  obs-text, the existing Basic and SOCKS method policy, permissive legacy framing and
+  the lossless binary pipeline. An anonymous identity is never replaced by an empty
+  authenticated username for direct routing.
+
+### Fixed
+
+- Unsupported SOCKS5 commands, including BIND and UDP ASSOCIATE, now flush the
+  canonical refusal `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]`, and an unknown address type
+  flushes `[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]` before the protocol error, with either
+  authentication method. A wrong protocol version keeps its terminal no-response
+  contract.
+- A flaky macOS test of the delayed accept deadline: it waited on real loopback
+  sockets under a paused clock, which auto-advances while the runtime is idle, so a
+  late FIN could trip the timeout. It now resumes the clock after the deliberate
+  advance and uses wall-clock timeouts.
 
 ## [0.2.0] - 2026-10-01
 
@@ -613,7 +630,8 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/PHPCraftdream/resocks5/releases/tag/v0.1.0

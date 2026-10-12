@@ -167,7 +167,8 @@ password may contain `:`.
 
 ```toml
 [dependencies]
-resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
+resocks5-net = "0.3"
+# resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
