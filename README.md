@@ -150,13 +150,15 @@ build Rust — but no `cmake` is needed.
 cargo build --release
 # → target/release/resocks5[.exe]
 
-# …or install the binary onto your PATH (from crates.io, since 0.3.0):
-cargo install resocks5
-# …or from a checkout:
+# …or install the binary onto your PATH from a checkout:
 cargo install --path crates/resocks5
 # …or straight from git:
 cargo install --git https://github.com/PHPCraftdream/resocks5 resocks5
 ```
+
+Prebuilt binaries are attached to each
+[GitHub Release](https://github.com/PHPCraftdream/resocks5/releases); the
+binary is not published on crates.io (only the `resocks5-net` library is).
 
 ### Run with Docker
 

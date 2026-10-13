@@ -6,21 +6,16 @@ name: release
 #   - a multi-arch (amd64 + arm64) container image pushed to ghcr.io
 #
 # `workflow_dispatch` lets a maintainer re-run the pipeline for an existing tag
-# (e.g. to republish a botched release) without force-pushing the tag. Its
-# `only_app` input skips builds/Release/Docker and publishes just the
-# `resocks5` binary crate to crates.io (for a version whose SDK crate is
-# already published).
+# (e.g. to republish a botched release) without force-pushing the tag.
+#
+# The `resocks5` binary is distributed only through the GitHub Release and the
+# container image; crates.io carries just the `resocks5-net` SDK.
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      only_app:
-        description: 'Only publish the resocks5 binary crate to crates.io (skip builds, GitHub Release, Docker, SDK publish)'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -35,7 +30,6 @@ jobs:
   # target. The two macOS targets are both built on a single arm64 runner —
   # arm64 natively, x86_64 as a same-OS cross (same SDK, just `-target`).
   build:
-    if: ${{ !inputs.only_app }}
     name: build (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -102,7 +96,6 @@ jobs:
           retention-days: 7
 
   release:
-    if: ${{ !inputs.only_app }}
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -148,18 +141,11 @@ jobs:
   #     PHPCraftdream/resocks5, workflow release.yml. Then set the variable
   #     to "oidc" and delete the CARGO_REGISTRY_TOKEN secret.
   #
-  # Two crates are published, strictly in this order (`max-parallel: 1`;
-  # a failed leg stops the next): the SDK `resocks5-net` first, then the
-  # `resocks5` binary, which depends on the SDK version just uploaded —
-  # `cargo publish` waits for the SDK to appear in the index. A trusted
-  # publisher must be configured per crate on crates.io.
+  # Only the SDK is published; the `resocks5` binary crate is `publish =
+  # false` (binaries ship via the GitHub Release and the container image).
   publish-crates:
-    name: publish ${{ matrix.crate }} to crates.io
+    name: publish resocks5-net to crates.io
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        crate: ${{ fromJSON(inputs.only_app && '["resocks5"]' || '["resocks5-net","resocks5"]') }}
     # Job-level permissions replace the workflow-level ones: read-only
     # contents, plus the OIDC identity token for the trusted-publishing
     # exchange (unused in token mode).
@@ -176,14 +162,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: publish-${{ matrix.crate }}
+          key: publish-resocks5-net
       - name: Dry-run (packaging + build sanity, no upload)
-        run: cargo publish -p ${{ matrix.crate }} --locked --dry-run
+        run: cargo publish -p resocks5-net --locked --dry-run
       - name: Publish (API token)
         if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN == 'true' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p ${{ matrix.crate }} --locked
+        run: cargo publish -p resocks5-net --locked
       - name: Upload skipped (no credentials configured)
         if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN != 'true' }}
         run: echo "::notice::crates.io upload skipped - add the CARGO_REGISTRY_TOKEN secret, or set the CRATES_IO_AUTH variable to 'oidc' once a trusted publisher is configured."
@@ -195,14 +181,13 @@ jobs:
         if: ${{ vars.CRATES_IO_AUTH == 'oidc' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-        run: cargo publish -p ${{ matrix.crate }} --locked
+        run: cargo publish -p resocks5-net --locked
 
   # Multi-arch container image → ghcr.io/<owner>/resocks5.
   # Built with Buildx + QEMU so a single ubuntu runner emits both linux/amd64
   # and linux/arm64 manifests. `metadata-action` lowercases the repo name
   # (ghcr.io requires all-lowercase) and derives semver tags from the git tag.
   docker:
-    if: ${{ !inputs.only_app }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

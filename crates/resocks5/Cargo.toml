@@ -9,14 +9,14 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["socks5", "proxy", "http-connect", "tokio", "networking"]
 categories = ["network-programming", "command-line-utilities"]
+# The binary ships via the GitHub Release and the container image only.
+publish = false
 
 [dependencies]
-# `version` is required for `cargo package`/`cargo publish`: a registry
-# consumer has no `../resocks5-net` on disk, so Cargo resolves this from
-# crates.io instead, using `path` only for the local workspace build. Not
-# covered by workspace inheritance (that's for a crate's own version, not
-# a sibling dependency's) — bump this alongside `[workspace.package].version`
-# whenever resocks5-net's API changes.
+# `version` is what a registry build would resolve from crates.io (`path` is
+# only for the local workspace build); the crate is `publish = false`, so
+# it is kept in step with `[workspace.package].version` in case publishing
+# is ever re-enabled. Not covered by workspace inheritance.
 resocks5-net = { path = "../resocks5-net", version = "0.3.0", features = ["pool", "tls", "serde", "rating", "rotator"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true

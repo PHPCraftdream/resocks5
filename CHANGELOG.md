@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI: the release workflow no longer publishes the `resocks5` binary crate to
+  crates.io (the 0.3.0 note about `cargo install resocks5` was never realised:
+  the crate was not published). Binaries ship only as GitHub Release archives and
+  the container image; the crate is `publish = false`. `resocks5-net` is still
+  published to crates.io. The `only_app` manual-run input is removed.
+
 ## [0.3.0] - 2026-10-12
 
 Adds the reusable inbound server API (`resocks5_net::server`) that the Tor-based
