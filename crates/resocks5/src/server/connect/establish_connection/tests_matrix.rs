@@ -211,15 +211,22 @@ async fn drain_stream(stream: &mut ErasedStream, drain: &Drain) {
             collected,
         } => {
             let mut buf = vec![0u8; *chunk];
+            let start = tokio::time::Instant::now();
+            let mut total = 0usize;
             loop {
                 let n = match stream.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
                 collected.lock().unwrap().extend_from_slice(&buf[..n]);
-                // Paced drain: scale the silence to the bytes actually
-                // read (edb1230) — never a flat per-read sleep.
-                tokio::time::sleep(delay.mul_f64(n as f64 / *chunk as f64)).await;
+                // Paced drain: the silence scales with the bytes actually
+                // read (edb1230) — never a flat per-read sleep. Pace against
+                // a deadline, not per-read sleeps: small TLS reads would
+                // otherwise each round up to the OS timer tick (~15.6 ms on
+                // Windows) and stretch the ~15 s drip toward the test budget.
+                total += n;
+                let due = start + delay.mul_f64(total as f64 / *chunk as f64);
+                tokio::time::sleep_until(due).await;
             }
             let _ = stream.shutdown().await;
         }
