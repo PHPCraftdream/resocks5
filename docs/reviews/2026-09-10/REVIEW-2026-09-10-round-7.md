@@ -18,13 +18,13 @@ serde 1.0.228, anyhow 1.0.103, bytes 1.11.1. Для проверки буфер�
 прочитаны исходники закреплённого tokio-rustls, включая `poll_write` и `poll_flush`.
 
 Сверенные гарантии: запрет входа в клиентскую фазу после deadline
-([NetworkConfig](../../../crates/resocks5/src/config/network_config.rs#L38)),
+([NetworkConfig](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/config/network_config.rs#L38)),
 idle по отсутствию прогресса записи
-([фрагментация](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L113)),
+([фрагментация](https://github.com/PHPCraftdream/resocks5/blob/7d30b92e2dc308ec34e090faac227a7296ef29ab/crates/resocks5-net/src/connect/tls_fragment.rs#L113)),
 сохранение победителя init-claim и доступность чтения пользователей во время
-persistence ([AuthState](../../../crates/resocks5/src/auth/state.rs#L43)),
+persistence ([AuthState](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L43)),
 ограниченное завершение runtime
-([production-wrapper](../../../crates/resocks5/src/main.rs#L194)).
+([production-wrapper](https://github.com/PHPCraftdream/resocks5/blob/8e3c3d424ea3d8299b50d8b678f83d75ec778d92/crates/resocks5/src/main.rs#L194)).
 
 **7 открытых замечаний: 2 P2 и 5 P3.** Оба P2 уточняют оставшиеся случаи
 R6-02/R6-03. Пункты P3 касаются дополнительной сериализации аутентификации,
@@ -51,11 +51,11 @@ P0/P1 в проверенном объёме не обнаружены. Ссыл
 
 **R7-01 — P2 — Новый guard подключён к handshake, но не к recovery.**
 
-[run_phase_in_client_budget](../../../crates/resocks5/src/server/handle_client.rs#L90)
+[run_phase_in_client_budget](https://github.com/PHPCraftdream/resocks5/blob/c43d2a18343ed8402d07a77d6d2488068cb63c33/crates/resocks5/src/server/handle_client.rs#L90)
 правильно отвергает нулевой остаток до первого poll операции. Его используют
 SOCKS5- и HTTP-handshake. Однако
-[SOCKS5 recovery](../../../crates/resocks5/src/server/handle_socks5_client.rs#L262)
-и [HTTP recovery](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L298)
+[SOCKS5 recovery](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/server/handle_socks5_client.rs#L262)
+и [HTTP recovery](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L298)
 сначала отправляют положительный ответ, затем по-прежнему вызывают
 `timeout(remaining_client_budget(deadline), peek_recovery(...))`.
 
@@ -65,7 +65,7 @@ SOCKS5- и HTTP-handshake. Однако
 в [документации timeout](https://docs.rs/tokio/latest/tokio/time/fn.timeout.html).
 
 Для HTTP достаточно полного pipelined-префикса, переданного вместе с CONNECT
-к IPv4. [peek_recovery](../../../crates/resocks5/src/server/recovery.rs#L66) передаёт
+к IPv4. [peek_recovery](https://github.com/PHPCraftdream/resocks5/blob/ad51d898b62b9c714bb16d95127c65e601ba447c/crates/resocks5/src/server/recovery.rs#L66) передаёт
 его в `read_recovery_prefix`, который может сразу вернуть найденное имя без
 ожидания сокета. Просроченная recovery-фаза тогда проходит и продолжает
 установление upstream. При этом ранний 200/SOCKS5 success уже отправлен
@@ -81,10 +81,10 @@ upstream connect, как они описаны в NetworkConfig. Критери�
 **R7-02 — P2 — Таймер всего flush не является таймером отсутствия прогресса.**
 
 Обычные частичные `write` теперь правильно обновляют окно. Но
-[write_progress_bounded](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L187)
+[write_progress_bounded](https://github.com/PHPCraftdream/resocks5/blob/7d30b92e2dc308ec34e090faac227a7296ef29ab/crates/resocks5-net/src/connect/tls_fragment.rs#L187)
 по-прежнему ограничивает весь `writer.flush()` одним `timeout(idle, ...)`.
 Для прямого TcpStream flush обычно немедленный; для используемого приложением
-[TLS-варианта AnyUpstream](../../../crates/resocks5-net/src/pool/any_upstream.rs)
+[TLS-варианта AnyUpstream](https://github.com/PHPCraftdream/resocks5/blob/857d64ffbf32be332fbc66e1fb8ec2ea64ad7361/crates/resocks5-net/src/pool/any_upstream.rs)
 он выполняет настоящую отправку накопленных данных.
 
 В tokio-rustls 0.26.4 `common/mod.rs::poll_write` может вернуть число принятых
@@ -100,7 +100,7 @@ flush. Буферизация и необходимость отдельного
 который сразу принимает chunk в память, а при flush отдаёт его частями
 каждые 200 мс более секунды при idle 1 с. Такой прогресс helper не наблюдает.
 Тот же пробел есть в основном
-[Tracked::poll_flush](../../../crates/resocks5-net/src/connect/tunnel.rs#L122):
+[Tracked::poll_flush](https://github.com/PHPCraftdream/resocks5/blob/dccae469d95124552da3f8b5472e6f2583ceb7d7/crates/resocks5-net/src/connect/tunnel.rs#L122):
 он не обновляет activity по работе, происходящей внутри TLS-обёртки.
 
 Учитывать подтверждённый прогресс на слое, где выполняются фактические записи,
@@ -114,11 +114,11 @@ R6-02; описанное исключение намеренных `delay_ms` �
 
 **R7-03 — P3 — Запись claim продолжает занимать общий слот проверки паролей.**
 
-[verify_async](../../../crates/resocks5/src/auth/state.rs#L140) при cache miss получает
+[verify_async](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L140) при cache miss получает
 permit `verify_slots` и передаёт его blocking-задаче. Permit живёт до полного
 возврата `state.verify`, включая ожидание `claim_lock`, межпроцессного lock
 и запись users-файла. Число permits равно
-[min(available_parallelism, 4)](../../../crates/resocks5/src/auth/state.rs#L104),
+[min(available_parallelism, 4)](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L104),
 с fallback 1.
 
 При одном слоте единственный init-claim, задержанный users-файлом, не даёт
@@ -127,11 +127,12 @@ permit `verify_slots` и передаёт его blocking-задаче. Permit �
 время свободен, но клиент ждёт более ранний semaphore. Попадания в auth cache
 обходят эту очередь; замечание относится к промахам cache и медленному claim I/O.
 
-[Тест отсутствия блокировки другого пользователя](../../../crates/resocks5/src/auth/state.rs#L1215)
-вызывает синхронный `state.verify` и потому не проходит через `verify_slots`.
-Он не доказывает доступность полного серверного пути `verify_async`.
+[Тест отсутствия блокировки другого пользователя](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5/src/auth/state.rs)
+вызывает синхронный `state.verify` и потому не доказывает доступность полного серверного пути `verify_async`.
 Это дополнительная точка сериализации той же области R5-10, а не новая
 гонка уже исправленного users RwLock.
+
+Примечание: исходные шесть номеров строк раунда 7 не удалось восстановить по доступной git-истории; ссылки ведут на снимки файлов без якорей строк.
 
 Разделить ограничение CPU-верификации и сериализацию/ожидание persistence,
 сохранив ограниченное число задач и очередей для обоих видов работы. Простое
@@ -143,9 +144,9 @@ hash, пока другой claim ждёт разрешения записи ф�
 
 **R7-04 — P3 — Тест гонки claim может пройти без проверки состояния после mutex.**
 
-В [init_claim_race_loser_after_winner_commit_does_not_clobber_hash](../../../crates/resocks5/src/auth/state.rs#L895)
+В [init_claim_race_loser_after_winner_commit_does_not_clobber_hash](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L895)
 родитель удерживает `claim_lock`, запускает T2, ждёт
-[500 мс](../../../crates/resocks5/src/auth/state.rs#L939), затем вручную публикует
+[500 мс](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L939), затем вручную публикует
 состояние победителя в файл, память и cache. Подтверждения, что T2 уже прошёл
 первоначальную проверку и дошёл до ожидания mutex, нет.
 
@@ -155,7 +156,7 @@ hash, пока другой claim ждёт разрешения записи ф�
 прямо допускает такой проход. Две итерации не устанавливают нужного
 межпоточного порядка.
 
-В [проверке ожидания users-файла](../../../crates/resocks5/src/auth/state.rs#L1296)
+В [проверке ожидания users-файла](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5/src/auth/state.rs)
 `claim_lock.try_lock() == WouldBlock` подтверждает владение mutex, но не
 вход T1 в persistence: между ними остаются повторная проверка состояния
 и файловый stat. Проверяемое чтение другого пользователя может успеть
@@ -172,12 +173,12 @@ hash, пока другой claim ждёт разрешения записи ф�
 **R7-05 — P3 — Счётчик DripWriter не доказывает сохранность переданных данных.**
 
 Новые DripWriter в
-[библиотеке](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L535) и
-[приложении](../../../crates/resocks5/src/server/forward_tunnel.rs#L638) хранят
+[библиотеке](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5-net/src/connect/tls_fragment.rs) и
+[приложении](https://github.com/PHPCraftdream/resocks5/blob/dccae469d95124552da3f8b5472e6f2583ceb7d7/crates/resocks5/src/server/forward_tunnel.rs) хранят
 число принятых байтов и управляют готовностью, но не сохраняют сами принятые
 срезы. Поэтому assertions с текстом `no byte may be lost`
-([библиотека](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L596),
-[приложение](../../../crates/resocks5/src/server/forward_tunnel.rs#L723)) проверяют
+([библиотека](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5-net/src/connect/tls_fragment.rs),
+[приложение](https://github.com/PHPCraftdream/resocks5/blob/dccae469d95124552da3f8b5472e6f2583ceb7d7/crates/resocks5/src/server/forward_tunnel.rs)) проверяют
 только равенство длин.
 
 В новом ручном цикле частичных записей можно ошибочно заменить
@@ -196,7 +197,7 @@ hash, пока другой claim ждёт разрешения записи ф�
 
 **R7-06 — P3 — Счётчик для теста выполняется при выборе маршрутов в обычной сборке.**
 
-В [ProxyRotator::pick_order](../../../crates/resocks5-net/src/rotator/mod.rs#L327)
+В [ProxyRotator::pick_order](https://github.com/PHPCraftdream/resocks5/blob/3422dad6e93845cc77d95890d14359616876fc38/crates/resocks5-net/src/rotator/mod.rs#L327)
 добавлен безусловный `AtomicU64::fetch_add(Relaxed)`. Поле и публичный
 `pick_order_calls()` компилируются всегда, поскольку обычный `cfg(test)`
 в библиотеке не виден тестам зависимого binary-crate. По комментарию и
@@ -217,9 +218,9 @@ throughput здесь не заявляется. Проверка R6-08 при �
 
 **R7-07 — P3 — Измерение времени начинается после запуска helper.**
 
-В [проверке штатного teardown](../../../crates/resocks5/src/main.rs#L802) helper
+В [проверке штатного teardown](https://github.com/PHPCraftdream/resocks5/blob/8e3c3d424ea3d8299b50d8b678f83d75ec778d92/crates/resocks5/src/main.rs#L802) helper
 запускается до `let start = Instant::now()` в родителе. То же расположение
-есть в [проверке panic-пути](../../../crates/resocks5/src/main.rs#L866). Затем
+есть в [проверке panic-пути](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5/src/main.rs). Затем
 родитель требует `elapsed >= budget - 1 s`, считая, что измерил практически
 всё пятисекундное ожидание teardown.
 
@@ -256,9 +257,9 @@ blocking-задачи и её освобождение в новых теста�
 Прежний **R5-09 — P3** остаётся: для ещё не исчерпанного малого бюджета
 строится весь weighted order, а для очередного gate он может строиться снова.
 Под mutex по-прежнему генерируются N ключей
-([Ratings](../../../crates/resocks5-net/src/rating/mod.rs#L114)), полная сортировка
+([Ratings](https://github.com/PHPCraftdream/resocks5/blob/70e3d19e9f0db5016bcedbadfbb01243ea307205/crates/resocks5-net/src/rating/mod.rs#L114)), полная сортировка
 за `O(N log N)` выполняется снаружи
-([order_keys](../../../crates/resocks5-net/src/rating/select.rs#L76)). Проверка бюджета
+([order_keys](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5-net/src/rating/select.rs#L76)). Проверка бюджета
 до построения исправлена и теперь наблюдаема тестом, но ограниченный префикс
 ещё не реализован. Практический выбор следующей оптимизации требует размеров
 реальных списков и измерений. Согласование внешнего срока остановки контейнера

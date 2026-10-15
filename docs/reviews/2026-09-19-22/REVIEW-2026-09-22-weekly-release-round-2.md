@@ -54,9 +54,9 @@ P1: нет подтверждённых находок.
   graph. Обычный вызов с нетипизированным `None` уже исправлен; проблема
   сохраняется для публичного именуемого типа и обёрток над API.
 - Concrete evidence: в
-  [connect_proxy.rs:30](../../../crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L30)
+  [connect_proxy.rs:30](https://github.com/PHPCraftdream/resocks5/blob/eb7aa6e2168f48f4b2a80432481cc178c07ab501/crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L30)
   lean-вариант объявлен как `pub struct TlsConnector`, а в том же файле
-  [строка 6](../../../crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L6)
+  [строка 6](https://github.com/PHPCraftdream/resocks5/blob/eb7aa6e2168f48f4b2a80432481cc178c07ab501/crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs#L6)
   TLS-вариант — приватный `use tokio_rustls::TlsConnector`. Модуль публично
   реэкспортирован через `connect::connect_proxy`. Введено `cdf866a`,
   сохраняется на `93d4701`.
@@ -99,12 +99,12 @@ P1: нет подтверждённых находок.
   не завершается. Это также важная граница для SOCKS5 поверх TLS/gate при
   backpressure; сам real-TLS случай отдельно этим probe не воспроизводился.
 - Concrete evidence:
-  [handshake_over_stream.rs:18](../../../crates/resocks5-net/src/connect/util/handshake_over_stream.rs#L18),
+  [handshake_over_stream.rs:18](https://github.com/PHPCraftdream/resocks5/blob/aebadbf71b9154ecdc6d8916e5cfae3a1b47cc02/crates/resocks5-net/src/connect/util/handshake_over_stream.rs#L18),
   строки 40, 51 и 83: за каждым `write_all` следует `read_exact`, ни одного
   `flush` между ними нет. Контракт функции в строках 1–15 допускает
   произвольный async stream. `tunnel_hop` вызывает её для SOCKS5 hop поверх
   уже построенной erased-цепочки в
-  [dial.rs:43](../../../crates/resocks5/src/server/connect/establish_connection/dial.rs#L43).
+  [dial.rs:43](https://github.com/PHPCraftdream/resocks5/blob/293186d007b1eb00bdbd7810267b6ffb5f4f3cd0/crates/resocks5/src/server/connect/establish_connection/dial.rs#L43).
   Дефект существовал уже на `v0.1.1`; `8ddbd3d` перенёс файл, а текущие
   исправления progress не изменили этот handshake. Проверено на `93d4701`.
 - Reproduction / reasoning: два paused-time теста используют одинаковую
@@ -145,7 +145,7 @@ P1: нет подтверждённых находок.
   levels в TLS 1.3. Transcript остаётся аутентифицированным: это не
   подтверждение MITM, обхода сертификатов или раскрытия proxy password.
   Lean SDK без TLS эту зависимость не подключает.
-- Concrete evidence: [Cargo.lock:743](../../../Cargo.lock#L743) фиксирует
+- Concrete evidence: [Cargo.lock:743](https://github.com/PHPCraftdream/resocks5/blob/480934d0bff32a2f5450dfb42acfa79aaf132f31/Cargo.lock#L743) фиксирует
   `rustls 0.23.40` на `93d4701`.
   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)
   опубликована 14 сентября; затронуты `0.23.13..=0.23.44`, исправление
@@ -175,7 +175,7 @@ P1: нет подтверждённых находок.
   после отмены caller. При этом независимый общий cap в два claims работает,
   поэтому неограниченного накопления blocking jobs больше нет.
 - Concrete evidence: `bb73240`,
-  [verify.rs:73](../../../crates/resocks5/src/auth/state/verify.rs#L73):
+  [verify.rs:73](https://github.com/PHPCraftdream/resocks5/blob/0978ad6d083a010bc76151ce87acd05607c09695/crates/resocks5/src/auth/state/verify.rs#L73):
   `_gate_guard` принадлежит async future. В blocking closure строк 86–89
   перемещается admission permit, но не gate guard. Значение hash публикуется
   только после persistence в `claim.rs::claim_commit`.
