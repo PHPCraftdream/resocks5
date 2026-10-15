@@ -263,7 +263,8 @@ meaning.
 is assembled by the application.
 
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
-`error`, `server`, `pool` (`pool` feature), `progress`, `rating`, `rotator`, `types`.
+`error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`
+feature), `rotator` (`rotator` feature), `types`.
 
 A working version of the pooled example lives at
 [`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).

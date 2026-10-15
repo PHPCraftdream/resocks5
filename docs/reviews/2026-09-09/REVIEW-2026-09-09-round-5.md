@@ -41,20 +41,20 @@
 
 **R5-01 — P2 — Проверять authority CONNECT до выбора upstream и изменения рейтинга.**
 
-[Парсер CONNECT](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L450)
+[Парсер CONNECT](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L450)
 проверяет у target только наличие двоеточия. Например, строка
 `CONNECT example.com:notaport HTTP/1.1` с завершёнными заголовками проходит эту
 проверку. При разрешённом anonymous или успешной аутентификации target поступает
 в `establish_connection` без разбора порта.
 
 Для SOCKS5-upstream сначала вызывается
-[pool.acquire](../../../crates/resocks5-net/src/connect/connect_socks5_proxy.rs#L24),
+[pool.acquire](https://github.com/PHPCraftdream/resocks5/blob/3b11706fb65a2aa6bfa35b48d3a3e7c50c405ac9/crates/resocks5-net/src/connect/connect_socks5_proxy.rs#L24),
 затем выполняется greeting/auth; только после этого
-[HostPort::parse](../../../crates/resocks5-net/src/connect/handshake_over_stream.rs#L62)
-отвергает порт. [Учёт результата](../../../crates/resocks5/src/server/establish_connection.rs#L635)
+[HostPort::parse](https://github.com/PHPCraftdream/resocks5/blob/857d64ffbf32be332fbc66e1fb8ec2ea64ad7361/crates/resocks5-net/src/connect/handshake_over_stream.rs#L62)
+отвергает порт. [Учёт результата](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5/src/server/establish_connection.rs#L635)
 считает это отказом прокси: `should_record_failure` исключает лишь `AtCapacity`.
 Происходит переход к следующим маршрутам до исчерпания бюджета, а клиент
-обычного HTTP-пути получает [502](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L201).
+обычного HTTP-пути получает [502](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L201).
 Клиентская ошибка вызывает ненужные соединения и штрафы исправным upstream.
 
 CONNECT с пустым или недопустимым портом должен быть отвергнут самим сервером.
@@ -66,15 +66,15 @@ CONNECT с пустым или недопустимым портом долже�
 
 **R5-02 — P2 — Один документированный бюджет превращается в несколько полных ожиданий.**
 
-[NetworkConfig](../../../crates/resocks5/src/config/network_config.rs#L38) описывает
+[NetworkConfig](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/config/network_config.rs#L38) описывает
 `client_protocol_timeout_sec` как бюджет от подключения до окончания setup
-и начала forwarding. [Диспетчер](../../../crates/resocks5/src/server/handle_client.rs#L46)
+и начала forwarding. [Диспетчер](https://github.com/PHPCraftdream/resocks5/blob/c43d2a18343ed8402d07a77d6d2488068cb63c33/crates/resocks5/src/server/handle_client.rs#L46)
 тратит отдельный полный бюджет на `peek` первого байта. После него
-[SOCKS5](../../../crates/resocks5/src/server/handle_socks5_client.rs#L39) и
-[HTTP](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L88) создают новый
+[SOCKS5](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/server/handle_socks5_client.rs#L39) и
+[HTTP](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L88) создают новый
 `timeout` той же длины. В recovery снова создаётся полный бюджет:
-[SOCKS5](../../../crates/resocks5/src/server/handle_socks5_client.rs#L257),
-[HTTP](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L289).
+[SOCKS5](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/server/handle_socks5_client.rs#L257),
+[HTTP](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L289).
 
 При бюджете T клиент может прислать первый байт непосредственно перед T,
 завершить остальной handshake непосредственно перед 2T, а в recovery удерживать
@@ -91,11 +91,11 @@ permit и обработчик остаются заняты дольше нас
 
 **R5-03 — P2 — Таймер простоя измеряет длительность всей отправки ClientHello.**
 
-[prepare_payload](../../../crates/resocks5/src/server/forward_tunnel.rs#L62) оборачивает
+[prepare_payload](https://github.com/PHPCraftdream/resocks5/blob/7d30b92e2dc308ec34e090faac227a7296ef29ab/crates/resocks5/src/server/forward_tunnel.rs#L62) оборачивает
 целый `send_possibly_fragmented` в `within_idle`. В пути накопления аналогично
-ограничивается весь [step](../../../crates/resocks5/src/server/forward_tunnel.rs#L84),
+ограничивается весь [step](https://github.com/PHPCraftdream/resocks5/blob/7d30b92e2dc308ec34e090faac227a7296ef29ab/crates/resocks5/src/server/forward_tunnel.rs#L84),
 включая последующую отправку. Сам
-[цикл фрагментации](../../../crates/resocks5-net/src/connect/tls_fragment.rs#L114)
+[цикл фрагментации](https://github.com/PHPCraftdream/resocks5/blob/7d30b92e2dc308ec34e090faac227a7296ef29ab/crates/resocks5-net/src/connect/tls_fragment.rs#L114)
 пишет и сбрасывает каждый chunk, затем ждёт `delay_ms`; успешная запись не
 перезапускает окружающий таймер.
 
@@ -103,7 +103,7 @@ permit и обработчик остаются заняты дольше нас
 отправка полного ClientHello длиной более 100 байтов требует более 10 с.
 Даже при немедленно успешных write/flush и движении байтов каждые 100 мс
 forwarding прекращается примерно через 1 с. Это противоречит
-[определению idle](../../../crates/resocks5/src/config/network_config.rs#L73).
+[определению idle](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/config/network_config.rs#L73).
 Условие предполагает отключённый либо достаточно большой общий lifetime.
 
 Учитывать фактический прогресс записи в стадии подготовки так же, как в основном
@@ -115,16 +115,16 @@ forwarding прекращается примерно через 1 с. Это п�
 
 **R5-04 — P2 — Возраст spare не доказывает, что соединение пригодно для handshake.**
 
-[checkout_prewarmed](../../../crates/resocks5-net/src/pool/proxy_pool.rs#L386) удаляет
+[checkout_prewarmed](https://github.com/PHPCraftdream/resocks5/blob/49811a02ad9a70c622060c9762062905ee6c34a4/crates/resocks5-net/src/pool/proxy_pool.rs#L386) удаляет
 только записи старше `max_session_age_sec`. Для остальных нет проверки уже
-доступного EOF/ошибки. [acquire](../../../crates/resocks5-net/src/pool/proxy_pool.rs#L343)
+доступного EOF/ошибки. [acquire](https://github.com/PHPCraftdream/resocks5/blob/49811a02ad9a70c622060c9762062905ee6c34a4/crates/resocks5-net/src/pool/proxy_pool.rs#L343)
 немедленно возвращает такой stream и не выполняет fresh-connect fallback.
 
 Upstream может закрыть соединение по своему таймауту ожидания greeting раньше,
 чем истечёт локальный max age. Если FIN уже пришёл в очередь spare, следующий
 handshake закончится на записи или чтении ответа. Между тем сервер upstream
 может исправно принимать новые подключения. Маршрут уже занесён в
-[tried_routes](../../../crates/resocks5/src/server/establish_connection.rs#L575), поэтому
+[tried_routes](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5/src/server/establish_connection.rs#L575), поэтому
 при единственном обычном upstream клиент получает отказ без попытки открыть
 к нему свежий сокет. Предварительное открытие соединений снижает доступность
 по сравнению с отключённым пулом; сам пул описан как best-effort accelerator.
@@ -138,12 +138,12 @@ handshake закончится на записи или чтении ответ�
 
 **R5-05 — P2 — Обычная остановка контейнера обходит graceful shutdown.**
 
-В [accept-loop](../../../crates/resocks5/src/server/run_server.rs#L187) обрабатывается
+В [accept-loop](https://github.com/PHPCraftdream/resocks5/blob/76655c765477d33d04c21e16c8e6d5e828d06930/crates/resocks5/src/server/run_server.rs#L187) обрабатывается
 только `tokio::signal::ctrl_c()`. Закрытие listener и
-[ожидание обработчиков до 30 с](../../../crates/resocks5/src/server/run_server.rs#L201)
+[ожидание обработчиков до 30 с](https://github.com/PHPCraftdream/resocks5/blob/76655c765477d33d04c21e16c8e6d5e828d06930/crates/resocks5/src/server/run_server.rs#L201)
 происходят после выхода из этого цикла. Unix SIGTERM в эту ветку не входит.
 
-В [Dockerfile](../../../Dockerfile#L64) указан прямой ENTRYPOINT, а переопределения
+В [Dockerfile](https://github.com/PHPCraftdream/resocks5/blob/4eb77a38bcdd1be58ca6681e1fe50b242c33a3ee/Dockerfile#L64) указан прямой ENTRYPOINT, а переопределения
 stop signal нет. Docker по умолчанию отправляет SIGTERM, затем SIGKILL после
 истечения срока остановки; для Linux-контейнера стандартный срок составляет
 10 с. [Docker: container stop](https://docs.docker.com/reference/cli/docker/container/stop/).
@@ -159,12 +159,12 @@ drain активных туннелей и логгера. Точное дейс
 
 **R5-06 — P2 — Таймаут ожидания JoinHandle не ограничивает runtime teardown.**
 
-[shutdown_log_drain](../../../crates/resocks5/src/main.rs#L480) передаёт `JoinHandle`
+[shutdown_log_drain](https://github.com/PHPCraftdream/resocks5/blob/8e3c3d424ea3d8299b50d8b678f83d75ec778d92/crates/resocks5/src/main.rs#L480) передаёт `JoinHandle`
 по значению в пятисекундный `timeout`. При истечении времени handle уничтожается,
 а задача остаётся отделённой. Затем завершается функция с
-[#[tokio::main]](../../../crates/resocks5/src/main.rs#L145), которая уничтожает runtime.
+[#[tokio::main]](https://github.com/PHPCraftdream/resocks5/blob/8e3c3d424ea3d8299b50d8b678f83d75ec778d92/crates/resocks5/src/main.rs#L145), которая уничтожает runtime.
 
-[Логгер](../../../crates/resocks5/src/main.rs#L418) использует `tokio::fs` и Tokio
+[Логгер](https://github.com/PHPCraftdream/resocks5/blob/8e3c3d424ea3d8299b50d8b678f83d75ec778d92/crates/resocks5/src/main.rs#L418) использует `tokio::fs` и Tokio
 stdout/stderr. В исходниках закреплённого Tokio 1.43.1 `io::Stdout` содержит
 `Blocking<std::io::Stdout>`, а `io/blocking.rs::poll_write` отправляет операцию
 в blocking pool. Запущенные blocking-операции продолжаются после отмены
@@ -185,17 +185,17 @@ async-задачи. `Runtime::drop` ожидает их завершения б�
 
 **R5-07 — P2 — Нулевой PLEN проходит RFC 1929 auth и сохраняет пустой пароль.**
 
-[SOCKS5 auth](../../../crates/resocks5/src/server/handle_socks5_client.rs#L444) принимает
+[SOCKS5 auth](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/server/handle_socks5_client.rs#L444) принимает
 ULEN и PLEN как любые значения u8, включая ноль. Чтение пустого password-буфера
 успешно, UTF-8-преобразование возвращает пустую строку, после чего вызывается
 `verify_async`. RFC 1929 задаёт длины имени и пароля от 1 до 255 байтов.
 [RFC 1929, §2](https://www.rfc-editor.org/rfc/rfc1929.html#section-2).
 
 Для включённого пользователя с `hash = "init"`
-[try_claim_init](../../../crates/resocks5/src/auth/state.rs#L191) передаёт пустую строку
-в [compute_hash](../../../crates/resocks5/src/auth/compute_hash.rs#L10) и при успешной
+[try_claim_init](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L191) передаёт пустую строку
+в [compute_hash](https://github.com/PHPCraftdream/resocks5/blob/5d08f96dfb0b5efdcc4e61dadaa3ea5ea26f6df6/crates/resocks5/src/auth/compute_hash.rs#L10) и при успешной
 записи users-файла закрепляет полученный Argon2 hash. Проверки непустого пароля
-в этом пути нет. При этом [CLI](../../../crates/resocks5/src/cli/run_user_command.rs#L269)
+в этом пути нет. При этом [CLI](https://github.com/PHPCraftdream/resocks5/blob/857d64ffbf32be332fbc66e1fb8ec2ea64ad7361/crates/resocks5/src/cli/run_user_command.rs#L269)
 явно запрещает пустой пароль. Требуется знать имя доступного init-пользователя;
 сам принцип назначения пароля первым вошедшим здесь не оспаривается.
 
@@ -206,7 +206,7 @@ init остаётся незанятым; допустимые длины 1 и 2
 
 **R5-08 — P2 — Парсер CONNECT требует UTF-8 от всего блока заголовков.**
 
-[parse_http_connect](../../../crates/resocks5/src/http_proxy/handle_http_client.rs#L445)
+[parse_http_connect](https://github.com/PHPCraftdream/resocks5/blob/1b283fed9e1b8fe9894b622c16b1b4118d26e621/crates/resocks5/src/http_proxy/handle_http_client.rs#L445)
 вызывает `str::from_utf8` для всей секции до разделителя заголовков. Достаточно
 одного байта `0xE9` в значении неиспользуемого `X-Opaque`, чтобы корректные
 ASCII request line, Host и Proxy-Authorization не были разобраны. Функция
@@ -227,19 +227,19 @@ HTTP допускает obs-text `0x80..0xFF` в значениях полей; 
 
 **R5-09 — P3 — Стоимость полного порядка не зависит от малого бюджета попыток.**
 
-[Ratings::pick_order](../../../crates/resocks5-net/src/rating/mod.rs#L114) строит N
+[Ratings::pick_order](https://github.com/PHPCraftdream/resocks5/blob/70e3d19e9f0db5016bcedbadfbb01243ea307205/crates/resocks5-net/src/rating/mod.rs#L114) строит N
 ключей под mutex, затем
-[сортирует весь массив](../../../crates/resocks5-net/src/rating/select.rs#L53) за
-`O(N log N)`. [ProxyRotator](../../../crates/resocks5-net/src/rotator/mod.rs#L314)
+[сортирует весь массив](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5-net/src/rating/select.rs#L53) за
+`O(N log N)`. [ProxyRotator](https://github.com/PHPCraftdream/resocks5/blob/3422dad6e93845cc77d95890d14359616876fc38/crates/resocks5-net/src/rotator/mod.rs#L314)
 материализует все N `Arc<ProxyConfig>`. Основная ветка использует только нужный
 префикс, часто один успешный маршрут, при стандартном бюджете до 10 попыток.
 
-В [gate-цикле](../../../crates/resocks5/src/server/establish_connection.rs#L486)
+В [gate-цикле](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5/src/server/establish_connection.rs#L486)
 сначала строится полный порядок G gates, а для очередного gate — новый полный
 порядок прокси. Проверка оставшегося бюджета находится внутри уже построенного
 порядка. Несколько рассмотренных gates могут повторить работу `O(N log N)`;
 даже исчерпанный бюджет не всегда предотвращает следующую сортировку.
-В [обычном пути](../../../crates/resocks5/src/server/establish_connection.rs#L571)
+В [обычном пути](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5/src/server/establish_connection.rs#L571)
 порядок также строится до проверки бюджета.
 
 Это незавершённая часть R26. R3-10 уже вынес сортировку из mutex, и замечание
@@ -256,17 +256,17 @@ HTTP допускает obs-text `0x80..0xFF` в значениях полей; 
 
 **R5-10 — P3 — Межпроцессное ожидание и файловая запись удерживают общий users RwLock.**
 
-[try_claim_init](../../../crates/resocks5/src/auth/state.rs#L199) захватывает write guard
+[try_claim_init](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L199) захватывает write guard
 всего списка пользователей и сохраняет его на протяжении
-[persist_claim](../../../crates/resocks5/src/auth/state.rs#L278). Внутри выполняются
+[persist_claim](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L278). Внутри выполняются
 межпроцессный lock, чтение/разбор файла и атомарная запись с синхронизацией.
-Только ожидание [UsersFileLock](../../../crates/resocks5/src/config/users_file.rs#L48)
+Только ожидание [UsersFileLock](https://github.com/PHPCraftdream/resocks5/blob/3422dad6e93845cc77d95890d14359616876fc38/crates/resocks5/src/config/users_file.rs#L48)
 может занять до 10 с; к нему добавляется время хранилища.
 
 Другие входы с промахом auth cache блокируются на
-[users.read](../../../crates/resocks5/src/auth/state.rs#L169), даже если относятся
+[users.read](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L169), даже если относятся
 к давно настроенным пользователям. Работа выполняется в blocking pool, но
-занимает ограниченные [verify_slots](../../../crates/resocks5/src/auth/state.rs#L135):
+занимает ограниченные [verify_slots](https://github.com/PHPCraftdream/resocks5/blob/2b4ef7a994a915260d8081ed475a155a584083c9/crates/resocks5/src/auth/state.rs#L135):
 при нескольких таких входах общий лимит проверки паролей оказывается занят
 ожиданием одного claim. Входы с попаданием в cache этот lock обходят.
 
@@ -281,11 +281,11 @@ HTTP допускает obs-text `0x80..0xFF` в значениях полей; 
 
 **R5-11 — P3 — Лишние endpoint-строки и blocking hop для IPv6-литералов.**
 
-[acquire](../../../crates/resocks5-net/src/pool/proxy_pool.rs#L343) форматирует
+[acquire](https://github.com/PHPCraftdream/resocks5/blob/49811a02ad9a70c622060c9762062905ee6c34a4/crates/resocks5-net/src/pool/proxy_pool.rs#L343) форматирует
 диагностический endpoint до проверки spare, хотя на успешном пути эта строка
 не используется. При fresh connect дополнительно создаётся `format!("{}:{}", ... )`.
 Сходный строковый адрес используется
-[refill-задачей](../../../crates/resocks5-net/src/pool/proxy_pool.rs#L471).
+[refill-задачей](https://github.com/PHPCraftdream/resocks5/blob/49811a02ad9a70c622060c9762062905ee6c34a4/crates/resocks5-net/src/pool/proxy_pool.rs#L471).
 
 Host хранится без IPv6-скобок. Поэтому для `host = "::1"`, `port = 1080`
 получается `::1:1080`, который не разбирается как `SocketAddr`. В закреплённом
@@ -304,7 +304,7 @@ Tokio 1.43.1 `net/addr.rs` реализация `ToSocketAddrs` для `str` п�
 
 **R5-12 — P3 — Конечные веса переполняют сумму в weighted_index.**
 
-Публичный [weighted_index](../../../crates/resocks5-net/src/rating/select.rs#L8)
+Публичный [weighted_index](https://github.com/PHPCraftdream/resocks5/blob/f6019c9b511107fb6695b614a39febde64052b1e/crates/resocks5-net/src/rating/select.rs#L8)
 складывает исходные f64 без масштабирования. Для
 `[f64::MAX, f64::MAX]` каждый вес положительный и конечный, а total становится
 `+infinity`. Ненулевой случайный draw даёт бесконечный dart, который остаётся

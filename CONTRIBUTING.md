@@ -26,22 +26,19 @@ cargo build --workspace
 
 ## The checks your PR must pass
 
-CI runs exactly these four — match them locally and your PR turns green
-on the first push:
+CI's core local checks are:
 
 ```bash
-cargo build --workspace
+cargo build --workspace --all-targets
 cargo test  --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Notes:
-
-- `clippy -D warnings` means `unwrap()` in a hot path, `dbg!`, or a stray
-  `TODO` will fail CI. That's intentional.
-- `fmt --check` means run `cargo fmt --all` before committing. If it's
-  already clean, the CI step is a no-op.
+CI also runs structure, MSRV, documentation, feature-matrix, and lean-library
+checks. The workflow's `RUSTFLAGS=-D warnings` treats compiler warnings as
+errors; this does not prohibit particular constructs such as `unwrap()`,
+`dbg!`, or `TODO` by itself.
 
 ### Code structure (the `structure` CI job)
 

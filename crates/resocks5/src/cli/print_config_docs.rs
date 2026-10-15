@@ -105,8 +105,9 @@ file_log: { ... }              (optional file destination for logs)
     file_log.path: String                 (default "resocks5.log")
         File path opened with O_APPEND | O_CREATE at startup. Each
         log line — both info and error — is written in the format
-        "YYYY-MM-DD HH:MM:SS: <message>". No rotation; rotate
-        externally (logrotate, etc.) via rename + signal.
+        "YYYY-MM-DD HH:MM:SS: <message>". No automatic rotation or
+        reopen. After renaming the log file, restart the process to
+        write to a new file.
 
     file_log.also_console: bool           (default true)
         When true, log lines are written to BOTH the file AND
@@ -153,11 +154,10 @@ tls_fragment: { ... }           (TLS ClientHello fragmentation)
         lightweight DPI needs to be bypassed.
 
     tls_fragment.delay_ms: u64              (default 0)
-        Milliseconds to wait between consecutive fragments. Zero sends
-        all fragments back-to-back. A small value (1–5 ms) can help
-        against stateful DPI that reassembles only within a short time
-        window. Raises per-connection latency by delay_ms × (record
-        size / fragment_size), so keep it low.
+        Milliseconds to wait after each fragment, including the last.
+        Zero sends all fragments back-to-back. A small value (1–5 ms)
+        can help against stateful DPI that reassembles only within a short
+        time window. Adds delay_ms per chunk; keep it low.
 
 network: { ... }                (timeouts and TCP keepalive)
     Safety net against dead upstreams and half-closed tunnels. Without
@@ -172,10 +172,9 @@ network: { ... }                (timeouts and TCP keepalive)
         multiplied by every fallback attempt.
 
     network.handshake_timeout_sec: u64      (default 10)
-        Maximum time for one SOCKS5 handshake exchange with an
-        upstream (greeting + auth + CONNECT). A proxy that accepts
-        our TCP but stalls in the middle of the protocol is treated
-        as dead and the next candidate is tried.
+        Maximum time for one SOCKS5, HTTP, or HTTPS handshake exchange
+        with an upstream. A proxy that accepts our TCP but stalls during
+        the protocol is treated as dead and the next candidate is tried.
 
     network.tunnel_max_lifetime_sec: u64    (default 1800)
         Hard cap on total lifetime of a forwarded tunnel, from the

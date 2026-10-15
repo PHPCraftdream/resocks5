@@ -19,8 +19,8 @@ cargo install --path .
 cargo install --git https://github.com/PHPCraftdream/resocks5 resocks5
 ```
 
-Requires Rust 1.88+ (enforced by CI). Uses the pure-Rust `ring` crypto
-provider — no `cmake` or C toolchain needed.
+Requires Rust 1.88+ (enforced by CI). The `ring` provider compiles bundled C
+sources, so a C compiler is required; `cmake` is not needed.
 
 ## Quick start
 

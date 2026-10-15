@@ -166,20 +166,42 @@ A multi-arch image (`linux/amd64`, `linux/arm64`) is published to ghcr.io on
 every release tag:
 
 ```bash
-# latest release (auto-created configs land in the mounted volume)
-docker run --rm -p 20082:20082 \
+# Prepare a writable bind-mount directory on Linux; the image runs as UID 65532.
+mkdir -p "$PWD/resocks5-config"
+sudo chown 65532:65532 resocks5-config
+# First run creates the three config files, then exits; it does NOT start a usable proxy.
+docker run --rm \
   -v "$PWD/resocks5-config:/etc/resocks5" \
   ghcr.io/phpcraftdream/resocks5:latest
 
-# …or build it yourself
+# Edit resocks5.main.ktav in the mounted host directory before starting:
+# set listen_host: 0.0.0.0 and auth.allow_anonymous: false.
+# Add at least one upstream to resocks5.proxy_list.ktav by replacing its
+# existing `socks5_v4: []` line; do not add a duplicate key.
+# Example: socks5_v4: [ user:pass@198.51.100.7:1080 ]
+# The generated files are owned by UID 65532; on Linux use an elevated editor
+# or choose host permissions that let your user edit them.
+# Add a client user (interactive password prompt):
+docker run --rm -it \
+  -v "$PWD/resocks5-config:/etc/resocks5" \
+  ghcr.io/phpcraftdream/resocks5:latest users add alice
+
+# Start with host access restricted to localhost by default.
+docker run --rm -p 127.0.0.1:20082:20082 \
+  -v "$PWD/resocks5-config:/etc/resocks5" \
+  ghcr.io/phpcraftdream/resocks5:latest
+
+# …or build it yourself and use resocks5 instead of the image name above:
 docker build -t resocks5 .
-docker run --rm -p 20082:20082 -v "$PWD/resocks5-config:/etc/resocks5" resocks5
 ```
 
-Mount your `resocks5.*.ktav` at `/etc/resocks5` (the image's working dir). The
-process runs as a non-root user; the three config files are created there on
-first run if they're missing. The image is distroless (~the binary + glibc),
-so there's no shell inside it.
+The mounted config directory must be writable by UID 65532. On Linux, prepare
+it as shown above; permissions depend on the host platform (`chown` is
+Linux-specific, and Docker Desktop bind mounts generally work). The generated
+files are owned by UID 65532, so on Linux use an elevated editor or choose host
+permissions that let your user edit them. The image is distroless, so it has no
+shell; edit the bind-mounted config files on the host. Keep the host port bound
+to `127.0.0.1` unless remote access is intended and secured.
 
 ## Quick start
 
@@ -385,6 +407,8 @@ resocks5 users list                  # list users (never hashes)
 resocks5 users enable  <name>
 resocks5 users disable <name>
 resocks5 users remove  <name> [--yes]
+resocks5 users direct  <name>       # bypass upstream pool
+resocks5 users pool    <name>       # route through upstream pool (default)
 ```
 
 Anonymous access defaults to `auth.allow_anonymous: true`, including when users
