@@ -41,6 +41,13 @@ resocks5
 
 Print the full configuration reference with `resocks5 config`.
 
+## Ограничение клиентов по IP
+
+Полем `allowed_clients` (глобально в `resocks5.main.ktav` и опционально
+у каждого пользователя в `resocks5.users.ktav`) можно разрешить
+подключения только с указанных IP (по умолчанию `"*"` — все). Подробности
+и синтаксис — в `resocks5 config`.
+
 ## More
 
 This crate is the CLI proxy server. It builds on top of the

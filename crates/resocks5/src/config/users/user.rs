@@ -17,6 +17,12 @@ pub struct User {
     /// and goes directly from this server's IP.
     #[serde(default)]
     pub direct: bool,
+    /// Правило допуска клиентов для этого пользователя (`None` = не
+    /// ограничивает, не сериализуется). Итоговое правило = глобальное
+    /// ∩ пользовательское; `None` у пользователя не расширяет
+    /// глобальное. См. `config::allowed_clients`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_clients: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -37,5 +43,41 @@ is_enabled: true
         let user: User = ktav::from_str(src).unwrap();
         assert_eq!(user.name, "alice");
         assert!(!user.direct);
+        assert!(user.allowed_clients.is_none());
+    }
+
+    #[test]
+    fn old_user_without_allowed_clients_deserializes_to_none() {
+        let src = "\
+name: alice
+hash: init
+";
+        let user: User = ktav::from_str(src).unwrap();
+        assert_eq!(user.allowed_clients, None);
+    }
+
+    #[test]
+    fn user_allowed_clients_round_trips_and_none_is_skipped() {
+        let mut user = User {
+            name: "alice".into(),
+            hash: "init".into(),
+            is_enabled: true,
+            direct: false,
+            allowed_clients: Some("127.0.0.1,10.*.0.1".into()),
+        };
+        let serialized = ktav::to_string(&user).unwrap();
+        assert!(serialized.contains("allowed_clients:"));
+        let parsed: User = ktav::from_str(&serialized).unwrap();
+        assert_eq!(
+            parsed.allowed_clients.as_deref(),
+            Some("127.0.0.1,10.*.0.1")
+        );
+
+        user.allowed_clients = None;
+        let serialized = ktav::to_string(&user).unwrap();
+        assert!(!serialized.contains("allowed_clients"));
+        // Отсутствие ключа при десериализации даёт None.
+        let parsed: User = ktav::from_str(&serialized).unwrap();
+        assert_eq!(parsed.allowed_clients, None);
     }
 }

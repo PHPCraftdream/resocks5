@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 
 use crate::auth::AuthState;
+use crate::config::AllowedClients;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server::handle_client;
@@ -48,6 +49,7 @@ pub async fn run_server(
     frag: Arc<TlsFragmentConfig>,
     network: Arc<NetworkConfig>,
     tls_connector: Option<Arc<TlsConnector>>,
+    allowed_clients: Option<Arc<AllowedClients>>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(local_addr).await?;
     let local_addr_for_log = local_addr.to_string();
@@ -148,6 +150,23 @@ pub async fn run_server(
                     }
                 };
 
+                // Глобальный фильтр: сразу после accept, ДО spawn,
+                // nodelay/keepalive и permit'а. Peer — только TCP;
+                // fail-closed, если адрес недоступен.
+                if let Some(rule) = &allowed_clients {
+                    let peer = client_stream.peer_addr().ok().map(|a| a.ip());
+                    if peer.is_none_or(|ip| !rule.matches(ip)) {
+                        logger.connection_error(|| {
+                            format!(
+                                "client IP {peer:?} rejected by global allowed_clients — \
+                                 dropping new connection"
+                            )
+                        });
+                        drop(client_stream);
+                        continue;
+                    }
+                }
+
                 let client_deadline = tokio::time::Instant::now()
                     + Duration::from_secs(network.client_protocol_timeout_sec);
 
@@ -189,6 +208,7 @@ pub async fn run_server(
                 let network_clone = network.clone();
                 let tls_clone = tls_connector.clone();
                 let direct_limiter_clone = direct_limiter.clone();
+                let allowed_clone = allowed_clients.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     if let Err(e) = handle_client(
@@ -204,6 +224,7 @@ pub async fn run_server(
                         &network_clone,
                         tls_clone.as_deref(),
                         &direct_limiter_clone,
+                        &allowed_clone,
                         client_deadline,
                     )
                     .await

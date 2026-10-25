@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, Result};
@@ -20,6 +21,10 @@ struct UserEntry {
     index: usize,
     enabled: bool,
     direct: bool,
+    /// Скомпилированное при старте пользовательское правило
+    /// `allowed_clients` (`None` = не ограничивает). Снапшот запуска:
+    /// пере-компиляции в рантайме нет.
+    allowed: Option<crate::config::AllowedClients>,
 }
 
 /// Server-side auth bundle, built once at startup and shared with each
@@ -132,15 +137,31 @@ impl AuthState {
         users: &UsersConfig,
         users_path: impl Into<String>,
     ) -> Result<Self> {
+        let users_path = users_path.into();
         let mut server_secret = [0u8; 32];
         getrandom::getrandom(&mut server_secret)
             .map_err(|e| anyhow!("OS random source unavailable: {}", e))?;
         let mut entries = HashMap::with_capacity(users.users.len());
         for (index, user) in users.users.iter().enumerate() {
+            // Компилируем правило КАЖДОГО пользователя — включая disabled
+            // и дубликаты имён: невалидная строка обязана валить старт с
+            // понятной ошибкой, а не притворяться отсутствием правила.
+            // Для дубликатов имени в `entries` попадает первая (first
+            // wins) — как и раньше.
+            let allowed = match &user.allowed_clients {
+                Some(spec) => Some(crate::config::compile_allowed_clients(spec).map_err(|e| {
+                    anyhow!(
+                        "{users_path}: пользователь {:?}: allowed_clients: {e}",
+                        user.name
+                    )
+                })?),
+                None => None,
+            };
             entries.entry(user.name.clone()).or_insert(UserEntry {
                 index,
                 enabled: user.is_enabled,
                 direct: user.direct,
+                allowed,
             });
         }
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
@@ -154,10 +175,17 @@ impl AuthState {
             allow_anonymous: auth_cfg.allow_anonymous,
             server_secret,
             cache: DashMap::new(),
-            users_path: users_path.into(),
+            users_path,
             #[cfg(test)]
             claim_probe: Mutex::new(None),
         })
+    }
+
+    /// Test-only: есть ли закешированный HMAC у пользователя (для
+    /// проверки, что запрещённый IP не дошёл до verify_async).
+    #[cfg(test)]
+    pub(crate) fn cache_contains(&self, name: &str) -> bool {
+        self.cache.contains_key(name)
     }
 
     /// True when no users are configured.
@@ -169,6 +197,21 @@ impl AuthState {
     /// `hash == "init"` placeholders).
     pub fn users_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Пользовательский фильтр IP. `None` у пользователя не ограничивает;
+    /// неизвестное или выключенное имя → `false` (клиент получает обычный
+    /// отказ аутентификации, до Argon2/cache/claim дело не доходит).
+    /// Анонимный клиент (без credentials) сюда не попадает и подчиняется
+    /// только глобальному правилу.
+    pub(crate) fn client_ip_allowed(&self, name: &str, ip: Option<IpAddr>) -> bool {
+        let Some(ip) = ip else {
+            // Адрес недоступен — fail-closed.
+            return false;
+        };
+        self.entries
+            .get(name)
+            .is_some_and(|u| u.enabled && u.allowed.as_ref().is_none_or(|r| r.matches(ip)))
     }
 
     /// Returns `true` when the named user exists, is enabled, and has

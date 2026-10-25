@@ -6,7 +6,7 @@ use regex::RegexSet;
 use tokio::sync::mpsc;
 
 use crate::auth;
-use crate::config;
+use crate::config::{self, AllowedClients};
 use crate::logger::{self, ELog};
 use crate::server;
 use resocks5_net::connect::parse_proxy_str;
@@ -169,12 +169,40 @@ fn warn_obsolete_cb_keys() {
     }
 }
 
+/// Единая точка валидации allowed_clients на старте: компиляция
+/// глобального правила и AuthState::build (включая правила каждого
+/// пользователя). Вызывается в `run_server_inner` ДО route-bailout и
+/// до spawn_log_drain, чтобы невалидная строка давала контекстную
+/// allowed_clients-ошибку даже при отсутствии upstreams и не скрывалась
+/// сообщением «no upstream proxies». Выделена pub(crate) как seam для
+/// focused-теста пути валидации.
+pub(crate) fn validate_allowed_clients(
+    cfg_main: &crate::config::MainConfig,
+    users: &crate::config::UsersConfig,
+) -> anyhow::Result<(Arc<AllowedClients>, Arc<auth::AuthState>)> {
+    let allowed_clients = Arc::new(
+        crate::config::compile_allowed_clients(&cfg_main.allowed_clients)
+            .map_err(|e| anyhow::anyhow!("{}: allowed_clients: {e}", crate::config::MAIN_PATH))?,
+    );
+    let auth = Arc::new(auth::AuthState::build(
+        &cfg_main.auth,
+        users,
+        crate::config::USERS_PATH,
+    )?);
+    Ok((allowed_clients, auth))
+}
+
 /// Previous `#[tokio::main]` body, unchanged apart from the name: all
 /// runtime-dependent work stays here so `run_server` alone owns
 /// runtime creation and the bounded teardown.
 pub(super) async fn run_server_inner() -> Result<()> {
     let configs = config::load_or_init()?;
     let cfg_main = &configs.main;
+
+    // Глобальное правило + правила пользователей — ОДНА точка валидации
+    // на старте, до route-bailout и до spawn_log_drain (все `?`-return'ы
+    // выше спавна).
+    let (allowed_clients, auth) = validate_allowed_clients(cfg_main, &configs.users)?;
 
     warn_obsolete_cb_keys();
 
@@ -319,15 +347,6 @@ pub(super) async fn run_server_inner() -> Result<()> {
         );
     }
 
-    // Build auth state BEFORE spawning the log-drain task: its `?` is
-    // the only fallible early-return left after that spawn, and an
-    // early return there would skip the shutdown drain-join below.
-    let auth = Arc::new(auth::AuthState::build(
-        &cfg_main.auth,
-        &configs.users,
-        crate::config::USERS_PATH,
-    )?);
-
     // Async drain of the log channel.
     //
     // `println!`/`eprintln!` take `stdout().lock()` (a `std::sync::Mutex`)
@@ -404,6 +423,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
         frag,
         network,
         tls_connector,
+        Some(allowed_clients),
     )
     .await;
 

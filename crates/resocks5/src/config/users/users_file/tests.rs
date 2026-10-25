@@ -23,6 +23,7 @@ fn user(name: &str, hash: &str) -> User {
         hash: hash.to_string(),
         is_enabled: true,
         direct: false,
+        allowed_clients: None,
     }
 }
 

@@ -38,8 +38,18 @@ pub struct MainConfig {
     /// `enabled: false` by default, so existing configs are unaffected.
     #[serde(default)]
     pub file_log: FileLogConfig,
+    /// Глобальное правило допуска клиентов (список IP/масок через
+    /// запятую, `"*"` = любой). См. `config::allowed_clients`.
+    /// Итоговое правило = глобальное ∩ пользовательское; отсутствие
+    /// пользовательского (`None`) НЕ расширяет глобальное.
+    #[serde(default = "default_allowed_clients")]
+    pub allowed_clients: String,
 }
 
 fn default_listen_host() -> String {
     "127.0.0.1".to_string()
+}
+
+fn default_allowed_clients() -> String {
+    "*".to_string()
 }

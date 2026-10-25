@@ -17,6 +17,7 @@ fn user(name: &str, enabled: bool, direct: bool) -> User {
         hash: String::new(),
         is_enabled: enabled,
         direct,
+        allowed_clients: None,
     }
 }
 
@@ -230,6 +231,64 @@ fn obsolete_cb_keys_are_detected() {
     // Quoted values (banned patterns) and key-less lines never match.
     let clean = "banned_patterns: [\n  \"^cb_x$\"\n]\nnetwork: {\n  sand_max: 8.0\n}\n";
     assert!(obsolete_cb_keys(clean).is_empty());
+}
+
+/// Конфигурация для проверки общей точки валидации `allowed_clients`.
+/// Тесты проверяют ошибки правил, но не порядок вызовов всего startup.
+fn main_cfg_with_allowed(rule: &str) -> crate::config::MainConfig {
+    crate::config::MainConfig {
+        port: 20082,
+        listen_host: "127.0.0.1".to_string(),
+        banned_patterns: Vec::new(),
+        auth: crate::config::AuthConfig {
+            allow_anonymous: false,
+        },
+        log: crate::logger::LogConfig::default(),
+        pool: Default::default(),
+        tls_fragment: Default::default(),
+        network: Default::default(),
+        file_log: Default::default(),
+        allowed_clients: rule.to_string(),
+    }
+}
+
+fn user_with_rule(name: &str, rule: Option<&str>) -> User {
+    User {
+        name: name.to_string(),
+        hash: String::new(),
+        is_enabled: true,
+        direct: false,
+        allowed_clients: rule.map(str::to_string),
+    }
+}
+
+#[test]
+fn invalid_global_allowed_clients_fails_before_route_bailout() {
+    let cfg = main_cfg_with_allowed("10.*.0");
+    let err = validate_allowed_clients(&cfg, &users_cfg(vec![]))
+        .err()
+        .expect("невалидная глобальная строка обязана дать ошибку");
+    let text = err.to_string();
+    assert!(
+        text.contains("allowed_clients"),
+        "ожидалась контекстная allowed_clients-ошибка, получено: {text}"
+    );
+}
+
+#[test]
+fn invalid_user_allowed_clients_fails_before_route_bailout() {
+    let cfg = main_cfg_with_allowed("*");
+    let err = validate_allowed_clients(
+        &cfg,
+        &users_cfg(vec![user_with_rule("alice", Some("2001:db8:*"))]),
+    )
+    .err()
+    .expect("невалидная user-строка обязана дать ошибку");
+    let text = err.to_string();
+    assert!(
+        text.contains("allowed_clients") && text.contains("alice"),
+        "ожидалась контекстная allowed_clients-ошибка с именем пользователя, получено: {text}"
+    );
 }
 
 #[tokio::test]

@@ -8,11 +8,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 fn make_user(name: &str, password: &str, enabled: bool) -> User {
+    user_with_rule(name, password, enabled, None)
+}
+
+fn user_with_rule(
+    name: &str,
+    password: &str,
+    enabled: bool,
+    allowed_clients: Option<String>,
+) -> User {
     User {
         name: name.to_string(),
         hash: compute_hash(password).unwrap(),
         is_enabled: enabled,
         direct: false,
+        allowed_clients,
     }
 }
 
@@ -22,6 +32,7 @@ fn make_init_user(name: &str, enabled: bool) -> User {
         hash: INIT_HASH.to_string(),
         is_enabled: enabled,
         direct: false,
+        allowed_clients: None,
     }
 }
 
@@ -174,6 +185,106 @@ fn disabled_user_rejects_even_with_correct_password() {
     assert!(!state.verify("alice", "s3cret"));
 }
 
+// ─── allowed_clients: пользовательский фильтр ───────────────────────
+
+fn ip(s: &str) -> Option<std::net::IpAddr> {
+    Some(s.parse().unwrap())
+}
+
+/// `None` у пользователя не ограничивает IP.
+#[test]
+fn user_rule_none_does_not_restrict() {
+    let state = build_state(vec![make_user("alice", "s3cret", true)], false);
+    assert!(state.client_ip_allowed("alice", ip("203.0.113.7")));
+    assert!(state.client_ip_allowed("alice", ip("::1")));
+}
+
+/// Пользовательское правило применяется; disabled/unknown → false
+/// (fail-closed: обычный отказ аутентификации, без хеширования).
+#[test]
+fn user_rule_and_disabled_unknown_semantics() {
+    let state = build_state(
+        vec![
+            user_with_rule("alice", "s3cret", true, Some("10.*.0.1".into())),
+            user_with_rule("bob", "s3cret", false, None),
+        ],
+        false,
+    );
+    assert!(state.client_ip_allowed("alice", ip("10.9.0.1")));
+    assert!(!state.client_ip_allowed("alice", ip("10.9.0.2")));
+
+    // Disabled — fail-closed.
+    assert!(!state.client_ip_allowed("bob", ip("10.9.0.1")));
+
+    // Unknown — fail-closed.
+    assert!(!state.client_ip_allowed("carol", ip("10.9.0.1")));
+
+    // Недоступный адрес — fail-closed.
+    assert!(!state.client_ip_allowed("alice", None));
+}
+
+/// Невалидная строка у DISABLED пользователя валит build (старт).
+#[test]
+fn disabled_user_invalid_rule_fails_build() {
+    let res = AuthState::build(
+        &AuthConfig {
+            allow_anonymous: false,
+        },
+        &UsersConfig {
+            users: vec![user_with_rule(
+                "alice",
+                "s3cret",
+                false,
+                Some("10.*.0".into()),
+            )],
+        },
+        "/__resocks5_test_never_written__",
+    );
+    // AuthState не реализует Debug (секреты) — берём ошибку без expect_err.
+    let err = res
+        .err()
+        .expect("invalid rule of a disabled user must fail startup");
+    assert!(err.to_string().contains("alice"), "got: {err}");
+}
+
+/// Дубликат имени с невалидной строкой тоже валит build, даже если
+/// first-wins сохраняет первую запись.
+#[test]
+fn duplicate_user_invalid_rule_fails_build() {
+    let res = AuthState::build(
+        &AuthConfig {
+            allow_anonymous: false,
+        },
+        &UsersConfig {
+            users: vec![
+                make_user("alice", "s3cret", true),
+                user_with_rule("alice", "other", true, Some("no-such-host".into())),
+            ],
+        },
+        "/__resocks5_test_never_written__",
+    );
+    assert!(
+        res.is_err(),
+        "invalid rule of a duplicate user must fail startup"
+    );
+}
+
+/// First-wins для дубликатов имени не изменился: действует правило
+/// ПЕРВОГО вхождения.
+#[test]
+fn duplicate_names_keep_first_rule() {
+    let state = build_state(
+        vec![
+            user_with_rule("alice", "s3cret", true, Some("10.1.1.1".into())),
+            user_with_rule("alice", "other", true, None),
+        ],
+        false,
+    );
+    // first wins: правило первого alice, None второго не расширяет его.
+    assert!(state.client_ip_allowed("alice", ip("10.1.1.1")));
+    assert!(!state.client_ip_allowed("alice", ip("203.0.113.7")));
+}
+
 #[test]
 fn shared_password_distinct_hashes() {
     // Per-user random salt: same password produces different PHC strings.
@@ -250,6 +361,7 @@ fn malformed_stored_hash_rejects_safely() {
         hash: "not-a-phc-string".into(),
         is_enabled: true,
         direct: false,
+        allowed_clients: None,
     };
     let state = build_state(vec![bad], false);
     assert!(!state.verify("alice", "anything"));
