@@ -137,7 +137,13 @@ try {
         throw 'В sha256sums.txt нет единственной корректной записи архива.'
     }
     $expected = ($matchingLines[0] -split '\s+')[0]
-    $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $archiveStream = [IO.File]::OpenRead($archive)
+        try { $actual = [BitConverter]::ToString($sha256.ComputeHash($archiveStream)).Replace('-', '') }
+        finally { $archiveStream.Dispose() }
+    }
+    finally { $sha256.Dispose() }
     if ($actual -ine $expected) {
         throw 'SHA-256 не совпадает; установка отменена.'
     }
