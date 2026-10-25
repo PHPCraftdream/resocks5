@@ -144,6 +144,7 @@ fn default_main(port: u16, banned_patterns: Vec<String>) -> MainConfig {
         tls_fragment: TlsFragmentConfig::default(),
         network: NetworkConfig::default(),
         file_log: FileLogConfig::default(),
+        allowed_clients: "*".to_string(),
     }
 }
 
@@ -204,6 +205,7 @@ mod tests {
                 hash: "init".into(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         crate::config::users_file::write_atomic(&path, &users).unwrap();
@@ -214,6 +216,29 @@ mod tests {
         let loaded = result.unwrap();
         assert_eq!(loaded.users.len(), 1);
         assert_eq!(loaded.users[0].name, "existing");
+        assert_eq!(loaded.users[0].allowed_clients, None);
+    }
+
+    /// Старый конфиг без поля `allowed_clients` получает default `"*"`.
+    #[test]
+    fn old_main_without_allowed_clients_defaults_to_star() {
+        let src = "\
+port: 20082
+listen_host: 127.0.0.1
+auth: { allow_anonymous: true }
+";
+        let cfg: MainConfig = ktav::from_str(src).unwrap();
+        assert_eq!(cfg.allowed_clients, "*");
+    }
+
+    /// Round-trip значения allowed_clients через ktav.
+    #[test]
+    fn main_allowed_clients_round_trips() {
+        let mut cfg = default_main(20082, Vec::new());
+        cfg.allowed_clients = "127.0.0.1,10.*.0.1,loopback".to_string();
+        let serialized = ktav::to_string(&cfg).unwrap();
+        let parsed: MainConfig = ktav::from_str(&serialized).unwrap();
+        assert_eq!(parsed.allowed_clients, "127.0.0.1,10.*.0.1,loopback");
     }
 
     /// The serializer must not emit ktav type-tags (`:i` for integers,
@@ -275,6 +300,7 @@ mod tests {
             "tls_fragment:",
             "network:",
             "file_log:",
+            "allowed_clients:",
             // AuthConfig
             "allow_anonymous:",
             // LogConfig (every flag)

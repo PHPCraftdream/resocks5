@@ -11,6 +11,7 @@ use tokio::time::{timeout, Instant};
 use tokio_rustls::TlsConnector;
 
 use crate::auth::AuthState;
+use crate::config::AllowedClients;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::http_proxy::handle_http_client;
 use crate::logger::Logger;
@@ -70,6 +71,23 @@ where
     }
 }
 
+/// Глобальная проверка IP до любого handshake: только TCP peer-адрес,
+/// fail-closed, если адрес недоступен.
+fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> anyhow::Result<()> {
+    let Some(rule) = rule else {
+        return Ok(());
+    };
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
+    let peer_dbg = peer;
+    if peer.is_some_and(|ip| rule.matches(ip)) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "client IP {peer_dbg:?} rejected by global allowed_clients"
+        ))
+    }
+}
+
 /// Parse/authenticate once under the listener-supplied accept deadline, then route egress.
 ///
 /// cancel-safe: NO — owns the client stream and closes it on failure/cancellation;
@@ -88,8 +106,14 @@ pub async fn handle_client(
     network: &Arc<NetworkConfig>,
     tls_connector: Option<&TlsConnector>,
     direct_limiter: &Arc<Semaphore>,
+    allowed_clients: &Option<Arc<AllowedClients>>,
     client_deadline: Instant,
 ) -> anyhow::Result<()> {
+    // Глобальный фильтр — ДО протокольного peek/handshake. Правило
+    // приходит уже скомпилированным (одна компиляция на старте), здесь
+    // только проверка.
+    global_allowed(&client_stream, allowed_clients)?;
+    let peer_ip = client_stream.peer_addr().ok().map(|a| a.ip());
     #[cfg(test)]
     stage_probe::emit("client_handler_started");
     let options = resocks5_net::server::ServerOptions::new(
@@ -102,6 +126,11 @@ pub async fn handle_client(
         &mut client_stream,
         &options,
         move |credentials| async move {
+            // Пользовательский фильтр ДО verify_async: запрещённый IP
+            // не доходит до Argon2/cache/init-claim/persistence.
+            if !auth_state.client_ip_allowed(credentials.username(), peer_ip) {
+                return false;
+            }
             auth_state
                 .verify_async(credentials.username(), credentials.password())
                 .await
@@ -200,7 +229,7 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
     use tokio::sync::Semaphore;
@@ -346,6 +375,7 @@ mod tests {
         let frag = Arc::new(TlsFragmentConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
         let no_rotator: Option<Arc<ProxyRotator>> = None;
+        let no_allowed: Option<Arc<AllowedClients>> = None;
 
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -368,6 +398,7 @@ mod tests {
                 &network,
                 None,
                 &direct_limiter,
+                &no_allowed,
                 client_deadline,
             )
             .await
@@ -437,6 +468,7 @@ mod tests {
         let frag = Arc::new(TlsFragmentConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
         let no_rotator: Option<Arc<ProxyRotator>> = None;
+        let no_allowed: Option<Arc<AllowedClients>> = None;
 
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -459,6 +491,7 @@ mod tests {
                 &network,
                 None,
                 &direct_limiter,
+                &no_allowed,
                 client_deadline,
             )
             .await
@@ -660,6 +693,7 @@ mod tests {
                         hash: "init".into(),
                         is_enabled: true,
                         direct: true,
+                        allowed_clients: None,
                     }],
                 },
                 "unused-empty-user",
@@ -683,6 +717,7 @@ mod tests {
         // branch sends 503 before checking the ban. Correct pool policy sends 403.
         let direct_limiter = Arc::new(Semaphore::new(0));
         let no_rotator = None;
+        let no_allowed: Option<Arc<AllowedClients>> = None;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let host = async {
@@ -701,6 +736,7 @@ mod tests {
                 &network,
                 None,
                 &direct_limiter,
+                &no_allowed,
                 deadline,
             )
             .await
@@ -728,5 +764,173 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// Глобальный фильтр в handle_client: peer вне правила отвергается
+    /// ДО любого протокольного ввода-вывода. Клиент коннектится без
+    /// данных — handler обязан отказать, не прочитав ни байта.
+    #[tokio::test]
+    async fn global_allowed_clients_denies_before_handshake() {
+        let auth = test_auth();
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(1),
+            1,
+        ));
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let network = Arc::new(NetworkConfig::default());
+        let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_rotator = None;
+        // loopback не входит в правило — peer 127.0.0.1 обязан быть
+        // отвергнут ещё до чтения первого байта.
+        let allowed = Arc::new(crate::config::compile_allowed_clients("203.0.113.7").unwrap());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let error = handle_client(
+                stream,
+                &auth,
+                &no_rotator,
+                &no_rotator,
+                &no_rotator,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                &direct_limiter,
+                &Some(allowed),
+                deadline,
+            )
+            .await
+            .expect_err("loopback peer must be rejected by the global rule");
+            assert!(
+                error.to_string().contains("global allowed_clients"),
+                "got: {error}"
+            );
+        };
+        let peer = async {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            // Ничего не пишем: фильтр обязан отказать до любого ввода.
+            // Ждём закрытия соединения: EOF (0 байт) или RST — иные
+            // ошибки не проглатываем.
+            let mut reply = [0u8; 2];
+            match socket.read(&mut reply).await {
+                Ok(0) => {}
+                Ok(n) => panic!("unexpected {n} byte(s) past the global filter"),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof => {}
+                    other => panic!("unexpected read error: {other}"),
+                },
+            }
+        };
+        // Общий таймаут на обе стороны — детерминированная защита от
+        // взаимного зависания без sleep/yield-поллинга.
+        timeout(Duration::from_secs(8), async {
+            tokio::join!(host, peer);
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Пользовательский фильтр в accept-callback: валидный пароль с
+    /// запрещённого IP даёт ОБЫЧНЫЙ отказ аутентификации ([1,1]) — и до
+    /// verify_async (Argon2/cache/claim) дело не доходит.
+    #[tokio::test]
+    async fn user_allowed_clients_denies_before_verify() {
+        let auth = Arc::new(
+            AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: true,
+                },
+                &crate::config::UsersConfig {
+                    users: vec![crate::config::User {
+                        name: "alice".into(),
+                        hash: crate::auth::compute_hash("pw").unwrap(),
+                        is_enabled: true,
+                        direct: false,
+                        // loopback НЕ входит — peer 127.0.0.1 запрещён.
+                        allowed_clients: Some("203.0.113.9".into()),
+                    }],
+                },
+                "unused-user-filter",
+            )
+            .unwrap(),
+        );
+        let logger = test_logger();
+        let banned = Arc::new(regex::RegexSet::empty());
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(1),
+            1,
+        ));
+        let frag = Arc::new(TlsFragmentConfig::default());
+        let network = Arc::new(NetworkConfig::default());
+        let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_rotator = None;
+        let no_allowed: Option<Arc<AllowedClients>> = None;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let error = handle_client(
+                stream,
+                &auth,
+                &no_rotator,
+                &no_rotator,
+                &no_rotator,
+                &logger,
+                &banned,
+                &pool,
+                &frag,
+                &network,
+                None,
+                &direct_limiter,
+                &no_allowed,
+                deadline,
+            )
+            .await
+            .expect_err("user rule must deny this IP");
+            assert!(
+                matches!(
+                    error.downcast_ref::<resocks5_net::server::ServerError>(),
+                    Some(resocks5_net::server::ServerError::Authentication(_))
+                ),
+                "ordinary auth failure expected, got: {error}"
+            );
+        };
+        let peer = async {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+            let mut method = [0u8; 2];
+            socket.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [0x05, 0x02]);
+            // subnegotiation: alice / pw — валидные credentials.
+            socket
+                .write_all(&[0x01, 5, b'a', b'l', b'i', b'c', b'e', 2, b'p', b'w'])
+                .await
+                .unwrap();
+            let mut verdict = [0u8; 2];
+            socket.read_exact(&mut verdict).await.unwrap();
+            assert_eq!(verdict, [0x01, 0x01], "auth must fail without hashing");
+        };
+        timeout(Duration::from_secs(8), async {
+            tokio::join!(host, peer);
+        })
+        .await
+        .unwrap();
+        // Подтверждение «до verify_async»: закешированного HMAC нет —
+        // успешный verify положил бы его в cache.
+        assert!(!auth.cache_contains("alice"));
     }
 }

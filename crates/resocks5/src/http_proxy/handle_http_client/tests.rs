@@ -660,6 +660,7 @@ async fn handle_client_hands_partial_http_pipeline_to_recovery_losslessly() {
                 &network,
                 None,
                 &direct_limiter,
+                &None,
                 deadline,
             )
             .await
@@ -711,6 +712,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
                     hash: "init".into(),
                     is_enabled: true,
                     direct: false,
+                    allowed_clients: None,
                 }],
             },
             path.to_string_lossy().into_owned(),
@@ -768,6 +770,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
         &network,
         None,
         &direct_limiter,
+        &None,
         deadline,
     )
     .await

@@ -55,6 +55,7 @@ fn init_user(name: &str) -> crate::config::User {
         hash: "init".to_string(),
         is_enabled: true,
         direct: false,
+        allowed_clients: None,
     }
 }
 

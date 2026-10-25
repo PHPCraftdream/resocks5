@@ -12,12 +12,15 @@
 //! `socks5_ipv6_list.txt`) are migrated automatically on first launch
 //! when the new files don't exist yet.
 
+mod allowed_clients;
 mod configs;
 pub mod load_or_init;
 mod main;
 mod proxy_list;
 mod users;
 
+pub(crate) use allowed_clients::compile_allowed_clients;
+pub(crate) use allowed_clients::AllowedClients;
 pub use configs::Configs;
 pub use load_or_init::load_or_init;
 pub use main::AuthConfig;

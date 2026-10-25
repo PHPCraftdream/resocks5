@@ -9,6 +9,7 @@ fn is_direct_true_for_enabled_direct_user() {
         hash: compute_hash("pw").unwrap(),
         is_enabled: true,
         direct: true,
+        allowed_clients: None,
     };
     let state = build_state(vec![user], false);
     assert!(state.is_direct("direct_alice"));
@@ -27,6 +28,7 @@ fn is_direct_false_for_disabled_direct_user() {
         hash: compute_hash("pw").unwrap(),
         is_enabled: false,
         direct: true,
+        allowed_clients: None,
     };
     let state = build_state(vec![user], false);
     assert!(!state.is_direct("disabled_alice"));
@@ -317,6 +319,7 @@ fn init_claim_persist_failure_after_winner_cannot_reset_winner_hash() {
                 hash: winner_hash.clone(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         },
         &path,
@@ -487,6 +490,7 @@ fn init_claim_yields_to_cli_password_change_for_same_user() {
                 hash: cli_hash.clone(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         },
         &path,

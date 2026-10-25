@@ -51,6 +51,7 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
+- [Список допуска клиентов по IP (allowed_clients)](#список-допуска-клиентов-по-ip-allowed_clients)
 - [Use as a library](#use-as-a-library)
 - [User management](#user-management)
 - [Repository layout](#repository-layout)
@@ -262,9 +263,9 @@ the working directory, all auto-created on first launch:
 
 | File | Purpose |
 |------|---------|
-| `resocks5.main.ktav` | server settings: port, auth, logging, pool, network/sand-rating, TLS fragmentation, banned patterns |
+| `resocks5.main.ktav` | server settings: port, auth, logging, pool, network/sand-rating, TLS fragmentation, banned patterns, `allowed_clients` |
 | `resocks5.proxy_list.ktav` | upstream proxies, grouped by transport and IP family |
-| `resocks5.users.ktav` | client users — managed by `resocks5 users …`, do not edit by hand |
+| `resocks5.users.ktav` | Пользователи: пароли и флаги — через `resocks5 users …`; `allowed_clients` — вручную при остановленном сервере |
 
 Print the **full field reference** — every option, its default, and behaviour
 notes — with:
@@ -291,6 +292,60 @@ http_v4:  [ user:pass@198.51.100.20:8080 ]
 https_v4: [ user:pass@198.51.100.30:443 ]
 ## …and the corresponding *_v6 arrays for IPv6 upstreams.
 ```
+
+## Список допуска клиентов по IP (allowed_clients)
+
+Глобальная строка `allowed_clients` в `resocks5.main.ktav` (по умолчанию
+`"*"` — все) ограничивает, с каких IP клиентов вообще можно подключаться.
+Проверка выполняется по **реальному TCP-адресу пира** до чтения любых
+байтов протокола; отклонённому пиру соединение закрывается без ответа.
+Невалидное правило валит старт сервера (fail-closed), включая правила,
+прикреплённые к disabled- и дублирующимся пользователям. Изменения
+требуют рестарта: правило компилируется один раз в снапшот на старте.
+
+Каждый пользователь в `resocks5.users.ktav` может нести опциональную
+строку `allowed_clients`. Итоговая проверка — **И глобального правила,
+и правила пользователя** (поле пользователя добавляет ограничение только
+если задано); элементы внутри одного списка — альтернативы **ИЛИ**.
+Фильтр пользователя выполняется **до проверки пароля**, поэтому
+отклонённый IP получает обычный отказ аутентификации (SOCKS5 `[1,1]` /
+HTTP 407) без работы Argon2, без попадания в HMAC-кеш и без записи
+init-claim на диск. К anonymous-клиентам он не применяется вообще
+(они подчиняются только глобальному правилу); direct-пользователи
+подчиняются ему как все.
+
+Поддерживаемые формы (через запятую; элементы обрезаются по пробелам):
+
+- точный IP: `127.0.0.1`, `::1`, `2001:db8::1` — только стандартный
+  синтаксис std;
+- `loopback` — `127.0.0.0/8` и `::1` (не любой адрес интерфейса и не
+  замена аутентификации);
+- wildcard `*` — весь список (`*`) или ровно один октет IPv4-маски
+  (ровно 4 октета): `192.168.*.*`, либо ровно одна hex-группа
+  IPv6-маски (ровно 8 групп): `2001:db8:*:*:*:*:*:*`. `::` может
+  встречаться один раз и означает **только** нулевые группы:
+  `2001:db8::*` — это `2001:db8:0:0:0:0:0:*`, а не /64.
+
+При проверке IPv6-маской IPv4-адрес рассматривается как
+`::ffff:a.b.c.d`; совместимые с IPv4 адреса (`::a.b.c.d` без ffff) не
+разворачиваются. Пример: маска `::ffff:7f00:*` совпадает с `127.0.0.1`
+и `127.0.255.255`, но НЕ с `127.1.0.1`. Отвергаемые формы — имена
+хостов, CIDR, порты, частичные звёзды (`1*.2.3.4`), пустые элементы
+(`a,,b`) — делают всю строку невалидной.
+
+Примеры KTAV (строки в кавычках — `'*'` и запятые требуют кавычек):
+
+```text
+allowed_clients: '*'
+allowed_clients: "127.0.0.1,::1"
+allowed_clients: "loopback"
+allowed_clients: "192.168.*.*"
+allowed_clients: "2001:db8:*:*:*:*:*:*"
+```
+
+Пир — это фактический адрес TCP-источника, как его видит сервер: за NAT
+или обратным прокси пиром будет адрес прокси — `X-Forwarded-For`
+НЕ учитывается.
 
 ## Use as a library
 

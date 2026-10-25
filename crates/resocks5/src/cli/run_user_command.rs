@@ -96,6 +96,7 @@ fn build_added_user(name: &str, hash: String) -> User {
         hash,
         is_enabled: true,
         direct: false,
+        allowed_clients: None,
     }
 }
 
@@ -112,6 +113,7 @@ fn add_init_user(users: &UsersConfig, name: &str) -> Result<UserOp> {
         hash: "init".to_string(),
         is_enabled: true,
         direct: false,
+        allowed_clients: None,
     }))
 }
 
@@ -352,6 +354,7 @@ mod tests {
             hash: hash.to_string(),
             is_enabled: true,
             direct: false,
+            allowed_clients: None,
         }
     }
 
@@ -401,6 +404,7 @@ mod tests {
                 hash: "$argon2id$v=19$m=5120,t=2,p=1$abc$def".into(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         let err = add_init_user(&u, "bob").unwrap_err();
@@ -456,6 +460,7 @@ mod tests {
                 hash: "$argon2id$v=19$m=5120,t=2,p=1$abc$def".into(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         let op = add_init_user(&u, "bob").unwrap();
@@ -477,6 +482,7 @@ mod tests {
                 hash: "init".into(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         let op = set_direct(&u, "alice", true).unwrap();
@@ -492,6 +498,7 @@ mod tests {
                 hash: "init".into(),
                 is_enabled: true,
                 direct: true,
+                allowed_clients: None,
             }],
         };
         let op = set_direct(&u, "alice", false).unwrap();
@@ -525,6 +532,7 @@ mod tests {
                 hash: "init".into(),
                 is_enabled: false,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         let op = set_enabled(&u, "alice", true).unwrap();
@@ -540,6 +548,7 @@ mod tests {
                 hash: "old".into(),
                 is_enabled: true,
                 direct: false,
+                allowed_clients: None,
             }],
         };
         let op = UserOp::SetPassword {
@@ -617,6 +626,7 @@ mod tests {
             hash: "init".into(),
             is_enabled: true,
             direct: false,
+            allowed_clients: None,
         });
         commit_op_to(&path, &op).unwrap();
 
@@ -661,6 +671,7 @@ mod tests {
             hash: "hash-new".into(),
             is_enabled: true,
             direct: false,
+            allowed_clients: None,
         });
         let err = commit_op_to(&path, &op).unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -696,6 +707,7 @@ mod tests {
             hash: "init".into(),
             is_enabled: true,
             direct: false,
+            allowed_clients: None,
         });
 
         // This is commit_op_to's mutating work; its lock scope ends
