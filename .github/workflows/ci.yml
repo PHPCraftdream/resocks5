@@ -11,6 +11,24 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  installers:
+    name: installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Обновление работающего сервера и очистка старых бинарников
+        run: python -I .github/scripts/test_installers.py
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
