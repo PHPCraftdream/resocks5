@@ -16,6 +16,7 @@ WORKDIR /src
 # the layer hash only changes on real source edits.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY docs/REFERENCE.md ./docs/REFERENCE.md
 
 # Build the server binary only (`--bin resocks5`), skipping the library's
 # examples and tests. `--locked` refuses to silently resolve versions above

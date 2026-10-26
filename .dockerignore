@@ -22,14 +22,15 @@ Dockerfile
 .DS_Store
 Thumbs.db
 
-# Docs — the image is a binary distribution, not a source dump.
-docs/
+# В сборку входит только встроенный справочник.
+docs/**
 *.md
 README.md
 CHANGELOG.md
 CONTRIBUTING.md
 SECURITY.md
 CODE_OF_CONDUCT.md
+!docs/REFERENCE.md
 
 # Runtime state — secrets.
 *.ktav

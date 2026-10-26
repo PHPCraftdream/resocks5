@@ -49,6 +49,9 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - [Why resocks5](#why-resocks5)
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Самостоятельный прокси без upstream](#самостоятельный-прокси-без-upstream)
+- [Подробная справка и все возможности](#подробная-справка-и-все-возможности)
+- [Полный справочник полей и команд](docs/REFERENCE.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
 - [Список допуска клиентов по IP (allowed_clients)](#список-допуска-клиентов-по-ip-allowed_clients)
@@ -347,6 +350,68 @@ auth: { allow_anonymous: false }
 Restart the server after applying these settings. Adding users alone leaves
 anonymous access enabled when `allow_anonymous` is `true`. Apply both settings
 before changing `listen_host` to a public interface.
+
+## Самостоятельный прокси без upstream
+
+`resocks5` может сам обслуживать SOCKS5 и HTTP CONNECT, подключаясь к цели
+с IP сервера. Это **настройка аккаунта `direct: true`**, не глобальный режим
+и не автоматический fallback при отказе upstream.
+
+В рабочем каталоге экземпляра создайте пользователя и включите direct:
+
+```sh
+resocks5 users add alice
+resocks5 users direct alice
+resocks5
+```
+
+В `resocks5.main.ktav` задайте `auth: { allow_anonymous: false }`, чтобы
+требовать пароль. Все шесть upstream-массивов могут оставаться пустыми:
+достаточно одного включённого direct-пользователя. После изменения аккаунта
+или конфигов перезапустите сервер. Вернуть аккаунт к upstream-маршрутизации:
+`resocks5 users pool alice`.
+
+Anonymous direct-доступ не получает. Цель видит IP сервера, DNS разрешается
+сервером; IP-фильтры, banned_patterns, таймауты и лимиты продолжают действовать.
+Подробности и команды клиентов: [полный справочник](docs/REFERENCE.md).
+
+## Подробная справка и все возможности
+
+```sh
+resocks5 -h                         # краткая справка
+resocks5 --help                     # полный встроенный справочник
+resocks5 config                     # тот же справочник без запуска сервера
+resocks5 users --help               # управление аккаунтами
+resocks5 users add-init --help      # первый вход задаёт пароль: ограничения и риски
+resocks5 users direct --help        # самостоятельный proxy по аккаунту
+```
+
+**[docs/REFERENCE.md](docs/REFERENCE.md)** — единый полный справочник,
+встроенный в бинарник: все команды, все поля трёх конфигов, типы, defaults,
+особые значения, примеры, ограничения и диагностика. `--help` и `config`
+работают без интернета; `config` не читает и не создаёт конфиги.
+
+| Возможность | Настройка / управление |
+|-------------|------------------------|
+| SOCKS5 и HTTP CONNECT на одном порту | `listen_host`, `port`; TCP CONNECT, без SOCKS5 UDP/BIND и обычного HTTP forward GET |
+| Самостоятельный прокси | `users direct/pool`, `users[].direct`; только именные enabled-аккаунты |
+| Пароли, disabled, первый вход | `users add/add-init/set-password/enable/disable/remove/list`, `auth.allow_anonymous` |
+| Допуск IP клиента | `allowed_clients`, `users[].allowed_clients`: пересечение правил, loopback и маски |
+| Запрет целей | `banned_patterns`: regex по `host:port`, не автоматическая фильтрация DNS-адресов |
+| Upstream SOCKS5/HTTP/HTTPS | Шесть массивов в proxy_list, credentials, IPv6 и `*`-gates |
+| Ротация и привязка цели | Sand-rating и ограниченный sticky cache, не жёсткий circuit breaker |
+| Предварительные TCP-соединения | `pool.enabled`, `spare_per_proxy`, `max_session_age_sec`; не путать с pool-аккаунтом |
+| Защита от зависаний и перегрузки | Все `network.*`: connect/handshake/client/tunnel deadlines, idle, keepalive и лимиты |
+| SNI / Host recovery | `network.recover_host_from_payload`: pool + буквальный IPv4, возможен ранний ответ CONNECT |
+| ClientHello fragmentation | `tls_fragment.*`: дробление первого распознанного ClientHello, без обещания обхода DPI |
+| Журналирование | Все `log.*`, `file_log.*`; файл append, без автоматической ротации |
+| Установка и обновление | Последний GitHub Release, SHA-256, Windows rename/cleanup и Unix atomic rename |
+| Отдельные экземпляры | Конфиги из cwd, снимок на старте, перезапуск для применения изменений |
+| Контейнер и остановка | Docker amd64/arm64, UID 65532, writable volume; Ctrl+C/SIGTERM и bounded drain |
+| Безопасность и диагностика | Не открывать anonymous наружу; входной TCP не шифрует пароль; см. [SECURITY.md](SECURITY.md) |
+
+Настройки, допустимые значения и практические ограничения каждой строки
+раскрыты в справочнике, а устройство реализации — в [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 

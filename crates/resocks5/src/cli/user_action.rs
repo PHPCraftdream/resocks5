@@ -2,42 +2,83 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
 pub enum UserAction {
-    /// Add a new user. Password is read interactively (no echo).
-    Add {
-        /// Username. Will be rejected if it already exists.
-        name: String,
-    },
-    /// Add a new user with a placeholder hash. The first client that
-    /// connects with this username claims the account by submitting
-    /// the password — it is then hashed (Argon2id), written into
-    /// `resocks5.users.ktav`, and from that point on the account
-    /// behaves as a normally-managed user.
+    /// Создать аккаунт; пароль запрашивается без CLI-флага.
     ///
-    /// Use only when you control the timing of the first login —
-    /// anyone who knows the username and beats the legitimate user to
-    /// the first connection claims it instead.
-    AddInit {
-        /// Username. Will be rejected if it already exists.
+    /// Имя: 1–255 байт, без ':', должно быть свободным. Пароль: 1–255 байт.
+    /// В TTY пароль вводится дважды без эха; из stdin читается одна строка.
+    /// Сохраняется Argon2id hash, аккаунт включён, direct=false.
+    /// Для применения в работающем сервере нужен перезапуск.
+    Add {
+        /// Имя нового аккаунта (регистрозависимое).
         name: String,
     },
-    /// Change an existing user's password. Read interactively.
-    SetPassword { name: String },
-    /// Remove a user from the list.
-    Remove {
+    /// Создать аккаунт с hash=init: первый вход задаст пароль.
+    ///
+    /// Первый успешно аутентифицирующийся клиент фиксирует пароль на диске.
+    /// Посторонний, знающий имя, может успеть раньше владельца аккаунта.
+    /// Используйте только при контроле первого подключения; ограничьте IP
+    /// через allowed_clients и защитите транспорт. Новая запись pool-routed.
+    AddInit {
+        /// Свободное имя: 1–255 байт, без ':'.
         name: String,
-        /// Skip the interactive confirmation prompt.
+    },
+    /// Изменить пароль существующего аккаунта.
+    ///
+    /// В TTY ввод и подтверждение без эха, из stdin — одна строка.
+    /// Пароль не передаётся в аргументах, лимит — 1–255 байт.
+    /// Работающий сервер использует прежний снимок до перезапуска.
+    SetPassword {
+        /// Имя существующего аккаунта.
+        name: String,
+    },
+    /// Удалить аккаунт из users-файла текущего каталога.
+    ///
+    /// В TTY требуется подтверждение, если не указан --yes.
+    /// При неинтерактивном stdin подтверждение не запрашивается.
+    /// Работающий сервер применит удаление после перезапуска.
+    Remove {
+        /// Имя удаляемого аккаунта.
+        name: String,
+        /// Не запрашивать интерактивное подтверждение удаления.
         #[arg(long)]
         yes: bool,
     },
-    /// List configured users (names, enabled flag — never the hashes).
+    /// Показать имена, enabled/disabled и direct/pool; без хешей и паролей.
+    ///
+    /// Это содержимое users-файла, а не снимок уже работающего сервера.
+    /// Пустой список не определяет anonymous: это настраивается в main.
     List,
-    /// Mark a user as enabled.
-    Enable { name: String },
-    /// Mark a user as disabled — auth attempts will fail without revealing
-    /// disabled vs unknown.
-    Disable { name: String },
-    /// Mark a user as direct (bypass-pool): traffic goes from this server's IP.
-    Direct { name: String },
-    /// Mark a user as pool-routed (default): traffic flows through configured upstream proxies.
-    Pool { name: String },
+    /// Разрешить вход существующему аккаунту; нужен перезапуск сервера.
+    Enable {
+        /// Имя существующего аккаунта.
+        name: String,
+    },
+    /// Запретить вход аккаунту; внешний отказ как для неизвестного имени.
+    ///
+    /// Изменение действует для работающего сервера после перезапуска.
+    Disable {
+        /// Имя существующего аккаунта.
+        name: String,
+    },
+    /// Самостоятельный SOCKS5/HTTP CONNECT proxy без upstream для аккаунта.
+    ///
+    /// Установить direct=true: исходящие TCP и DNS выполняются сервером,
+    /// цель видит IP сервера. Достаточно включённого direct-пользователя,
+    /// чтобы запустить сервер с пустыми upstream-массивами.
+    /// Anonymous этот доступ не получает. IP-фильтры, banned_patterns,
+    /// таймауты и max_concurrent_direct продолжают действовать.
+    /// Изменение применяется после перезапуска, текущие туннели не меняются.
+    Direct {
+        /// Имя существующего аккаунта.
+        name: String,
+    },
+    /// Вернуть аккаунт к SOCKS5/HTTP/HTTPS upstream-прокси (direct=false).
+    ///
+    /// Без доступного upstream запрос не становится direct автоматически.
+    /// При отсутствии любых маршрутов старт невозможен, если нет другого
+    /// включённого direct-пользователя. Требуется перезапуск сервера.
+    Pool {
+        /// Имя существующего аккаунта.
+        name: String,
+    },
 }
