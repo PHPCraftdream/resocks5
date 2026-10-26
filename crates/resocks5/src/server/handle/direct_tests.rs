@@ -46,7 +46,8 @@ impl Case {
             Self::Direct => 200,
             Self::Disabled | Self::WrongPassword => 407,
             Self::Banned => 403,
-            Self::Pool | Self::Anonymous | Self::AtCapacity => 503,
+            Self::Pool | Self::Anonymous => 502,
+            Self::AtCapacity => 503,
         }
     }
 }
@@ -87,7 +88,8 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
             let expected = match case {
                 Case::Direct => 0,
                 Case::Banned => 2,
-                Case::Pool | Case::Anonymous | Case::AtCapacity => 1,
+                Case::Pool | Case::Anonymous => 4,
+                Case::AtCapacity => 1,
                 Case::Disabled | Case::WrongPassword => unreachable!(),
             };
             assert_eq!(&reply[..2], &[5, expected]);

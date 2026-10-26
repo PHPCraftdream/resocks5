@@ -156,10 +156,42 @@ mod tests {
         assert_eq!(examples.len(), 2);
         let main: crate::config::MainConfig = ktav::from_str(examples[0]).unwrap();
         assert!(!main.auth.allow_anonymous);
+        assert_eq!(main.listen_host, "127.0.0.1");
         assert_eq!(main.allowed_clients, "loopback");
+        let allowed = crate::config::compile_allowed_clients(&main.allowed_clients).unwrap();
+        assert!(allowed.matches("127.0.0.1".parse().unwrap()));
+        assert!(!allowed.matches("203.0.113.1".parse().unwrap()));
         let proxies: crate::config::ProxyListConfig = ktav::from_str(examples[1]).unwrap();
         assert_eq!(proxies.socks5_v4.len(), 2);
         assert_eq!(proxies.https_v4.len(), 1);
+        use resocks5_net::types::ProxyProtocol::{Http, Https, Socks5};
+        for (list, protocol) in [
+            (&proxies.socks5_v4, Socks5),
+            (&proxies.socks5_v6, Socks5),
+            (&proxies.http_v4, Http),
+            (&proxies.http_v6, Http),
+            (&proxies.https_v4, Https),
+            (&proxies.https_v6, Https),
+        ] {
+            for entry in list {
+                resocks5_net::connect::parse_proxy_str(entry, protocol).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn readme_ip_rules_are_valid_native_ktav_values() {
+        let mut count = 0;
+        for line in include_str!("../../../../README.md")
+            .lines()
+            .filter(|line| line.starts_with("allowed_clients: "))
+        {
+            let source = format!("port: 1\nauth: {{}}\n{line}\n");
+            let main: crate::config::MainConfig = ktav::from_str(&source).unwrap();
+            crate::config::compile_allowed_clients(&main.allowed_clients).unwrap();
+            count += 1;
+        }
+        assert!(count >= 5);
     }
 
     #[test]
