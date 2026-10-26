@@ -81,7 +81,9 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
             }
             let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
             request.extend_from_slice(&port.to_be_bytes());
-            request.extend_from_slice(PAYLOAD);
+            if case == Case::Direct {
+                request.extend_from_slice(PAYLOAD);
+            }
             stream.write_all(&request).await.unwrap();
             let mut reply = [0; 10];
             stream.read_exact(&mut reply).await.unwrap();
@@ -102,7 +104,9 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
             }
             request.push_str("\r\n");
             let mut bytes = request.into_bytes();
-            bytes.extend_from_slice(PAYLOAD);
+            if case == Case::Direct {
+                bytes.extend_from_slice(PAYLOAD);
+            }
             stream.write_all(&bytes).await.unwrap();
             let mut header = Vec::new();
             while !header.ends_with(b"\r\n\r\n") {
@@ -149,10 +153,17 @@ async fn exercise(protocol: Protocol, case: Case) {
             )
             .unwrap(),
         );
-        let target_std = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        target_std.set_nonblocking(true).unwrap();
-        let port = target_std.local_addr().unwrap().port();
-        let target = TcpListener::from_std(target_std.try_clone().unwrap()).unwrap();
+        let (target, denied_target, port) = if case == Case::Direct {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            (Some(listener), None, port)
+        } else {
+            // Этот handle не клонируется и не регистрируется в Tokio.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            (None, Some(listener), port)
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let no_rotator = None;
@@ -205,9 +216,9 @@ async fn exercise(protocol: Protocol, case: Case) {
             client(stream, protocol, case, port).await;
         };
         let echo = async {
-            if case != Case::Direct {
+            let Some(target) = &target else {
                 return;
-            }
+            };
             let (mut stream, _) = target.accept().await.unwrap();
             let mut payload = vec![0; PAYLOAD.len()];
             stream.read_exact(&mut payload).await.unwrap();
@@ -224,9 +235,9 @@ async fn exercise(protocol: Protocol, case: Case) {
         } else {
             assert!(result.is_err());
         }
-        if case != Case::Direct {
+        if let Some(target) = denied_target {
             assert!(
-                matches!(target_std.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                matches!(target.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
             );
         }
         assert_eq!(direct_limiter.available_permits(), slots);
