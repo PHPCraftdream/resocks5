@@ -139,6 +139,117 @@ to keep flowing when they misbehave," that's the case resocks5 is built for.
 
 ## Install
 
+### Последний релиз: Linux, macOS и Windows
+
+Установщики скачивают **последний стабильный GitHub Release**, а не собирают
+код из `main`. Rust и C-компилятор для этого не нужны. Тег определяется один
+раз; архив и `sha256sums.txt` загружаются из одного релиза, SHA-256 проверяется
+до установки. Проверка защищает от повреждения загрузки, но не заменяет
+доверие к издателю релиза.
+
+| ОС | Архитектура | Установщик | Каталог по умолчанию |
+|----|-------------|------------|---------------------|
+| Linux с glibc | x86_64 | `sh` | `~/.local/bin` |
+| macOS | Intel x86_64, Apple Silicon arm64 | `sh` | `~/.local/bin` |
+| Windows | x86_64 | PowerShell 5.1+ | `%LOCALAPPDATA%\resocks5\bin` |
+
+Для остальных платформ (включая Linux ARM64, Alpine/musl и Windows ARM64)
+нативные архивы пока не выпускаются: установщик завершится с ошибкой,
+без попытки собрать проект. Для Linux ARM64 доступен Docker-образ ниже.
+
+**Linux / macOS** — нужны `curl`, `tar` и `sha256sum` либо `shasum`:
+
+```sh
+(
+  set -eu
+  installer_dir=$(mktemp -d)
+  trap 'rm -rf -- "$installer_dir"' 0
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+    https://raw.githubusercontent.com/PHPCraftdream/resocks5/main/.github/scripts/install.sh \
+    -o "$installer_dir/install.sh"
+  sh "$installer_dir/install.sh"
+)
+
+# Для текущего терминала; для постоянной настройки добавьте в ~/.profile
+# или файл конфигурации своего shell:
+export PATH="$HOME/.local/bin:$PATH"
+resocks5 --version
+```
+
+**Windows** — выполните в PowerShell, права администратора не нужны:
+
+```powershell
+$installerDir = Join-Path ([IO.Path]::GetTempPath()) ("resocks5-script-" + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $installerDir
+try {
+    $script = Join-Path $installerDir 'install.ps1'
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/PHPCraftdream/resocks5/main/.github/scripts/install.ps1' -OutFile $script -ErrorAction Stop
+    powershell -NoProfile -ExecutionPolicy Bypass -File $script
+    if ($LASTEXITCODE -ne 0) { throw 'Установка не выполнена.' }
+}
+finally {
+    Remove-Item -LiteralPath $installerDir -Recurse -Force
+}
+
+# Для текущего терминала:
+$env:Path = "$env:LOCALAPPDATA\resocks5\bin;$env:Path"
+resocks5 --version
+```
+
+Для постоянной настройки Windows добавьте `%LOCALAPPDATA%\resocks5\bin`
+в пользовательскую переменную `Path` через параметры среды и откройте новый
+терминал. `-ExecutionPolicy Bypass` действует только для запущенного процесса,
+системная политика не меняется. Обе команды выполняют скрипт из этого
+репозитория; перед запуском можно просмотреть скачанный файл.
+
+Другой каталог можно передать как `sh install.sh /путь/к/bin` либо
+`powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -InstallDir 'D:\apps\resocks5'`.
+Установщики не меняют `PATH`, не запускают сервер и не трогают конфиги.
+Повторный запуск обновляет только бинарник, **останавливать работающий
+`resocks5` не требуется**. Установщик не перезапускает процесс: существующий
+сервер продолжает работать на старой версии, новые запуски используют новую.
+
+- **Linux/macOS:** новый файл атомарно переименовывается поверх старого.
+  Старый inode остаётся доступен работающему процессу; ОС освобождает его
+  после завершения процесса. Резервные имена не создаются.
+- **Windows:** старый файл переименовывается в `.resocks5-old-<GUID>.exe`,
+  затем новый получает имя `resocks5.exe`. При ошибке второго шага установщик
+  пытается восстановить прежнее имя. Каждая успешная установка удаляет
+  неиспользуемые старые копии; занятые процессами, заблокированные или
+  недоступные файлы сохраняются с предупреждением. После завершения старого
+  процесса его копия будет удалена при следующей успешной установке.
+  Удаляются только резервные имена этого установщика, не произвольные `.exe`.
+  Файл `.resocks5-install.lock` предотвращает одновременное изменение каталога
+  несколькими установщиками; само наличие файла не означает активную блокировку.
+
+### Откуда берутся настройки после установки
+
+`resocks5` читает и создаёт `resocks5.main.ktav`, `resocks5.proxy_list.ktav`
+и `resocks5.users.ktav` **в текущем рабочем каталоге запуска**, а не рядом
+с установленным бинарником. Это относится и к `resocks5 users …`.
+Каталог должен быть доступен для записи; установка в `PATH` это правило
+не меняет. Например, на Linux/macOS:
+
+```sh
+mkdir -p my-proxy
+cd my-proxy
+resocks5
+```
+
+На Windows в PowerShell:
+
+```powershell
+$null = New-Item -ItemType Directory -Path 'my-proxy' -Force
+Set-Location 'my-proxy'
+resocks5
+```
+
+Запуски из разных каталогов используют независимые наборы настроек.
+Первый запуск создаёт отсутствующие файлы в выбранном каталоге; для работы
+затем настройте upstream-прокси или direct-пользователей, как описано ниже.
+
+### Сборка из исходников
+
 Requires a recent stable Rust toolchain. The dependency tree (rustls 0.23,
 rpassword 7) sets the floor at **Rust 1.88+**, declared as `rust-version` in
 every crate and enforced by the `msrv` job in CI. The crate uses the `ring`
