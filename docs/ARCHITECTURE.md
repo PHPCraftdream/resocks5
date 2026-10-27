@@ -1,5 +1,17 @@
 # Architecture
 
+Полный пользовательский справочник: [REFERENCE.md](REFERENCE.md). Он встроен
+в `resocks5 --help` и `resocks5 config`; содержит все команды, поля, defaults
+и ограничения. README даёт быстрые сценарии, этот документ — устройство кода.
+
+Самостоятельный proxy уже является политикой аккаунта `direct: true`:
+оба входных протокола вызывают `establish_direct`, не обращаясь к rotator.
+Запуск без upstream разрешён при наличии включённого direct-пользователя;
+anonymous и pool-пользователи автоматически direct-доступ не получают.
+Глобальный `allowed_clients` проверяется до handshake, пользовательский —
+до проверки пароля и init-claim; оба правила пересекаются. Настройки — снимок
+из cwd, изменение требует перезапуска.
+
 This document explains how `resocks5` is put together — the request-flow,
 the upstream-selection model, the safety nets, and where each concern lives
 in the codebase. Read it once and the `.rs` files map onto a coherent system
@@ -153,15 +165,15 @@ not an open one.
 
 | Concern | File |
 |---|---|
-| `Sand` cell state machine | `crates/resocks5-net/src/rating/sand.rs` |
-| `RatingPolicy` (knobs + derived constants) | `crates/resocks5-net/src/rating/policy.rs` |
-| Weighted index / weighted permutation | `crates/resocks5-net/src/rating/select.rs` |
-| Deterministic small RNG (splitmix64) | `crates/resocks5-net/src/rating/rng.rs` |
-| `Ratings` integrator (Mutex + cells + RNG) | `crates/resocks5-net/src/rating/mod.rs` |
+| `Sand` cell state machine | `crates/resocks5-net/src/session/rating/sand.rs` |
+| `RatingPolicy` (knobs + derived constants) | `crates/resocks5-net/src/session/rating/policy.rs` |
+| Weighted index / weighted permutation | `crates/resocks5-net/src/session/rating/select.rs` |
+| Deterministic small RNG (splitmix64) | `crates/resocks5-net/src/session/rating/rng.rs` |
+| `Ratings` integrator (Mutex + cells + RNG) | `crates/resocks5-net/src/session/rating/mod.rs` |
 
 ## The TCP pool and `AtCapacity`
 
-`crates/resocks5-net/src/pool/proxy_pool/mod.rs` keeps two things per upstream
+`crates/resocks5-net/src/session/pool/proxy_pool/mod.rs` keeps two things per upstream
 `(host, port)`:
 
 1. A bounded queue of pre-warmed TCP sockets (master switch `pool.enabled`).
@@ -286,7 +298,7 @@ generated files are pure values.
 ## Testing strategy
 
 - Unit tests inline (`#[cfg(test)] mod tests`) cover each module.
-- Rating-model tests live in `crates/resocks5-net/src/rating/` and include
+- Rating-model tests live in `crates/resocks5-net/src/session/rating/` and include
   property-style assertions: chi-square on uniform distribution, χ²-ish
   bounds on bad-upstream pick rate, simulated convergence over 100k iters.
 - The `default_main_round_trips_through_ktav` and
@@ -306,8 +318,8 @@ generated files are pure values.
 3. `crates/resocks5/src/server/connect/establish_connection/` — the heart of
    upstream selection (sticky cache, gates, sand-rated rotator,
    `should_record_failure`).
-4. `crates/resocks5-net/src/rating/` — the math of sand-rating.
-5. `crates/resocks5-net/src/pool/proxy_pool/mod.rs` — the pool and
+4. `crates/resocks5-net/src/session/rating/` — the math of sand-rating.
+5. `crates/resocks5-net/src/session/pool/proxy_pool/mod.rs` — the pool and
    `AtCapacity`.
 
 Everything else hangs off these five.

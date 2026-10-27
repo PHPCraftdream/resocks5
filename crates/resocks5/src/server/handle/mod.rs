@@ -5,3 +5,5 @@ pub(crate) mod handle_socks5_client;
 // Регрессионные тесты AND-каскада allowed_clients (общий handle_client).
 #[cfg(test)]
 mod allowed_clients_tests;
+#[cfg(test)]
+mod direct_tests;
