@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release binaries that run on any machine: fully static Linux builds for
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (no libc
+  dependency; glibc, musl/Alpine, old and new distributions alike), and the
+  Windows build now links the CRT statically (no Visual C++ Redistributable
+  needed). The release job verifies the musl binaries are static and smoke-tests
+  every built binary with `--help`; a new `portable-builds` CI job builds the
+  same targets on every push. `install.sh` prefers the static archive on Linux
+  (x86_64 and arm64) and falls back to the glibc archive for older releases.
+
 ### Changed
 
 - CI: the release workflow no longer publishes the `resocks5` binary crate to

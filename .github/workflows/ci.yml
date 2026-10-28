@@ -202,3 +202,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc -p resocks5-net --no-default-features --no-deps --locked
       - run: cargo doc -p resocks5-net --no-default-features --features pool --no-deps --locked
+
+  # The release binaries must run on a bare machine: fully static on Linux
+  # (musl, x86_64 + arm64) and a static CRT on Windows (no VC++ Redistributable).
+  # Building them here, on every push, catches a toolchain/dependency change
+  # that breaks a release target long before a tag does.
+  portable-builds:
+    name: portable build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: -D warnings -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: portable-${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '-D warnings' }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build -p resocks5 --locked --target ${{ matrix.target }}
+      - name: Verify the binary is fully static
+        if: matrix.musl
+        run: |
+          bin="target/${{ matrix.target }}/debug/resocks5"
+          ldd "$bin" 2>&1 | grep -qE "not a dynamic executable|statically linked"
+      - name: Smoke test (--help)
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/debug/resocks5"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --help > /dev/null

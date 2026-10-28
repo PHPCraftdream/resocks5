@@ -15,14 +15,15 @@ done
 os=$(uname -s)
 arch=$(uname -m)
 case "$os:$arch" in
-    Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-gnu ;;
+    # Статическая musl-сборка работает на любом Linux (glibc и musl/Alpine).
+    # Релизы без неё (до 0.3.0 включительно) имели только glibc-архив x86_64.
+    Linux:x86_64|Linux:amd64) target=x86_64-unknown-linux-musl; legacy_target=x86_64-unknown-linux-gnu ;;
+    Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-musl ;;
     Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin ;;
     Darwin:x86_64) target=x86_64-apple-darwin ;;
     *) fail "Готовый релиз для $os/$arch не выпускается. Windows: используйте install.ps1." ;;
 esac
-if [ "$os" = Linux ] && ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
-    fail 'Linux-архив требует glibc; musl/Alpine не поддерживается этим установщиком.'
-fi
+legacy_target=${legacy_target:-}
 
 if command -v sha256sum >/dev/null 2>&1; then
     hash_tool=sha256sum
@@ -62,16 +63,26 @@ trap cleanup 0
 trap 'exit 1' 1 2 15
 # Загрузки, извлечённые данные и сам скрипт находятся отдельно.
 mkdir "$scratch/archive" "$scratch/checksums" "$scratch/extracted"
-asset="resocks5-$target.tar.gz"
 base="$repo/releases/download/$tag"
 fetch() {
     curl --fail --silent --show-error --location \
         --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --connect-timeout 20 --max-time 300 --output "$2" "$1"
 }
+fetch "$base/sha256sums.txt" "$scratch/checksums/sha256sums.txt" || fail 'Не удалось скачать SHA-256.'
+asset="resocks5-$target.tar.gz"
+if [ -n "$legacy_target" ] && ! awk -v name="$asset" '$2 == name { found = 1 } END { exit !found }' \
+    "$scratch/checksums/sha256sums.txt"; then
+    if ls /lib/ld-musl-*.so.1 >/dev/null 2>&1; then
+        fail "В релизе $tag нет статической сборки, а glibc-архив на musl/Alpine не запустится."
+    fi
+    target=$legacy_target
+    asset="resocks5-$target.tar.gz"
+fi
+awk -v name="$asset" '$2 == name { found = 1 } END { exit !found }' "$scratch/checksums/sha256sums.txt" \
+    || fail "В релизе $tag нет архива $asset для $os/$arch."
 printf 'Установка resocks5 %s (%s)…\n' "$tag" "$target"
 fetch "$base/$asset" "$scratch/archive/$asset" || fail "Не удалось скачать $asset."
-fetch "$base/sha256sums.txt" "$scratch/checksums/sha256sums.txt" || fail 'Не удалось скачать SHA-256.'
 
 expected=$(awk -v name="$asset" '
     $2 == name { count++; hash = $1 }

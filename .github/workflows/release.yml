@@ -38,9 +38,22 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+          # Static musl builds run on any Linux (glibc or musl/Alpine, any
+          # age) with no shared-library dependencies. The ARM64 one is built
+          # natively on GitHub's arm64 runner.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            musl: true
+          # Static CRT: the exe needs no Visual C++ Redistributable.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+            rustflags: -C target-feature=+crt-static
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
@@ -56,8 +69,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      - name: Install musl toolchain (static Linux builds)
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify the binary is fully static
+        if: matrix.musl
+        run: |
+          bin="target/${{ matrix.target }}/release/resocks5"
+          ldd "$bin" 2>&1 | grep -qE "not a dynamic executable|statically linked"
+      # Run the freshly built binary once (all legs but the Intel macOS one,
+      # which is a cross build on an arm64 runner).
+      - name: Smoke test (--help)
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/resocks5"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --help > /dev/null
       # We stage the binary and the LICENSE files into a single directory and
       # archive from there. Earlier versions used `tar -C target/.../release`,
       # which made the LICENSE paths relative to the target dir (where they
