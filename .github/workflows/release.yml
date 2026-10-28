@@ -98,6 +98,18 @@ jobs:
       # don't exist) and would fail the release on the first v* tag. The zip
       # path used absolute-style paths and produced a deeply-nested archive
       # (`target/.../release/resocks5.exe`); the staging dir flattens it too.
+      # Attribution: MIT / Apache-2.0 / ISC … dependencies must ship their
+      # license texts with the binary.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Generate third-party license texts
+        shell: bash
+        run: >
+          cargo about generate --workspace --all-features --locked --fail
+          -c .github/licenses/about.toml
+          -o THIRD-PARTY-LICENSES.txt
+          .github/licenses/about.hbs
       - name: Stage archive contents
         shell: bash
         run: |
@@ -107,7 +119,7 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/resocks5" stage/
           fi
-          cp LICENSE-MIT LICENSE-APACHE stage/
+          cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt stage/
       - name: Archive (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash

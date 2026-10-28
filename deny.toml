@@ -19,3 +19,9 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
 ]
+
+# Dependencies must come from crates.io only — no git or alternate-registry
+# sources slip in unnoticed.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

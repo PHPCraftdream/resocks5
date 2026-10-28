@@ -251,3 +251,50 @@ jobs:
           bin="target/${{ matrix.target }}/debug/resocks5"
           [ -f "$bin.exe" ] && bin="$bin.exe"
           "$bin" --help > /dev/null
+
+  # License / supply-chain policy (deny.toml). `licenses`, `bans` and
+  # `sources` gate every push and PR: a dependency under a license outside the
+  # allow-list, a banned crate, or a non-crates.io source fails the build.
+  # `advisories` runs separately and non-blocking, so a new RUSTSEC entry on
+  # an unrelated crate does not block unrelated work; it is still reported.
+  deny:
+    name: cargo deny (licenses, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+  deny-advisories:
+    name: cargo deny (advisories, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+  # The distributed binaries embed third-party code, so their archives must
+  # carry the license texts (MIT / Apache-2.0 / ISC … require attribution).
+  # This job proves the THIRD-PARTY-LICENSES.txt generation works on every
+  # push; release.yml generates the same file into each archive.
+  third-party-licenses:
+    name: third-party license texts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Generate THIRD-PARTY-LICENSES.txt
+        run: >
+          cargo about generate --workspace --all-features --locked --fail
+          -c .github/licenses/about.toml
+          -o THIRD-PARTY-LICENSES.txt
+          .github/licenses/about.hbs
+      - name: Sanity-check the output
+        run: |
+          test -s THIRD-PARTY-LICENSES.txt
+          grep -q "tokio" THIRD-PARTY-LICENSES.txt
+          grep -q "MIT" THIRD-PARTY-LICENSES.txt

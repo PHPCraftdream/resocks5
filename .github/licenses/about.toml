@@ -1,0 +1,19 @@
+# cargo-about config: collect the license texts of every third-party crate that
+# ends up in a distributed binary, for THIRD-PARTY-LICENSES.txt. The allow-list
+# mirrors /deny.toml (cargo-deny is what actually gates new licenses in CI).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Unlicense",
+    "0BSD",
+    "Zlib",
+    "ISC",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+# `ring` ships a bespoke license file that needs special handling.
+workarounds = ["ring"]

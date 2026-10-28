@@ -1,0 +1,27 @@
+resocks5 — third-party licenses
+================================
+
+This distribution includes the open-source components listed below. Each is
+used under the terms of the license shown; the full text follows.
+
+Overview
+--------
+{{#each overview}}
+- {{name}} ({{count}} crate(s))
+{{/each}}
+
+License texts
+-------------
+{{#each licenses}}
+
+================================================================================
+{{name}}
+================================================================================
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
