@@ -17,7 +17,7 @@ publish = false
 # only for the local workspace build); the crate is `publish = false`, so
 # it is kept in step with `[workspace.package].version` in case publishing
 # is ever re-enabled. Not covered by workspace inheritance.
-resocks5-net = { path = "../resocks5-net", version = "0.3.0", features = ["pool", "tls", "serde", "rating", "rotator"] }
+resocks5-net = { path = "../resocks5-net", version = "0.3.1", features = ["pool", "tls", "serde", "rating", "rotator"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true
 serde.workspace = true

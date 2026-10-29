@@ -1,4 +1,5 @@
-//! Pool-free one-shot dial through a single upstream proxy.
+//! Pool-free one-shot dial through a single upstream proxy, or through a
+//! chain of them ([`dial_chain`]).
 
 use std::time::Duration;
 
@@ -13,6 +14,10 @@ use crate::connect::tcp_dial::tcp_dial;
 use crate::connect::{AnyUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::{ProxyConfig, ProxyProtocol};
+
+mod chain;
+
+pub use chain::{dial_chain, ChainError, ChainStage};
 
 /// Time budgets for [`dial`].
 ///

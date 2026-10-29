@@ -23,9 +23,9 @@ const REDACTED: &str = "<redacted>";
 /// `Arc` rather than `Box` so that constructing a gate-wrapped variant
 /// (e.g. when caching a successful gate+proxy pair in
 /// `ProxyRotator::link_proxy`) is a cheap refcount bump instead of a deep
-/// copy of the gate's `String` fields. `connect_proxy` and
-/// `connect_proxy_once` do NOT interpret `gate`; chain assembly lives in
-/// the application.
+/// copy of the gate's `String` fields. [`dial_chain`](crate::connect::dial_chain)
+/// follows `gate` links (to any depth); `dial`, `connect_proxy` and
+/// `connect_proxy_once` do NOT interpret `gate`.
 ///
 /// The [`Debug`](std::fmt::Debug) output is redacted: `user` and `password`
 /// values are replaced with a placeholder, recursively through
@@ -48,8 +48,9 @@ pub struct ProxyConfig {
     /// reached through). Set by a leading `*` in the parsed line.
     pub is_gate: bool,
     /// The outer gate node dialed first; this entry is reached through its
-    /// tunnel. `None` for a direct entry. Not interpreted by `connect_proxy`
-    /// / `connect_proxy_once`.
+    /// tunnel. `None` for a direct entry. Followed by
+    /// [`dial_chain`](crate::connect::dial_chain); not interpreted by `dial`,
+    /// `connect_proxy` or `connect_proxy_once`.
     pub gate: Option<Arc<ProxyConfig>>,
 }
 

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use resocks5_net::connect::tunnel::tunnel_with_timeouts;
 use resocks5_net::connect::{
-    connect_proxy_once, dial, dial_plain, handshake_over_stream, socks5_handshake, AnyUpstream,
-    DialOptions, UpstreamStream,
+    connect_proxy_once, dial, dial_chain, dial_plain, handshake_over_stream, socks5_handshake,
+    AnyUpstream, ChainError, DialOptions, UpstreamStream,
 };
 use resocks5_net::types::ProxyConfig;
 use resocks5_net::ConnectError;
@@ -40,6 +40,8 @@ fn errors_cross_threads_and_tasks() {
     assert_send_sync::<ConnectError>();
     assert_send_static::<ConnectError>();
     assert_send_static::<Result<AnyUpstream, ConnectError>>();
+    assert_send_sync::<ChainError>();
+    assert_send_static::<Result<AnyUpstream, ChainError>>();
 }
 
 #[test]
@@ -54,6 +56,7 @@ fn dial_futures_are_send() {
     let opts = DialOptions::new();
     future_is_send(dial(&proxy, "example.com", 80, &opts, None));
     future_is_send(dial_plain(&proxy, "example.com", 80, &opts));
+    future_is_send(dial_chain(&proxy, "example.com", 80, &opts, None));
     future_is_send(connect_proxy_once(
         "example.com:80",
         &proxy,

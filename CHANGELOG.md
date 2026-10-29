@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-29
+
 ### Added
 
+- `resocks5-net`: `connect::dial_chain` — a pool-free multi-hop dial that
+  follows `ProxyConfig::gate` links (any depth, SOCKS5 / HTTP CONNECT / HTTPS
+  at every hop, one TCP connection, per-hop handshake timeout, optional total
+  timeout). Failures are a `ChainError` carrying the typed `ConnectError` and
+  a `ChainStage` (`Connect`, `Hop(n)`, `Target`) so callers can tell which
+  node to blame. Without a gate it behaves like `dial`.
 - License compliance in CI: `cargo deny check licenses bans sources` now gates
   every push and PR (allow-list in `deny.toml`; `sources` is strict —
   crates.io only), with `cargo deny check advisories` reported alongside as a
@@ -656,7 +664,8 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...v0.1.1

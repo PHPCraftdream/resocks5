@@ -258,9 +258,13 @@ non-SOCKS5 version byte is `Protocol(Socks5BadVersion { got })`, not
 meaning.
 
 `ProxyConfig` is built with `ProxyConfig::socks5/http/https(..)` plus
-`with_auth` / `with_gate`. Its `gate` field is the outer gate node and is
-**not** interpreted by `connect_proxy` / `dial`: chaining through a gate
-is assembled by the application.
+`with_auth` / `with_gate`. Its `gate` field is the outer node dialed first.
+`dial_chain(&proxy, host, port, &opts, tls)` follows those links to any
+depth, tunnelling hop by hop over one TCP connection (SOCKS5, HTTP CONNECT
+or HTTPS at every hop) and returning `AnyUpstream::Gate`; its
+`ChainError::stage()` says which step failed (`Connect`, `Hop(n)`,
+`Target`). `dial`, `connect_proxy` and `connect_proxy_once` do **not**
+interpret `gate`.
 
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
 `error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`
