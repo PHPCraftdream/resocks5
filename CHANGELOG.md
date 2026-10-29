@@ -33,6 +33,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same targets on every push. `install.sh` prefers the static archive on Linux
   (x86_64 and arm64) and falls back to the glibc archive for older releases.
 
+- `resocks5`: client IP allow-list. A global `allowed_clients` in
+  `resocks5.main.ktav` (default `"*"`) and an optional per-user
+  `allowed_clients` in `resocks5.users.ktav` restrict which peer addresses may
+  connect: exact IPs, `loopback`, and `*` masks (one IPv4 octet / one IPv6
+  group each), comma-separated alternatives. The check uses the real TCP peer
+  address before any protocol byte is read; both rules must pass; the per-user
+  rule runs before password verification (no Argon2 work, no init-claim write
+  for a rejected IP) and does not apply to anonymous clients. An invalid rule
+  fails server start (fail-closed). Changes need a restart.
+- Installers for the latest GitHub Release: `.github/scripts/install.sh`
+  (Linux, macOS) and `install.ps1` (Windows, PowerShell 5.1+). They resolve the
+  release tag once, download the archive and `sha256sums.txt` from that same
+  release, verify the SHA-256 before installing, and never build from source.
+  CI exercises both installers.
+- `resocks5`: full built-in reference. `resocks5 --help` and the new
+  `resocks5 config` print every command and every field of the three config
+  files (types, defaults, special values, examples, diagnostics) without
+  network access or reading configs; `resocks5 users <command> --help` documents
+  each account command (including the `add-init` first-login-claim risks). The
+  same text is published as `docs/REFERENCE.md`. Self-contained "direct" proxy
+  mode (`users direct` / `users pool`) is documented and covered by tests.
+
 ### Changed
 
 - CI: the release workflow no longer publishes the `resocks5` binary crate to
@@ -40,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the crate was not published). Binaries ship only as GitHub Release archives and
   the container image; the crate is `publish = false`. `resocks5-net` is still
   published to crates.io. The `only_app` manual-run input is removed.
+
+### Security
+
+- Dependencies: `rustls` 0.23.45 → 0.23.46 (RUSTSEC-2026-0346 … 0349);
+  `rustls-webpki` 0.103.16, `webpki-roots` 1.0.11 and `tokio` 1.54.1 in the
+  lockfile (RUSTSEC-2026-0381, -0382, -0386). No `Cargo.toml` requirement
+  changed.
 
 ## [0.3.0] - 2026-10-12
 
