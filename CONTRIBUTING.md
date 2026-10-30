@@ -40,6 +40,55 @@ checks. The workflow's `RUSTFLAGS=-D warnings` treats compiler warnings as
 errors; this does not prohibit particular constructs such as `unwrap()`,
 `dbg!`, or `TODO` by itself.
 
+### Segmented CI: targeted runs and the full run
+
+A push or PR does not run everything. The `changes` job
+(`.github/scripts/changed-areas.sh`) maps the **diff** to what is needed and CI
+runs only that, on ubuntu. Nothing needs to be written in the commit message.
+
+| Changed files | What runs |
+|---------------|-----------|
+| SDK core: `crates/resocks5-net/src/{lib.rs,connect,error,types}`, `session/{pool,progress.rs}`, `tests/` | all SDK tests in every feature-matrix row, lean clippy/doc, and all app tests |
+| `crates/resocks5-net/src/session/rating`, `rotator` | SDK tests of `rating::` / `rotator::` in every matrix row; app `server::` tests |
+| `crates/resocks5-net/src/server` | SDK `server::` tests; app `server::` and `http_proxy::` tests |
+| SDK examples, fixtures | test builds of every matrix row (`--no-run`) |
+| `crates/resocks5/src/{main.rs,config}` | all app tests |
+| `crates/resocks5/src/{auth,cli,server,http_proxy,logger}` | app tests of that module (`auth` also `server::`, `http_proxy::`) |
+| `README.md`, `docs/REFERENCE.md`, `docs/ARCHITECTURE.md` (embedded and tested by the app) | app `print_config_docs` tests |
+| any Rust file | fmt + clippy, MSRV, docs, portable builds |
+| `Cargo.toml`, `Cargo.lock`, `.cargo/**` | everything above for both crates, plus the license/supply-chain jobs |
+| `deny.toml`, `.github/licenses/**` | license/supply-chain jobs, portable builds |
+| `.github/workflows/release.yml` | portable builds |
+| `.github/scripts/install.*`, `test_installers.py` | installer tests on Linux, macOS and Windows |
+| anything else (changelog, other docs) | only the `structure` job |
+
+Tests are chosen by module: a libtest filter such as `server::` selects every
+unit test and doctest under that module. Limits of this mapping: a change is
+tested in its own module (and the modules known to depend on it), so
+cross-module behaviour changes and Windows/macOS-only breakage can slip past a
+targeted run. The full run exists for exactly that.
+
+**The full run** (every segment, the whole workspace, Linux, macOS and
+Windows, no filters) is started explicitly, at the end of a sprint and before a
+release:
+
+- put `[ci: full]` (or `[full-ci]`) in the text of a commit message of the push
+  or PR, or in the PR title:
+
+  ```text
+  chore: sprint close [ci: full]
+  ```
+
+  Write that marker only when you want the full run: it is matched anywhere in
+  the commit messages of the range;
+- or start it by hand: **Actions → CI → Run workflow**, branch `main`
+  (`workflow_dispatch`, always a full run);
+- it also runs for every `v*` tag, and when `.github/workflows/ci.yml` or the
+  classifier script changes (to prove the change).
+
+Require the single **`ci result`** check in branch protection: segments that
+were skipped count as passing, a failed or cancelled one fails it.
+
 ### Code structure (the `structure` CI job)
 
 - A Rust file has at most **1000 lines**

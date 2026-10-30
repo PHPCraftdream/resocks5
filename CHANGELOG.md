@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI is segmented by diff: a push or PR runs only the segments its changed files
+  need, on ubuntu only, and only the SDK/app tests of the touched modules (feature
+  matrix, lean clippy/doc, lint, MSRV, docs, license checks, installers, portable
+  builds are selected the same way). The full run, with every segment and the
+  whole workspace on Linux, macOS and Windows, is explicit: `[ci: full]` in a
+  commit message or PR title, a manual run from Actions, a `v*` tag, or a change
+  to the CI definition. A single `ci result` check summarises the run for branch
+  protection. See `CONTRIBUTING.md`.
+
 ## [0.3.1] - 2026-10-29
 
 ### Added

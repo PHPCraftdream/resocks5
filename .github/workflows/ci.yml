@@ -1,18 +1,71 @@
 name: CI
 
+# Segmented CI. A push or PR runs only what its diff needs, on ubuntu only
+# (`changes` job, .github/scripts/changed-areas.sh maps the changed files to
+# segments and to the SDK / app tests of the touched modules).
+# The FULL run — every segment, whole workspace, every OS — is explicit:
+#   - `[ci: full]` (or `[full-ci]`) in a commit message of the push/PR, or in
+#     the PR title;
+#   - Actions -> CI -> Run workflow (`workflow_dispatch`);
+#   - a `v*` tag;
+#   - a change to this workflow or the classifier script (to prove it).
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  changes:
+    name: changes (which segments to run)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      full: ${{ steps.areas.outputs.full }}
+      run_test: ${{ steps.areas.outputs.run_test }}
+      run_lint: ${{ steps.areas.outputs.run_lint }}
+      run_msrv: ${{ steps.areas.outputs.run_msrv }}
+      run_doc: ${{ steps.areas.outputs.run_doc }}
+      run_net: ${{ steps.areas.outputs.run_net }}
+      net_matrix: ${{ steps.areas.outputs.net_matrix }}
+      net_test_args: ${{ steps.areas.outputs.net_test_args }}
+      run_clippy_net: ${{ steps.areas.outputs.run_clippy_net }}
+      run_doc_net: ${{ steps.areas.outputs.run_doc_net }}
+      run_portable: ${{ steps.areas.outputs.run_portable }}
+      run_deny: ${{ steps.areas.outputs.run_deny }}
+      run_licenses: ${{ steps.areas.outputs.run_licenses }}
+      run_installers: ${{ steps.areas.outputs.run_installers }}
+      test_os: ${{ steps.areas.outputs.test_os }}
+      msrv_os: ${{ steps.areas.outputs.msrv_os }}
+      test_scope: ${{ steps.areas.outputs.test_scope }}
+      test_filter: ${{ steps.areas.outputs.test_filter }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          MARKER: ${{ github.event.pull_request.title || github.event.head_commit.message }}
+        run: sh .github/scripts/changed-areas.sh "$EVENT" "$BASE" "$HEAD_SHA" "$MARKER" >> "$GITHUB_OUTPUT"
+
   installers:
     name: installer (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.run_installers == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -29,22 +82,29 @@ jobs:
       - name: Обновление работающего сервера и очистка старых бинарников
         run: python -I -X utf8 .github/scripts/test_installers.py
 
+  # Targeted: ubuntu only, the app's package, and only the app tests of the
+  # modules the diff touched (libtest filters). Full: all three OSes, whole
+  # workspace, no filter.
   test:
     name: test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.run_test == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(needs.changes.outputs.test_os) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      - run: cargo build ${{ needs.changes.outputs.test_scope }} --all-targets
+      - run: cargo test ${{ needs.changes.outputs.test_scope }} ${{ needs.changes.outputs.test_filter }}
 
   lint:
     name: fmt + clippy
+    needs: changes
+    if: needs.changes.outputs.run_lint == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,11 +133,13 @@ jobs:
   # resolving versions above the MSRV.
   msrv:
     name: msrv (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.run_msrv == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: ${{ fromJSON(needs.changes.outputs.msrv_os) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -89,6 +151,8 @@ jobs:
   # and `rustdoc::redundant_explicit_links` drift. Same `--locked` discipline.
   doc:
     name: cargo doc
+    needs: changes
+    if: needs.changes.outputs.run_doc == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
@@ -128,39 +192,22 @@ jobs:
   # features is 32 serial runs in one job (its implied-feature pairs like
   # {rotator} == {rating, rotator} do not collapse), and it would add a
   # third-party action (taiki-e/install-action) to the trust base. The cost
-  # of this shape: when you add a feature to resocks5-net, add a row below.
+  # of this shape: when you add a feature to resocks5-net, add a row to
+  # `row_args` and `ALL_ROWS` in .github/scripts/changed-areas.sh (the matrix
+  # is generated there so `[ci: net=<row>+<row>]` can run a subset).
   net-features:
     name: net features (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.run_net == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: lean
-            args: --no-default-features
-          - name: pool
-            args: --no-default-features --features pool
-          - name: tls
-            args: --no-default-features --features tls
-          - name: pool-tls
-            args: --no-default-features --features pool,tls
-          - name: serde
-            args: --no-default-features --features serde
-          - name: rating
-            args: --no-default-features --features rating
-          - name: rotator
-            args: --no-default-features --features rotator
-          - name: test-instrumentation
-            args: --no-default-features --features test-instrumentation
-          - name: default
-            args: ""
-          - name: all
-            args: --all-features
+      matrix: ${{ fromJSON(needs.changes.outputs.net_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p resocks5-net ${{ matrix.args }} --locked
+      - run: cargo test -p resocks5-net ${{ matrix.args }} --locked ${{ needs.changes.outputs.net_test_args }}
 
   # Lean clippy for the library: dead-code and unused-import lints surface
   # only in feature-off builds, and the workspace `lint` job always sees
@@ -169,6 +216,8 @@ jobs:
   # lint set on the lean path.
   clippy-net-lean:
     name: clippy (net, no default features)
+    needs: changes
+    if: needs.changes.outputs.run_clippy_net == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -193,6 +242,8 @@ jobs:
   # off. Same RUSTDOCFLAGS=-D warnings discipline as the `doc` job.
   doc-net-lean:
     name: cargo doc (net, no default features)
+    needs: changes
+    if: needs.changes.outputs.run_doc_net == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
@@ -209,6 +260,8 @@ jobs:
   # that breaks a release target long before a tag does.
   portable-builds:
     name: portable build (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.run_portable == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -259,6 +312,8 @@ jobs:
   # an unrelated crate does not block unrelated work; it is still reported.
   deny:
     name: cargo deny (licenses, bans, sources)
+    needs: changes
+    if: needs.changes.outputs.run_deny == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -267,6 +322,8 @@ jobs:
           command: check licenses bans sources
   deny-advisories:
     name: cargo deny (advisories, informational)
+    needs: changes
+    if: needs.changes.outputs.run_deny == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -281,6 +338,8 @@ jobs:
   # push; release.yml generates the same file into each archive.
   third-party-licenses:
     name: third-party license texts
+    needs: changes
+    if: needs.changes.outputs.run_licenses == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -298,3 +357,34 @@ jobs:
           test -s THIRD-PARTY-LICENSES.txt
           grep -q "tokio" THIRD-PARTY-LICENSES.txt
           grep -q "MIT" THIRD-PARTY-LICENSES.txt
+
+  # The one check to require in branch protection. Segments skipped by
+  # `changes` count as passing; a failed or cancelled one fails the gate.
+  ci-result:
+    name: ci result
+    if: always()
+    needs:
+      - changes
+      - installers
+      - test
+      - lint
+      - structure
+      - msrv
+      - doc
+      - net-features
+      - clippy-net-lean
+      - doc-net-lean
+      - portable-builds
+      - deny
+      - deny-advisories
+      - third-party-licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any segment failed or was cancelled
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "segment results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "* | *" cancelled "*) exit 1 ;;
+          esac
