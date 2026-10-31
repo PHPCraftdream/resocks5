@@ -420,6 +420,21 @@ pub(super) async fn run_server_inner() -> Result<()> {
         });
     }
 
+    // In the background: the listener must bind at once, a refused
+    // connection makes browsers mark the proxy failed for a long time.
+    if cfg_main.network.quarantine_threshold > 0 {
+        let rotators: Vec<Arc<ProxyRotator>> = [&gate_rotator, &v6_rotator, &v4_rotator]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        tokio::spawn(quarantine_unreachable_at_start(
+            rotators,
+            logger.clone(),
+            Duration::from_secs(cfg_main.network.connect_timeout_sec.clamp(1, 3)),
+        ));
+    }
+
     let frag = Arc::new(cfg_main.tls_fragment.clone());
     let network = Arc::new(cfg_main.network.clone());
 
@@ -451,4 +466,45 @@ pub(super) async fn run_server_inner() -> Result<()> {
     // a bounded wait.
     shutdown_log_drain(logger, log_drain).await;
     result
+}
+
+/// Right after startup: one TCP connect to every upstream, all at once,
+/// bounded by `timeout`. Unreachable ones get quarantined, so clients after
+/// a restart soon stop drawing a dead upstream; background probes bring
+/// them back once they answer.
+async fn quarantine_unreachable_at_start(
+    rotators: Vec<Arc<ProxyRotator>>,
+    logger: Arc<logger::Logger>,
+    timeout: Duration,
+) {
+    let mut checks = tokio::task::JoinSet::new();
+    for rotator in &rotators {
+        for proxy in rotator.all_proxies() {
+            let rotator = rotator.clone();
+            let proxy = proxy.clone();
+            checks.spawn(async move {
+                let connect = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port));
+                let reachable = matches!(tokio::time::timeout(timeout, connect).await, Ok(Ok(_)));
+                (rotator, proxy, reachable)
+            });
+        }
+    }
+    while let Some(joined) = checks.join_next().await {
+        let Ok((rotator, proxy, reachable)) = joined else {
+            continue;
+        };
+        // Requests already run: a request may have quarantined it meanwhile.
+        if reachable || rotator.is_quarantined(&proxy) {
+            continue;
+        }
+        if let Some(length) = rotator.quarantine_now(&proxy) {
+            logger.proxy_failure(|| {
+                format!(
+                    "Upstream {} is unreachable at startup - quarantined for {}s",
+                    crate::server::print_cfg(&proxy),
+                    length.as_secs()
+                )
+            });
+        }
+    }
 }

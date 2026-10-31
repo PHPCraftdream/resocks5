@@ -486,6 +486,15 @@ impl ProxyRotator {
             .collect()
     }
 
+    /// Quarantine the proxy right away, without waiting for the failure
+    /// threshold — for an explicit health check that found it down (e.g.
+    /// at startup). Returns the quarantine length; `None` without a
+    /// quarantine or for an unknown proxy.
+    pub fn quarantine_now(&self, proxy: &ProxyConfig) -> Option<Duration> {
+        let i = self.index_of(proxy)?;
+        self.ratings.quarantine_now(i)
+    }
+
     /// `true` while the proxy is quarantined or on probation. Unknown
     /// proxies are never quarantined.
     pub fn is_quarantined(&self, proxy: &ProxyConfig) -> bool {

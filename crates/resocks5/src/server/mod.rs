@@ -14,3 +14,4 @@ pub use handle::handle_socks5_client::handle_socks5_client;
 pub use run_server::run_server;
 pub(crate) use tunnel::forward_tunnel::forward_tunnel;
 pub(crate) use tunnel::recovery;
+pub(crate) use tunnel::tunnel_log::TunnelLabel;

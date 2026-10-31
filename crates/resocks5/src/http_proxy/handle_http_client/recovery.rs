@@ -143,8 +143,19 @@ pub(super) async fn recover_and_tunnel_http(
             if frag.enabled {
                 upstream.set_nodelay(true)?;
             }
-            return server::forward_tunnel(client_stream, upstream, Vec::new(), frag, network)
-                .await;
+            return server::forward_tunnel(
+                client_stream,
+                upstream,
+                Vec::new(),
+                frag,
+                network,
+                Some(server::TunnelLabel {
+                    logger,
+                    target,
+                    client: client_user,
+                }),
+            )
+            .await;
         }
         RecoveryPeek::Client(prefix) => prefix,
     };
@@ -207,5 +218,17 @@ pub(super) async fn recover_and_tunnel_http(
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
     }
-    server::forward_tunnel(client_stream, proxy_stream, buf, frag, network).await
+    server::forward_tunnel(
+        client_stream,
+        proxy_stream,
+        buf,
+        frag,
+        network,
+        Some(server::TunnelLabel {
+            logger,
+            target: &effective_target,
+            client: client_user,
+        }),
+    )
+    .await
 }

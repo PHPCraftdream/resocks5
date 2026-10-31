@@ -95,6 +95,12 @@ impl Logger {
             self.send(msg, ELog::Log);
         }
     }
+
+    pub fn tunnel(&self, msg: impl FnOnce() -> String) {
+        if self.cfg.tunnels {
+            self.send(msg, ELog::Log);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +123,7 @@ mod tests {
             connection_errors: false,
             client_disconnects: false,
             attempts: false,
+            tunnels: false,
         }
     }
 
@@ -131,6 +138,7 @@ mod tests {
             connection_errors: true,
             client_disconnects: true,
             attempts: true,
+            tunnels: true,
         }
     }
 

@@ -185,6 +185,18 @@ impl Cell {
         Some(length)
     }
 
+    /// Quarantine right away, as if the threshold had just been reached
+    /// (an explicit health check said the upstream is down). Returns the
+    /// quarantine length.
+    pub(super) fn trip_now(&mut self, now: Instant, policy: &QuarantinePolicy) -> Duration {
+        self.lease_until = None;
+        self.consecutive = self.consecutive.max(policy.threshold);
+        self.trips = self.trips.saturating_add(1);
+        let length = policy.duration_for(self.trips);
+        self.until = Some(now.checked_add(length).unwrap_or(now));
+        length
+    }
+
     /// A success proves the upstream alive: forget everything.
     pub(super) fn success(&mut self) {
         *self = Cell::default();

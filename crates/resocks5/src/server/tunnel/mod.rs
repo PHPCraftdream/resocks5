@@ -2,3 +2,4 @@
 // the recovery peek that feeds it.
 pub(crate) mod forward_tunnel;
 pub(crate) mod recovery;
+pub(crate) mod tunnel_log;

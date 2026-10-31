@@ -36,8 +36,19 @@ pub async fn connect_http_proxy(
     pool: &ProxyPool,
     handshake_timeout: Duration,
 ) -> Result<UpstreamStream, ConnectError> {
-    let mut stream = pool.acquire(proxy).await?;
+    let stream = pool.acquire(proxy).await?;
+    http_on_acquired(stream, target_addr, proxy, handshake_timeout).await
+}
 
+/// The HTTP CONNECT half of [`connect_http_proxy`] on a socket already
+/// taken from the pool, bounded by `handshake_timeout`.
+#[cfg(feature = "pool")]
+pub(crate) async fn http_on_acquired(
+    mut stream: UpstreamStream,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    handshake_timeout: Duration,
+) -> Result<UpstreamStream, ConnectError> {
     let endpoint = upstream_endpoint(proxy);
     let result = timeout(
         handshake_timeout,

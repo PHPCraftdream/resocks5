@@ -8,36 +8,54 @@ use resocks5_net::connect::tls_fragment::{
     classify_client_hello, send_possibly_fragmented, ClientHelloMatch, SendProgress,
 };
 use resocks5_net::connect::tls_records::client_hello_is_complete;
-use resocks5_net::connect::tunnel::tunnel_with_timeouts;
+use resocks5_net::connect::tunnel::{tunnel_with_timeouts, TunnelEnd};
 
+use super::tunnel_log::{self, TunnelLabel};
+
+/// Forward `client` <-> `upstream` until both sides finish or a deadline
+/// hits. With a `label`, the tunnel's bytes each way and how it ended are
+/// logged when it closes (see `tunnel_log::report`).
+///
 /// cancel-safe: NO — partial forwarding is terminal; both owned streams close.
 pub(crate) async fn forward_tunnel<A, B>(
     mut client: A,
-    mut upstream: B,
+    upstream: B,
     initial: Vec<u8>,
     frag: &TlsFragmentConfig,
     network: &NetworkConfig,
+    label: Option<TunnelLabel<'_>>,
 ) -> anyhow::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    let (mut upstream, counters) = tunnel_log::counted(upstream);
+    let started = std::time::Instant::now();
     let idle = Duration::from_secs(network.tunnel_idle_timeout_sec);
     let lifetime = Duration::from_secs(network.tunnel_max_lifetime_sec);
     let forwarding = async {
         if !prepare_payload(&mut client, &mut upstream, initial, frag, idle).await? {
-            return Ok(());
+            return Ok("stalled sending the first bytes");
         }
-        tunnel_with_timeouts(client, upstream, idle, Duration::ZERO).await?;
-        Ok(())
+        let outcome = tunnel_with_timeouts(client, upstream, idle, Duration::ZERO).await?;
+        Ok(match outcome.end {
+            TunnelEnd::Eof => "closed",
+            TunnelEnd::IdleTimeout => "idle timeout",
+            TunnelEnd::LifetimeTimeout => "max lifetime",
+            _ => "ended",
+        })
     };
-    if lifetime.is_zero() {
+    let result: anyhow::Result<&'static str> = if lifetime.is_zero() {
         forwarding.await
     } else {
         tokio::time::timeout(lifetime, forwarding)
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok("max lifetime"))
+    };
+    if let Some(label) = label {
+        tunnel_log::report(&label, &result, &counters, started.elapsed());
     }
+    result.map(|_| ())
 }
 
 /// cancel-safe: NO — callers close both streams when a deadline expires.
@@ -197,6 +215,7 @@ mod tests {
                 Vec::new(),
                 &fragmentation(),
                 &NetworkConfig::default(),
+                None,
             )
             .await
         });
@@ -241,6 +260,7 @@ mod tests {
                 Vec::new(),
                 &fragmentation(),
                 &NetworkConfig::default(),
+                None,
             )
             .await
         });
@@ -348,6 +368,7 @@ mod tests {
                 Vec::new(),
                 &fragmentation(),
                 &network,
+                None,
             )
             .await
         });
@@ -395,6 +416,7 @@ mod tests {
                 Vec::new(),
                 &fragmentation(),
                 &network,
+                None,
             ),
         )
         .await
@@ -421,6 +443,7 @@ mod tests {
                 hello[..6].to_vec(),
                 &fragmentation_with_size(4),
                 &network,
+                None,
             ),
         )
         .await
@@ -448,6 +471,7 @@ mod tests {
                 b"payload".to_vec(),
                 &fragmentation(),
                 &network,
+                None,
             ),
         )
         .await
@@ -575,7 +599,7 @@ mod tests {
             delay_ms: 100,
         };
         let task = tokio::spawn(async move {
-            forward_tunnel(client_inner, upstream_inner, hello, &frag, &network).await
+            forward_tunnel(client_inner, upstream_inner, hello, &frag, &network, None).await
         });
         let mut seen = vec![0u8; expected.len()];
         let start = tokio::time::Instant::now();
@@ -614,6 +638,7 @@ mod tests {
                 Vec::new(),
                 &fragmentation_with_size(1),
                 &network,
+                None,
             )
             .await
         });

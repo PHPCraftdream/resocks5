@@ -50,6 +50,8 @@ pub use connect_http_proxy::connect_http_proxy;
 pub use connect_http_proxy::http_connect_handshake;
 #[cfg(feature = "pool")]
 pub use connect_proxy::connect_proxy;
+#[cfg(feature = "pool")]
+pub use connect_proxy::connect_proxy_on;
 pub use connect_proxy::connect_proxy_once;
 #[cfg(feature = "pool")]
 pub use connect_socks5_proxy::connect_socks5_proxy;

@@ -45,7 +45,18 @@ pub async fn connect_socks5_proxy(
     handshake_timeout: Duration,
 ) -> Result<UpstreamStream, ConnectError> {
     let stream = pool.acquire(proxy).await?;
+    socks5_on_acquired(stream, target_addr, proxy, handshake_timeout).await
+}
 
+/// The SOCKS5 half of [`connect_socks5_proxy`] on a socket already taken
+/// from the pool, bounded by `handshake_timeout`.
+#[cfg(feature = "pool")]
+pub(crate) async fn socks5_on_acquired(
+    stream: UpstreamStream,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    handshake_timeout: Duration,
+) -> Result<UpstreamStream, ConnectError> {
     match timeout(
         handshake_timeout,
         handshake_over_stream(stream, target_addr, socks5_auth(proxy)),

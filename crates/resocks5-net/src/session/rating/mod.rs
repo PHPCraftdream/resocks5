@@ -148,6 +148,20 @@ impl Ratings {
         inner.quarantine[i].hard_failure(now, &self.quarantine)
     }
 
+    /// Quarantine upstream `i` right away, without waiting for the failure
+    /// threshold: for an explicit health check that found it down (e.g. at
+    /// startup). Returns the quarantine length; `None` without a quarantine
+    /// or for an unknown index.
+    pub fn quarantine_now(&self, i: usize) -> Option<Duration> {
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let cell = inner.quarantine.get_mut(i)?;
+        Some(cell.trip_now(now, &self.quarantine))
+    }
+
     /// Record a success for upstream `i`. Also lifts any quarantine.
     pub fn on_success(&self, i: usize) {
         let mut inner = self.inner.lock().unwrap();

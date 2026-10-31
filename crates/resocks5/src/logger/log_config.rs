@@ -45,6 +45,12 @@ pub struct LogConfig {
     /// temporarily to diagnose which upstreams are slow/dead.
     #[serde(default)]
     pub attempts: bool,
+    /// One line per closed tunnel: target, how it ended, bytes sent and
+    /// received, duration. High volume; enable to see whether traffic
+    /// actually flows. A tunnel whose upstream sent nothing back is
+    /// reported under `proxy_failures` regardless of this flag.
+    #[serde(default)]
+    pub tunnels: bool,
 }
 
 fn default_true() -> bool {
@@ -63,6 +69,7 @@ impl Default for LogConfig {
             connection_errors: true,
             client_disconnects: false,
             attempts: false,
+            tunnels: false,
         }
     }
 }

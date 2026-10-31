@@ -115,7 +115,8 @@ mod tests {
             banned_targets,
             connection_errors,
             client_disconnects,
-            attempts
+            attempts,
+            tunnels
         );
         check!(main.file_log, "file_log.", enabled, path, also_console);
         let proxies = crate::config::ProxyListConfig::default();

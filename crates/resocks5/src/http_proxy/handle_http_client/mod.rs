@@ -161,5 +161,17 @@ pub async fn handle_http_client(
     if frag.enabled {
         proxy_stream.set_nodelay(true)?;
     }
-    server::forward_tunnel(client_stream, proxy_stream, pipeline, frag, network).await
+    server::forward_tunnel(
+        client_stream,
+        proxy_stream,
+        pipeline,
+        frag,
+        network,
+        Some(server::TunnelLabel {
+            logger,
+            target: target_addr,
+            client: client_user,
+        }),
+    )
+    .await
 }

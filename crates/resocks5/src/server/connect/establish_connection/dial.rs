@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use crate::config::NetworkConfig;
 use crate::logger::Logger;
 use crate::server::{get_auth, print_cfg};
 use resocks5_net::connect::{
-    connect_proxy, handshake_over_stream, http_connect_handshake, HostPort,
+    connect_proxy, connect_proxy_on, handshake_over_stream, http_connect_handshake, HostPort,
 };
 use resocks5_net::pool::{AnyUpstream, BoxedUpstream, ProxyPool};
 use resocks5_net::progress::ProgressReportingWriter;
@@ -256,9 +257,24 @@ pub async fn establish_connection(
         spawn_due_probes(rotator, logger, connect_timeout);
     }
 
-    // Check cached proxies
+    // Check cached proxies. A plain (gate-less) cached upstream is not
+    // tried alone: it leads the direct race below, so a cached upstream
+    // that died since costs the hedge delay, not the connect timeout.
+    let mut candidates: Vec<Candidate> = Vec::new();
     for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         if let Some(cached_proxy) = rotator.get_linked(target_addr) {
+            if cached_proxy.gate.is_none() {
+                let route = route_key(None, &cached_proxy);
+                if !tried_routes.contains(&route) {
+                    tried_routes.insert(route);
+                    candidates.push(Candidate {
+                        rotator: rotator.clone(),
+                        proxy: cached_proxy,
+                        cached: true,
+                    });
+                }
+                continue;
+            }
             let route = route_key(cached_proxy.gate.as_ref(), &cached_proxy);
             if tried_routes.contains(&route) {
                 continue;
@@ -439,12 +455,16 @@ pub async fn establish_connection(
         }
     }
 
-    // Check direct connections. An attempt still running after
-    // `hedge_delay_ms` does not hold the request: the next candidate starts
-    // beside it, the first success wins and the rest are aborted. A dead
-    // upstream that no rating knows about yet (e.g. right after start) then
-    // costs the hedge delay instead of the full connect timeout.
-    let mut candidates: Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)> = Vec::new();
+    // Check direct connections. An attempt whose TCP connect is still
+    // pending after `hedge_delay_ms` does not hold the request: the next
+    // candidate starts beside it and the first success wins. A dead upstream
+    // that no rating knows about yet (e.g. right after start) then costs the
+    // hedge delay instead of the full connect timeout. Once an attempt has
+    // reached its upstream, no new one starts while it talks to the target,
+    // so the target does not see duplicate CONNECTs. Attempts still running
+    // when one wins finish in the background, so their outcome still feeds
+    // the ratings and the quarantine; those that reach their upstream only
+    // after the win stop there.
     'direct: for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         // R5-09: an exhausted budget must not build another full order.
         if attempts + candidates.len() >= max_attempts {
@@ -461,31 +481,41 @@ pub async fn establish_connection(
                 break 'direct;
             }
             tried_routes.insert(route);
-            candidates.push((rotator.clone(), proxy_config));
+            candidates.push(Candidate {
+                rotator: rotator.clone(),
+                proxy: proxy_config,
+                cached: false,
+            });
         }
     }
 
     let hedge_delay = Duration::from_millis(network.hedge_delay_ms);
     let mut pending = candidates.into_iter();
-    let mut launched: Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)> = Vec::new();
-    let mut running = tokio::task::JoinSet::new();
-    let launch = |running: &mut tokio::task::JoinSet<_>,
-                  launched: &mut Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)>,
-                  (rotator, proxy): (Arc<ProxyRotator>, Arc<ProxyConfig>)| {
+    let mut launched: Vec<Candidate> = Vec::new();
+    let mut running: Attempts = tokio::task::JoinSet::new();
+    let race = Arc::new(RaceState::default());
+    let mut hedge_at = tokio::time::Instant::now();
+    let launch = |running: &mut Attempts, launched: &mut Vec<Candidate>, candidate: Candidate| {
         let id = launched.len();
         let target = target_addr.to_string();
         let pool = pool.clone();
         let tls = tls_connector.cloned();
-        let task_proxy = proxy.clone();
+        let proxy = candidate.proxy.clone();
+        let race = race.clone();
         running.spawn(async move {
             let t0 = Instant::now();
-            let result =
-                connect_proxy(&target, &task_proxy, &pool, handshake_timeout, tls.as_ref())
-                    .await
-                    .map_err(anyhow::Error::new);
+            let result = race_attempt(
+                &race,
+                &target,
+                &proxy,
+                &pool,
+                handshake_timeout,
+                tls.as_ref(),
+            )
+            .await;
             (id, result, t0.elapsed())
         });
-        launched.push((rotator, proxy));
+        launched.push(candidate);
     };
     loop {
         if running.is_empty() {
@@ -493,6 +523,7 @@ pub async fn establish_connection(
                 Some(candidate) => {
                     attempts += 1;
                     launch(&mut running, &mut launched, candidate);
+                    hedge_at = tokio::time::Instant::now() + hedge_delay;
                 }
                 None => break,
             }
@@ -503,56 +534,31 @@ pub async fn establish_connection(
                 let Some(Ok((id, result, elapsed))) = joined else {
                     continue;
                 };
-                let (rotator, proxy_config) = launched[id].clone();
-                let ms = elapsed.as_millis();
-                match result {
-                    Ok(stream) => {
-                        logger.attempt(|| {
-                            format!(
-                                "attempt target={} via={} path=direct outcome=ok dur={}ms{}",
-                                target_addr,
-                                print_cfg(&proxy_config),
-                                ms,
-                                ctag
-                            )
-                        });
-                        rotator.record_success(&proxy_config);
-                        rotator.link_proxy(target_addr.to_string(), proxy_config.clone());
-                        logger.cache_write(|| {
-                            format!("Cache written for {} directly{}", target_addr, ctag)
-                        });
-                        return Ok(stream);
-                    }
-                    Err(e) => {
-                        logger.attempt(|| {
-                            format!(
-                                "attempt target={} via={} path=direct outcome=fail dur={}ms err={}{}",
-                                target_addr,
-                                print_cfg(&proxy_config),
-                                ms,
-                                e,
-                                ctag,
-                            )
-                        });
-                        logger.proxy_failure(|| {
-                            format!(
-                                "Failed direct: {} - {} - {}{}",
-                                target_addr,
-                                e,
-                                print_cfg(&proxy_config),
-                                ctag,
-                            )
-                        });
-                        if should_record_failure(&e) {
-                            record_proxy_failure(&rotator, &proxy_config, &e, logger, &ctag);
+                let outcome = settle_attempt(&launched[id], result, elapsed, true, target_addr, logger, &ctag);
+                if let Some(stream) = outcome {
+                    race.won.store(true, Ordering::Release);
+                    let launched = Arc::new(launched);
+                    let logger = logger.clone();
+                    let target = target_addr.to_string();
+                    let ctag = ctag.clone();
+                    tokio::spawn(async move {
+                        while let Some(joined) = running.join_next().await {
+                            if let Ok((id, result, elapsed)) = joined {
+                                drop(settle_attempt(&launched[id], result, elapsed, false, &target, &logger, &ctag));
+                            }
                         }
-                    }
+                    });
+                    return Ok(stream);
                 }
             }
-            _ = tokio::time::sleep(hedge_delay), if can_hedge => {
-                if let Some(candidate) = pending.next() {
-                    attempts += 1;
-                    launch(&mut running, &mut launched, candidate);
+            _ = tokio::time::sleep_until(hedge_at), if can_hedge => {
+                hedge_at = tokio::time::Instant::now() + hedge_delay;
+                // An attempt talking to the target holds the race.
+                if race.handshaking.load(Ordering::Acquire) == 0 {
+                    if let Some(candidate) = pending.next() {
+                        attempts += 1;
+                        launch(&mut running, &mut launched, candidate);
+                    }
                 }
             }
         }
@@ -563,4 +569,157 @@ pub async fn establish_connection(
         attempts,
         target_addr
     ))
+}
+
+/// One upstream a request may race through.
+struct Candidate {
+    rotator: Arc<ProxyRotator>,
+    proxy: Arc<ProxyConfig>,
+    /// Came from the target's sticky-cache entry.
+    cached: bool,
+}
+
+type Attempts = tokio::task::JoinSet<(usize, anyhow::Result<AnyUpstream>, std::time::Duration)>;
+
+/// Shared by the attempts of one race.
+#[derive(Default)]
+pub(super) struct RaceState {
+    /// Set once an attempt won.
+    pub(super) won: AtomicBool,
+    /// Attempts past their TCP connect, talking to the target.
+    pub(super) handshaking: AtomicUsize,
+}
+
+/// An attempt that reached its upstream after the race was already won;
+/// it stops before asking the upstream for the target.
+#[derive(Debug)]
+pub(super) struct RaceLost;
+
+impl std::fmt::Display for RaceLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("race already won by another upstream")
+    }
+}
+
+impl std::error::Error for RaceLost {}
+
+/// One direct attempt: TCP connect to the upstream, then — unless the race
+/// is already won — the protocol handshake to the target.
+pub(super) async fn race_attempt(
+    race: &RaceState,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    pool: &ProxyPool,
+    handshake_timeout: Duration,
+    tls_connector: Option<&TlsConnector>,
+) -> anyhow::Result<AnyUpstream> {
+    let stream = pool.acquire(proxy).await.map_err(anyhow::Error::new)?;
+    if race.won.load(Ordering::Acquire) {
+        return Err(RaceLost.into());
+    }
+    race.handshaking.fetch_add(1, Ordering::AcqRel);
+    let result = connect_proxy_on(stream, target_addr, proxy, handshake_timeout, tls_connector)
+        .await
+        .map_err(anyhow::Error::new);
+    race.handshaking.fetch_sub(1, Ordering::AcqRel);
+    result
+}
+
+/// Log a finished race attempt and feed it into the ratings. Returns the
+/// stream on success (the caller either uses it or drops it).
+///
+/// `in_race` is false for attempts that finish after another one won: they
+/// still feed the ratings but leave the target's sticky link alone.
+fn settle_attempt(
+    candidate: &Candidate,
+    result: anyhow::Result<AnyUpstream>,
+    elapsed: std::time::Duration,
+    in_race: bool,
+    target_addr: &str,
+    logger: &Arc<Logger>,
+    ctag: &str,
+) -> Option<AnyUpstream> {
+    let Candidate {
+        rotator,
+        proxy,
+        cached,
+    } = candidate;
+    let path = if *cached { "cache" } else { "direct" };
+    let ms = elapsed.as_millis();
+    match result {
+        Ok(stream) => {
+            logger.attempt(|| {
+                format!(
+                    "attempt target={} via={} path={} outcome={} dur={}ms{}",
+                    target_addr,
+                    print_cfg(proxy),
+                    path,
+                    if in_race { "ok" } else { "ok-late" },
+                    ms,
+                    ctag
+                )
+            });
+            rotator.record_success(proxy);
+            if !in_race {
+                return None;
+            }
+            if *cached {
+                logger.cache_hit(|| format!("Cache used for {}{}", target_addr, ctag));
+            } else {
+                rotator.link_proxy(target_addr.to_string(), proxy.clone());
+                logger
+                    .cache_write(|| format!("Cache written for {} directly{}", target_addr, ctag));
+            }
+            Some(stream)
+        }
+        Err(e) if e.is::<RaceLost>() => {
+            logger.attempt(|| {
+                format!(
+                    "attempt target={} via={} path={} outcome=lost dur={}ms{}",
+                    target_addr,
+                    print_cfg(proxy),
+                    path,
+                    ms,
+                    ctag
+                )
+            });
+            None
+        }
+        Err(e) => {
+            logger.attempt(|| {
+                format!(
+                    "attempt target={} via={} path={} outcome=fail dur={}ms err={}{}",
+                    target_addr,
+                    print_cfg(proxy),
+                    path,
+                    ms,
+                    e,
+                    ctag,
+                )
+            });
+            if *cached {
+                logger.proxy_failure(|| {
+                    format!("Cached proxy failed: {} - {}{}", e, print_cfg(proxy), ctag)
+                });
+                // After the win the link already names the winner.
+                if in_race {
+                    rotator.unlink_proxy(target_addr);
+                }
+            } else {
+                logger.proxy_failure(|| {
+                    format!(
+                        "Failed direct: {} - {} - {}{}",
+                        target_addr,
+                        e,
+                        print_cfg(proxy),
+                        ctag,
+                    )
+                });
+            }
+            if should_record_failure(&e) {
+                record_proxy_failure(rotator, proxy, &e, logger, ctag);
+            }
+            None
+        }
+    }
 }

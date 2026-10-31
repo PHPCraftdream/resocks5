@@ -8,11 +8,13 @@ pub use tokio_rustls::TlsConnector;
 
 use crate::connect::dial::{dial, DialOptions};
 use crate::connect::host_port::HostPort;
-#[cfg(all(feature = "pool", feature = "tls"))]
-use crate::connect::upstream_tls::connect_https_proxy;
 use crate::connect::AnyUpstream;
 #[cfg(feature = "pool")]
-use crate::connect::{connect_http_proxy, connect_socks5_proxy};
+use crate::connect::UpstreamStream;
+#[cfg(feature = "pool")]
+use crate::connect::{
+    connect_http_proxy::http_on_acquired, connect_socks5_proxy::socks5_on_acquired,
+};
 use crate::error::ConnectError;
 #[cfg(feature = "pool")]
 use crate::pool::ProxyPool;
@@ -76,38 +78,92 @@ pub async fn connect_proxy(
     handshake_timeout: Duration,
     tls_connector: Option<&TlsConnector>,
 ) -> Result<AnyUpstream, ConnectError> {
+    // An HTTPS upstream that cannot be served must not take a socket.
+    check_tls_slot(proxy, tls_connector)?;
+    let stream = pool.acquire(proxy).await?;
+    connect_proxy_on(stream, target_addr, proxy, handshake_timeout, tls_connector).await
+}
+
+/// The protocol half of `connect_proxy`: run `proxy`'s handshake to
+/// `target_addr` over a socket already taken with
+/// [`ProxyPool::acquire`](crate::pool::ProxyPool::acquire).
+///
+/// `connect_proxy` is exactly `pool.acquire(proxy)` followed by this.
+/// Splitting the two lets a caller act on the moment the TCP connection to
+/// the upstream is up — e.g. stop racing other upstreams once this one is
+/// known to be reachable, while the proxy still talks to the target.
+///
+/// # Errors
+///
+/// Same as `connect_proxy` minus the pool's own errors.
+#[cfg(feature = "pool")]
+pub async fn connect_proxy_on(
+    stream: UpstreamStream,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    handshake_timeout: Duration,
+    tls_connector: Option<&TlsConnector>,
+) -> Result<AnyUpstream, ConnectError> {
+    check_tls_slot(proxy, tls_connector)?;
     match proxy.protocol {
-        ProxyProtocol::Socks5 => {
-            let s = connect_socks5_proxy(target_addr, proxy, pool, handshake_timeout).await?;
-            Ok(AnyUpstream::Plain(s))
-        }
-        ProxyProtocol::Http => {
-            let s = connect_http_proxy(target_addr, proxy, pool, handshake_timeout).await?;
-            Ok(AnyUpstream::Plain(s))
-        }
+        ProxyProtocol::Socks5 => Ok(AnyUpstream::Plain(
+            socks5_on_acquired(stream, target_addr, proxy, handshake_timeout).await?,
+        )),
+        ProxyProtocol::Http => Ok(AnyUpstream::Plain(
+            http_on_acquired(stream, target_addr, proxy, handshake_timeout).await?,
+        )),
         ProxyProtocol::Https => {
             #[cfg(feature = "tls")]
             {
-                let connector = tls_connector.ok_or_else(|| ConnectError::Tls {
-                    message: "HTTPS upstream requires TLS connector".to_string(),
-                    source: None,
-                })?;
-                let s = connect_https_proxy(target_addr, proxy, pool, handshake_timeout, connector)
-                    .await?;
+                let connector = tls_connector.expect("checked by check_tls_slot");
+                let s = crate::connect::upstream_tls::https_on_stream(
+                    stream,
+                    target_addr,
+                    proxy,
+                    handshake_timeout,
+                    connector,
+                )
+                .await?;
                 Ok(AnyUpstream::Tls(Box::new(s)))
             }
             #[cfg(not(feature = "tls"))]
             {
-                // The slot exists purely for signature stability across
-                // feature unification; there is nothing to plug in without
-                // the `tls` feature.
-                let _ = tls_connector;
+                drop(stream);
                 Err(ConnectError::TlsFeatureMissing {
                     host: proxy.host.clone(),
                 })
             }
         }
     }
+}
+
+/// An HTTPS upstream needs a connector (and the `tls` feature).
+#[cfg(feature = "pool")]
+fn check_tls_slot(
+    proxy: &ProxyConfig,
+    tls_connector: Option<&TlsConnector>,
+) -> Result<(), ConnectError> {
+    if proxy.protocol != ProxyProtocol::Https {
+        return Ok(());
+    }
+    #[cfg(feature = "tls")]
+    if tls_connector.is_none() {
+        return Err(ConnectError::Tls {
+            message: "HTTPS upstream requires TLS connector".to_string(),
+            source: None,
+        });
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        // The slot exists purely for signature stability across feature
+        // unification; there is nothing to plug in without `tls`.
+        let _ = tls_connector;
+        return Err(ConnectError::TlsFeatureMissing {
+            host: proxy.host.clone(),
+        });
+    }
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 /// Connect to `target_addr` through a single upstream `proxy` without a

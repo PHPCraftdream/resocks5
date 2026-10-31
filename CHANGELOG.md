@@ -10,10 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Parallel fallback attempt (`network.hedge_delay_ms`, default 2000): an upstream
-  attempt still running after this delay no longer holds the request — the next
-  candidate starts beside it and the first success wins. A dead upstream that
-  nothing knows about yet (right after start) now costs a request about 2 s, not
-  `connect_timeout_sec`. `0` restores strictly sequential attempts.
+  attempt whose TCP connect is still pending after this delay no longer holds
+  the request — the next candidate starts beside it and the first success wins.
+  A dead upstream that nothing knows about yet (right after start) now costs a
+  request about 2 s, not `connect_timeout_sec`. `0` restores strictly
+  sequential attempts. Once an upstream is reached, no further attempt starts
+  while it talks to the target, so the target never sees duplicate CONNECTs.
+  Attempts that lose the race finish in the background and still feed the
+  ratings and the quarantine, without touching the target's sticky link; one
+  that reaches its upstream only after the win stops before CONNECT. A
+  target's sticky-cache upstream now leads the race instead of being waited
+  for on its own.
+- At startup every upstream gets one TCP check in the background, after the
+  listener is up; unreachable ones start quarantined (`Upstream … is
+  unreachable at startup`). `resocks5-net`: `ProxyRotator::quarantine_now`,
+  `Ratings::quarantine_now`, and `connect::connect_proxy_on` — the handshake
+  half of `connect_proxy` over a socket already taken from the pool.
+- `log.tunnels` (default off): one line per closed tunnel with target, how it
+  ended, bytes sent and received and duration. A tunnel whose upstream sent
+  nothing back is reported under `log.proxy_failures` regardless.
 
 - Doctests are forbidden: rustdoc examples are `text` blocks, `resocks5-net`
   sets `doctest = false`, the examples run as ordinary tests in
