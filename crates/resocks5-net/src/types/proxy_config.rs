@@ -25,7 +25,8 @@ const REDACTED: &str = "<redacted>";
 /// `ProxyRotator::link_proxy`) is a cheap refcount bump instead of a deep
 /// copy of the gate's `String` fields. [`dial_chain`](crate::connect::dial_chain)
 /// follows `gate` links (to any depth); `dial`, `connect_proxy` and
-/// `connect_proxy_once` do NOT interpret `gate`.
+/// `connect_proxy_once` do NOT interpret `gate`. No `dial*` or
+/// `connect_proxy*` function interprets gate levels.
 ///
 /// The [`Debug`](std::fmt::Debug) output is redacted: `user` and `password`
 /// values are replaced with a placeholder, recursively through
@@ -44,8 +45,10 @@ pub struct ProxyConfig {
     pub user: Option<String>,
     /// Optional password, paired with [`user`](ProxyConfig::user).
     pub password: Option<String>,
-    /// `true` when this entry is itself a gate node (a hop other proxies are
-    /// reached through). Set by a leading `*` in the parsed line.
+    /// The number of leading `*` markers; 0 denotes an ordinary/exit proxy.
+    /// `is_gate == (gate_level > 0)`.
+    pub gate_level: u8,
+    /// `true` exactly when `gate_level > 0`.
     pub is_gate: bool,
     /// The outer gate node dialed first; this entry is reached through its
     /// tunnel. `None` for a direct entry. Followed by
@@ -70,6 +73,7 @@ impl ProxyConfig {
             user: None,
             password: None,
             is_gate: false,
+            gate_level: 0,
             gate: None,
         }
     }
@@ -96,15 +100,17 @@ impl ProxyConfig {
         self
     }
 
-    /// Parse a `[*]user:pass@host:port` address into a [`ProxyConfig`],
+    /// Parse a proxy address with optional credentials and leading gate markers,
     /// delegating to `parse_proxy_str` (same grammar, same
     /// [`ParseProxyError`] variants).
     ///
-    /// The host may be a domain, an IPv4 literal, or an IPv6 literal
-    /// (bracketed, or bare with the trailing `:port` for backward
-    /// compatibility). A leading `*` marks the entry as a gate node; like
-    /// everywhere in the SDK it is only recorded in
-    /// [`is_gate`](ProxyConfig::is_gate) and never interpreted by dialing.
+    /// Parse an address with 0–255 leading `*` markers (zero means an
+    /// ordinary proxy); markers record gate level only. `gate` links this
+    /// entry to the outer gate dialed first, and `dial_chain` follows those
+    /// links. Neither `dial`/`dial_chain` nor `connect_proxy*` interprets
+    /// the level value. The host may be a domain, an IPv4 literal, or an
+    /// IPv6 literal (bracketed, or bare with trailing `:port` for backward
+    /// compatibility).
     pub fn from_addr(protocol: ProxyProtocol, addr: &str) -> Result<Self, ParseProxyError> {
         parse_proxy_str(addr, protocol)
     }
@@ -115,9 +121,17 @@ impl ProxyConfig {
         self
     }
 
-    /// Mark this entry as a gate node (`is_gate = true`).
+    /// Mark this entry as a gate node, raising level to at least one.
     pub fn as_gate(mut self) -> Self {
+        self.gate_level = self.gate_level.max(1);
         self.is_gate = true;
+        self
+    }
+
+    /// Set gate level and synchronize [`is_gate`](ProxyConfig::is_gate).
+    pub fn with_gate_level(mut self, level: u8) -> Self {
+        self.gate_level = level;
+        self.is_gate = level > 0;
         self
     }
 }
@@ -130,6 +144,7 @@ impl fmt::Debug for ProxyConfig {
             .field("port", &self.port)
             .field("user", &self.user.as_ref().map(|_| REDACTED))
             .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("gate_level", &self.gate_level)
             .field("is_gate", &self.is_gate)
             .field("gate", &self.gate)
             .finish()
@@ -183,6 +198,7 @@ mod tests {
         assert!(rendered.contains("protocol: Socks5"));
         assert!(rendered.contains("host: \"203.0.113.1\""));
         assert!(rendered.contains("port: 1080"));
+        assert!(rendered.contains("gate_level: 1"));
         assert!(rendered.contains("is_gate: true"));
         assert!(rendered.contains("gate: Some(ProxyConfig"));
         // Three chained configs, two credential fields each, all redacted.
@@ -215,7 +231,13 @@ mod tests {
         let c = ProxyConfig::socks5("example.com", 1080);
         assert_eq!(c.protocol, ProxyProtocol::Socks5);
         assert_eq!((c.host.as_str(), c.port), ("example.com", 1080));
-        assert!(c.user.is_none() && c.password.is_none() && !c.is_gate && c.gate.is_none());
+        assert!(
+            c.user.is_none()
+                && c.password.is_none()
+                && !c.is_gate
+                && c.gate_level == 0
+                && c.gate.is_none()
+        );
         assert_eq!(ProxyConfig::http("h", 8080).protocol, ProxyProtocol::Http);
         assert_eq!(ProxyConfig::https("h", 443).protocol, ProxyProtocol::Https);
     }
@@ -232,6 +254,7 @@ mod tests {
     fn from_addr_delegates_to_parse_proxy_str() {
         let c = ProxyConfig::from_addr(ProxyProtocol::Https, "*u:p@[2001:db8::1]:443").unwrap();
         assert_eq!(c.protocol, ProxyProtocol::Https);
+        assert_eq!(c.gate_level, 1);
         assert!(c.is_gate);
         assert_eq!(c.user.as_deref(), Some("u"));
         assert_eq!(c.password.as_deref(), Some("p"));
@@ -244,6 +267,20 @@ mod tests {
     }
 
     #[test]
+    fn gate_level_builders_synchronize_and_preserve_values() {
+        let direct = ProxyConfig::socks5("h", 1);
+        assert_eq!(direct.gate_level, 0);
+        assert!(!direct.is_gate);
+        let raised = direct.clone().with_gate_level(7).as_gate();
+        assert_eq!(raised.gate_level, 7);
+        assert!(raised.is_gate);
+        let lowered = raised.with_gate_level(0);
+        assert_eq!(lowered.gate_level, 0);
+        assert!(!lowered.is_gate);
+        assert_eq!(direct.as_gate().gate_level, 1);
+    }
+
+    #[test]
     fn builders() {
         let gate = ProxyConfig::socks5("gate.example", 1).as_gate();
         let c = ProxyConfig::socks5("1.2.3.4", 2)
@@ -253,7 +290,9 @@ mod tests {
         assert_eq!(c.password.as_deref(), Some("p"));
         let g = c.gate.as_ref().unwrap();
         assert_eq!(g.host, "gate.example");
+        assert_eq!(g.gate_level, 1);
         assert!(g.is_gate);
+        assert_eq!(c.gate_level, 0);
         assert!(!c.is_gate);
     }
 }

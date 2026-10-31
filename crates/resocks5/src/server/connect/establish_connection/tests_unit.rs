@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
-fn route_membership_matches_composites_but_distinguishes_accounts_and_gates() {
+fn route_membership_matches_composites_but_distinguishes_accounts_and_gate_levels() {
     let proxy = Arc::new(socks5_config("127.0.0.1:1000".parse().unwrap(), false));
     let gate = Arc::new(socks5_config("127.0.0.1:1001".parse().unwrap(), true));
     let mut composite = (*proxy).clone();
@@ -33,6 +33,8 @@ fn route_membership_matches_composites_but_distinguishes_accounts_and_gates() {
     account.password = Some("secret".to_string());
     assert!(!tried.contains(&route_key(Some(&gate), &Arc::new(account))));
 
+    let level_two_gate = Arc::new((*gate).clone().with_gate_level(2));
+    assert!(!tried.contains(&route_key(Some(&level_two_gate), &proxy)));
     let mut other_gate = (*gate).clone();
     other_gate.port += 1;
     assert!(!tried.contains(&route_key(Some(&Arc::new(other_gate)), &proxy)));
@@ -40,6 +42,9 @@ fn route_membership_matches_composites_but_distinguishes_accounts_and_gates() {
     let mut dead = HashSet::new();
     dead.insert(UpstreamKey(composite));
     assert!(dead.contains(&UpstreamKey(Arc::new((*proxy).clone()))));
+    let mut level_two_proxy = (*proxy).clone().with_gate_level(2);
+    level_two_proxy.gate = Some(gate);
+    assert!(!dead.contains(&UpstreamKey(Arc::new(level_two_proxy))));
 }
 
 /// Extract the `AtCapacity` payload from either the legacy bare sentinel

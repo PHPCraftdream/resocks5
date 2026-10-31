@@ -478,33 +478,25 @@ async fn quarantine_unreachable_at_start(
     timeout: Duration,
 ) {
     let mut checks = tokio::task::JoinSet::new();
-    for rotator in &rotators {
-        for proxy in rotator.all_proxies() {
-            let rotator = rotator.clone();
-            let proxy = proxy.clone();
-            checks.spawn(async move {
-                let connect = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port));
-                let reachable = matches!(tokio::time::timeout(timeout, connect).await, Ok(Ok(_)));
-                (rotator, proxy, reachable)
-            });
-        }
+    for rotator in rotators {
+        let logger = logger.clone();
+        checks.spawn(async move {
+            for event in rotator.probe_all(timeout).await {
+                if let resocks5_net::rotator::ProbeEvent::QuarantinedAtStart {
+                    proxy,
+                    quarantined_for,
+                } = event
+                {
+                    logger.proxy_failure(|| {
+                        format!(
+                            "Upstream {} is unreachable at startup - quarantined for {}s",
+                            crate::server::print_cfg(&proxy),
+                            quarantined_for.as_secs()
+                        )
+                    });
+                }
+            }
+        });
     }
-    while let Some(joined) = checks.join_next().await {
-        let Ok((rotator, proxy, reachable)) = joined else {
-            continue;
-        };
-        // Requests already run: a request may have quarantined it meanwhile.
-        if reachable || rotator.is_quarantined(&proxy) {
-            continue;
-        }
-        if let Some(length) = rotator.quarantine_now(&proxy) {
-            logger.proxy_failure(|| {
-                format!(
-                    "Upstream {} is unreachable at startup - quarantined for {}s",
-                    crate::server::print_cfg(&proxy),
-                    length.as_secs()
-                )
-            });
-        }
-    }
+    while checks.join_next().await.is_some() {}
 }

@@ -1,4 +1,5 @@
-//! Parser for the `[*]user:pass@host:port` upstream-list line format.
+//! Parser for upstream-list lines: `host:port`, `user:pass@host:port`, or
+//! those forms with 0–255 leading `*` markers specifying gate level.
 
 use std::fmt;
 
@@ -15,7 +16,7 @@ pub enum ParseProxyError {
     Comment,
     /// Malformed `host:port` or credentials part.
     BadHostPort,
-    /// Malformed gate marker: a `*` with no target, or a repeated `*`.
+    /// Malformed gate marker: no target, or a marker count beyond 255.
     BadGate,
 }
 
@@ -35,9 +36,12 @@ impl std::error::Error for ParseProxyError {}
 /// Parse a single proxy-list line into a [`ProxyConfig`].
 ///
 /// Accepted forms: `host:port`, `user:pass@host:port`, and the same with a
-/// leading `*` marking a gate. The host may be a bracketed IPv6 literal
+/// leading sequence of up to 255 `*` markers specifying the gate level. The
+/// host may be a bracketed IPv6 literal
 /// (`[2001:db8::1]:1080`); a bare IPv6 literal followed by the port
-/// (`2001:db8::1:443`) is also accepted for backward compatibility. The
+/// (`2001:db8::1:443`) is also accepted for backward compatibility. Zero
+/// markers means an ordinary proxy. Gate levels are recorded only: neither
+/// `dial`/`dial_chain` nor `connect_proxy*` interpret level values. The
 /// password may contain `:` — only the first colon separates user and
 /// password. Blank lines, `#` comments and anything that fails to parse
 /// yield a [`ParseProxyError`]. `protocol` is supplied by the caller
@@ -53,14 +57,13 @@ pub fn parse_proxy_str(
         return Err(ParseProxyError::Comment);
     }
 
-    let (is_gate, conn_str) = if let Some(rest) = conn_str.strip_prefix('*') {
-        if rest.is_empty() || rest.starts_with('*') {
-            return Err(ParseProxyError::BadGate);
-        }
-        (true, rest)
-    } else {
-        (false, conn_str)
-    };
+    let marker_count = conn_str.bytes().take_while(|byte| *byte == b'*').count();
+    let gate_level = u8::try_from(marker_count).map_err(|_| ParseProxyError::BadGate)?;
+    let conn_str = &conn_str[marker_count..];
+    if marker_count > 0 && conn_str.is_empty() {
+        return Err(ParseProxyError::BadGate);
+    }
+    let is_gate = gate_level > 0;
 
     let (creds, host_port) = match conn_str.split_once('@') {
         // A second '@' cannot occur in a valid host or IPv6 literal.
@@ -84,6 +87,7 @@ pub fn parse_proxy_str(
     let mut cfg = ProxyConfig::new(protocol, host, port);
     cfg.user = user;
     cfg.password = password;
+    cfg.gate_level = gate_level;
     cfg.is_gate = is_gate;
     Ok(cfg)
 }
@@ -177,13 +181,56 @@ mod tests {
     }
 
     #[test]
+    fn gate_levels_count_all_markers_and_validate_bounds() {
+        for (input, level, user, password, host, port) in [
+            ("*a:b@h:1", 1, Some("a"), Some("b"), "h", 1),
+            ("**x:1", 2, None, None, "x", 1),
+            (
+                "***user:pass@[::1]:1080",
+                3,
+                Some("user"),
+                Some("pass"),
+                "::1",
+                1080,
+            ),
+            ("plain:0", 0, None, None, "plain", 0),
+        ] {
+            let cfg = parse_proxy_str(input, ProxyProtocol::Socks5).unwrap();
+            assert_eq!(cfg.gate_level, level, "{input}");
+            assert_eq!(cfg.is_gate, level > 0, "{input}");
+            assert_eq!(cfg.user.as_deref(), user, "{input}");
+            assert_eq!(cfg.password.as_deref(), password, "{input}");
+            assert_eq!(cfg.host, host, "{input}");
+            assert_eq!(cfg.port, port, "{input}");
+        }
+        let max = format!("{}x:1", "*".repeat(255));
+        assert_eq!(
+            parse_proxy_str(&max, ProxyProtocol::Socks5)
+                .unwrap()
+                .gate_level,
+            255
+        );
+        let too_many = format!("{}x:1", "*".repeat(256));
+        assert!(matches!(
+            parse_proxy_str(&too_many, ProxyProtocol::Socks5),
+            Err(ParseProxyError::BadGate)
+        ));
+        for stars in ["*", "**"] {
+            assert!(matches!(
+                parse_proxy_str(stars, ProxyProtocol::Socks5),
+                Err(ParseProxyError::BadGate)
+            ));
+        }
+    }
+
+    #[test]
     fn error_variants() {
         let parse = |s| parse_proxy_str(s, ProxyProtocol::Socks5).unwrap_err();
         assert_eq!(parse(""), ParseProxyError::Empty);
         assert_eq!(parse("   "), ParseProxyError::Empty);
         assert_eq!(parse("# comment"), ParseProxyError::Comment);
         assert_eq!(parse("*"), ParseProxyError::BadGate);
-        assert_eq!(parse("**1.2.3.4:1"), ParseProxyError::BadGate);
+        assert_eq!(parse("**"), ParseProxyError::BadGate);
         assert_eq!(parse("host"), ParseProxyError::BadHostPort);
         assert!(!ParseProxyError::BadGate.to_string().is_empty());
     }
@@ -220,6 +267,9 @@ mod tests {
         assert!(cfg.is_gate);
         assert_eq!(cfg.user.as_deref(), Some("g"));
         assert_eq!(cfg.password.as_deref(), Some("p"));
+        let cfg = ProxyConfig::from_addr(ProxyProtocol::Socks5, "***x:1").unwrap();
+        assert_eq!(cfg.gate_level, 3);
+        assert!(cfg.is_gate);
     }
 
     #[test]
@@ -228,7 +278,7 @@ mod tests {
         assert_eq!(err(""), ParseProxyError::Empty);
         assert_eq!(err("# comment"), ParseProxyError::Comment);
         assert_eq!(err("*"), ParseProxyError::BadGate);
-        assert_eq!(err("**host:1"), ParseProxyError::BadGate);
+        assert_eq!(err("**"), ParseProxyError::BadGate);
         assert_eq!(err("user@host:80"), ParseProxyError::BadHostPort);
     }
 }

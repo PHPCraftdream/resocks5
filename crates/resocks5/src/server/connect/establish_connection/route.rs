@@ -91,34 +91,35 @@ pub(super) fn spawn_due_probes(
     logger: &Arc<Logger>,
     connect_timeout: std::time::Duration,
 ) {
-    for proxy in rotator.take_probes() {
-        let rotator = rotator.clone();
-        let logger = logger.clone();
-        tokio::spawn(async move {
-            let connect = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port));
-            let reachable = matches!(
-                tokio::time::timeout(connect_timeout, connect).await,
-                Ok(Ok(_))
-            );
-            if reachable {
-                rotator.record_success(&proxy);
-                logger.proxy_failure(|| {
-                    format!(
-                        "Upstream {} is reachable again - back in rotation",
-                        print_cfg(&proxy)
-                    )
-                });
-            } else if let Some(length) = rotator.record_hard_failure(&proxy) {
-                logger.proxy_failure(|| {
-                    format!(
-                        "Upstream {} is still unreachable - quarantined for {}s",
-                        print_cfg(&proxy),
-                        length.as_secs()
-                    )
-                });
+    let rotator = rotator.clone();
+    let logger = logger.clone();
+    tokio::spawn(async move {
+        for event in rotator.probe_due(connect_timeout).await {
+            match event {
+                resocks5_net::rotator::ProbeEvent::Recovered { proxy } => {
+                    logger.proxy_failure(|| {
+                        format!(
+                            "Upstream {} is reachable again - back in rotation",
+                            print_cfg(&proxy)
+                        )
+                    });
+                }
+                resocks5_net::rotator::ProbeEvent::StillDown {
+                    proxy,
+                    quarantined_for,
+                } => {
+                    logger.proxy_failure(|| {
+                        format!(
+                            "Upstream {} is still unreachable - quarantined for {}s",
+                            print_cfg(&proxy),
+                            quarantined_for.as_secs()
+                        )
+                    });
+                }
+                _ => {}
             }
-        });
-    }
+        }
+    });
 }
 
 /// Which stage of a gate tunnel failed. Attached to `use_gate` errors
@@ -234,7 +235,7 @@ pub(super) fn apply_gate_failure(
 
 /// True when `a` and `b` are the same real upstream within this
 /// call: everything that distinguishes genuinely different
-/// upstreams (endpoint, protocol, account, gate flag) matches,
+/// upstreams (endpoint, protocol, account, gate level) matches,
 /// deliberately excluding `gate` — that field records only how the
 /// upstream is reached on this attempt. Mirrors the rating identity
 /// `ProxyRotator` uses, so a sticky-cache composite (an inner
@@ -244,7 +245,7 @@ pub(super) fn apply_gate_failure(
 pub(super) fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
     a.port == b.port
         && a.protocol == b.protocol
-        && a.is_gate == b.is_gate
+        && a.gate_level == b.gate_level
         && a.host == b.host
         && a.user == b.user
         && a.password == b.password
@@ -270,7 +271,7 @@ impl Hash for UpstreamKey {
             std::mem::discriminant(&proxy.protocol),
             proxy.user.as_deref(),
             proxy.password.as_deref(),
-            proxy.is_gate,
+            proxy.gate_level,
         )
             .hash(state);
     }

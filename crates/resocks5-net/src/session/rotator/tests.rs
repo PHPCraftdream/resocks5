@@ -6,6 +6,37 @@ fn make_proxy(host: &str, port: u16) -> ProxyConfig {
 }
 
 #[test]
+fn distinct_gate_levels_have_distinct_rating_slots() {
+    let base = make_proxy("host", 1000);
+    let level_one = base.clone().with_gate_level(1);
+    let level_two = base.clone().with_gate_level(2);
+    let policy = RatingPolicy {
+        fail_penalty: 2.0,
+        sand_max: 8.0,
+        min_weight: 0.01,
+        ..Default::default()
+    };
+    let rotator = ProxyRotator::with_policy(
+        vec![base.clone(), level_one.clone(), level_two.clone()],
+        policy,
+    );
+    for _ in 0..8 {
+        rotator.record_failure(&level_one);
+    }
+    let after_level_one = rotator.ratings.weights();
+    assert!(after_level_one[1] < 1.0);
+    assert!((after_level_one[0] - 1.0).abs() < 1e-9);
+    assert!((after_level_one[2] - 1.0).abs() < 1e-9);
+    for _ in 0..8 {
+        rotator.record_failure(&level_two);
+    }
+    let after_level_two = rotator.ratings.weights();
+    assert!(after_level_two[2] < 1.0);
+    assert!((after_level_two[1] - after_level_one[1]).abs() < 1e-9);
+    assert!((after_level_two[0] - 1.0).abs() < 1e-9);
+}
+
+#[test]
 fn rating_index_checks_identity_on_hash_collision() {
     let first = make_proxy("one", 1000);
     let second = make_proxy("two", 1001);
@@ -400,8 +431,7 @@ fn same_endpoint_different_protocols_rate_independently() {
 fn gate_composite_maps_to_original_rating_slot() {
     let inner = make_proxy("host", 1000);
     let other = make_proxy("host", 1001);
-    let mut gate = make_proxy("gatehost", 999);
-    gate.is_gate = true;
+    let gate = make_proxy("gatehost", 999).with_gate_level(1);
     let mut composite = inner.clone();
     composite.gate = Some(Arc::new(gate));
     let policy = RatingPolicy {

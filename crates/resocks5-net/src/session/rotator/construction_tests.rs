@@ -8,6 +8,7 @@ fn make_proxy(host: &str, port: u16) -> ProxyConfig {
         user: None,
         password: None,
         is_gate: false,
+        gate_level: 0,
         gate: None,
     }
 }

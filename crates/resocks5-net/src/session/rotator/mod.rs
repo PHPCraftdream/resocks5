@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 use crate::rating::{QuarantinePolicy, RatingError, RatingPolicy, Ratings};
 use crate::types::ProxyConfig;
 
+mod probe;
+pub use probe::ProbeEvent;
+
 /// Error returned when a [`ProxyRotator`] cannot be constructed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RotatorError {
@@ -64,7 +67,7 @@ impl From<RatingError> for RotatorError {
 fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
     a.port == b.port
         && a.protocol == b.protocol
-        && a.is_gate == b.is_gate
+        && a.gate_level == b.gate_level
         && a.host == b.host
         && a.user == b.user
         && a.password == b.password
@@ -77,7 +80,7 @@ fn upstream_hash(state: &RandomState, proxy: &ProxyConfig) -> u64 {
         std::mem::discriminant(&proxy.protocol),
         proxy.user.as_deref(),
         proxy.password.as_deref(),
-        proxy.is_gate,
+        proxy.gate_level,
     ))
 }
 
@@ -541,6 +544,8 @@ impl ProxyRotator {
 
 #[cfg(test)]
 mod construction_tests;
+#[cfg(test)]
+mod probe_tests;
 #[cfg(test)]
 mod quarantine_tests;
 #[cfg(test)]

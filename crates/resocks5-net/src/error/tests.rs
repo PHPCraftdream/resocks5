@@ -24,6 +24,7 @@ fn http_proxy_config(host: &str, port: u16) -> ProxyConfig {
         user: None,
         password: None,
         is_gate: false,
+        gate_level: 0,
         gate: None,
     }
 }
@@ -37,6 +38,7 @@ fn socks5_proxy_config(host: &str, port: u16) -> ProxyConfig {
         user: None,
         password: None,
         is_gate: false,
+        gate_level: 0,
         gate: None,
     }
 }
@@ -602,6 +604,7 @@ async fn https_without_connector_yields_tls_variant_with_legacy_text() {
         user: None,
         password: None,
         is_gate: false,
+        gate_level: 0,
         gate: None,
     };
     let Err(err) = crate::connect::connect_proxy(
@@ -630,6 +633,7 @@ async fn https_in_lean_build_yields_tls_feature_missing() {
         user: None,
         password: None,
         is_gate: false,
+        gate_level: 0,
         gate: None,
     };
     let Err(err) = crate::connect::connect_proxy(
