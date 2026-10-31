@@ -16,8 +16,12 @@ use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::{ProxyConfig, ProxyProtocol};
 
 mod chain;
-
 pub use chain::{dial_chain, ChainError, ChainStage};
+#[cfg(feature = "pool")]
+mod chain_pool;
+
+#[cfg(feature = "pool")]
+pub use chain_pool::connect_chain;
 
 /// Time budgets for [`dial`].
 ///

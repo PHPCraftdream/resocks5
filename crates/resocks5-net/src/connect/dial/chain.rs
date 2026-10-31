@@ -73,7 +73,7 @@ pub struct ChainError {
 }
 
 impl ChainError {
-    fn new(stage: ChainStage, error: ConnectError) -> Self {
+    pub(super) fn new(stage: ChainStage, error: ConnectError) -> Self {
         Self { stage, error }
     }
 
@@ -209,24 +209,44 @@ async fn chain_inner(
     // The one real socket sits under every tunnel: wrapping it here (and
     // only here) lets confirmed ciphertext writes below the first TLS hop
     // count as progress while nested plaintext cannot fake it.
-    let mut stream: BoxedUpstream =
+    let stream: BoxedUpstream =
         Box::new(ProgressReportingWriter::new(UpstreamStream::from_tcp(tcp)));
-
-    for (i, node) in nodes.iter().enumerate() {
-        let (target, stage) = match nodes.get(i + 1) {
-            Some(next) => (HostPort::format(&next.host, next.port), ChainStage::Hop(i)),
-            None => (HostPort::format(host, port), ChainStage::Target),
-        };
-        progress.store(stage.encode(), Ordering::Relaxed);
-        stream = hop(stream, node, &target, opts.handshake_timeout, tls_connector)
-            .await
-            .map_err(|e| ChainError::new(stage, e))?;
-    }
+    let stream = run_chain_hops(
+        &nodes,
+        &HostPort::format(host, port),
+        stream,
+        opts.handshake_timeout,
+        tls_connector,
+        |stage| progress.store(stage.encode(), Ordering::Relaxed),
+    )
+    .await
+    .map_err(|(stage, error)| ChainError::new(stage, error))?;
     Ok(AnyUpstream::Gate(stream))
 }
 
+pub(super) async fn run_chain_hops(
+    nodes: &[&ProxyConfig],
+    target: &str,
+    mut stream: BoxedUpstream,
+    hs: Duration,
+    tls_connector: Option<&TlsConnector>,
+    mut progress: impl FnMut(ChainStage),
+) -> Result<BoxedUpstream, (ChainStage, ConnectError)> {
+    for (i, node) in nodes.iter().enumerate() {
+        let (next_target, stage) = match nodes.get(i + 1) {
+            Some(next) => (HostPort::format(&next.host, next.port), ChainStage::Hop(i)),
+            None => (target.to_owned(), ChainStage::Target),
+        };
+        progress(stage);
+        stream = hop(stream, node, &next_target, hs, tls_connector)
+            .await
+            .map_err(|e| (stage, e))?;
+    }
+    Ok(stream)
+}
+
 /// Fail before any socket is opened if an HTTPS node cannot be served.
-fn check_tls(
+pub(super) fn check_tls(
     nodes: &[&ProxyConfig],
     tls_connector: Option<&TlsConnector>,
 ) -> Result<(), ConnectError> {

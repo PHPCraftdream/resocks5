@@ -101,7 +101,7 @@ fn handshake_and_tunnel_futures_are_send() {
 #[cfg(feature = "pool")]
 #[allow(dead_code)]
 fn pool_api_is_send() {
-    use resocks5_net::connect::connect_proxy;
+    use resocks5_net::connect::{connect_chain, connect_proxy};
     use resocks5_net::pool::{PoolConfig, ProxyPool};
 
     assert_send_sync::<ProxyPool>();
@@ -110,6 +110,13 @@ fn pool_api_is_send() {
     future_is_send(connect_proxy(
         "example.com:80",
         &proxy,
+        &pool,
+        Duration::from_secs(1),
+        None,
+    ));
+    future_is_send(connect_chain(
+        &proxy,
+        "example.com:80",
         &pool,
         Duration::from_secs(1),
         None,

@@ -55,6 +55,8 @@ pub use connect_proxy::connect_proxy_on;
 pub use connect_proxy::connect_proxy_once;
 #[cfg(feature = "pool")]
 pub use connect_socks5_proxy::connect_socks5_proxy;
+#[cfg(feature = "pool")]
+pub use dial::connect_chain;
 pub use dial::{dial, dial_chain, dial_plain, ChainError, ChainStage, DialOptions};
 pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};
 pub use host_port::HostPort;

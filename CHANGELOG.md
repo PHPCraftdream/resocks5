@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gate_level > 0`. A single `*` behaves as before.
 - `resocks5-net`: a proxy chain as a value — `ProxyConfig::chain`, `chain_nodes`,
   `chain_len`, and `ChainKey`, a hashable identity of a whole chain.
+- `resocks5-net`: `connect::connect_chain` — the pool-backed multi-hop dial
+  (feature `pool`): the outermost node takes a pooled socket, every other node
+  reserves its `max_per_upstream` permit for the life of the tunnel, each hop is
+  bounded by the handshake timeout, failures carry the `ChainStage`.
 
 ### Changed
 
