@@ -159,9 +159,16 @@ pub async fn establish_connection(
                         )
                     });
                     // The plan is only built once a cached chain has failed, so a
-                    // cache hit costs no node selection.
+                    // cache hit costs no node selection; with the budget spent it
+                    // stays empty (R5-09: no gate order is built for nothing).
                     for q in plan
-                        .get_or_insert_with(|| ChainPlan::new(gates, &exits))
+                        .get_or_insert_with(|| {
+                            if attempts + direct_reserve < max_attempts {
+                                ChainPlan::new(gates, &exits)
+                            } else {
+                                ChainPlan::new(&GateLevels::default(), &[])
+                            }
+                        })
                         .record_failure(&pick, &error)
                     {
                         logger.proxy_failure(|| {
