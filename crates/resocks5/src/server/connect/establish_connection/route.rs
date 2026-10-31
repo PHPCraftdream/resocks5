@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// model's failure signal. Matches both the bare
 /// [`AtCapacity`](resocks5_net::pool::AtCapacity) sentinel (legacy
 /// call sites) and the typed
-/// [`ConnectError::AtCapacity`](resocks5_net::ConnectError::AtCapacity)
+/// [`ConnectError::AtCapacity`]
 /// wrapper the pool API now returns.
 pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
     if err

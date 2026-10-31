@@ -231,7 +231,8 @@ if [ "$net_all" = true ] || [ -n "$net_f" ] || [ "$net_touched" = true ]; then
   if [ "$net_all" = true ]; then
     net_test_args=""
   elif [ -n "$net_f" ]; then
-    net_test_args="$net_f"
+    # `cargo test` takes ONE filter before `--`; several go after it.
+    net_test_args="-- $net_f"
   else
     # Only examples / README / fixtures changed: prove the test builds compile.
     net_test_args="--no-run"
@@ -241,7 +242,7 @@ fi
 if [ "$app_all" = true ] || [ -n "$app_f" ]; then
   run_test=true
   if [ "$app_all" = false ]; then
-    test_filter="$app_f"
+    test_filter="-- $app_f"
   fi
 fi
 
