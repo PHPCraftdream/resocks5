@@ -219,33 +219,27 @@ impl Ratings {
 
     /// Return a weighted permutation of the selectable upstream indices.
     ///
-    /// Without a quarantine this is every index. With one, quarantined
-    /// upstreams are left out while at least one upstream is healthy; an
-    /// upstream whose quarantine just ended appears at the very front as a
-    /// single probe (one at a time, see [`QuarantinePolicy::probe_lease`]);
-    /// when no upstream is healthy the quarantine is ignored and every index
-    /// is returned.
+    /// Without a quarantine this is every index. With one, quarantined and
+    /// probing upstreams are left out while at least one upstream is
+    /// healthy, so no client request ever waits on a dead upstream; when no
+    /// upstream is healthy the quarantine is ignored and every index is
+    /// returned. Upstreams whose quarantine ended are handed out by
+    /// [`Ratings::take_probes`] instead, for an out-of-band check.
     pub fn pick_order(&self) -> Vec<usize> {
         self.pick_order_at(Instant::now())
     }
 
     fn pick_order_at(&self, now: Instant) -> Vec<usize> {
-        let (probes, eligible, keyed) = {
+        let (eligible, keyed) = {
             let mut inner = self.inner.lock().unwrap();
             let Inner {
                 cells,
                 quarantine,
                 rng,
             } = &mut *inner;
-            let mut probes = Vec::new();
             let eligible: Vec<usize> = if self.quarantine.enabled()
                 && quarantine.iter().any(|c| c.state(now) == State::Healthy)
             {
-                for (i, c) in quarantine.iter_mut().enumerate() {
-                    if c.try_lease(now, &self.quarantine) {
-                        probes.push(i);
-                    }
-                }
                 (0..cells.len())
                     .filter(|&i| quarantine[i].state(now) == State::Healthy)
                     .collect()
@@ -256,12 +250,37 @@ impl Ratings {
                 eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
                 rng,
             );
-            (probes, eligible, keyed)
+            (eligible, keyed)
         };
         // The O(n log n) sort does not hold the ratings lock.
-        let mut order = probes;
-        order.extend(select::order_keys(keyed).into_iter().map(|j| eligible[j]));
-        order
+        select::order_keys(keyed)
+            .into_iter()
+            .map(|j| eligible[j])
+            .collect()
+    }
+
+    /// Claim the upstreams that are due for a probe: their quarantine has
+    /// ended and no other probe holds them (see
+    /// [`QuarantinePolicy::probe_lease`]). The caller checks each one out of
+    /// band (e.g. a TCP connect) and reports the outcome with
+    /// [`Ratings::on_success`] (back into rotation) or
+    /// [`Ratings::on_hard_failure`] (quarantined again, twice as long).
+    /// Empty without a quarantine.
+    pub fn take_probes(&self) -> Vec<usize> {
+        self.take_probes_at(Instant::now())
+    }
+
+    fn take_probes_at(&self, now: Instant) -> Vec<usize> {
+        if !self.quarantine.enabled() {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .quarantine
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, c)| c.try_lease(now, &self.quarantine).then_some(i))
+            .collect()
     }
 }
 
@@ -467,21 +486,37 @@ mod quarantine_tests {
     }
 
     #[test]
-    fn one_probe_goes_first_after_the_backoff_and_only_one() {
+    fn probes_are_handed_out_once_and_never_enter_the_order() {
         let r = ratings(3);
         let t0 = Instant::now();
         trip(&r, 0, t0);
+        assert!(r.take_probes_at(t0).is_empty(), "still quarantined");
         let t1 = t0 + Duration::from_secs(31);
-        let first = r.pick_order_at(t1);
-        assert_eq!(first.len(), 3);
-        assert_eq!(first[0], 0, "probe leads: {first:?}");
+        // Client orders never carry the probing upstream.
+        assert!(!r.pick_order_at(t1).contains(&0));
+        assert_eq!(r.take_probes_at(t1), vec![0]);
         // The lease is held: the probe is not handed out again.
-        let again = r.pick_order_at(t1 + Duration::from_secs(1));
-        assert_eq!(again.len(), 2);
-        assert!(!again.contains(&0));
+        assert!(r.take_probes_at(t1 + Duration::from_secs(1)).is_empty());
+        assert!(!r.pick_order_at(t1 + Duration::from_secs(1)).contains(&0));
         // A probe that never reported back is re-issued after the lease.
-        let later = r.pick_order_at(t1 + Duration::from_secs(25));
-        assert_eq!(later[0], 0);
+        assert_eq!(r.take_probes_at(t1 + Duration::from_secs(25)), vec![0]);
+    }
+
+    #[test]
+    fn simultaneous_expiries_give_independent_probes() {
+        let r = ratings(4);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        trip(&r, 1, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(r.take_probes_at(t1), vec![0, 1]);
+        assert_eq!(r.pick_order_at(t1).len(), 2);
+    }
+
+    #[test]
+    fn no_probes_without_a_quarantine() {
+        let r = Ratings::new(2, RatingPolicy::default());
+        assert!(r.take_probes().is_empty());
     }
 
     #[test]
@@ -490,7 +525,7 @@ mod quarantine_tests {
         let t0 = Instant::now();
         trip(&r, 0, t0);
         let t1 = t0 + Duration::from_secs(31);
-        assert_eq!(r.pick_order_at(t1)[0], 0);
+        assert_eq!(r.take_probes_at(t1), vec![0]);
         assert_eq!(r.on_hard_failure_at(0, t1), Some(Duration::from_secs(60)));
         assert!(!r.pick_order_at(t1 + Duration::from_secs(59)).contains(&0));
     }
@@ -501,7 +536,7 @@ mod quarantine_tests {
         let t0 = Instant::now();
         trip(&r, 0, t0);
         let t1 = t0 + Duration::from_secs(31);
-        assert_eq!(r.pick_order_at(t1)[0], 0);
+        assert_eq!(r.take_probes_at(t1), vec![0]);
         r.on_success(0);
         assert!(!r.is_quarantined(0));
         assert_eq!(r.pick_order_at(t1).len(), 3);

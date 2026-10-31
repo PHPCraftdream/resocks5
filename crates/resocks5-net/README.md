@@ -22,8 +22,8 @@ What's inside:
 - **Quarantine** (opt-in, `ProxyRotator::try_with_quarantine`) — after
   repeated *hard* failures (`record_hard_failure`) an upstream leaves
   `pick_order` and the sticky cache for a doubling backoff while healthy
-  upstreams exist, then is probed by one request at a time; a success clears
-  it. Without it the sand weights alone apply.
+  upstreams exist; then `take_probes` hands it out for an out-of-band check
+  (`record_success` / `record_hard_failure`). Client orders never wait on it. Without it the sand weights alone apply.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
 
 No application concerns leak in: no config-file format, logger, credential

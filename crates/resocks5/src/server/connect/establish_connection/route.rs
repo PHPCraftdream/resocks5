@@ -81,6 +81,46 @@ pub(super) fn record_proxy_failure(
     }
 }
 
+/// Check, off the request path, every upstream of `rotator` whose
+/// quarantine has ended: one TCP connect each, bounded by
+/// `connect_timeout`. Reachable → back into rotation; unreachable →
+/// quarantined again for twice as long. No client request ever waits on
+/// these checks.
+pub(super) fn spawn_due_probes(
+    rotator: &Arc<ProxyRotator>,
+    logger: &Arc<Logger>,
+    connect_timeout: std::time::Duration,
+) {
+    for proxy in rotator.take_probes() {
+        let rotator = rotator.clone();
+        let logger = logger.clone();
+        tokio::spawn(async move {
+            let connect = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port));
+            let reachable = matches!(
+                tokio::time::timeout(connect_timeout, connect).await,
+                Ok(Ok(_))
+            );
+            if reachable {
+                rotator.record_success(&proxy);
+                logger.proxy_failure(|| {
+                    format!(
+                        "Upstream {} is reachable again - back in rotation",
+                        print_cfg(&proxy)
+                    )
+                });
+            } else if let Some(length) = rotator.record_hard_failure(&proxy) {
+                logger.proxy_failure(|| {
+                    format!(
+                        "Upstream {} is still unreachable - quarantined for {}s",
+                        print_cfg(&proxy),
+                        length.as_secs()
+                    )
+                });
+            }
+        });
+    }
+}
+
 /// Which stage of a gate tunnel failed. Attached to `use_gate` errors
 /// as an `anyhow` context value so the caller can penalize only the
 /// node actually responsible, while `AtCapacity` stays downcastable

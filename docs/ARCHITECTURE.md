@@ -179,10 +179,12 @@ is the hard layer on top:
   and omitted from `pick_order`, from `pick`, and from the sticky cache hits,
   as long as at least one upstream is healthy. When none is, the quarantine is
   ignored so selection never runs dry.
-- When the period ends the upstream is on **probation**: exactly one request
-  at a time (a lease of connect + handshake timeout + 5 s) gets it as the first
-  candidate. A success clears everything; a failure re-quarantines for double
-  the length, up to `quarantine_max_sec`.
+- When the period ends the upstream is on **probation**. It still stays out of
+  every client order; instead `take_probes` hands it to a background check (one
+  TCP connect, bounded by `connect_timeout_sec`, one at a time per upstream via a
+  lease). Reachable → back in rotation; unreachable → quarantined again for
+  double the length, up to `quarantine_max_sec`. No client request ever waits on
+  a probe.
 
 Failures that land while an upstream is already quarantined (requests that
 started before the trip) are ignored, so they cannot inflate the backoff.

@@ -6,11 +6,11 @@
 //! top: after `threshold` consecutive *hard* failures (unreachable,
 //! handshake timeout, broken proxy protocol) the upstream leaves the
 //! selection order for a backoff period that doubles on every re-trip.
-//! When the period ends the upstream is on *probation*: one request at a
-//! time (a lease) is routed to it as a probe. A success clears the
-//! quarantine; a failure re-trips it with the doubled period. While at least
-//! one upstream is healthy, quarantined and probing upstreams never appear
-//! in the order except as that single probe; when none is healthy the
+//! When the period ends the upstream is on *probation*: it is handed out,
+//! one holder at a time (a lease), for an out-of-band probe by the caller.
+//! A success clears the quarantine; a failure re-trips it with the doubled
+//! period. While at least one upstream is healthy, quarantined and probing
+//! upstreams never appear in the selection order; when none is healthy the
 //! quarantine is ignored, so selection never runs dry.
 
 use std::time::{Duration, Instant};
@@ -31,8 +31,9 @@ pub struct QuarantinePolicy {
     pub initial: Duration,
     /// Upper bound of the (doubling) quarantine length.
     pub max: Duration,
-    /// How long a probe request owns the probation slot before another
-    /// probe may be issued. Should exceed the connect plus handshake budget.
+    /// How long a probe owns the probation slot before another probe may be
+    /// issued (a probe that never reports back is retried after it). Should
+    /// exceed the probe's own timeout.
     pub probe_lease: Duration,
 }
 
@@ -134,7 +135,7 @@ pub(super) enum State {
     Healthy,
     /// Inside the backoff period: not selectable.
     Quarantined,
-    /// Backoff over, not yet confirmed alive: selectable only as a probe.
+    /// Backoff over, not yet confirmed alive: handed out only as a probe.
     Probation,
 }
 

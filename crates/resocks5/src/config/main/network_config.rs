@@ -135,8 +135,9 @@ pub struct NetworkConfig {
     pub quarantine_threshold: u32,
 
     /// Quarantine: length in seconds of the first quarantine. After it ends
-    /// the upstream is probed by a single request; a failed probe doubles
-    /// the next quarantine, a success clears it.
+    /// the upstream is checked in the background (one TCP connect, no
+    /// client request waits on it); unreachable doubles the next
+    /// quarantine, reachable clears it.
     #[serde(default = "default_quarantine_initial_sec")]
     pub quarantine_initial_sec: u64,
 

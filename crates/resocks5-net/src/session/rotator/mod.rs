@@ -333,8 +333,9 @@ impl ProxyRotator {
     /// With the quarantine enabled, an upstream that keeps failing hard
     /// (see [`ProxyRotator::record_hard_failure`]) leaves
     /// [`pick_order`](ProxyRotator::pick_order) and the sticky cache for a
-    /// backoff period while healthy upstreams exist, and is then probed by
-    /// one request at a time.
+    /// backoff period while healthy upstreams exist; then
+    /// [`take_probes`](ProxyRotator::take_probes) hands it out for one
+    /// out-of-band check at a time.
     ///
     /// # Errors
     /// Returns [`RotatorError::Empty`] when `proxies` is empty, or
@@ -472,6 +473,19 @@ impl ProxyRotator {
         self.ratings.on_hard_failure(i)
     }
 
+    /// Claim the upstreams due for a probe (quarantine over, no probe in
+    /// flight). Check each one out of band and report with
+    /// [`record_success`](ProxyRotator::record_success) or
+    /// [`record_hard_failure`](ProxyRotator::record_hard_failure). Empty
+    /// without a quarantine.
+    pub fn take_probes(&self) -> Vec<Arc<ProxyConfig>> {
+        self.ratings
+            .take_probes()
+            .into_iter()
+            .map(|i| self.proxies[i].clone())
+            .collect()
+    }
+
     /// `true` while the proxy is quarantined or on probation. Unknown
     /// proxies are never quarantined.
     pub fn is_quarantined(&self, proxy: &ProxyConfig) -> bool {
@@ -489,9 +503,10 @@ impl ProxyRotator {
 
     /// Returns proxies in weighted-random order via the sand model.
     ///
-    /// Quarantined upstreams are omitted while a healthy one exists; one
-    /// whose quarantine just ended leads the list as a probe. See
-    /// [`ProxyRotator::try_with_quarantine`].
+    /// Quarantined and probing upstreams are omitted while a healthy one
+    /// exists, so a client request never waits on a dead upstream. See
+    /// [`ProxyRotator::try_with_quarantine`] and
+    /// [`ProxyRotator::take_probes`].
     pub fn pick_order(&self) -> Vec<Arc<ProxyConfig>> {
         #[cfg(feature = "test-instrumentation")]
         self.pick_order_calls.fetch_add(1, Ordering::Relaxed);

@@ -167,3 +167,88 @@ async fn dead_upstream_is_quarantined_and_requests_keep_succeeding() {
         );
     }
 }
+
+async fn request(v4: &Arc<ProxyRotator>, target: &str) -> std::time::Duration {
+    let logger = test_logger();
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        8,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 2,
+        handshake_timeout_sec: 2,
+        ..Default::default()
+    });
+    let t0 = std::time::Instant::now();
+    drop(
+        establish_connection(
+            target,
+            &None,
+            &None,
+            &Some(v4.clone()),
+            &logger,
+            &banned,
+            &pool,
+            &network,
+            None,
+            None,
+        )
+        .await
+        .expect("a live upstream exists"),
+    );
+    t0.elapsed()
+}
+
+fn short_quarantine(proxies: Vec<resocks5_net::types::ProxyConfig>) -> Arc<ProxyRotator> {
+    Arc::new(
+        ProxyRotator::try_with_quarantine(
+            proxies,
+            Default::default(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_millis(200))
+                .with_max(Duration::from_secs(5))
+                .with_probe_lease(Duration::from_secs(5)),
+            16,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn background_probe_returns_a_recovered_upstream_to_rotation() {
+    let a = socks5_config(spawn_socks5_stub().await, false);
+    let b = socks5_config(spawn_socks5_stub().await, false);
+    let v4 = short_quarantine(vec![a.clone(), b.clone()]);
+    // Pretend `a` failed: it is quarantined although it is reachable.
+    assert!(v4.record_hard_failure(&a).is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The request is served by `b`; the probe of `a` runs beside it.
+    request(&v4, "p1.example.com:443").await;
+    for _ in 0..50 {
+        if !v4.is_quarantined(&a) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the background probe never returned the reachable upstream");
+}
+
+#[tokio::test]
+async fn requests_never_wait_on_a_dead_upstream_under_probation() {
+    let dead = socks5_config(SocketAddr::from(([192, 0, 2, 1], 9)), false);
+    let live = socks5_config(spawn_socks5_stub().await, false);
+    let v4 = short_quarantine(vec![dead.clone(), live]);
+    assert!(v4.record_hard_failure(&dead).is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // `dead` (TEST-NET-1, never answers) is due for a probe now: the probe
+    // takes the full connect timeout, the request must not.
+    for i in 0..5 {
+        let took = request(&v4, &format!("q{i}.example.com:443")).await;
+        assert!(took < Duration::from_secs(1), "request waited {took:?}");
+    }
+    assert!(v4.is_quarantined(&dead));
+}

@@ -249,6 +249,13 @@ pub async fn establish_connection(
         return Err(anyhow!("Banned target address"));
     }
 
+    // Quarantined upstreams that are due are checked in the background;
+    // this request only ever sees the healthy ones.
+    let connect_timeout = Duration::from_secs(network.connect_timeout_sec);
+    for rotator in [gate_rotator, v6_rotator, v4_rotator].into_iter().flatten() {
+        spawn_due_probes(rotator, logger, connect_timeout);
+    }
+
     // Check cached proxies
     for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         if let Some(cached_proxy) = rotator.get_linked(target_addr) {
