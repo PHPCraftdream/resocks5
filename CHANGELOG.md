@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Parallel fallback attempt (`network.hedge_delay_ms`, default 2000): an upstream
+  attempt still running after this delay no longer holds the request — the next
+  candidate starts beside it and the first success wins. A dead upstream that
+  nothing knows about yet (right after start) now costs a request about 2 s, not
+  `connect_timeout_sec`. `0` restores strictly sequential attempts.
+
 - Doctests are forbidden: rustdoc examples are `text` blocks, `resocks5-net`
   sets `doctest = false`, the examples run as ordinary tests in
   `tests/doc_examples.rs`, and the `structure` CI job enforces the rule

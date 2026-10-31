@@ -87,6 +87,7 @@ mod tests {
             quarantine_threshold,
             quarantine_initial_sec,
             quarantine_max_sec,
+            hedge_delay_ms,
             recover_host_from_payload
         );
         check!(

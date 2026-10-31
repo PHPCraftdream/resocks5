@@ -252,3 +252,47 @@ async fn requests_never_wait_on_a_dead_upstream_under_probation() {
     }
     assert!(v4.is_quarantined(&dead));
 }
+
+#[tokio::test]
+async fn an_unknown_dead_upstream_costs_only_the_hedge_delay() {
+    // No quarantine: the dead upstream (TEST-NET-1, never answers) keeps its
+    // full weight and leads about half of the orders. Each request must
+    // still finish in about the hedge delay, not the connect timeout.
+    let dead = socks5_config(SocketAddr::from(([192, 0, 2, 1], 9)), false);
+    let live = socks5_config(spawn_socks5_stub().await, false);
+    let v4 = Arc::new(ProxyRotator::new(vec![dead, live]));
+    let logger = test_logger();
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(5),
+        16,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 5,
+        handshake_timeout_sec: 5,
+        hedge_delay_ms: 200,
+        ..Default::default()
+    });
+    for i in 0..12 {
+        let t0 = std::time::Instant::now();
+        drop(
+            establish_connection(
+                &format!("h{i}.example.com:443"),
+                &None,
+                &None,
+                &Some(v4.clone()),
+                &logger,
+                &banned,
+                &pool,
+                &network,
+                None,
+                None,
+            )
+            .await
+            .expect("the live upstream must win"),
+        );
+        let took = t0.elapsed();
+        assert!(took < Duration::from_secs(2), "request {i} waited {took:?}");
+    }
+}

@@ -338,6 +338,7 @@ auth: { allow_anonymous: true }
             "quarantine_threshold:",
             "quarantine_initial_sec:",
             "quarantine_max_sec:",
+            "hedge_delay_ms:",
             "recover_host_from_payload:",
             // FileLogConfig
             "enabled:",

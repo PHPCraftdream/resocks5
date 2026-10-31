@@ -439,79 +439,120 @@ pub async fn establish_connection(
         }
     }
 
-    // Check direct connections
+    // Check direct connections. An attempt still running after
+    // `hedge_delay_ms` does not hold the request: the next candidate starts
+    // beside it, the first success wins and the rest are aborted. A dead
+    // upstream that no rating knows about yet (e.g. right after start) then
+    // costs the hedge delay instead of the full connect timeout.
+    let mut candidates: Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)> = Vec::new();
     'direct: for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
-        // R5-09: hoist the per-proxy budget check above the build —
-        // an exhausted budget must not build another full order.
-        if attempts >= max_attempts {
+        // R5-09: an exhausted budget must not build another full order.
+        if attempts + candidates.len() >= max_attempts {
             break 'direct;
         }
-        let order = rotator.pick_order();
-        for proxy_config in &order {
-            let route = route_key(None, proxy_config);
+        for proxy_config in rotator.pick_order() {
+            let route = route_key(None, &proxy_config);
             if dead_proxies.contains(&UpstreamKey(proxy_config.clone()))
                 || tried_routes.contains(&route)
             {
                 continue;
             }
-            if attempts >= max_attempts {
+            if attempts + candidates.len() >= max_attempts {
                 break 'direct;
             }
             tried_routes.insert(route);
-            attempts += 1;
+            candidates.push((rotator.clone(), proxy_config));
+        }
+    }
+
+    let hedge_delay = Duration::from_millis(network.hedge_delay_ms);
+    let mut pending = candidates.into_iter();
+    let mut launched: Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)> = Vec::new();
+    let mut running = tokio::task::JoinSet::new();
+    let launch = |running: &mut tokio::task::JoinSet<_>,
+                  launched: &mut Vec<(Arc<ProxyRotator>, Arc<ProxyConfig>)>,
+                  (rotator, proxy): (Arc<ProxyRotator>, Arc<ProxyConfig>)| {
+        let id = launched.len();
+        let target = target_addr.to_string();
+        let pool = pool.clone();
+        let tls = tls_connector.cloned();
+        let task_proxy = proxy.clone();
+        running.spawn(async move {
             let t0 = Instant::now();
-            match connect_proxy(
-                target_addr,
-                proxy_config,
-                pool,
-                handshake_timeout,
-                tls_connector,
-            )
-            .await
-            .map_err(anyhow::Error::new)
-            {
-                Ok(stream) => {
-                    let ms = t0.elapsed().as_millis();
-                    logger.attempt(|| {
-                        format!(
-                            "attempt target={} via={} path=direct outcome=ok dur={}ms{}",
-                            target_addr,
-                            print_cfg(proxy_config),
-                            ms,
-                            ctag
-                        )
-                    });
-                    rotator.record_success(proxy_config);
-                    rotator.link_proxy(target_addr.to_string(), proxy_config.clone());
-                    logger.cache_write(|| {
-                        format!("Cache written for {} directly{}", target_addr, ctag)
-                    });
-                    return Ok(stream);
+            let result =
+                connect_proxy(&target, &task_proxy, &pool, handshake_timeout, tls.as_ref())
+                    .await
+                    .map_err(anyhow::Error::new);
+            (id, result, t0.elapsed())
+        });
+        launched.push((rotator, proxy));
+    };
+    loop {
+        if running.is_empty() {
+            match pending.next() {
+                Some(candidate) => {
+                    attempts += 1;
+                    launch(&mut running, &mut launched, candidate);
                 }
-                Err(e) => {
-                    let ms = t0.elapsed().as_millis();
-                    logger.attempt(|| {
-                        format!(
-                            "attempt target={} via={} path=direct outcome=fail dur={}ms err={}{}",
-                            target_addr,
-                            print_cfg(proxy_config),
-                            ms,
-                            e,
-                            ctag,
-                        )
-                    });
-                    logger.proxy_failure(|| {
-                        format!(
-                            "Failed direct: {} - {} - {}{}",
-                            target_addr,
-                            e,
-                            print_cfg(proxy_config),
-                            ctag,
-                        )
-                    });
-                    if should_record_failure(&e) {
-                        record_proxy_failure(rotator, proxy_config, &e, logger, &ctag);
+                None => break,
+            }
+        }
+        let can_hedge = !hedge_delay.is_zero() && pending.len() > 0;
+        tokio::select! {
+            joined = running.join_next() => {
+                let Some(Ok((id, result, elapsed))) = joined else {
+                    continue;
+                };
+                let (rotator, proxy_config) = launched[id].clone();
+                let ms = elapsed.as_millis();
+                match result {
+                    Ok(stream) => {
+                        logger.attempt(|| {
+                            format!(
+                                "attempt target={} via={} path=direct outcome=ok dur={}ms{}",
+                                target_addr,
+                                print_cfg(&proxy_config),
+                                ms,
+                                ctag
+                            )
+                        });
+                        rotator.record_success(&proxy_config);
+                        rotator.link_proxy(target_addr.to_string(), proxy_config.clone());
+                        logger.cache_write(|| {
+                            format!("Cache written for {} directly{}", target_addr, ctag)
+                        });
+                        return Ok(stream);
                     }
+                    Err(e) => {
+                        logger.attempt(|| {
+                            format!(
+                                "attempt target={} via={} path=direct outcome=fail dur={}ms err={}{}",
+                                target_addr,
+                                print_cfg(&proxy_config),
+                                ms,
+                                e,
+                                ctag,
+                            )
+                        });
+                        logger.proxy_failure(|| {
+                            format!(
+                                "Failed direct: {} - {} - {}{}",
+                                target_addr,
+                                e,
+                                print_cfg(&proxy_config),
+                                ctag,
+                            )
+                        });
+                        if should_record_failure(&e) {
+                            record_proxy_failure(&rotator, &proxy_config, &e, logger, &ctag);
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(hedge_delay), if can_hedge => {
+                if let Some(candidate) = pending.next() {
+                    attempts += 1;
+                    launch(&mut running, &mut launched, candidate);
                 }
             }
         }
