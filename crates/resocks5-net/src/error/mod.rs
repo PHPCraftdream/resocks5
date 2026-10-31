@@ -372,5 +372,6 @@ impl From<io::Error> for ConnectError {
     }
 }
 
+mod classify;
 #[cfg(test)]
 mod tests;

@@ -2,7 +2,7 @@ use crate::logger::Logger;
 use crate::server::print_cfg;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::ProxyConfig;
-use resocks5_net::{ConnectError, ProtocolViolation, TimeoutKind};
+use resocks5_net::ConnectError;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -11,9 +11,7 @@ use std::sync::Arc;
 /// our own load, not an upstream fault, and must NOT feed the sand
 /// model's failure signal. Matches both the bare
 /// [`AtCapacity`](resocks5_net::pool::AtCapacity) sentinel (legacy
-/// call sites) and the typed
-/// [`ConnectError::AtCapacity`]
-/// wrapper the pool API now returns.
+/// call sites) and the typed [`ConnectError::AtCapacity`] wrapper.
 pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
     if err
         .downcast_ref::<resocks5_net::pool::AtCapacity>()
@@ -21,38 +19,15 @@ pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
     {
         return false;
     }
-    if let Some(e) = err.downcast_ref::<resocks5_net::ConnectError>() {
-        if matches!(e, resocks5_net::ConnectError::AtCapacity(_)) {
-            return false;
-        }
-    }
-    true
+    err.downcast_ref::<ConnectError>()
+        .is_none_or(ConnectError::counts_against_upstream)
 }
 
-/// True when the error proves the upstream ITSELF is down, as opposed to
-/// a failure that may be the target's fault: its TCP connect was refused or
-/// timed out, its TLS handshake failed, its credentials were refused, or it
-/// answers with something that is not its protocol. A stalled or refused
-/// SOCKS5/HTTP CONNECT is deliberately NOT here: a dead destination looks
-/// exactly like that, and quarantining a healthy proxy over it would be
-/// worse than the timeouts it saves.
+/// Classify typed errors through the SDK; untyped errors remain soft.
+#[cfg(test)]
 pub(super) fn is_hard_failure(err: &anyhow::Error) -> bool {
-    match err.downcast_ref::<ConnectError>() {
-        Some(ConnectError::Timeout { kind, .. }) => {
-            matches!(
-                kind,
-                TimeoutKind::TcpConnect | TimeoutKind::HttpsTlsHandshake
-            )
-        }
-        Some(ConnectError::Io { stage, .. }) => matches!(stage, resocks5_net::Stage::Connect),
-        Some(ConnectError::AuthFailed { .. } | ConnectError::MethodUnsupported { .. }) => true,
-        Some(ConnectError::Protocol(
-            ProtocolViolation::Socks5BadVersion { .. }
-            | ProtocolViolation::Socks5BadAuthVersion { .. },
-        )) => true,
-        Some(ConnectError::Tls { .. }) => true,
-        _ => false,
-    }
+    err.downcast_ref::<ConnectError>()
+        .is_some_and(ConnectError::is_upstream_down)
 }
 
 /// Feed a failed attempt on `proxy` into the rotator: hard failures count
@@ -65,20 +40,23 @@ pub(super) fn record_proxy_failure(
     logger: &Logger,
     ctag: &str,
 ) {
-    if !is_hard_failure(err) {
-        rotator.record_failure(proxy);
+    if !should_record_failure(err) {
         return;
     }
-    if let Some(length) = rotator.record_hard_failure(proxy) {
-        logger.proxy_failure(|| {
-            format!(
-                "Upstream {} is unreachable - quarantined for {}s{}",
-                print_cfg(proxy),
-                length.as_secs(),
-                ctag
-            )
-        });
+    if let Some(connect_error) = err.downcast_ref::<ConnectError>() {
+        if let Some(length) = rotator.record_error(proxy, connect_error) {
+            logger.proxy_failure(|| {
+                format!(
+                    "Upstream {} is unreachable - quarantined for {}s{}",
+                    print_cfg(proxy),
+                    length.as_secs(),
+                    ctag
+                )
+            });
+        }
+        return;
     }
+    rotator.record_failure(proxy);
 }
 
 /// Check, off the request path, every upstream of `rotator` whose

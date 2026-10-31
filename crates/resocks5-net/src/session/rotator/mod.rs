@@ -548,5 +548,6 @@ mod construction_tests;
 mod probe_tests;
 #[cfg(test)]
 mod quarantine_tests;
+mod record_error;
 #[cfg(test)]
 mod tests;

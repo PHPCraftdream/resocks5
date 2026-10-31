@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_quarantined` / `take_probes`; the existing constructors are unchanged and keep the plain
   sand model.
 
+- `resocks5-net`: the quarantine logic the app used now lives in the SDK.
+  `ConnectError::is_upstream_down` / `counts_against_upstream` classify errors,
+  `ProxyRotator::record_error` applies them (capacity errors are ignored, an
+  upstream-down error counts towards the quarantine, the rest only lower the
+  weight), and `ProxyRotator::probe_due` / `probe_all` with `ProbeEvent` run the
+  background and startup TCP checks.
+- Gate levels: the number of leading `*` on an upstream line is now its level
+  (`ProxyConfig::gate_level`, `with_gate_level`; `parse_proxy_str` accepts up to
+  255 stars, a second `*` is no longer an error). `is_gate` stays and equals
+  `gate_level > 0`. A single `*` behaves as before.
+- `resocks5-net`: a proxy chain as a value — `ProxyConfig::chain`, `chain_nodes`,
+  `chain_len`, and `ChainKey`, a hashable identity of a whole chain.
+
 ### Changed
 
 - CI is segmented by diff: a push or PR runs only the segments its changed files
