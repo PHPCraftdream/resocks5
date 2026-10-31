@@ -158,7 +158,7 @@ mod tests {
             .skip(1)
             .map(|block| block.split("```").next().unwrap())
             .collect();
-        assert_eq!(examples.len(), 2);
+        assert_eq!(examples.len(), 3);
         let main: crate::config::MainConfig = ktav::from_str(examples[0]).unwrap();
         assert!(!main.auth.allow_anonymous);
         assert_eq!(main.listen_host, "127.0.0.1");
@@ -169,6 +169,20 @@ mod tests {
         let proxies: crate::config::ProxyListConfig = ktav::from_str(examples[1]).unwrap();
         assert_eq!(proxies.socks5_v4.len(), 2);
         assert_eq!(proxies.https_v4.len(), 1);
+        // The gate-level example: stars before the host are the level.
+        let levels: Vec<u8> = examples[2]
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                resocks5_net::connect::parse_proxy_str(
+                    line,
+                    resocks5_net::types::ProxyProtocol::Socks5,
+                )
+                .unwrap()
+                .gate_level
+            })
+            .collect();
+        assert_eq!(levels, [3, 2, 1, 0]);
         use resocks5_net::types::ProxyProtocol::{Http, Https, Socks5};
         for (list, protocol) in [
             (&proxies.socks5_v4, Socks5),
