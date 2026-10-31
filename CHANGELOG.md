@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (feature `pool`): the outermost node takes a pooled socket, every other node
   reserves its `max_per_upstream` permit for the life of the tunnel, each hop is
   bounded by the handshake timeout, failures carry the `ChainStage`.
+- `resocks5-net`: `chain::GateLevels` and `chain::ChainPlan` (feature `rotator`)
+  — the chain-selection engine. Gate levels are ranks (outermost first, gaps
+  allowed); the plan lazily walks one node per level, the exit last, skips dead
+  nodes with their whole subtree, excludes chains already tried, and attributes
+  a failed `ChainError` by stage (`Connect` -> outermost node; `Hop(i)` -> node
+  `i` if it is down, else a soft penalty on both neighbours; `Target` -> exit).
 
 ### Changed
 

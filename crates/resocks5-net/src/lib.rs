@@ -47,6 +47,9 @@
 
 pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
 
+#[cfg(feature = "rotator")]
+#[path = "session/chain/mod.rs"]
+pub mod chain;
 pub mod connect;
 pub mod error;
 #[cfg(feature = "pool")]
