@@ -32,7 +32,8 @@ fn distinct_gate_levels_have_distinct_rating_slots() {
     }
     let after_level_two = rotator.ratings.weights();
     assert!(after_level_two[2] < 1.0);
-    assert!((after_level_two[1] - after_level_one[1]).abs() < 1e-9);
+    // Weights recover with time, so level-two failures may only leave slot 1 equal or higher.
+    assert!(after_level_two[1] >= after_level_one[1] - 1e-9);
     assert!((after_level_two[0] - 1.0).abs() < 1e-9);
 }
 
