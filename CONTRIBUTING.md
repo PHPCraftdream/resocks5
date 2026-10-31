@@ -89,6 +89,14 @@ release:
 Require the single **`ci result`** check in branch protection: segments that
 were skipped count as passing, a failed or cancelled one fails it.
 
+### No doctests
+
+Doctests are forbidden. Code examples in rustdoc (`///`, `//!`) are ```` ```text ```` blocks,
+and every example's behaviour is covered by an ordinary test (see
+`crates/resocks5-net/tests/doc_examples.rs`). Library crates set
+`doctest = false` in `[lib]`; `sh .github/scripts/check-no-doctests.sh` (run by the
+`structure` job) fails on any other code block or a missing setting.
+
 ### Code structure (the `structure` CI job)
 
 - A Rust file has at most **1000 lines**

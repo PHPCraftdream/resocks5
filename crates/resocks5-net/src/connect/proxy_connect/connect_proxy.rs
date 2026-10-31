@@ -137,14 +137,12 @@ pub async fn connect_proxy(
 /// Dial a one-shot tunnel through a SOCKS5 upstream. `no_run` because it
 /// needs a live upstream to execute:
 ///
-/// ```no_run
+/// ```text
 /// use std::time::Duration;
 ///
 /// use resocks5_net::connect::{connect_proxy_once, parse_proxy_str};
 /// use resocks5_net::types::ProxyProtocol;
 ///
-/// # #[tokio::main]
-/// # async fn main() -> anyhow::Result<()> {
 /// let proxy = parse_proxy_str("user:pass@203.0.113.7:1080", ProxyProtocol::Socks5)
 ///     .expect("valid proxy line");
 /// let stream = connect_proxy_once(
@@ -156,8 +154,6 @@ pub async fn connect_proxy(
 /// )
 /// .await?;
 /// drop(stream);
-/// # Ok(())
-/// # }
 /// ```
 pub async fn connect_proxy_once(
     target_addr: &str,

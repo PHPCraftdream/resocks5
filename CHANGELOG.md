@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Doctests are forbidden: rustdoc examples are `text` blocks, `resocks5-net`
+  sets `doctest = false`, the examples run as ordinary tests in
+  `tests/doc_examples.rs`, and the `structure` CI job enforces the rule
+  (`.github/scripts/check-no-doctests.sh`).
+
 - Dead upstreams now leave the rotation temporarily. After
   `network.quarantine_threshold` (default 3) consecutive hard failures — TCP
   connect refused or timed out, TLS to the proxy failed, credentials refused —

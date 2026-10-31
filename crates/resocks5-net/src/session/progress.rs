@@ -50,7 +50,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// through the ambient scope — the one the bounded helpers install —
 /// using [`FlushProgress::report_confirmed`]:
 ///
-/// ```
+/// ```text
 /// use std::pin::Pin;
 /// use std::task::{Context, Poll};
 /// use resocks5_net::progress::FlushProgress;

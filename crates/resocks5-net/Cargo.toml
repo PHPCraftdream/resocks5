@@ -61,6 +61,12 @@ test-instrumentation = ["rotator"]
 name = "connect_through_proxy"
 required-features = ["rotator", "pool"]
 
+# Doctests are forbidden in this repository: examples in rustdoc are
+# `text` blocks, behaviour is covered by ordinary tests (tests/doc_examples.rs).
+# Enforced by .github/scripts/check-no-doctests.sh.
+[lib]
+doctest = false
+
 [dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 serde = { workspace = true, optional = true }

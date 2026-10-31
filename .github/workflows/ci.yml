@@ -119,12 +119,13 @@ jobs:
   # per directory. Files and directories that were already over are recorded
   # with their size in the scripts' BASELINE (a ratchet that can only shrink).
   structure:
-    name: structure (1000 lines, 7 entries)
+    name: structure (1000 lines, 7 entries, no doctests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sh .github/scripts/check-line-limit.sh
       - run: sh .github/scripts/check-dir-entries.sh
+      - run: sh .github/scripts/check-no-doctests.sh
 
   # Machine-verifies the `rust-version` declared in the workspace manifest.
   # Runs on ubuntu AND windows because some deps gate code behind cfg(windows)

@@ -162,7 +162,7 @@ pub(crate) async fn https_on_stream(
 ///
 /// # Example
 ///
-/// ```
+/// ```text
 /// // Once per process, before any TLS is attempted (e.g. in `main`):
 /// rustls::crypto::ring::default_provider()
 ///     .install_default()
@@ -201,7 +201,7 @@ pub fn make_tls_connector() -> TlsConnector {
 ///
 /// # Example
 ///
-/// ```
+/// ```text
 /// let connector = resocks5_net::connect::make_tls_connector_with_provider(
 ///     std::sync::Arc::new(rustls::crypto::ring::default_provider()),
 /// );
