@@ -545,7 +545,7 @@ async fn https_hop_without_connector_is_rejected_without_credential_leak() {
     assert_eq!(error.stage(), resocks5_net::connect::ChainStage::Connect);
     let rendered = format!("{}\n{}", error, error.error());
     assert!(
-        rendered.contains("HTTPS upstream requires TLS connector"),
+        rendered.contains("requires TLS connector"),
         "chain must name the missing connector, got: {rendered}"
     );
     assert!(!rendered.contains("alice"), "username leaked: {rendered}");

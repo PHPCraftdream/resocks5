@@ -18,7 +18,14 @@ pub(super) fn healthy_prefix(gates: &GateLevels, rank: u8) -> Option<ProxyConfig
             break;
         }
         if level_rank > rank {
-            nodes.push(rotator.pick_order().into_iter().next()?);
+            // pick_order ignores a quarantine when nothing is healthy; a probe
+            // must not travel through a node known to be down.
+            nodes.push(
+                rotator
+                    .pick_order()
+                    .into_iter()
+                    .find(|proxy| !rotator.is_quarantined(proxy))?,
+            );
         }
     }
     ProxyConfig::chain(nodes)
