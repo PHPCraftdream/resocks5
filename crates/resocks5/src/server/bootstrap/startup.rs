@@ -9,6 +9,7 @@ use crate::auth;
 use crate::config::{self, AllowedClients};
 use crate::logger::{self, ELog};
 use crate::server;
+use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::parse_proxy_str;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol};
@@ -89,16 +90,19 @@ pub(super) fn skipped_line_message(list_name: &str, line_no: usize) -> String {
 }
 
 /// Which routing group an owned proxy entry belongs to. A trait, not a
-/// direct `ProxyConfig` field read, only so [`partition_proxy_groups`]
-/// can be unit-tested with a clone-counting stand-in: with no `Clone`
-/// bound the helper structurally cannot copy entries (review R8-07).
+/// direct `ProxyConfig` field read, so the clone-free partitioning and
+/// gate-rank grouping helpers can be tested with a clone-counting stand-in.
 pub(super) trait GateSplit {
     fn is_gate(&self) -> bool;
+    fn gate_level(&self) -> u8;
 }
 
 impl GateSplit for ProxyConfig {
     fn is_gate(&self) -> bool {
         self.is_gate
+    }
+    fn gate_level(&self) -> u8 {
+        self.gate_level
     }
 }
 
@@ -137,11 +141,37 @@ pub(super) fn partition_proxy_groups<P: GateSplit>(
     (v6, v4, gates)
 }
 
+/// Ordered map keys make gaps explicit and rotator construction deterministic.
+pub(super) fn group_gate_levels<P: GateSplit>(
+    gates: Vec<P>,
+) -> std::collections::BTreeMap<u8, Vec<P>> {
+    let mut levels = std::collections::BTreeMap::new();
+    for gate in gates {
+        levels
+            .entry(gate.gate_level())
+            .or_insert_with(Vec::new)
+            .push(gate);
+    }
+    levels
+}
+/// Rotators dialed directly by the pool path: outermost gate, then exits.
+pub(super) fn directly_dialed_rotators(
+    gates: &GateLevels,
+    exits: &[Option<Arc<ProxyRotator>>],
+) -> Vec<Arc<ProxyRotator>> {
+    gates
+        .iter()
+        .take(1)
+        .map(|(_, rotator)| Arc::clone(rotator))
+        .chain(exits.iter().filter_map(Option::as_ref).map(Arc::clone))
+        .collect()
+}
+
 /// `cb_*` key names found in the raw main-config text, in file order.
-/// Pure so the detection is unit-testable; matching is deliberately
-/// textual (ktav drops unknown keys during deserialize without
-/// reporting them): a key line starts (after indentation) with `cb_`
-/// and contains `:`. Quoted values such as banned patterns never match.
+/// Pure so the detection is unit-testable; matching is deliberately textual
+/// (ktav drops unknown keys during deserialize without reporting them): a key
+/// line starts (after indentation) with `cb_` and contains `:`. Quoted values
+/// such as banned patterns never match.
 pub(super) fn obsolete_cb_keys(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
@@ -245,6 +275,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
     ));
 
     let (v6_proxies, v4_proxies, gate_proxies) = partition_proxy_groups(all_v6, all_v4);
+    let gate_groups = group_gate_levels(gate_proxies);
 
     let has_https = !pl.https_v4.is_empty() || !pl.https_v6.is_empty();
 
@@ -263,14 +294,17 @@ pub(super) async fn run_server_inner() -> Result<()> {
     println!();
 
     println!("gates:");
-    for p in &gate_proxies {
-        println!(
-            "{:?}://{}:{} - {}",
-            p.protocol,
-            p.host,
-            p.port,
-            crate::server::connect::print_cfg::family_label(&p.host)
-        );
+    for (rank, proxies) in gate_groups.iter().rev() {
+        println!("gates level {rank}:");
+        for proxy in proxies {
+            println!(
+                "{:?}://{}:{} - {}",
+                proxy.protocol,
+                proxy.host,
+                proxy.port,
+                crate::server::connect::print_cfg::family_label(&proxy.host)
+            );
+        }
     }
 
     // Bounded log channel — under sudden bursts (e.g. cache_hits=true
@@ -328,11 +362,12 @@ pub(super) async fn run_server_inner() -> Result<()> {
         None
     };
 
-    let gate_rotator = if !gate_proxies.is_empty() {
-        Some(Arc::new(new_rotator(gate_proxies).map_err(map_cfg_err)?))
-    } else {
-        None
-    };
+    let gate_levels = Arc::new(GateLevels::new(
+        gate_groups
+            .into_iter()
+            .map(|(rank, proxies)| Ok((rank, Arc::new(new_rotator(proxies).map_err(map_cfg_err)?))))
+            .collect::<Result<Vec<_>>>()?,
+    ));
 
     let v4_rotator = if !v4_proxies.is_empty() {
         Some(Arc::new(new_rotator(v4_proxies).map_err(map_cfg_err)?))
@@ -346,8 +381,8 @@ pub(super) async fn run_server_inner() -> Result<()> {
             "no upstream proxies configured.\n\
              \n\
              Add SOCKS5 entries to `{}` under `socks5_v4: [...]` or\n\
-             `socks5_v6: [...]`. Each line is `[*]user:pass@host:port`;\n\
-             a leading `*` marks a gate.\n\
+             `socks5_v6: [...]`. Proxy lines may start with `*` repeated N times to set\n\
+             gate level N; highest levels are outermost and dialed first.\n\
              \n\
              Example:\n\
                  socks5_v4: [\n\
@@ -382,10 +417,8 @@ pub(super) async fn run_server_inner() -> Result<()> {
     println!("port:{}", cfg_main.port);
     println!();
 
-    // Pre-connect TCP pool. Spawns one refill task per unique upstream
-    // proxy `(host, port)` — `spawn_refill_for` deduplicates internally,
-    // so calling it for every proxy in every rotator (gates + v4 + v6)
-    // is safe.
+    // Pre-connect TCP pool for the outermost gate and each plain exit rotator;
+    // inner gates are dialed only after the outer hop has completed.
     let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
         cfg_main.pool.clone(),
         Duration::from_secs(cfg_main.network.connect_timeout_sec),
@@ -393,10 +426,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
     ));
     if pool.enabled() {
         let mut count = 0usize;
-        for r in [&gate_rotator, &v6_rotator, &v4_rotator]
-            .iter()
-            .filter_map(|r| r.as_ref())
-        {
+        for r in directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]) {
             for proxy in r.all_proxies() {
                 pool.spawn_refill_for(proxy.clone());
                 count += 1;
@@ -423,11 +453,8 @@ pub(super) async fn run_server_inner() -> Result<()> {
     // In the background: the listener must bind at once, a refused
     // connection makes browsers mark the proxy failed for a long time.
     if cfg_main.network.quarantine_threshold > 0 {
-        let rotators: Vec<Arc<ProxyRotator>> = [&gate_rotator, &v6_rotator, &v4_rotator]
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect();
+        let rotators =
+            directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
         tokio::spawn(quarantine_unreachable_at_start(
             rotators,
             logger.clone(),
@@ -446,7 +473,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
 
     let result = server::run_server(
         auth,
-        gate_rotator,
+        gate_levels,
         v6_rotator,
         v4_rotator,
         &local_addr,

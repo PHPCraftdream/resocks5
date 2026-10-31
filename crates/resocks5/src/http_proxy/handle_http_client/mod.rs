@@ -12,6 +12,7 @@ use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
+use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
@@ -26,7 +27,7 @@ pub async fn handle_http_client(
     mut client_stream: TcpStream,
     mut req: IncomingRequest,
     auth: &Arc<AuthState>,
-    gate_rotator: &Option<Arc<ProxyRotator>>,
+    gate_rotator: &Arc<GateLevels>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
     v4_rotator: &Option<Arc<ProxyRotator>>,
     logger: &Arc<Logger>,

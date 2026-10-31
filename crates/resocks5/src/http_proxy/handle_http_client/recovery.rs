@@ -13,6 +13,7 @@ use crate::logger::Logger;
 use crate::server;
 use crate::server::handle_client::run_phase_in_client_budget;
 use crate::server::recovery::{peek_recovery, RecoveryPeek};
+use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::connect::{parse_http_host, parse_sni};
 use resocks5_net::pool::ProxyPool;
@@ -56,7 +57,7 @@ pub(super) async fn recover_and_tunnel_http(
     target: &str,
     port: &str,
     pipelined: Vec<u8>,
-    gate_rotator: &Option<Arc<ProxyRotator>>,
+    gate_rotator: &Arc<GateLevels>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
     v4_rotator: &Option<Arc<ProxyRotator>>,
     logger: &Arc<Logger>,

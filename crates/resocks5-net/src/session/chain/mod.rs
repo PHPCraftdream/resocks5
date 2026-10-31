@@ -41,6 +41,52 @@ impl GateLevels {
     pub fn iter(&self) -> impl Iterator<Item = (u8, &Arc<ProxyRotator>)> {
         self.levels.iter().map(|(rank, rotator)| (*rank, rotator))
     }
+
+    /// Resolve an existing chain to the rotators configured for its exact nodes.
+    ///
+    /// `chain` is ordered outermost first; gate levels must match the configured
+    /// ranks and the final node must match one of the supplied exit rotators.
+    pub fn resolve(&self, exits: &[Arc<ProxyRotator>], chain: &ProxyConfig) -> Option<ChainPick> {
+        let nodes = chain.chain_nodes();
+        if nodes.len() != self.levels.len() + 1 {
+            return None;
+        }
+        let mut hops = Vec::with_capacity(nodes.len());
+        for ((rank, rotator), node) in self.levels.iter().zip(nodes.iter().take(self.levels.len()))
+        {
+            if node.gate_level != *rank {
+                return None;
+            }
+            let proxy = rotator
+                .all_proxies()
+                .iter()
+                .find(|candidate| same_node(candidate, node))?
+                .clone();
+            hops.push(Hop {
+                rotator: rotator.clone(),
+                proxy,
+            });
+        }
+        let exit_node = nodes.last()?;
+        for rotator in exits {
+            if let Some(proxy) = rotator
+                .all_proxies()
+                .iter()
+                .find(|candidate| same_node(candidate, exit_node))
+                .cloned()
+            {
+                hops.push(Hop {
+                    rotator: rotator.clone(),
+                    proxy,
+                });
+                let key = ChainKey::new(Arc::new(ProxyConfig::chain(
+                    hops.iter().map(|hop| hop.proxy.clone()),
+                )?));
+                return Some(ChainPick { hops, key });
+            }
+        }
+        None
+    }
 }
 
 impl std::fmt::Debug for GateLevels {
@@ -49,6 +95,15 @@ impl std::fmt::Debug for GateLevels {
             .entries(self.levels.iter().map(|(rank, _)| rank))
             .finish()
     }
+}
+
+fn same_node(a: &ProxyConfig, b: &ProxyConfig) -> bool {
+    a.protocol == b.protocol
+        && a.host == b.host
+        && a.port == b.port
+        && a.user == b.user
+        && a.password == b.password
+        && a.gate_level == b.gate_level
 }
 
 /// One selected node and its source rotator.

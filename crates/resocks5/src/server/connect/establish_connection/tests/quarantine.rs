@@ -3,6 +3,7 @@ use super::route::*;
 use super::tests_unit::{socks5_config, spawn_socks5_stub, test_logger};
 use crate::config::NetworkConfig;
 use regex::RegexSet;
+use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rating::QuarantinePolicy;
 use resocks5_net::rotator::ProxyRotator;
@@ -82,12 +83,6 @@ fn target_side_or_ambiguous_failures_are_not_hard() {
     assert!(!is_hard_failure(&anyhow::anyhow!("something else")));
 }
 
-#[test]
-fn classification_sees_through_gate_stage_context() {
-    let err = anyhow::Error::new(io(Stage::Connect)).context(GateStage::GateConnect);
-    assert!(is_hard_failure(&err));
-}
-
 #[tokio::test]
 async fn dead_upstream_is_quarantined_and_requests_keep_succeeding() {
     let logger = test_logger();
@@ -122,7 +117,7 @@ async fn dead_upstream_is_quarantined_and_requests_keep_succeeding() {
         let target = format!("t{i}.example.com:443");
         let stream = establish_connection(
             &target,
-            &None,
+            &Arc::new(GateLevels::default()),
             &None,
             &Some(v4.clone()),
             &logger,
@@ -154,7 +149,7 @@ async fn dead_upstream_is_quarantined_and_requests_keep_succeeding() {
         drop(
             establish_connection(
                 &target,
-                &None,
+                &Arc::new(GateLevels::default()),
                 &None,
                 &Some(v4.clone()),
                 &logger,
@@ -187,7 +182,7 @@ async fn request(v4: &Arc<ProxyRotator>, target: &str) -> std::time::Duration {
     drop(
         establish_connection(
             target,
-            &None,
+            &Arc::new(GateLevels::default()),
             &None,
             &Some(v4.clone()),
             &logger,
@@ -281,7 +276,7 @@ async fn an_unknown_dead_upstream_costs_only_the_hedge_delay() {
         drop(
             establish_connection(
                 &format!("h{i}.example.com:443"),
-                &None,
+                &Arc::new(GateLevels::default()),
                 &None,
                 &Some(v4.clone()),
                 &logger,
@@ -321,7 +316,7 @@ async fn hedged_request(
     drop(
         establish_connection(
             target,
-            &None,
+            &Arc::new(GateLevels::default()),
             &None,
             &Some(v4.clone()),
             &logger,
@@ -448,7 +443,7 @@ async fn a_slow_target_answer_is_not_hedged() {
     drop(
         establish_connection(
             target,
-            &None,
+            &Arc::new(GateLevels::default()),
             &None,
             &Some(v4.clone()),
             &test_logger(),

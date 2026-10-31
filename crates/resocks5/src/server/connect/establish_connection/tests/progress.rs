@@ -53,14 +53,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Instant};
 
 use resocks5_net::connect::tls_fragment::SendProgress;
-use resocks5_net::connect::{send_possibly_fragmented, FragmentSpec};
+use resocks5_net::connect::{
+    connect_chain, dial_chain, send_possibly_fragmented, DialOptions, FragmentSpec,
+};
 use resocks5_net::pool::{AnyUpstream, ProxyPool};
 use resocks5_net::progress::CONFIRMED_WRITE_PROGRESS_TOTAL;
-use resocks5_net::types::ProxyProtocol;
+use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
 use socket2::SockRef;
 
-use super::dial::{tunnel_hop, use_gate};
 use super::tests_matrix::{
     spawn_draining_stub, stub_config, stub_tls_connector, CollectedPayload, Drain,
 };
@@ -149,10 +150,11 @@ async fn connect_instrumented(
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
     let connector = stub_tls_connector();
 
-    let upstream = use_gate(
+    let chain = ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(inner.clone())])
+        .expect("valid gate chain");
+    let upstream = connect_chain(
+        &chain,
         "example.com:443",
-        &gate,
-        &inner,
         &pool,
         HANDSHAKE,
         Some(&connector),
@@ -274,14 +276,8 @@ async fn slow_drain_https_gate_https_inner_completes_byte_for_byte() {
     .expect("HTTPS→HTTPS slow drain must not hang");
 }
 
-/// The negative control: the SAME chain shape, the SAME drip-paced
-/// stub, the SAME bounded send — but the raw gate transport boxed
-/// WITHOUT the `ProgressReportingWriter`, exactly the pre-fix
-/// `use_gate` construction (it calls these very `tunnel_hop`s).
-/// Without the lower instrumentation nothing increments
-/// `FlushProgress`, so the first congested fragment's flush must NOT
-/// be renewed: the send loses the resilience the positives assert.
-/// This is what proves the positive tests are not vacuous.
+/// Deliberately uninstrumented baseline: SDK dial_chain uses the same
+/// public protocol handshakes but has no progress-reporting pool wrapper.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uninstrumented_gate_chain_loses_slow_drain_resilience() {
     timeout(Duration::from_secs(45), async {
@@ -290,69 +286,47 @@ async fn uninstrumented_gate_chain_loses_slow_drain_resilience() {
             spawn_draining_stub(ProxyProtocol::Https, ProxyProtocol::Http, drain).await;
         let gate = stub_config(addr, ProxyProtocol::Https, true);
         let inner = stub_config(addr, ProxyProtocol::Http, false);
-        let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
         let connector = stub_tls_connector();
-
-        let mut gate_stream = pool.acquire(&gate).await.expect("gate dial");
-        gate_stream.attach_permit(pool.reserve_permit(&inner).expect("inner slot"));
-        // PRE-FIX construction: no ProgressReportingWriter around the
-        // raw gate transport; otherwise identical to use_gate.
-        let stream = tunnel_hop(
-            Box::new(gate_stream),
-            &gate,
-            &format!("{}:{}", inner.host, inner.port),
+        let mut composite = inner.clone();
+        composite.gate = Some(Arc::new(gate));
+        let mut stream = dial_chain(
+            &composite,
+            "example.com",
+            443,
+            &DialOptions::new()
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_handshake_timeout(HANDSHAKE),
             Some(&connector),
-            HANDSHAKE,
         )
         .await
-        .expect("gate hop");
-        let mut upstream = AnyUpstream::Gate(
-            tunnel_hop(
-                stream,
-                &inner,
-                "example.com:443",
-                Some(&connector),
-                HANDSHAKE,
-            )
-            .await
-            .expect("inner hop"),
-        );
-
+        .expect("SDK chain dial");
         let payload = gate_payload(CONTROL_LEN);
         let start = Instant::now();
         let outcome =
-            send_possibly_fragmented(&mut upstream, &payload, &fragment_spec(), IDLE_STRICT)
+            send_possibly_fragmented(&mut stream, &payload, &fragment_spec(), IDLE_STRICT)
                 .await
                 .expect("bounded send must not error");
         let elapsed = start.elapsed();
-
         assert_eq!(
             outcome,
             SendProgress::Stalled,
-            "without the lower instrumentation a congested flush must stall, \
-             got {outcome:?} after {elapsed:?}"
+            "uninstrumented chain must stall, got {outcome:?} after {elapsed:?}"
         );
         assert!(
             elapsed >= IDLE_STRICT && elapsed <= Duration::from_secs(15),
-            "the stall must be bounded by about one idle window past congestion: {elapsed:?}"
+            "stall must remain bounded: {elapsed:?}"
         );
-
-        // Whatever reached the wire is a strict PREFIX: the stalled
-        // fragment's ciphertext died inside rustls' buffer and is lost
-        // with the stream. (The stub keeps draining kernel-held bytes,
-        // but it can never see past the lost fragment.)
         let got = collected.lock().unwrap().clone();
         assert!(
             got.len() < payload.len(),
-            "an uninstrumented chain must not deliver the whole payload"
+            "uninstrumented chain must not deliver the whole payload"
         );
         assert_eq!(
             &got[..],
             &payload[..got.len()],
-            "the delivered prefix must be intact"
+            "delivered bytes must remain an intact prefix"
         );
-
-        drop(upstream);
+        drop(stream);
     })
     .await
     .expect("negative control must not hang");

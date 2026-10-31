@@ -16,6 +16,7 @@ use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::http_proxy::handle_http_client;
 use crate::logger::Logger;
 use crate::server::handle_socks5_client;
+use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 
@@ -96,7 +97,7 @@ fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> any
 pub async fn handle_client(
     mut client_stream: TcpStream,
     auth: &Arc<AuthState>,
-    gate_rotator: &Option<Arc<ProxyRotator>>,
+    gate_rotator: &Arc<GateLevels>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
     v4_rotator: &Option<Arc<ProxyRotator>>,
     logger: &Arc<Logger>,
@@ -236,6 +237,7 @@ mod tests {
 
     use super::*;
     use crate::config::{NetworkConfig, TlsFragmentConfig};
+    use resocks5_net::chain::GateLevels;
     use resocks5_net::rotator::ProxyRotator;
 
     fn test_auth() -> Arc<crate::auth::AuthState> {
@@ -374,6 +376,7 @@ mod tests {
         });
         let frag = Arc::new(TlsFragmentConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_gates = Arc::new(GateLevels::default());
         let no_rotator: Option<Arc<ProxyRotator>> = None;
         let no_allowed: Option<Arc<AllowedClients>> = None;
 
@@ -388,7 +391,7 @@ mod tests {
             handle_client(
                 server,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,
@@ -467,6 +470,7 @@ mod tests {
         });
         let frag = Arc::new(TlsFragmentConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_gates = Arc::new(GateLevels::default());
         let no_rotator: Option<Arc<ProxyRotator>> = None;
         let no_allowed: Option<Arc<AllowedClients>> = None;
 
@@ -481,7 +485,7 @@ mod tests {
             handle_client(
                 server,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,
@@ -716,6 +720,7 @@ mod tests {
         // If anonymous identity is incorrectly replaced with "", the direct cap
         // branch sends 503 before checking the ban. Correct pool policy sends 403.
         let direct_limiter = Arc::new(Semaphore::new(0));
+        let no_gates = Arc::new(GateLevels::default());
         let no_rotator = None;
         let no_allowed: Option<Arc<AllowedClients>> = None;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -726,7 +731,7 @@ mod tests {
             let error = handle_client(
                 stream,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,
@@ -782,6 +787,7 @@ mod tests {
         let frag = Arc::new(TlsFragmentConfig::default());
         let network = Arc::new(NetworkConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_gates = Arc::new(GateLevels::default());
         let no_rotator = None;
         // loopback не входит в правило — peer 127.0.0.1 обязан быть
         // отвергнут ещё до чтения первого байта.
@@ -795,7 +801,7 @@ mod tests {
             let error = handle_client(
                 stream,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,
@@ -875,6 +881,7 @@ mod tests {
         let frag = Arc::new(TlsFragmentConfig::default());
         let network = Arc::new(NetworkConfig::default());
         let direct_limiter = Arc::new(Semaphore::new(8));
+        let no_gates = Arc::new(GateLevels::default());
         let no_rotator = None;
         let no_allowed: Option<Arc<AllowedClients>> = None;
 
@@ -886,7 +893,7 @@ mod tests {
             let error = handle_client(
                 stream,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,

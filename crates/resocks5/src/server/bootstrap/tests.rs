@@ -8,6 +8,10 @@ use crate::logger::ELog;
 use resocks5_net::connect::parse_proxy_str;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
+use super::startup::{
+    directly_dialed_rotators, group_gate_levels, has_usable_route, partition_proxy_groups,
+    should_bail_no_upstreams, GateSplit,
+};
 use super::*;
 use crate::config::{User, UsersConfig};
 
@@ -102,6 +106,7 @@ fn comment_lines_are_skipped_silently() {
 #[derive(Debug)]
 struct CloneCountingProxy {
     gate: bool,
+    rank: u8,
     id: usize,
     clones: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -112,6 +117,7 @@ impl Clone for CloneCountingProxy {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             gate: self.gate,
+            rank: self.rank,
             id: self.id,
             clones: Arc::clone(&self.clones),
         }
@@ -122,23 +128,75 @@ impl GateSplit for CloneCountingProxy {
     fn is_gate(&self) -> bool {
         self.gate
     }
+    fn gate_level(&self) -> u8 {
+        self.rank
+    }
 }
 
 #[test]
+fn group_gate_levels_moves_owned_entries_without_cloning_and_keeps_gaps() {
+    let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entry = |rank, id| CloneCountingProxy {
+        gate: true,
+        rank,
+        id,
+        clones: Arc::clone(&clones),
+    };
+    let levels = group_gate_levels(vec![entry(1, 10), entry(3, 30), entry(1, 11), entry(5, 50)]);
+    assert_eq!(levels.keys().copied().collect::<Vec<_>>(), vec![1, 3, 5]);
+    assert_eq!(
+        levels[&1].iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![10, 11]
+    );
+    assert_eq!(
+        levels[&3].iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![30]
+    );
+    assert_eq!(
+        levels[&5].iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![50]
+    );
+    assert_eq!(clones.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[test]
+fn parsed_star_prefixes_group_by_rank_across_ipv4_and_ipv6_lists() {
+    let parse = |line| parse_proxy_str(line, ProxyProtocol::Socks5).expect("valid test proxy");
+    let (v6, v4, gates) = partition_proxy_groups(
+        vec![
+            parse("***v6:p@[2001:db8::1]:1080"),
+            parse("[2001:db8::2]:1080"),
+        ],
+        vec![
+            parse("**v4:p@10.0.0.1:1080"),
+            parse("*v4low:p@10.0.0.2:1080"),
+            parse("10.0.0.3:1080"),
+        ],
+    );
+    assert_eq!(v6.len(), 1);
+    assert_eq!(v4.len(), 1);
+    let levels = group_gate_levels(gates);
+    assert_eq!(levels.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(levels[&1][0].host, "10.0.0.2");
+    assert_eq!(levels[&2][0].host, "10.0.0.1");
+    assert_eq!(levels[&3][0].host, "2001:db8::1");
+}
+#[test]
 fn partition_proxy_groups_moves_plain_entries_without_cloning() {
     let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let entry = |gate: bool, id: usize| CloneCountingProxy {
+    let entry = |gate: bool, rank: u8, id: usize| CloneCountingProxy {
         gate,
+        rank,
         id,
         clones: Arc::clone(&clones),
     };
     // Interleave gates and plains in both source lists.
-    let all_v6 = vec![entry(false, 0), entry(true, 1), entry(false, 2)];
+    let all_v6 = vec![entry(false, 0, 0), entry(true, 1, 1), entry(false, 0, 2)];
     let all_v4 = vec![
-        entry(false, 3),
-        entry(true, 4),
-        entry(false, 5),
-        entry(true, 6),
+        entry(false, 0, 3),
+        entry(true, 2, 4),
+        entry(false, 0, 5),
+        entry(true, 3, 6),
     ];
 
     let (v6, v4, gates) = partition_proxy_groups(all_v6, all_v4);
@@ -158,10 +216,22 @@ fn partition_proxy_groups_moves_plain_entries_without_cloning() {
     );
 }
 
-/// Pin the splitter's composition and order on the real
-/// [`ProxyConfig`] type, matching the previous construction: plains
-/// keep their list order; gates are v6-list gates then v4-list
-/// gates, with credentials moved intact.
+#[test]
+fn directly_dialed_rotators_are_outermost_gate_then_all_exits() {
+    use resocks5_net::chain::GateLevels;
+    use resocks5_net::rotator::ProxyRotator;
+    let rotator = |host: &str| Arc::new(ProxyRotator::new(vec![ProxyConfig::socks5(host, 1080)]));
+    let gates = GateLevels::new(vec![(1, rotator("gate-low")), (3, rotator("gate-high"))]);
+    let exits = [Some(rotator("exit-v6")), None, Some(rotator("exit-v4"))];
+    let direct = directly_dialed_rotators(&gates, &exits);
+    let hosts = direct
+        .iter()
+        .flat_map(|r| r.all_proxies())
+        .map(|p| p.host.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(hosts, vec!["gate-high", "exit-v6", "exit-v4"]);
+}
+
 #[test]
 fn partition_proxy_groups_preserves_composition_and_order_on_proxy_config() {
     let parse = |line: &str| {
@@ -178,32 +248,13 @@ fn partition_proxy_groups_preserves_composition_and_order_on_proxy_config() {
         parse("10.0.0.3:1080"),
         parse("*u3:p3@10.0.0.4:1080"),
     ];
-
     let (v6, v4, gates) = partition_proxy_groups(all_v6, all_v4);
-
-    // Expected groups re-derived from the same source lines so the
-    // assertions don't depend on host-string formatting details.
-    let hosts =
-        |group: &[ProxyConfig]| -> Vec<String> { group.iter().map(|p| p.host.clone()).collect() };
-    assert_eq!(
-        hosts(&v6),
-        hosts(&[parse("[2001:db8::1]:1080"), parse("[2001:db8::3]:1080")])
-    );
-    assert_eq!(
-        hosts(&v4),
-        hosts(&[parse("10.0.0.1:1080"), parse("10.0.0.3:1080")])
-    );
-    assert_eq!(
-        hosts(&gates),
-        hosts(&[
-            parse("*u1:p1@[2001:db8::2]:1080"),
-            parse("*u2:p2@10.0.0.2:1080"),
-            parse("*u3:p3@10.0.0.4:1080")
-        ])
-    );
+    let hosts = |group: &[ProxyConfig]| group.iter().map(|p| p.host.clone()).collect::<Vec<_>>();
+    assert_eq!(hosts(&v6), vec!["2001:db8::1", "2001:db8::3"]);
+    assert_eq!(hosts(&v4), vec!["10.0.0.1", "10.0.0.3"]);
+    assert_eq!(hosts(&gates), vec!["2001:db8::2", "10.0.0.2", "10.0.0.4"]);
     assert!(gates.iter().all(|p| p.is_gate));
     assert!(v6.iter().chain(v4.iter()).all(|p| !p.is_gate));
-    // Credentials moved into the gate group intact, not copied.
     assert_eq!(gates[0].user.as_deref(), Some("u1"));
     assert_eq!(gates[0].password.as_deref(), Some("p1"));
 }

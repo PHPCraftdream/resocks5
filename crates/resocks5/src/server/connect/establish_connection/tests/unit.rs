@@ -3,48 +3,41 @@ use super::route::*;
 use crate::config::NetworkConfig;
 use crate::logger::Logger;
 use regex::RegexSet;
-use resocks5_net::connect::connect_proxy;
-use resocks5_net::pool::ProxyPool;
+use resocks5_net::chain::GateLevels;
+use resocks5_net::connect::{connect_chain, connect_proxy, ChainStage};
+use resocks5_net::pool::{AtCapacity, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::ProxyConfig;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
-
-use resocks5_net::pool::AtCapacity;
+use resocks5_net::types::{ChainKey, ProxyConfig};
 use resocks5_net::ConnectError;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
-fn route_membership_matches_composites_but_distinguishes_accounts_and_gate_levels() {
-    let proxy = Arc::new(socks5_config("127.0.0.1:1000".parse().unwrap(), false));
-    let gate = Arc::new(socks5_config("127.0.0.1:1001".parse().unwrap(), true));
-    let mut composite = (*proxy).clone();
-    composite.gate = Some(gate.clone());
-    let composite = Arc::new(composite);
-    let mut tried = HashSet::new();
-    tried.insert(route_key(composite.gate.as_ref(), &composite));
-    assert!(tried.contains(&route_key(Some(&gate), &proxy)));
-    assert!(!tried.contains(&route_key(None, &proxy)));
-
-    let mut account = (*proxy).clone();
-    account.user = Some("other".to_string());
-    account.password = Some("secret".to_string());
-    assert!(!tried.contains(&route_key(Some(&gate), &Arc::new(account))));
-
-    let level_two_gate = Arc::new((*gate).clone().with_gate_level(2));
-    assert!(!tried.contains(&route_key(Some(&level_two_gate), &proxy)));
-    let mut other_gate = (*gate).clone();
-    other_gate.port += 1;
-    assert!(!tried.contains(&route_key(Some(&Arc::new(other_gate)), &proxy)));
-
-    let mut dead = HashSet::new();
-    dead.insert(UpstreamKey(composite));
-    assert!(dead.contains(&UpstreamKey(Arc::new((*proxy).clone()))));
-    let mut level_two_proxy = (*proxy).clone().with_gate_level(2);
-    level_two_proxy.gate = Some(gate);
-    assert!(!dead.contains(&UpstreamKey(Arc::new(level_two_proxy))));
+fn chain_identity_distinguishes_accounts_levels_and_composites() {
+    let gate = ProxyConfig::socks5("127.0.0.1", 1000).with_gate_level(1);
+    let exit = ProxyConfig::socks5("127.0.0.1", 1001);
+    let composite =
+        Arc::new(ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(exit.clone())]).unwrap());
+    let same =
+        Arc::new(ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(exit.clone())]).unwrap());
+    assert_eq!(ChainKey::new(composite.clone()), ChainKey::new(same));
+    assert_ne!(
+        ChainKey::new(composite.clone()),
+        ChainKey::new(Arc::new(exit.clone()))
+    );
+    let account = ProxyConfig::socks5("127.0.0.1", 1001).with_auth("other", "secret");
+    let account_chain =
+        Arc::new(ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(account)]).unwrap());
+    assert_ne!(
+        ChainKey::new(composite.clone()),
+        ChainKey::new(account_chain)
+    );
+    let other_level = ProxyConfig::socks5("127.0.0.1", 1000).with_gate_level(2);
+    let level_chain =
+        Arc::new(ProxyConfig::chain([Arc::new(other_level), Arc::new(exit)]).unwrap());
+    assert_ne!(ChainKey::new(composite), ChainKey::new(level_chain));
 }
 
 /// Extract the `AtCapacity` payload from either the legacy bare sentinel
@@ -59,56 +52,90 @@ fn at_capacity_of(err: &anyhow::Error) -> Option<AtCapacity> {
     }
 }
 
-#[test]
-fn should_record_failure_returns_false_for_at_capacity() {
-    let err = anyhow::Error::new(resocks5_net::pool::AtCapacity {
-        host: "example.com".to_string(),
-        port: 1080,
-    });
-    assert!(
-        !should_record_failure(&err),
-        "AtCapacity should NOT be recorded as failure"
-    );
-}
-
-#[test]
-fn should_record_failure_returns_true_for_generic_error() {
-    let err = anyhow::anyhow!("connection refused");
-    assert!(
-        should_record_failure(&err),
-        "generic error SHOULD be recorded as failure"
-    );
-}
-
 #[tokio::test]
-async fn gate_capacity_error_retains_its_type() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let gate = ProxyConfig::socks5(address.ip().to_string(), address.port()).as_gate();
+async fn connect_chain_capacity_is_typed_and_composite_holds_exit_permit() {
+    use resocks5_net::connect::connect_chain;
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 1);
-    let _busy = pool.acquire(&gate).await.unwrap();
-    let error = use_gate(
+    let gate = socks5_config(spawn_socks5_stub().await, true);
+    let exit = socks5_config(spawn_socks5_stub().await, false);
+    let chain = ProxyConfig::chain([Arc::new(gate), Arc::new(exit.clone())]).unwrap();
+    let stream = connect_chain(
+        &chain,
         "example.com:443",
-        &gate,
-        &gate,
+        &pool,
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .expect("chain succeeds");
+    let error = connect_proxy(
+        "example.com:443",
+        &exit,
         &pool,
         Duration::from_secs(2),
         None,
     )
     .await
     .err()
-    .expect("gate at capacity must reject the connection");
-    assert!(!should_record_failure(&error));
-    // Strengthened for the typed error: the gate path now surfaces the
-    // cap hit as `ConnectError::AtCapacity`.
-    assert!(
-        matches!(
-            error.downcast_ref::<ConnectError>(),
-            Some(ConnectError::AtCapacity(_))
-        ),
-        "gate capacity failure must be a typed ConnectError::AtCapacity, got: {}",
-        error
-    );
+    .expect("chain reserves exit capacity");
+    assert!(at_capacity_of(&anyhow::Error::new(error)).is_some());
+    drop(stream);
+}
+
+#[tokio::test]
+async fn gate_capacity_error_retains_its_type() {
+    let gate = socks5_config(spawn_socks5_stub().await, true);
+    let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 1);
+    let _busy = pool.acquire(&gate).await.unwrap();
+    let error = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate)]).unwrap(),
+        "example.com:443",
+        &pool,
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .err()
+    .expect("gate capacity must fail");
+    assert!(matches!(error.error(), ConnectError::AtCapacity(_)));
+    assert!(!should_record_failure(&anyhow::Error::new(
+        error.into_error()
+    )));
+}
+
+#[tokio::test]
+async fn connect_chain_classifies_connect_and_hop_failures() {
+    use resocks5_net::connect::{connect_chain, ChainStage};
+    let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
+    let dead = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
+    let exit = socks5_config(spawn_socks5_stub().await, false);
+    let chain = ProxyConfig::chain([Arc::new(dead), Arc::new(exit)]).unwrap();
+    let error = connect_chain(
+        &chain,
+        "example.com:443",
+        &pool,
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .err()
+    .expect("dead gate fails");
+    assert_eq!(error.stage(), ChainStage::Connect);
+
+    let gate = socks5_config(spawn_garbage_socks5_stub().await, true);
+    let exit = socks5_config(spawn_socks5_stub().await, false);
+    let chain = ProxyConfig::chain([Arc::new(gate), Arc::new(exit)]).unwrap();
+    let error = connect_chain(
+        &chain,
+        "example.com:443",
+        &pool,
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .err()
+    .expect("invalid gate response fails");
+    assert_eq!(error.stage(), ChainStage::Hop(0));
 }
 
 /// Minimal no-auth SOCKS5 stub: answers method negotiation and
@@ -193,10 +220,9 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
     )
     .await
     .expect("direct connect");
-    let tunneled = use_gate(
+    let tunneled = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(upstream.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &upstream,
         &pool,
         Duration::from_secs(2),
         None,
@@ -217,13 +243,12 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
     .map_err(anyhow::Error::new)
     .err()
     .expect("direct path must hit the cap");
-    assert!(at_capacity_of(&err).is_some(), "unexpected error: {}", err);
+    assert!(at_capacity_of(&err).is_some());
     assert!(!should_record_failure(&err));
 
-    let err = use_gate(
+    let err = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(upstream.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &upstream,
         &pool,
         Duration::from_secs(2),
         None,
@@ -231,16 +256,15 @@ async fn direct_and_gate_paths_share_one_upstream_cap() {
     .await
     .err()
     .expect("gate path must hit the cap");
-    assert!(at_capacity_of(&err).is_some(), "unexpected error: {}", err);
-    assert!(!should_record_failure(&err));
+    assert!(matches!(err.error(), ConnectError::AtCapacity(_)));
+    assert!(!err.error().counts_against_upstream());
 
     // A freed slot is path-agnostic: the tunnel takes it, the
     // direct path is still shut out.
     drop(direct);
-    let _again = use_gate(
+    let _again = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(upstream.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &upstream,
         &pool,
         Duration::from_secs(2),
         None,
@@ -280,10 +304,9 @@ async fn failed_reservation_releases_gate_permit_and_target_is_identifiable() {
     let _holder = pool.acquire(&saturated).await.expect("fill the upstream");
 
     for _ in 0..5 {
-        let err = use_gate(
+        let error = connect_chain(
+            &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(saturated.clone())]).unwrap(),
             "example.com:443",
-            &gate,
-            &saturated,
             &pool,
             Duration::from_secs(2),
             None,
@@ -291,14 +314,15 @@ async fn failed_reservation_releases_gate_permit_and_target_is_identifiable() {
         .await
         .err()
         .expect("saturated upstream must fail");
-        let cap =
-            at_capacity_of(&err).unwrap_or_else(|| panic!("expected AtCapacity, got: {}", err));
+        let cap = match error.error() {
+            ConnectError::AtCapacity(cap) => cap.clone(),
+            other => panic!("expected AtCapacity, got {other}"),
+        };
         assert_eq!(
             (cap.host.as_str(), cap.port),
             (&*saturated.host, saturated.port)
         );
         assert!(!should_record_failure(&anyhow::Error::new(cap.clone())));
-        // Strengthened: the typed wrapper must ALSO be exempt.
         assert!(!should_record_failure(&anyhow::Error::new(
             ConnectError::AtCapacity(cap.clone())
         )));
@@ -306,10 +330,9 @@ async fn failed_reservation_releases_gate_permit_and_target_is_identifiable() {
 
     // The gate never leaked a permit: a tunnel to a healthy
     // upstream through the same gate still succeeds.
-    let _ok = use_gate(
+    let _ok = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate), Arc::new(healthy)]).unwrap(),
         "example.com:443",
-        &gate,
-        &healthy,
         &pool,
         Duration::from_secs(2),
         None,
@@ -400,10 +423,9 @@ async fn use_gate_classifies_gate_connect_failure() {
     let gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
     let inner = socks5_config(SocketAddr::from(([127, 0, 0, 1], 2)), false);
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
-    let err = use_gate(
+    let error = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(inner.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &inner,
         &pool,
         Duration::from_secs(2),
         None,
@@ -411,9 +433,9 @@ async fn use_gate_classifies_gate_connect_failure() {
     .await
     .err()
     .expect("dead gate must fail");
-    assert_eq!(gate_stage_of(&err), Some(GateStage::GateConnect));
+    assert_eq!(error.stage(), ChainStage::Connect);
     assert!(
-        should_record_failure(&err),
+        should_record_failure(&anyhow::Error::new(error.into_error())),
         "refused TCP is an upstream fault"
     );
 }
@@ -426,10 +448,9 @@ async fn use_gate_classifies_gate_to_proxy_hop_failure() {
     let gate = socks5_config(spawn_garbage_socks5_stub().await, true);
     let inner = socks5_config(spawn_socks5_stub().await, false);
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
-    let err = use_gate(
+    let error = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(inner.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &inner,
         &pool,
         Duration::from_secs(2),
         None,
@@ -437,7 +458,7 @@ async fn use_gate_classifies_gate_to_proxy_hop_failure() {
     .await
     .err()
     .expect("garbage gate hop must fail");
-    assert_eq!(gate_stage_of(&err), Some(GateStage::GateToProxy));
+    assert_eq!(error.stage(), ChainStage::Hop(0));
 }
 
 #[tokio::test]
@@ -448,10 +469,9 @@ async fn use_gate_classifies_proxy_to_target_hop_failure() {
     let gate = socks5_config(spawn_socks5_second_connect_refused_stub().await, true);
     let inner = socks5_config(spawn_socks5_stub().await, false);
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
-    let err = use_gate(
+    let error = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate.clone()), Arc::new(inner.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &inner,
         &pool,
         Duration::from_secs(2),
         None,
@@ -459,7 +479,7 @@ async fn use_gate_classifies_proxy_to_target_hop_failure() {
     .await
     .err()
     .expect("target-hop failure expected");
-    assert_eq!(gate_stage_of(&err), Some(GateStage::ProxyToTarget));
+    assert_eq!(error.stage(), ChainStage::Target);
 }
 
 #[tokio::test]
@@ -471,10 +491,9 @@ async fn inner_capacity_failure_classifies_gate_to_proxy_and_stays_noop() {
     let gate = socks5_config(spawn_socks5_stub().await, true);
     let saturated = socks5_config(spawn_socks5_stub().await, false);
     let _holder = pool.acquire(&saturated).await.expect("fill the upstream");
-    let err = use_gate(
+    let error = connect_chain(
+        &ProxyConfig::chain([Arc::new(gate), Arc::new(saturated.clone())]).unwrap(),
         "example.com:443",
-        &gate,
-        &saturated,
         &pool,
         Duration::from_secs(2),
         None,
@@ -482,16 +501,9 @@ async fn inner_capacity_failure_classifies_gate_to_proxy_and_stays_noop() {
     .await
     .err()
     .expect("saturated upstream must fail");
-    assert!(
-        matches!(
-            err.downcast_ref::<ConnectError>(),
-            Some(ConnectError::AtCapacity(_))
-        ) || err.downcast_ref::<AtCapacity>().is_some(),
-        "AtCapacity must stay downcastable through the stage marker, got: {}",
-        err
-    );
-    assert!(!should_record_failure(&err));
-    assert_eq!(gate_stage_of(&err), Some(GateStage::GateToProxy));
+    assert!(matches!(error.error(), ConnectError::AtCapacity(_)));
+    assert!(!error.error().counts_against_upstream());
+    assert_eq!(error.stage(), ChainStage::Hop(0));
 }
 
 pub(super) fn test_logger() -> Arc<Logger> {
@@ -526,11 +538,13 @@ async fn dead_cache_route_is_skipped_and_direct_fallback_survives() {
 
     let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
     v4.link_proxy(target.to_string(), Arc::new(composite));
-    let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
-
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![dead_gate.clone()])),
+    )]));
     let result = establish_connection(
         target,
-        &Some(gates),
+        &gates,
         &None,
         &Some(v4.clone()),
         &logger,
@@ -577,12 +591,14 @@ async fn gates_phase_cannot_exhaust_budget_before_direct_fallback() {
     let dead2 = socks5_config(SocketAddr::from(([127, 0, 0, 1], 2)), true);
     let inner = socks5_config(spawn_socks5_stub().await, false);
 
-    let gates = Arc::new(ProxyRotator::new(vec![dead1, dead2]));
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![dead1.clone(), dead2.clone()])),
+    )]));
     let v4 = Arc::new(ProxyRotator::new(vec![inner]));
-
     let result = establish_connection(
         target,
-        &Some(gates),
+        &gates,
         &None,
         &Some(v4.clone()),
         &logger,
@@ -632,13 +648,17 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
 
     let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
     v4.link_proxy(target.to_string(), Arc::new(composite));
-    let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
-    let gate_orders_before = gates.pick_order_calls();
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![dead_gate.clone()])),
+    )]));
+    let gate_rotator = gates.iter().next().unwrap().1.clone();
+    let gate_orders_before = gate_rotator.pick_order_calls();
     let v4_orders_before = v4.pick_order_calls();
 
     let result = establish_connection(
         target,
-        &Some(gates.clone()),
+        &gates,
         &None,
         &Some(v4.clone()),
         &logger,
@@ -668,7 +688,7 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
     // `pick_order` calls on both rotators is what actually pins
     // the R5-09 hoist.
     assert_eq!(
-        gates.pick_order_calls(),
+        gate_rotator.pick_order_calls(),
         gate_orders_before,
         "budget exhaustion must skip building the gate order"
     );

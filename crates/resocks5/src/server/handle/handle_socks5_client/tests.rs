@@ -244,6 +244,7 @@ use std::sync::Mutex;
 
 use super::recover::recover_and_tunnel;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
+use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 
 fn test_logger() -> Arc<crate::logger::Logger> {
@@ -393,7 +394,7 @@ async fn recovery_recovers_sni_across_segmented_reads() {
     let client_deadline =
         tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
     let frag = Arc::new(TlsFragmentConfig::default());
-    let gate: Option<Arc<ProxyRotator>> = None;
+    let gate = Arc::new(GateLevels::default());
     let v6: Option<Arc<ProxyRotator>> = None;
 
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -477,7 +478,7 @@ async fn server_first_upstream_banner_is_relayed_without_recovery() {
     let client_deadline =
         tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
     let frag = Arc::new(TlsFragmentConfig::default());
-    let gate: Option<Arc<ProxyRotator>> = None;
+    let gate = Arc::new(GateLevels::default());
     let v6: Option<Arc<ProxyRotator>> = None;
 
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -567,7 +568,7 @@ async fn undecidable_client_payload_falls_back_to_ip_promptly() {
     let client_deadline =
         tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
     let frag = Arc::new(TlsFragmentConfig::default());
-    let gate: Option<Arc<ProxyRotator>> = None;
+    let gate = Arc::new(GateLevels::default());
     let v6: Option<Arc<ProxyRotator>> = None;
 
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -642,7 +643,7 @@ async fn client_closed_before_payload_ends_cleanly() {
     let client_deadline =
         tokio::time::Instant::now() + Duration::from_secs(network.client_protocol_timeout_sec);
     let frag = Arc::new(TlsFragmentConfig::default());
-    let gate: Option<Arc<ProxyRotator>> = None;
+    let gate = Arc::new(GateLevels::default());
     let v6: Option<Arc<ProxyRotator>> = None;
 
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -715,7 +716,7 @@ async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
     // before recovery is even entered.
     let client_deadline = tokio::time::Instant::now() - Duration::from_secs(1);
     let frag = Arc::new(TlsFragmentConfig::default());
-    let gate: Option<Arc<ProxyRotator>> = None;
+    let gate = Arc::new(GateLevels::default());
     let v6: Option<Arc<ProxyRotator>> = None;
 
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -73,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nodes with their whole subtree, excludes chains already tried, and attributes
   a failed `ChainError` by stage (`Connect` -> outermost node; `Hop(i)` -> node
   `i` if it is down, else a soft penalty on both neighbours; `Target` -> exit).
+- Multi-level gate chains. The number of leading `*` on an upstream line is its
+  level: a request goes through one gate of the highest level, then one of each
+  lower level, then an ordinary proxy, then the target (`***a`, `**b`, `*c`, `d`
+  gives `a -> b -> c -> d -> target`). Levels are ranks, gaps are fine; a single
+  `*` behaves as before. Every node of a chain takes its `max_per_upstream`
+  permit, the sticky cache stores whole chains, the pool pre-warm and the
+  startup check cover only the outermost gate level and the exit proxies, and a
+  quarantined inner gate is probed through a healthy outer prefix.
 
 ### Changed
 

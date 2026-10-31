@@ -10,12 +10,13 @@ use crate::cli::Command;
     long_about = "\
 Прокси-сервер SOCKS5 и HTTP CONNECT на одном TCP-порту.
 Именованный direct-аккаунт подключается к цели от IP этого сервера;
-остальные клиенты используют SOCKS5/HTTP/HTTPS upstream, gates и sand-rating.
+остальные клиенты используют SOCKS5/HTTP/HTTPS upstream, каскад gates по уровням и sand-rating.
 
 Без аргументов запускается сервер. Настройки и аккаунты читаются из
 resocks5.main.ktav, resocks5.proxy_list.ktav и resocks5.users.ktav в текущем
 каталоге запуска, независимо от расположения бинарника. Нужен upstream
-либо хотя бы один включённый direct-пользователь.
+либо хотя бы один включённый direct-пользователь. Gate-аккаунты с более высоким
+уровнем идут первыми; выходные upstream остаются последним уровнем.
 
 Есть auth, каскадные IP-фильтры, banned_patterns, таймауты и лимиты,
 TCP keepalive, pre-connect pool, recovery SNI/Host, TLS fragmentation и логи.

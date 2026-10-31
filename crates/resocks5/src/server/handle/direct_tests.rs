@@ -14,6 +14,7 @@ use super::handle_client::handle_client;
 use crate::auth::AuthState;
 use crate::config::{AuthConfig, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
 use crate::logger::{LogConfig, Logger};
+use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
 
 const PAYLOAD: &[u8] = b"direct request\x00\xff";
@@ -167,6 +168,7 @@ async fn exercise(protocol: Protocol, case: Case) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let no_rotator = None;
+        let no_gates = Arc::new(GateLevels::default());
         let (sender, _receiver) = tokio::sync::mpsc::channel(64);
         let logger = Arc::new(Logger::new(sender, LogConfig::default()));
         let banned = Arc::new(if case == Case::Banned {
@@ -196,7 +198,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             handle_client(
                 stream,
                 &auth,
-                &no_rotator,
+                &no_gates,
                 &no_rotator,
                 &no_rotator,
                 &logger,

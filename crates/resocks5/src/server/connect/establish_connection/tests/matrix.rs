@@ -3,6 +3,8 @@ use super::tests_unit::{socks5_config, spawn_socks5_stub, test_logger};
 use crate::config::NetworkConfig;
 use crate::logger::Logger;
 use regex::RegexSet;
+use resocks5_net::chain::GateLevels;
+use resocks5_net::connect::connect_chain;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol};
@@ -426,53 +428,43 @@ pub(super) fn stub_config(addr: SocketAddr, protocol: ProxyProtocol, is_gate: bo
     }
 }
 
-/// One gate×inner combo end to end: `use_gate` must complete both
+/// One gate×inner combo end to end: `connect_chain` must complete both
 /// handshakes speaking each hop's actual wire protocol, in order,
 /// addressed first to the inner proxy and then to the target.
 async fn run_matrix_combo(gate_proto: ProxyProtocol, inner_proto: ProxyProtocol) {
     let (addr, log) = spawn_protocol_stub(gate_proto, inner_proto).await;
-    let gate = stub_config(addr, gate_proto, true);
+    let gate = stub_config(addr, gate_proto, true).with_gate_level(1);
     let inner = stub_config(addr, inner_proto, false);
+    let chain = ProxyConfig::chain([Arc::new(gate), Arc::new(inner.clone())]).unwrap();
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
     let connector = stub_tls_connector();
-    let tls_connector = if gate_proto == ProxyProtocol::Https || inner_proto == ProxyProtocol::Https
-    {
+    let tls = if gate_proto == ProxyProtocol::Https || inner_proto == ProxyProtocol::Https {
         Some(&connector)
     } else {
         None
     };
-
-    let tunneled = timeout(
+    let stream = timeout(
         Duration::from_secs(15),
-        use_gate(
+        connect_chain(
+            &chain,
             "example.com:443",
-            &gate,
-            &inner,
             &pool,
             Duration::from_secs(5),
-            tls_connector,
+            tls,
         ),
     )
     .await
     .expect("combo must not hang")
-    .expect("gate tunnel must complete");
-
-    // Socket options must reach the REAL gate socket through the
-    // erasure. Across the 9 rows this exercises all three erased
-    // shapes — plain (`UpstreamStream`), single TLS, and double
-    // TLS — with an observable TCP_NODELAY round-trip, not just a
-    // non-error return.
-    let gate_socket = tunneled
+    .expect("chain succeeds");
+    let sock = stream
         .as_tcp()
         .expect("gate tunnel exposes its real socket");
-    gate_socket
-        .set_nodelay(true)
+    sock.set_nodelay(true)
         .expect("set_nodelay reaches the gate socket");
     assert!(
-        gate_socket.nodelay().expect("nodelay readback"),
+        sock.nodelay().expect("nodelay readback"),
         "TCP_NODELAY must be observably applied on the gate socket"
     );
-
     let mut expected = Vec::new();
     for (proto, target) in [
         (gate_proto, format!("localhost:{}", inner.port)),
@@ -484,54 +476,44 @@ async fn run_matrix_combo(gate_proto: ProxyProtocol, inner_proto: ProxyProtocol)
         };
         expected.push((phase, target));
     }
-    let got = log.lock().unwrap().clone();
     assert_eq!(
-        got, expected,
-        "wire exchanges for gate={:?} inner={:?}",
-        gate_proto, inner_proto
+        *log.lock().unwrap(),
+        expected,
+        "wire exchanges gate={gate_proto:?} inner={inner_proto:?}"
     );
 }
-
 #[tokio::test]
 async fn matrix_socks5_gate_socks5_inner() {
     run_matrix_combo(ProxyProtocol::Socks5, ProxyProtocol::Socks5).await;
 }
-
 #[tokio::test]
 async fn matrix_socks5_gate_http_inner() {
     run_matrix_combo(ProxyProtocol::Socks5, ProxyProtocol::Http).await;
 }
-
 #[tokio::test]
 async fn matrix_socks5_gate_https_inner() {
     run_matrix_combo(ProxyProtocol::Socks5, ProxyProtocol::Https).await;
 }
-
 #[tokio::test]
 async fn matrix_http_gate_socks5_inner() {
     run_matrix_combo(ProxyProtocol::Http, ProxyProtocol::Socks5).await;
 }
-
 #[tokio::test]
 async fn matrix_http_gate_http_inner() {
     run_matrix_combo(ProxyProtocol::Http, ProxyProtocol::Http).await;
 }
-
 #[tokio::test]
 async fn matrix_http_gate_https_inner() {
     run_matrix_combo(ProxyProtocol::Http, ProxyProtocol::Https).await;
 }
-
 #[tokio::test]
 async fn matrix_https_gate_socks5_inner() {
     run_matrix_combo(ProxyProtocol::Https, ProxyProtocol::Socks5).await;
 }
-
 #[tokio::test]
 async fn matrix_https_gate_http_inner() {
     run_matrix_combo(ProxyProtocol::Https, ProxyProtocol::Http).await;
 }
-
 #[tokio::test]
 async fn matrix_https_gate_https_inner() {
     run_matrix_combo(ProxyProtocol::Https, ProxyProtocol::Https).await;
@@ -539,48 +521,36 @@ async fn matrix_https_gate_https_inner() {
 
 #[tokio::test]
 async fn https_hop_without_connector_is_rejected_without_credential_leak() {
-    let (addr, _log) = spawn_protocol_stub(ProxyProtocol::Https, ProxyProtocol::Socks5).await;
-    let mut gate = stub_config(addr, ProxyProtocol::Https, true);
-    gate.user = Some("alice".to_string());
-    gate.password = Some("s3cret".to_string());
+    let (addr, _) = spawn_protocol_stub(ProxyProtocol::Https, ProxyProtocol::Socks5).await;
+    let gate = stub_config(addr, ProxyProtocol::Https, true)
+        .with_auth("alice", "s3cret")
+        .with_gate_level(1);
     let inner = stub_config(addr, ProxyProtocol::Socks5, false);
+    let chain = ProxyConfig::chain([Arc::new(gate), Arc::new(inner)]).unwrap();
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
-
-    let err = timeout(
+    let error = timeout(
         Duration::from_secs(5),
-        use_gate(
+        connect_chain(
+            &chain,
             "example.com:443",
-            &gate,
-            &inner,
             &pool,
             Duration::from_secs(2),
             None,
         ),
     )
     .await
-    .expect("must not hang")
+    .expect("not hang")
     .err()
-    .expect("HTTPS hop without a TLS connector must fail");
-
-    let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+    .expect("missing TLS connector fails");
+    assert_eq!(error.stage(), resocks5_net::connect::ChainStage::Connect);
+    let rendered = format!("{}\n{}", error, error.error());
     assert!(
-        chain
-            .iter()
-            .any(|c| c.contains("HTTPS upstream requires TLS connector")),
-        "chain must name the missing connector, got: {:?}",
-        chain
+        rendered.contains("HTTPS upstream requires TLS connector"),
+        "chain must name the missing connector, got: {rendered}"
     );
-    let joined = chain.join("\n");
-    assert!(!joined.contains("alice"), "username leaked: {}", joined);
-    assert!(!joined.contains("s3cret"), "password leaked: {}", joined);
+    assert!(!rendered.contains("alice"), "username leaked: {rendered}");
+    assert!(!rendered.contains("s3cret"), "password leaked: {rendered}");
 }
-
-/// Rating policy where ONE failure saturates the sand completely
-/// (`fail_penalty == sand_max`) and decay is negligible over a test
-/// run: a penalized upstream weighs exactly `min_weight` = 0.01 vs
-/// 1.0 for a pristine one, so sampling `pick_order` separates the
-/// two within a few thousand draws (same technique as the
-/// rotator's own `record_failure_lowers_pick_probability`).
 fn sharp_policy() -> resocks5_net::rating::RatingPolicy {
     resocks5_net::rating::RatingPolicy {
         half_life_sec: 3600.0,
@@ -590,25 +560,17 @@ fn sharp_policy() -> resocks5_net::rating::RatingPolicy {
         success_factor: 0.5,
     }
 }
-
-/// Fraction of `n` weighted-random picks that put `proxy` first.
-fn first_pick_fraction(rotator: &ProxyRotator, proxy: &ProxyConfig, n: u32) -> f64 {
-    let mut hits = 0u32;
+fn first_pick_fraction(r: &ProxyRotator, p: &ProxyConfig, n: u32) -> f64 {
+    let mut hits = 0;
     for _ in 0..n {
-        if rotator.pick_order()[0].port == proxy.port {
-            hits += 1;
+        if r.pick_order()[0].port == p.port {
+            hits += 1
         }
     }
     f64::from(hits) / f64::from(n)
 }
-
 #[tokio::test]
 async fn cached_gate_connect_failure_penalizes_gate_not_inner_proxy() {
-    // R2-19: the cached-route retry of a gate composite must apply
-    // the same per-stage classification as the gates phase. The
-    // gate is unreachable (GateConnect): the inner proxy — never
-    // touched — keeps its rating, while the gate itself takes the
-    // penalty (and is excluded from the later gates phase).
     let target = "example.com:443";
     let logger = test_logger();
     let banned = Arc::new(RegexSet::empty());
@@ -619,34 +581,28 @@ async fn cached_gate_connect_failure_penalizes_gate_not_inner_proxy() {
     ));
     let network = Arc::new(NetworkConfig {
         handshake_timeout_sec: 2,
-        // One cache attempt, then the gates phase must bail before
-        // any pairing: budget 2 minus the direct reserve of 1. So
-        // the witness gate below is never attempted and its rating
-        // stays pristine as the control.
         max_upstream_attempts: 2,
         ..Default::default()
     });
-    let dead_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
-    let witness_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 2)), true);
+    let dead = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true).with_gate_level(1);
+    let witness = socks5_config(SocketAddr::from(([127, 0, 0, 1], 2)), true).with_gate_level(1);
     let inner_a = socks5_config(spawn_socks5_stub().await, false);
     let inner_b = socks5_config(spawn_socks5_stub().await, false);
-    let mut composite = inner_a.clone();
-    composite.gate = Some(Arc::new(dead_gate.clone()));
-
     let policy = sharp_policy();
     let v4 = Arc::new(ProxyRotator::with_policy(
-        vec![inner_a.clone(), inner_b.clone()],
+        vec![inner_a.clone(), inner_b],
         policy,
     ));
+    let gate_rotator = Arc::new(ProxyRotator::with_policy(
+        vec![dead.clone(), witness.clone()],
+        policy,
+    ));
+    let gates = Arc::new(GateLevels::new(vec![(1, gate_rotator.clone())]));
+    let composite = ProxyConfig::chain([Arc::new(dead), Arc::new(inner_a.clone())]).unwrap();
     v4.link_proxy(target.to_string(), Arc::new(composite));
-    let gates = Arc::new(ProxyRotator::with_policy(
-        vec![dead_gate, witness_gate.clone()],
-        policy,
-    ));
-
     let result = establish_connection(
         target,
-        &Some(gates.clone()),
+        &gates,
         &None,
         &Some(v4.clone()),
         &logger,
@@ -657,42 +613,14 @@ async fn cached_gate_connect_failure_penalizes_gate_not_inner_proxy() {
         None,
     )
     .await;
-    assert!(
-        result.is_ok(),
-        "direct fallback must serve the target: {:?}",
-        result.as_ref().err()
-    );
-
-    // The inner proxy was spared: both inners still weigh ~1.0, so
-    // either may be picked first about half the time. Before the
-    // fix the cached failure landed on the composite's inner
-    // identity (~1% first-pick).
-    let frac_a = first_pick_fraction(&v4, &inner_a, 2000);
-    assert!(
-        frac_a > 0.3,
-        "untouched inner proxy picked first only {:.1}%, expected ~50%",
-        frac_a * 100.0
-    );
-
-    // The gate took the penalty: the never-attempted witness gate
-    // must now dominate the gate rotator's picks. Before the fix
-    // both gates stayed pristine (~50%).
-    let frac_witness = first_pick_fraction(&gates, &witness_gate, 2000);
-    assert!(
-        frac_witness > 0.7,
-        "spared witness gate picked first only {:.1}%, expected ~99%",
-        frac_witness * 100.0
-    );
+    assert!(result.is_ok(), "fallback: {:?}", result.err());
+    let a = first_pick_fraction(&v4, &inner_a, 2000);
+    assert!(a > 0.3, "inner pick {:.1}%", a * 100.0);
+    let w = first_pick_fraction(&gate_rotator, &witness, 2000);
+    assert!(w > 0.7, "witness pick {:.1}%", w * 100.0);
 }
-
 #[tokio::test]
 async fn dead_gate_not_retried_against_second_proxy_within_one_call() {
-    // R2-19: once a gate fails at GateConnect against the FIRST
-    // proxy, the same call must not burn another attempt pairing
-    // it with the NEXT proxy — the dead-gate short-circuit takes
-    // effect immediately, not at the next outer-loop entry. The
-    // budget is deliberately generous so only the short-circuit
-    // (not the budget) can stop the gates phase.
     let target = "example.com:443";
     let banned = Arc::new(RegexSet::empty());
     let pool = Arc::new(ProxyPool::new(
@@ -705,10 +633,9 @@ async fn dead_gate_not_retried_against_second_proxy_within_one_call() {
         max_upstream_attempts: 10,
         ..Default::default()
     });
-    let dead_gate = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true);
+    let dead = socks5_config(SocketAddr::from(([127, 0, 0, 1], 1)), true).with_gate_level(1);
     let inner_a = socks5_config(spawn_socks5_stub().await, false);
     let inner_b = socks5_config(spawn_socks5_stub().await, false);
-
     let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
     let logger = Arc::new(Logger::new(
         tx,
@@ -717,15 +644,16 @@ async fn dead_gate_not_retried_against_second_proxy_within_one_call() {
             ..Default::default()
         },
     ));
-
-    let gates = Arc::new(ProxyRotator::new(vec![dead_gate]));
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![dead])),
+    )]));
     let v4 = Arc::new(ProxyRotator::new(vec![inner_a, inner_b]));
-
     let result = establish_connection(
         target,
-        &Some(gates),
+        &gates,
         &None,
-        &Some(v4.clone()),
+        &Some(v4),
         &logger,
         &banned,
         &pool,
@@ -734,33 +662,18 @@ async fn dead_gate_not_retried_against_second_proxy_within_one_call() {
         None,
     )
     .await;
-    assert!(
-        result.is_ok(),
-        "direct fallback must serve the target: {:?}",
-        result.as_ref().err()
-    );
-
-    // Each `use_gate` attempt logs exactly one `attempt ... path=gate`
-    // line; the direct fallback logs `path=direct`.
-    let mut gate_attempts = 0u32;
-    let mut direct_attempts = 0u32;
+    assert!(result.is_ok(), "fallback: {:?}", result.err());
+    let (mut gate, mut direct) = (0, 0);
     while let Ok(entry) = rx.try_recv() {
         let crate::logger::ELog::Log(msg) = entry else {
             continue;
         };
         if msg.contains("path=gate") {
-            gate_attempts += 1;
+            gate += 1
         } else if msg.contains("path=direct") {
-            direct_attempts += 1;
+            direct += 1
         }
     }
-    assert_eq!(
-        gate_attempts, 1,
-        "a gate proven dead against the first proxy must not be \
-         re-tried against the second within the same call"
-    );
-    assert_eq!(
-        direct_attempts, 1,
-        "the direct fallback must still run exactly once"
-    );
+    assert_eq!(gate, 1);
+    assert_eq!(direct, 1);
 }

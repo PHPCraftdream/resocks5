@@ -18,6 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use super::handle_client::handle_client;
 use crate::auth::AuthState;
 use crate::config::{AllowedClients, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
+use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::server::ServerError;
 use tokio::time::{timeout, Instant};
@@ -127,6 +128,7 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     let frag = Arc::new(TlsFragmentConfig::default());
     let network = Arc::new(NetworkConfig::default());
     let direct_limiter = Arc::new(tokio::sync::Semaphore::new(8));
+    let no_gates = Arc::new(GateLevels::default());
     let no_rotator: Option<Arc<ProxyRotator>> = None;
     let allowed: Option<Arc<AllowedClients>> = c.global_rule.map(|s| {
         Arc::new(
@@ -150,7 +152,7 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
         let handler = handle_client(
             stream,
             &auth,
-            &no_rotator,
+            &no_gates,
             &no_rotator,
             &no_rotator,
             &logger,

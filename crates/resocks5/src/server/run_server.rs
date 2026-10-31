@@ -13,6 +13,7 @@ use crate::config::AllowedClients;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server::handle_client;
+use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::tcp_keepalive::set_keepalive;
 use resocks5_net::pool::ProxyPool;
 use resocks5_net::rotator::ProxyRotator;
@@ -39,7 +40,7 @@ fn is_peer_disconnect(e: &anyhow::Error) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     auth: Arc<AuthState>,
-    gate_rotator: Option<Arc<ProxyRotator>>,
+    gate_rotator: Arc<GateLevels>,
     v6_rotator: Option<Arc<ProxyRotator>>,
     v4_rotator: Option<Arc<ProxyRotator>>,
     local_addr: &str,

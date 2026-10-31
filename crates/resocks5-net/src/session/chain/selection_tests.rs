@@ -19,6 +19,149 @@ fn key(proxy: ProxyConfig) -> ChainKey {
 }
 
 #[test]
+fn resolve_requires_exact_chain_identity_shape_and_returns_matching_rotators() {
+    let gate_proxy = p("gate").with_auth("g-user", "g-pass").with_gate_level(3);
+    let exit_proxy = p("exit").with_auth("e-user", "e-pass");
+    let gate = Arc::new(ProxyRotator::new(vec![gate_proxy.clone()]));
+    let exit = Arc::new(ProxyRotator::new(vec![exit_proxy.clone()]));
+    let levels = GateLevels::new(vec![(3, gate.clone())]);
+    let config =
+        ProxyConfig::chain([Arc::new(gate_proxy.clone()), Arc::new(exit_proxy.clone())]).unwrap();
+
+    let resolved = levels
+        .resolve(std::slice::from_ref(&exit), &config)
+        .unwrap();
+    assert_eq!(resolved.hops().len(), 2);
+    assert!(Arc::ptr_eq(&resolved.hops()[0].rotator, &gate));
+    assert!(Arc::ptr_eq(&resolved.hops()[1].rotator, &exit));
+    assert_eq!(resolved.key(), ChainKey::new(Arc::new(config.clone())));
+
+    let wrong_gate_host = {
+        let mut node = gate_proxy.clone();
+        node.host = "wrong".to_owned();
+        ProxyConfig::chain([Arc::new(node), Arc::new(exit_proxy.clone())]).unwrap()
+    };
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_gate_host)
+        .is_none());
+    let wrong_gate_port = {
+        let mut node = gate_proxy.clone();
+        node.port = 1081;
+        ProxyConfig::chain([Arc::new(node), Arc::new(exit_proxy.clone())]).unwrap()
+    };
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_gate_port)
+        .is_none());
+    let wrong_gate_protocol = ProxyConfig::chain([
+        Arc::new(
+            ProxyConfig::http("gate", 1080)
+                .with_auth("g-user", "g-pass")
+                .with_gate_level(3),
+        ),
+        Arc::new(exit_proxy.clone()),
+    ])
+    .unwrap();
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_gate_protocol)
+        .is_none());
+    let wrong_gate_auth = {
+        let mut node = gate_proxy.clone();
+        node.user = Some("wrong".to_owned());
+        ProxyConfig::chain([Arc::new(node), Arc::new(exit_proxy.clone())]).unwrap()
+    };
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_gate_auth)
+        .is_none());
+    let wrong_exit_auth = ProxyConfig::chain([
+        Arc::new(gate_proxy.clone()),
+        Arc::new(exit_proxy.clone().with_auth("e-user", "wrong")),
+    ])
+    .unwrap();
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_exit_auth)
+        .is_none());
+    let wrong_exit_user = ProxyConfig::chain([
+        Arc::new(gate_proxy.clone()),
+        Arc::new(exit_proxy.clone().with_auth("wrong", "e-pass")),
+    ])
+    .unwrap();
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_exit_user)
+        .is_none());
+    let wrong_level = ProxyConfig::chain([
+        Arc::new(gate_proxy.clone().with_gate_level(4)),
+        Arc::new(exit_proxy.clone()),
+    ])
+    .unwrap();
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &wrong_level)
+        .is_none());
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &exit_proxy)
+        .is_none());
+    let extra = ProxyConfig::chain([
+        Arc::new(gate_proxy.clone()),
+        Arc::new(exit_proxy.clone()),
+        Arc::new(p("extra")),
+    ])
+    .unwrap();
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &extra)
+        .is_none());
+
+    let no_gate = ProxyConfig::chain([Arc::new(exit_proxy.clone())]).unwrap();
+    assert!(GateLevels::default()
+        .resolve(std::slice::from_ref(&exit), &no_gate)
+        .is_some());
+    let three_gates = [
+        p("outer").with_gate_level(7),
+        p("middle").with_gate_level(4),
+        p("inner").with_gate_level(2),
+    ];
+    let gate_rotators: Vec<_> = three_gates
+        .iter()
+        .cloned()
+        .map(|proxy| Arc::new(ProxyRotator::new(vec![proxy])))
+        .collect();
+    let three_levels = GateLevels::new(vec![
+        (7, gate_rotators[0].clone()),
+        (4, gate_rotators[1].clone()),
+        (2, gate_rotators[2].clone()),
+    ]);
+    let three_chain = ProxyConfig::chain([
+        Arc::new(three_gates[0].clone()),
+        Arc::new(three_gates[1].clone()),
+        Arc::new(three_gates[2].clone()),
+        Arc::new(exit_proxy.clone()),
+    ])
+    .unwrap();
+    assert_eq!(
+        three_levels
+            .resolve(std::slice::from_ref(&exit), &three_chain)
+            .unwrap()
+            .hops()
+            .len(),
+        4
+    );
+
+    let unaccounted_gate = Arc::new(ProxyRotator::new(vec![gate_proxy]));
+    let unaccounted_exit = Arc::new(ProxyRotator::new(vec![exit_proxy]));
+    gate.quarantine_now(&resolved.hops()[0].proxy);
+    exit.quarantine_now(&resolved.hops()[1].proxy);
+    unaccounted_gate.quarantine_now(&resolved.hops()[0].proxy);
+    unaccounted_exit.quarantine_now(&resolved.hops()[1].proxy);
+    assert!(levels
+        .resolve(std::slice::from_ref(&exit), &config)
+        .is_some());
+    let plan = ChainPlan::new(&levels, std::slice::from_ref(&exit));
+    plan.record_success(&resolved);
+    assert!(!gate.is_quarantined(&resolved.hops()[0].proxy));
+    assert!(!exit.is_quarantined(&resolved.hops()[1].proxy));
+    assert!(unaccounted_gate.is_quarantined(&resolved.hops()[0].proxy));
+    assert!(unaccounted_exit.is_quarantined(&resolved.hops()[1].proxy));
+}
+
+#[test]
 fn gate_ranks_are_sorted_descending_with_gaps_and_debug_clone() {
     let levels = GateLevels::new(vec![(1, r(&["low"])), (9, r(&["high"])), (4, r(&["mid"]))]);
     assert_eq!(
