@@ -67,8 +67,8 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - **Rotation + stickiness:** weighted-random selection across the pool,
   with a per-target cache so a given destination keeps using the upstream
   that last worked.
-- **Gates (proxy chaining):** route through a gate proxy to a second proxy
-  before reaching the target.
+- **Gates (proxy chaining):** route through one proxy at each configured
+  gate level, highest to lowest, then one ordinary exit before the target.
 - **Sand-rating soft-weight rotator:** each upstream has a per-failure
   sand accumulator that decays exponentially over time. Upstream selection
   is weighted-random with weight `exp(-k · sand)` — failing upstreams are
@@ -462,8 +462,9 @@ resocks5 config
 ### Upstream proxy list
 
 In `resocks5.proxy_list.ktav`, list upstreams in arrays per transport and IP
-family. Each entry is `[*]user:pass@host:port` (credentials optional); a
-leading `*` marks a **gate**.
+family. Each entry is `user:pass@host:port` (credentials optional), prefixed
+by zero to 255 stars; more than 255 are invalid. Zero is an ordinary exit;
+positive counts are gate levels.
 
 ```text
 socks5_v4: [
@@ -474,6 +475,29 @@ http_v4:  [ user:pass@198.51.100.20:8080 ]
 https_v4: [ user:pass@198.51.100.30:443 ]
 ## …and the corresponding *_v6 arrays for IPv6 upstreams.
 ```
+
+One node at each rank contributes one gate, ordered from highest to lowest,
+then one ordinary exit and the target. Missing ranks are allowed. One star
+retains the original gate meaning; gates without an ordinary exit cannot
+form a route. The complete chain is sticky per target. Ordinary-route
+fallback bypasses gates and selects only ordinary exits; it does not connect
+directly to the target. All attempts share `network.max_upstream_attempts`,
+with at least one attempt reserved for fallback. `network.max_per_upstream`
+limits each node's permits for the whole tunnel lifetime. Startup probes
+and the pre-connect pool cover only the outermost gate level and exits;
+probes for inner quarantined gates traverse the healthy outer prefix.
+Independent rotators keep sand, quarantine, and sticky-cache state per
+proxy/rank; whole-chain stickiness uses the complete chain identity.
+
+For example, this skips rank 2 and uses one gate from each present rank:
+
+```text
+***user:pass@h1:1080
+*h3:1080
+h4:1080
+```
+
+The route is server -> h1 -> h3 -> h4 -> target.
 
 ## Список допуска клиентов по IP (allowed_clients)
 
@@ -550,7 +574,7 @@ anyhow = "1"
 Connect to a target through an upstream proxy and drive any protocol over the
 returned stream:
 
-```rust
+```text
 use std::time::Duration;
 
 use resocks5_net::connect::{connect_proxy, parse_proxy_str};
@@ -561,7 +585,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Parse upstream lines: "[*]user:pass@host:port" (credentials optional).
+    // Parse upstream lines: "user:pass@host:port" (credentials optional).
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
         .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
@@ -606,7 +630,7 @@ the top-level modules include `server`, `connect`, `error`, `progress`, `pool`,
 
 The unconditional `resocks5_net::server` module works without default features:
 
-```rust
+```text
 let options = resocks5_net::server::ServerOptions::new(accept_deadline, false, true);
 let mut req = resocks5_net::server::accept(&mut client, &options, move |credentials| async move {
     host_auth.verify_async(credentials.username(), credentials.password()).await

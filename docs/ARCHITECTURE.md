@@ -33,7 +33,7 @@ depend on `resocks5-net` and bring their own application layer.
 
 For every accepted client connection:
 
-```
+```text
 client TCP                                          target host
    │
    ▼
@@ -54,21 +54,20 @@ client TCP                                          target host
               │             │
               ▼             ▼
 ┌────────────────┐  ┌──────────────────────────────────────────────┐
-│ establish_     │  │ 3. Pick an upstream                          │
-│ direct         │  │    - if target was seen before:              │
-│                │  │      sticky cache → that one upstream        │
-│ TcpStream::    │  │    - else: rotator.pick_order() —            │
-│ connect from   │  │      weighted-random permutation driven      │
-│ server's IP    │  │      by sand-rating (see below)              │
-└───────┬────────┘  │    IPv6 targets prefer the IPv6 upstream set │
-        │          │                                              │
-        │          │ 4. Connect through the upstream              │
-        │          │    - optional pre-warmed TCP from the pool   │
-        │          │    - optional gate-chain (proxy → proxy)     │
-        │          │    - per-upstream semaphore caps concurrency │
-        │          │    - real failure → rotator.record_failure() │
-        │          │    - success → rotator.record_success()      │
-        │          │    - AtCapacity → don't sand (our load)      │
+│ establish_     │  │ 3. Pick route                               │
+│ direct         │  │    - resolve cached full chain via gates    │
+│                │  │    - otherwise lazy weighted ChainPlan      │
+│ TcpStream::    │  │      ranked candidates from independent     │
+│ connect from   │  │      rotators                              │
+│ server's IP    │  │    IPv6 targets prefer the IPv6 exit set    │
+└───────┬────────┘  │    Connect outer gate, then chain hops      │
+        │          │ 4. Connect through selected chain           │
+        │          │    - pre-warmed TCP to outer gate or exit    │
+        │          │    - per-node permits held for tunnel life   │
+        │          │    - connect_chain applies pool accounting   │
+        │          │    - ChainPlan::record_failure()             │
+        │          │    - ChainPlan::record_success()             │
+        │          │    - AtCapacity → no upstream penalty        │
         │          └──────────────────┬───────────────────────────┘
         │                             │
         └──────────────┬──────────────┘
@@ -94,7 +93,7 @@ sand-rating that converges back on its own as upstreams recover.
 
 ### State (per upstream)
 
-```rust
+```text
 struct Sand { level: f64, last: Instant }
 ```
 
@@ -116,6 +115,7 @@ of silence.
 ### Selection weight
 
 ```
+
 weight = exp(−K · level)        with  K = ln(1/MIN_WEIGHT) / SAND_MAX
 ```
 
@@ -155,6 +155,7 @@ Four predicates protect the model:
 Under a sustained failure rate `λ` (failures/sec), the steady-state level is
 
 ```
+
 level* = min(SAND_MAX, λ · FAIL_PENALTY · τ)
 ```
 
@@ -219,12 +220,37 @@ would punish its own healthy upstreams during traffic spikes.
 
 ## Gate chains
 
-A proxy entry with a leading `*` in `proxy_list.ktav` is a **gate** —
-`resocks5` will tunnel through the gate first, then issue a second
-SOCKS5/CONNECT handshake to the real upstream over that tunnel. The
-combinatorics (`gates × inner`) are walked in `server/connect/establish_connection/`,
-and the sticky cache stores the `(target → (gate, inner))` pair so the
-chain reuses on subsequent calls.
+A proxy entry's leading-star count sets its rank: zero stars is an ordinary
+exit; one through 255 stars are gate levels 1..255; more than 255 are
+invalid. Each present level contributes exactly one gate, in descending
+rank order, followed by exactly one ordinary exit and target. Gaps are
+allowed, and one star retains the original gate meaning. Gates alone do not
+form a route. For example, `***user:pass@h1:1080 / *h3:1080 / h4:1080`
+means server -> h1 -> h3 -> h4 -> target, with level 2 absent.
+
+`GateLevels` supplies rank-specific rotators. A lazy weighted Cartesian
+`ChainPlan` enumerates candidates, accounts for success and failure by
+`ChainStage`, and marks attributed dead nodes to skip their subtrees without
+enumerating descendants. Sticky routes are not held in `ChainPlan`: the
+application caches a successful complete-chain config on the exit rotator;
+`GateLevels::resolve` resolves it to the matching node rotators. Every hop
+has independent sand and quarantine state. Chain and ordinary-route
+fallback share `network.max_upstream_attempts`, reserving at least one
+attempt for ordinary-exit fallback. Fallback bypasses gates and never dials
+a target directly. `network.max_per_upstream` holds permits through the
+whole tunnel lifetime for every node. Startup probes and the pre-connect
+pool apply only to the outermost gate level and exits; a probe for an inner
+quarantined gate traverses the healthy outer prefix.
+
+`server/connect/establish_connection` obtains picks from the plan and passes
+complete-chain configs to `connect_chain`. `ChainPlan::record_failure` and
+`ChainPlan::record_success` account for outcomes. `ChainStage::Connect` attributes
+the outer TCP connection. `Hop(i)` is node i tunnelling to node i+1: hard
+upstream-down failures attribute node i; ambiguous failures softly penalize
+both adjacent nodes. `Target` attributes the exit. `ConnectError::is_upstream_down`
+distinguishes hard transport/TLS/auth failures from target-dependent
+handshake failures; `counts_against_upstream` excludes local capacity errors.
+
 
 ## Direct (bypass) users
 

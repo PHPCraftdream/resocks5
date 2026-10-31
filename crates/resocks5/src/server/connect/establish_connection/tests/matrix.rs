@@ -53,7 +53,7 @@ fn pem_der(pem: &str) -> Vec<u8> {
     B64.decode(b64).expect("valid base64 PEM body")
 }
 
-fn stub_tls_acceptor() -> TlsAcceptor {
+pub(super) fn stub_tls_acceptor() -> TlsAcceptor {
     let cert = CertificateDer::from(pem_der(STUB_CERT_PEM));
     let key = PrivatePkcs8KeyDer::from(pem_der(STUB_KEY_PEM));
     let config = ServerConfig::builder()

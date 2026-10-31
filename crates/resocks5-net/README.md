@@ -83,7 +83,7 @@ pool, TLS, serde, rating, or rotator feature. `accept` borrows any
 `AsyncRead + AsyncWrite + Unpin` stream and invokes an owned-credentials
 `FnOnce(Credentials) -> Future<Output = bool>` at most once. No public auth trait.
 
-```rust
+```text
 use std::time::Duration;
 use resocks5_net::server::{accept, Reply, ServerOptions};
 use tokio::{io::AsyncWriteExt, net::TcpStream, time::{timeout, Instant}};
@@ -163,12 +163,18 @@ Contracts:
 
 ## Usage
 
-Upstream lines are `[*]user:pass@host:port` — credentials optional, a
-leading `*` marks a gate node. Parse one with
-`parse_proxy_str(line, protocol)` or the
-`ProxyConfig::from_addr(protocol, addr)` shorthand; `host` may be a
-domain, an IPv4 literal, or a bracketed (or bare) IPv6 literal, and the
-password may contain `:`.
+Upstream lines encode rank with their leading-star count: zero stars is an
+ordinary exit, and levels 1..255 are gates. More than 255 stars are invalid;
+one star retains the original gate syntax. A chain uses one node from each
+present level, descending, then one ordinary exit and the target. Rank gaps
+are allowed. `ProxyConfig::gate_level` stores the rank, `with_gate_level`
+sets it, and `as_gate` promotes zero to level 1 without lowering a higher
+rank. `chain` links nodes outermost-first; `chain_nodes` returns that order
+and `chain_len` its count. `ChainKey` identity includes node order, length,
+and every node's protocol, host, port, username, password and gate level.
+Parse a proxy entry with `parse_proxy_str(line, protocol)` or use
+`ProxyConfig::from_addr(protocol, addr)`; host accepts domains, IPv4 and
+bracketed or bare IPv6, and password may contain `:`.
 
 ```toml
 [dependencies]
@@ -178,7 +184,7 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
 
-```rust
+```text
 use std::time::Duration;
 
 use resocks5_net::connect::{connect_proxy, parse_proxy_str};
@@ -228,7 +234,7 @@ returns an `AnyUpstream` through an extra `tls_connector` argument and
 is the one to use when the upstream is HTTPS (pass a `TlsConnector`).
 Cap accounting is then up to the caller.
 
-```rust,no_run
+```text
 use std::time::Duration;
 
 use resocks5_net::connect::{dial_plain, DialOptions};
@@ -262,18 +268,37 @@ non-SOCKS5 version byte is `Protocol(Socks5BadVersion { got })`, not
 `resocks5_net::socks5_rep_description(code)` gives the RFC 1928 reply
 meaning.
 
-`ProxyConfig` is built with `ProxyConfig::socks5/http/https(..)` plus
-`with_auth` / `with_gate`. Its `gate` field is the outer node dialed first.
-`dial_chain(&proxy, host, port, &opts, tls)` follows those links to any
-depth, tunnelling hop by hop over one TCP connection (SOCKS5, HTTP CONNECT
-or HTTPS at every hop) and returning `AnyUpstream::Gate`; its
-`ChainError::stage()` says which step failed (`Connect`, `Hop(n)`,
-`Target`). `dial`, `connect_proxy` and `connect_proxy_once` do **not**
-interpret `gate`.
+`ProxyConfig` builders include `socks5/http/https(..)`, `with_auth` and
+`with_gate`. `dial_chain` follows explicit `gate` links without a pool;
+`connect_chain` requires the `pool` feature and holds every node’s permit
+for the tunnel lifetime. `dial`, `connect_proxy` and `connect_proxy_once`
+do **not** follow gate links (`connect_proxy` requires `pool`). None of
+these dial/connect functions derives a route from `gate_level`; use
+`GateLevels`/`ChainPlan` for ranked selection and `ProxyConfig::chain`
+to build explicit links. `ChainError` provides the underlying `ConnectError` and `ChainStage`:
+`Connect` is outer TCP, `Hop(i)` is node i tunnelling to node i+1, and
+`Target` is the exit.
+
+`ConnectError::is_upstream_down` treats TCP-connect failures, HTTPS TLS
+handshake failures, auth/method refusal, bad SOCKS5 response versions, and
+TLS errors as hard upstream failures. It excludes destination-dependent
+CONNECT failures and ambiguous handshakes. `counts_against_upstream` is
+false for local `AtCapacity` errors when `pool` is enabled. The chain
+selection module (`rotator`, which implies `rating`) provides `GateLevels`,
+`ChainPlan`, `ChainPick`, `Hop` and `Quarantined`. The plan traverses
+weighted ranked candidates; application code owns sticky-route storage.
+
+`ProxyRotator::record_error` classifies an error, updates rating/quarantine,
+and returns the new quarantine duration when hard-failure threshold trips.
+`probe_all` probes every configured proxy. It reports
+`ProbeEvent::QuarantinedAtStart` only for newly quarantined failures when
+quarantine is enabled; `probe_due` reports recovered or still-down due
+proxies. Both return `ProbeEvent` lists.
 
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
 `error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`
-feature), `rotator` (`rotator` feature), `types`.
+feature), `rotator` (`rotator` feature), `types`, and `chain` (`rotator`
+feature).
 
 A working version of the pooled example lives at
 [`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).

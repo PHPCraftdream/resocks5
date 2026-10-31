@@ -64,7 +64,7 @@ P1: нет подтверждённых находок.
   `default-features = false`; его feature `tls` включает `resocks5-net/tls`.
   В обоих запусках `src/lib.rs` одинаков:
 
-  ```rust
+  ```text
   use resocks5_net::connect::connect_proxy::TlsConnector;
 
   pub fn no_tls_connector() -> Option<&'static TlsConnector> {
