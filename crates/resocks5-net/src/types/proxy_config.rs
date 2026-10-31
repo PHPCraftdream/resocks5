@@ -26,7 +26,8 @@ const REDACTED: &str = "<redacted>";
 /// copy of the gate's `String` fields. [`dial_chain`](crate::connect::dial_chain)
 /// follows `gate` links (to any depth); `dial`, `connect_proxy` and
 /// `connect_proxy_once` do NOT interpret `gate`. No `dial*` or
-/// `connect_proxy*` function interprets gate levels.
+/// `connect_proxy*` function interprets gate levels. Use [`ProxyConfig::chain`]
+/// to construct a chain from outermost node through its exit.
 ///
 /// The [`Debug`](std::fmt::Debug) output is redacted: `user` and `password`
 /// values are replaced with a placeholder, recursively through
