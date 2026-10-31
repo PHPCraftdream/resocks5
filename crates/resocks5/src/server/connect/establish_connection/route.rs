@@ -1,5 +1,8 @@
+use crate::logger::Logger;
+use crate::server::print_cfg;
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::ProxyConfig;
+use resocks5_net::{ConnectError, ProtocolViolation, TimeoutKind};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -24,6 +27,58 @@ pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
         }
     }
     true
+}
+
+/// True when the error proves the upstream ITSELF is down, as opposed to
+/// a failure that may be the target's fault: its TCP connect was refused or
+/// timed out, its TLS handshake failed, its credentials were refused, or it
+/// answers with something that is not its protocol. A stalled or refused
+/// SOCKS5/HTTP CONNECT is deliberately NOT here: a dead destination looks
+/// exactly like that, and quarantining a healthy proxy over it would be
+/// worse than the timeouts it saves.
+pub(super) fn is_hard_failure(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<ConnectError>() {
+        Some(ConnectError::Timeout { kind, .. }) => {
+            matches!(
+                kind,
+                TimeoutKind::TcpConnect | TimeoutKind::HttpsTlsHandshake
+            )
+        }
+        Some(ConnectError::Io { stage, .. }) => matches!(stage, resocks5_net::Stage::Connect),
+        Some(ConnectError::AuthFailed { .. } | ConnectError::MethodUnsupported { .. }) => true,
+        Some(ConnectError::Protocol(
+            ProtocolViolation::Socks5BadVersion { .. }
+            | ProtocolViolation::Socks5BadAuthVersion { .. },
+        )) => true,
+        Some(ConnectError::Tls { .. }) => true,
+        _ => false,
+    }
+}
+
+/// Feed a failed attempt on `proxy` into the rotator: hard failures count
+/// toward its quarantine (and are logged when they trip it), the rest only
+/// move the sand weight.
+pub(super) fn record_proxy_failure(
+    rotator: &ProxyRotator,
+    proxy: &Arc<ProxyConfig>,
+    err: &anyhow::Error,
+    logger: &Logger,
+    ctag: &str,
+) {
+    if !is_hard_failure(err) {
+        rotator.record_failure(proxy);
+        return;
+    }
+    if let Some(length) = rotator.record_hard_failure(proxy) {
+        logger.proxy_failure(|| {
+            format!(
+                "Upstream {} is unreachable - quarantined for {}s{}",
+                print_cfg(proxy),
+                length.as_secs(),
+                ctag
+            )
+        });
+    }
 }
 
 /// Which stage of a gate tunnel failed. Attached to `use_gate` errors
@@ -77,6 +132,7 @@ pub(super) fn gate_stage_of(err: &anyhow::Error) -> Option<GateStage> {
 /// unreachable: the caller can stop pairing this gate with further
 /// proxies right away, because `pool.acquire(gate)` does not involve
 /// the inner proxy.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_gate_failure(
     err: &anyhow::Error,
     proxy_rotator: &ProxyRotator,
@@ -85,12 +141,14 @@ pub(super) fn apply_gate_failure(
     gate_rotator: Option<&ProxyRotator>,
     dead_gates: &mut HashSet<UpstreamKey>,
     dead_proxies: &mut HashSet<UpstreamKey>,
+    logger: &Logger,
+    ctag: &str,
 ) -> bool {
     if !should_record_failure(err) {
         return false;
     }
     let Some(gate_config) = gate_config else {
-        proxy_rotator.record_failure(proxy_config);
+        record_proxy_failure(proxy_rotator, proxy_config, err, logger, ctag);
         return false;
     };
     match gate_stage_of(err) {
@@ -98,7 +156,7 @@ pub(super) fn apply_gate_failure(
             // Stage 1: the gate was never usable; the inner proxy was
             // not touched.
             if let Some(gate_rotator) = gate_rotator {
-                gate_rotator.record_failure(gate_config);
+                record_proxy_failure(gate_rotator, gate_config, err, logger, ctag);
             }
             dead_gates.insert(UpstreamKey(gate_config.clone()));
             true

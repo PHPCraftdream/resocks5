@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dead upstreams now leave the rotation temporarily. After
+  `network.quarantine_threshold` (default 3) consecutive hard failures — TCP
+  connect refused or timed out, TLS to the proxy failed, credentials refused —
+  an upstream is not tried at all for `network.quarantine_initial_sec` (default
+  30 s) while another upstream is healthy; then one request at a time probes it,
+  a success clears the quarantine, a failure doubles it up to
+  `network.quarantine_max_sec` (default 600 s). A stalled or refused CONNECT to
+  one target does not count, and a quarantine never empties the rotation. The
+  log shows `Upstream … is unreachable - quarantined for Ns`. `0` for the
+  threshold disables it. `resocks5-net`: `rating::QuarantinePolicy`,
+  `Ratings::try_with_quarantine` / `on_hard_failure` / `is_quarantined`,
+  `ProxyRotator::try_with_quarantine` / `record_hard_failure` /
+  `is_quarantined`; the existing constructors are unchanged and keep the plain
+  sand model.
+
 ### Changed
 
 - CI is segmented by diff: a push or PR runs only the segments its changed files

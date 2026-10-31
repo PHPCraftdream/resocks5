@@ -124,6 +124,27 @@ pub struct NetworkConfig {
     #[serde(default = "default_sand_success_factor")]
     pub sand_success_factor: f64,
 
+    /// Quarantine: how many CONSECUTIVE hard failures take an upstream out
+    /// of rotation. A hard failure means the upstream itself is down (its
+    /// TCP connect was refused or timed out, its TLS or credentials were
+    /// refused); a refused or stalled CONNECT to one target is not one. While
+    /// any other upstream is healthy, a quarantined one is not tried at all;
+    /// when none is, the quarantine is ignored. `0` disables the quarantine
+    /// (only the sand weights remain).
+    #[serde(default = "default_quarantine_threshold")]
+    pub quarantine_threshold: u32,
+
+    /// Quarantine: length in seconds of the first quarantine. After it ends
+    /// the upstream is probed by a single request; a failed probe doubles
+    /// the next quarantine, a success clears it.
+    #[serde(default = "default_quarantine_initial_sec")]
+    pub quarantine_initial_sec: u64,
+
+    /// Quarantine: ceiling in seconds of the doubling quarantine length.
+    /// Must be at least `quarantine_initial_sec`.
+    #[serde(default = "default_quarantine_max_sec")]
+    pub quarantine_max_sec: u64,
+
     /// Recover the original hostname from the client's first payload
     /// when the CONNECT target is a bare IP literal.
     ///
@@ -192,6 +213,15 @@ fn default_sand_min_weight() -> f64 {
 fn default_sand_success_factor() -> f64 {
     0.5
 }
+fn default_quarantine_threshold() -> u32 {
+    3
+}
+fn default_quarantine_initial_sec() -> u64 {
+    30
+}
+fn default_quarantine_max_sec() -> u64 {
+    600
+}
 fn default_recover_host_from_payload() -> bool {
     true
 }
@@ -214,6 +244,9 @@ impl Default for NetworkConfig {
             sand_max: default_sand_max(),
             sand_min_weight: default_sand_min_weight(),
             sand_success_factor: default_sand_success_factor(),
+            quarantine_threshold: default_quarantine_threshold(),
+            quarantine_initial_sec: default_quarantine_initial_sec(),
+            quarantine_max_sec: default_quarantine_max_sec(),
             recover_host_from_payload: default_recover_host_from_payload(),
         }
     }
@@ -245,6 +278,9 @@ mod tests {
         assert_eq!(d.sand_max, 8.0);
         assert_eq!(d.sand_min_weight, 0.05);
         assert_eq!(d.sand_success_factor, 0.5);
+        assert_eq!(d.quarantine_threshold, 3);
+        assert_eq!(d.quarantine_initial_sec, 30);
+        assert_eq!(d.quarantine_max_sec, 600);
         assert!(d.recover_host_from_payload);
     }
 
@@ -273,6 +309,9 @@ mod tests {
         assert_eq!(default_sand_max(), d.sand_max);
         assert_eq!(default_sand_min_weight(), d.sand_min_weight);
         assert_eq!(default_sand_success_factor(), d.sand_success_factor);
+        assert_eq!(default_quarantine_threshold(), d.quarantine_threshold);
+        assert_eq!(default_quarantine_initial_sec(), d.quarantine_initial_sec);
+        assert_eq!(default_quarantine_max_sec(), d.quarantine_max_sec);
         assert_eq!(
             default_recover_host_from_payload(),
             d.recover_host_from_payload

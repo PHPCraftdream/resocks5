@@ -6,21 +6,30 @@
 //! upstreams are picked less often but never zero. [`Ratings`] is the
 //! thread-safe integrator over a vector of cells. See `docs/ARCHITECTURE.md`
 //! for the full maths and convergence argument.
+//!
+//! On top of the soft weights, an optional [`QuarantinePolicy`] removes an
+//! upstream from the selection order for a backoff period after repeated hard
+//! failures (see [`Ratings::on_hard_failure`]), while healthy upstreams exist.
 
 pub mod policy;
+pub mod quarantine;
 pub mod rng;
 pub mod sand;
 pub mod select;
 
 pub use policy::{RatingError, RatingPolicy};
+pub use quarantine::QuarantinePolicy;
 pub use rng::SmallRng;
 pub use sand::Sand;
 
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use quarantine::{Cell, State};
 
 struct Inner {
     cells: Vec<Sand>,
+    quarantine: Vec<Cell>,
     rng: SmallRng,
 }
 
@@ -28,6 +37,7 @@ struct Inner {
 /// sand accumulators.
 pub struct Ratings {
     policy: RatingPolicy,
+    quarantine: QuarantinePolicy,
     inner: Mutex<Inner>,
 }
 
@@ -48,12 +58,30 @@ impl Ratings {
     /// Returns [`RatingError::InvalidPolicy`] when `policy` fails
     /// [`RatingPolicy::validate`].
     pub fn try_new(n: usize, policy: RatingPolicy) -> Result<Self, RatingError> {
+        Self::try_with_quarantine(n, policy, QuarantinePolicy::disabled())
+    }
+
+    /// Fallibly create `n` fresh upstreams with a [`QuarantinePolicy`] on
+    /// top of the sand model.
+    ///
+    /// # Errors
+    /// Returns [`RatingError::InvalidPolicy`] when `policy` fails
+    /// [`RatingPolicy::validate`] or `quarantine` fails
+    /// [`QuarantinePolicy::validate`].
+    pub fn try_with_quarantine(
+        n: usize,
+        policy: RatingPolicy,
+        quarantine: QuarantinePolicy,
+    ) -> Result<Self, RatingError> {
         policy.validate()?;
+        quarantine.validate()?;
         let now = Instant::now();
         Ok(Self {
             policy,
+            quarantine,
             inner: Mutex::new(Inner {
                 cells: (0..n).map(|_| Sand::new(now)).collect(),
+                quarantine: (0..n).map(|_| Cell::default()).collect(),
                 rng: SmallRng::from_os(),
             }),
         })
@@ -62,6 +90,11 @@ impl Ratings {
     /// The policy these ratings were constructed with.
     pub fn policy(&self) -> &RatingPolicy {
         &self.policy
+    }
+
+    /// The quarantine policy these ratings were constructed with.
+    pub fn quarantine_policy(&self) -> &QuarantinePolicy {
+        &self.quarantine
     }
 
     /// Number of upstreams in this set.
@@ -74,7 +107,11 @@ impl Ratings {
         self.len() == 0
     }
 
-    /// Record a failure for upstream `i`.
+    /// Record a failure for upstream `i` in the sand model only.
+    ///
+    /// Use this for failures that say little about the upstream's health
+    /// (e.g. it refused one particular target). For failures that mean the
+    /// upstream itself is down, use [`Ratings::on_hard_failure`].
     pub fn on_failure(&self, i: usize) {
         if !self.policy.enabled() {
             return;
@@ -86,16 +123,53 @@ impl Ratings {
         }
     }
 
-    /// Record a success for upstream `i`.
+    /// Record a hard failure for upstream `i`: the upstream itself looks
+    /// down (connect refused or timed out, handshake timeout, broken proxy
+    /// protocol). Counts in the sand model like [`Ratings::on_failure`] and
+    /// toward the quarantine.
+    ///
+    /// Returns the length of the quarantine when this failure started (or
+    /// extended) one, `None` otherwise.
+    pub fn on_hard_failure(&self, i: usize) -> Option<Duration> {
+        self.on_hard_failure_at(i, Instant::now())
+    }
+
+    fn on_hard_failure_at(&self, i: usize, now: Instant) -> Option<Duration> {
+        let mut inner = self.inner.lock().unwrap();
+        if i >= inner.cells.len() {
+            return None;
+        }
+        if self.policy.enabled() {
+            inner.cells[i].observe_failure(now, &self.policy);
+        }
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        inner.quarantine[i].hard_failure(now, &self.quarantine)
+    }
+
+    /// Record a success for upstream `i`. Also lifts any quarantine.
     pub fn on_success(&self, i: usize) {
-        if !self.policy.enabled() {
+        let mut inner = self.inner.lock().unwrap();
+        if i >= inner.cells.len() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        if i < inner.cells.len() {
+        if self.policy.enabled() {
             let now = Instant::now();
             inner.cells[i].observe_success(now, &self.policy);
         }
+        inner.quarantine[i].success();
+    }
+
+    /// `true` while upstream `i` is quarantined or on probation (tripped
+    /// and not yet confirmed alive by a success).
+    pub fn is_quarantined(&self, i: usize) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .quarantine
+            .get(i)
+            .is_some_and(Cell::is_tripped)
     }
 
     /// Snapshot of current decayed weights for all upstreams.
@@ -109,32 +183,85 @@ impl Ratings {
             .collect()
     }
 
-    /// Pick one upstream index via weighted random selection.
+    /// Pick one upstream index via weighted random selection. Quarantined
+    /// and probing upstreams are skipped while a healthy one exists.
     ///
     /// # Panics
     /// Panics if `len() == 0`.
     pub fn pick(&self) -> usize {
+        self.pick_at(Instant::now())
+    }
+
+    fn pick_at(&self, now: Instant) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let now = Instant::now();
-        let weights: Vec<f64> = inner
+        let mut weights: Vec<f64> = inner
             .cells
             .iter()
             .map(|s| s.weight(now, &self.policy))
             .collect();
         assert!(!weights.is_empty(), "Ratings::pick called on empty set");
+        if self.quarantine.enabled() {
+            let healthy: Vec<bool> = inner
+                .quarantine
+                .iter()
+                .map(|c| c.state(now) == State::Healthy)
+                .collect();
+            if healthy.iter().any(|&h| h) {
+                for (w, ok) in weights.iter_mut().zip(healthy) {
+                    if !ok {
+                        *w = 0.0;
+                    }
+                }
+            }
+        }
         select::weighted_index(&weights, &mut inner.rng)
     }
 
-    /// Return a weighted permutation of all upstream indices.
+    /// Return a weighted permutation of the selectable upstream indices.
+    ///
+    /// Without a quarantine this is every index. With one, quarantined
+    /// upstreams are left out while at least one upstream is healthy; an
+    /// upstream whose quarantine just ended appears at the very front as a
+    /// single probe (one at a time, see [`QuarantinePolicy::probe_lease`]);
+    /// when no upstream is healthy the quarantine is ignored and every index
+    /// is returned.
     pub fn pick_order(&self) -> Vec<usize> {
-        let keyed = {
+        self.pick_order_at(Instant::now())
+    }
+
+    fn pick_order_at(&self, now: Instant) -> Vec<usize> {
+        let (probes, eligible, keyed) = {
             let mut inner = self.inner.lock().unwrap();
-            let now = Instant::now();
-            let Inner { cells, rng } = &mut *inner;
-            select::weighted_keys(cells.iter().map(|s| s.weight(now, &self.policy)), rng)
+            let Inner {
+                cells,
+                quarantine,
+                rng,
+            } = &mut *inner;
+            let mut probes = Vec::new();
+            let eligible: Vec<usize> = if self.quarantine.enabled()
+                && quarantine.iter().any(|c| c.state(now) == State::Healthy)
+            {
+                for (i, c) in quarantine.iter_mut().enumerate() {
+                    if c.try_lease(now, &self.quarantine) {
+                        probes.push(i);
+                    }
+                }
+                (0..cells.len())
+                    .filter(|&i| quarantine[i].state(now) == State::Healthy)
+                    .collect()
+            } else {
+                (0..cells.len()).collect()
+            };
+            let keyed = select::weighted_keys(
+                eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
+                rng,
+            );
+            (probes, eligible, keyed)
         };
         // The O(n log n) sort does not hold the ratings lock.
-        select::order_keys(keyed)
+        let mut order = probes;
+        order.extend(select::order_keys(keyed).into_iter().map(|j| eligible[j]));
+        order
     }
 }
 
@@ -278,5 +405,163 @@ mod construction_tests {
             ..Default::default()
         };
         let _ = Ratings::new(2, p);
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+
+    fn ratings(n: usize) -> Ratings {
+        Ratings::try_with_quarantine(
+            n,
+            RatingPolicy::default(),
+            QuarantinePolicy::default()
+                .with_threshold(3)
+                .with_initial(Duration::from_secs(30))
+                .with_max(Duration::from_secs(600))
+                .with_probe_lease(Duration::from_secs(25)),
+        )
+        .unwrap()
+    }
+
+    fn trip(r: &Ratings, i: usize, now: Instant) {
+        for _ in 0..3 {
+            r.on_hard_failure_at(i, now);
+        }
+    }
+
+    #[test]
+    fn dead_upstream_leaves_the_order_while_healthy_ones_exist() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        assert!(r.is_quarantined(0));
+        for _ in 0..200 {
+            let order = r.pick_order_at(t0);
+            assert_eq!(order.len(), 2);
+            assert!(!order.contains(&0), "{order:?}");
+            assert_ne!(r.pick_at(t0), 0);
+        }
+    }
+
+    #[test]
+    fn fewer_failures_than_the_threshold_do_not_quarantine() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        r.on_hard_failure_at(0, t0);
+        r.on_hard_failure_at(0, t0);
+        assert!(!r.is_quarantined(0));
+        assert_eq!(r.pick_order_at(t0).len(), 3);
+    }
+
+    #[test]
+    fn hard_failure_reports_the_quarantine_length_once() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        assert_eq!(r.on_hard_failure_at(0, t0), None);
+        assert_eq!(r.on_hard_failure_at(0, t0), None);
+        assert_eq!(r.on_hard_failure_at(0, t0), Some(Duration::from_secs(30)));
+        // A request that was in flight before the trip fails late: ignored.
+        assert_eq!(r.on_hard_failure_at(0, t0 + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn one_probe_goes_first_after_the_backoff_and_only_one() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        let first = r.pick_order_at(t1);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0], 0, "probe leads: {first:?}");
+        // The lease is held: the probe is not handed out again.
+        let again = r.pick_order_at(t1 + Duration::from_secs(1));
+        assert_eq!(again.len(), 2);
+        assert!(!again.contains(&0));
+        // A probe that never reported back is re-issued after the lease.
+        let later = r.pick_order_at(t1 + Duration::from_secs(25));
+        assert_eq!(later[0], 0);
+    }
+
+    #[test]
+    fn failed_probe_requarantines_for_twice_as_long() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(r.pick_order_at(t1)[0], 0);
+        assert_eq!(r.on_hard_failure_at(0, t1), Some(Duration::from_secs(60)));
+        assert!(!r.pick_order_at(t1 + Duration::from_secs(59)).contains(&0));
+    }
+
+    #[test]
+    fn successful_probe_returns_the_upstream_to_rotation() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(r.pick_order_at(t1)[0], 0);
+        r.on_success(0);
+        assert!(!r.is_quarantined(0));
+        assert_eq!(r.pick_order_at(t1).len(), 3);
+    }
+
+    #[test]
+    fn when_nothing_is_healthy_the_quarantine_is_ignored() {
+        let r = ratings(3);
+        let t0 = Instant::now();
+        for i in 0..3 {
+            trip(&r, i, t0);
+        }
+        assert_eq!(r.pick_order_at(t0).len(), 3);
+        let _ = r.pick_at(t0);
+    }
+
+    #[test]
+    fn soft_failures_never_quarantine() {
+        let r = ratings(3);
+        for _ in 0..100 {
+            r.on_failure(0);
+        }
+        assert!(!r.is_quarantined(0));
+        assert_eq!(r.pick_order().len(), 3);
+    }
+
+    #[test]
+    fn disabled_quarantine_never_excludes() {
+        let r = Ratings::new(3, RatingPolicy::default());
+        for _ in 0..100 {
+            assert_eq!(r.on_hard_failure(0), None);
+        }
+        assert!(!r.is_quarantined(0));
+        assert_eq!(r.pick_order().len(), 3);
+    }
+
+    #[test]
+    fn quarantine_works_with_the_sand_model_off() {
+        let r = Ratings::try_with_quarantine(
+            2,
+            RatingPolicy {
+                fail_penalty: 0.0,
+                ..Default::default()
+            },
+            QuarantinePolicy::default(),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        trip(&r, 1, t0);
+        assert_eq!(r.pick_order_at(t0), vec![0]);
+        r.on_success(1);
+        assert_eq!(r.pick_order_at(t0).len(), 2);
+    }
+
+    #[test]
+    fn invalid_quarantine_policy_is_rejected() {
+        let bad = QuarantinePolicy::default().with_initial(Duration::ZERO);
+        assert!(matches!(
+            Ratings::try_with_quarantine(2, RatingPolicy::default(), bad),
+            Err(RatingError::InvalidPolicy(msg)) if msg.contains("initial")
+        ));
     }
 }

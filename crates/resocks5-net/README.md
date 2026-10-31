@@ -19,6 +19,11 @@ What's inside:
   but never excluded, and recover automatically as their sand drains.
   When every upstream is bad the weights equalise, so a full outage
   degrades to uniform random selection instead of locking out.
+- **Quarantine** (opt-in, `ProxyRotator::try_with_quarantine`) — after
+  repeated *hard* failures (`record_hard_failure`) an upstream leaves
+  `pick_order` and the sticky cache for a doubling backoff while healthy
+  upstreams exist, then is probed by one request at a time; a success clears
+  it. Without it the sand weights alone apply.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
 
 No application concerns leak in: no config-file format, logger, credential

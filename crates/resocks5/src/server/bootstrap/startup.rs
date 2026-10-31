@@ -288,36 +288,54 @@ pub(super) async fn run_server_inner() -> Result<()> {
         min_weight: cfg_main.network.sand_min_weight,
         success_factor: cfg_main.network.sand_success_factor,
     };
-    // The rotator constructor validates the rating policy itself; an
-    // invalid `network` section surfaces here with the same
-    // user-facing message the standalone validate() call used to give.
+    // A probe owns its slot long enough to finish one full upstream attempt.
+    let quarantine_policy = resocks5_net::rating::QuarantinePolicy::default()
+        .with_threshold(cfg_main.network.quarantine_threshold)
+        .with_initial(std::time::Duration::from_secs(
+            cfg_main.network.quarantine_initial_sec,
+        ))
+        .with_max(std::time::Duration::from_secs(
+            cfg_main.network.quarantine_max_sec,
+        ))
+        .with_probe_lease(std::time::Duration::from_secs(
+            cfg_main
+                .network
+                .connect_timeout_sec
+                .saturating_add(cfg_main.network.handshake_timeout_sec)
+                .saturating_add(5),
+        ));
+    let new_rotator = |proxies| {
+        ProxyRotator::try_with_quarantine(
+            proxies,
+            rating_policy,
+            quarantine_policy,
+            resocks5_net::rotator::DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+            resocks5_net::rotator::DEFAULT_STICKY_CACHE_TTL,
+        )
+    };
+    // The rotator constructor validates the rating and quarantine
+    // policies itself; an invalid `network` section surfaces here.
     let map_cfg_err = |e: resocks5_net::rotator::RotatorError| {
         anyhow::anyhow!(
-            "invalid sand rating configuration in `{}` (network section): {e}",
+            "invalid sand rating or quarantine configuration in `{}` (network section): {e}",
             crate::config::MAIN_PATH
         )
     };
 
     let v6_rotator = if !v6_proxies.is_empty() {
-        Some(Arc::new(
-            ProxyRotator::try_with_policy(v6_proxies, rating_policy).map_err(map_cfg_err)?,
-        ))
+        Some(Arc::new(new_rotator(v6_proxies).map_err(map_cfg_err)?))
     } else {
         None
     };
 
     let gate_rotator = if !gate_proxies.is_empty() {
-        Some(Arc::new(
-            ProxyRotator::try_with_policy(gate_proxies, rating_policy).map_err(map_cfg_err)?,
-        ))
+        Some(Arc::new(new_rotator(gate_proxies).map_err(map_cfg_err)?))
     } else {
         None
     };
 
     let v4_rotator = if !v4_proxies.is_empty() {
-        Some(Arc::new(
-            ProxyRotator::try_with_policy(v4_proxies, rating_policy).map_err(map_cfg_err)?,
-        ))
+        Some(Arc::new(new_rotator(v4_proxies).map_err(map_cfg_err)?))
     } else {
         None
     };

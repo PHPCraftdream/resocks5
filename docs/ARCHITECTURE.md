@@ -161,10 +161,37 @@ level* = min(SAND_MAX, λ · FAIL_PENALTY · τ)
 i.e. clamped, bounded, and falling — the model is a damped feedback loop,
 not an open one.
 
+### Quarantine: dead upstreams leave the rotation
+
+Sand only lowers a weight; the floor `MIN_WEIGHT` keeps a dead upstream
+selectable forever, and `pick_order` is a permutation of *all* upstreams, so
+when the live ones are skipped (cap reached) the walk reaches the dead ones and
+pays a connect timeout each. The quarantine (`QuarantinePolicy`, `network.quarantine_*`)
+is the hard layer on top:
+
+- A **hard failure** (`is_hard_failure` in `establish_connection/route.rs`: TCP
+  connect refused or timed out, TLS handshake to the proxy failed, credentials
+  refused, a reply that is not the proxy's protocol) counts toward
+  `quarantine_threshold` consecutive failures. A stalled or refused CONNECT is
+  *not* hard: a dead destination looks identical, and a healthy proxy must not
+  be punished for it. Any success resets the count.
+- At the threshold the upstream is **quarantined** for `quarantine_initial_sec`
+  and omitted from `pick_order`, from `pick`, and from the sticky cache hits,
+  as long as at least one upstream is healthy. When none is, the quarantine is
+  ignored so selection never runs dry.
+- When the period ends the upstream is on **probation**: exactly one request
+  at a time (a lease of connect + handshake timeout + 5 s) gets it as the first
+  candidate. A success clears everything; a failure re-quarantines for double
+  the length, up to `quarantine_max_sec`.
+
+Failures that land while an upstream is already quarantined (requests that
+started before the trip) are ignored, so they cannot inflate the backoff.
+
 ### Code map
 
 | Concern | File |
 |---|---|
+| Quarantine state machine and `QuarantinePolicy` | `crates/resocks5-net/src/session/rating/quarantine.rs` |
 | `Sand` cell state machine | `crates/resocks5-net/src/session/rating/sand.rs` |
 | `RatingPolicy` (knobs + derived constants) | `crates/resocks5-net/src/session/rating/policy.rs` |
 | Weighted index / weighted permutation | `crates/resocks5-net/src/session/rating/select.rs` |

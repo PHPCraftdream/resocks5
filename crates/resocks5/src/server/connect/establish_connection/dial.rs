@@ -321,6 +321,8 @@ pub async fn establish_connection(
                         gate_rotator.as_deref(),
                         &mut dead_gates,
                         &mut dead_proxies,
+                        logger,
+                        &ctag,
                     );
                     rotator.unlink_proxy(target_addr);
                 }
@@ -412,6 +414,8 @@ pub async fn establish_connection(
                                 Some(gate_rotator.as_ref()),
                                 &mut dead_gates,
                                 &mut dead_proxies,
+                                logger,
+                                &ctag,
                             ) {
                                 // The gate itself is proven dead for the
                                 // rest of this call — no proxy pairing
@@ -499,7 +503,7 @@ pub async fn establish_connection(
                         )
                     });
                     if should_record_failure(&e) {
-                        rotator.record_failure(proxy_config);
+                        record_proxy_failure(rotator, proxy_config, &e, logger, &ctag);
                     }
                 }
             }

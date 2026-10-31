@@ -84,6 +84,9 @@ mod tests {
             sand_max,
             sand_min_weight,
             sand_success_factor,
+            quarantine_threshold,
+            quarantine_initial_sec,
+            quarantine_max_sec,
             recover_host_from_payload
         );
         check!(
