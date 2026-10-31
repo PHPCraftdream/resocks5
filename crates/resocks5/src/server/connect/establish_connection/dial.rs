@@ -104,16 +104,6 @@ pub async fn establish_connection(
                 ));
             }
             tried_routes.insert(route.clone());
-            if plan.is_none() {
-                plan = Some(if attempts + 1 + direct_reserve < max_attempts {
-                    ChainPlan::new(gates, &exits)
-                } else {
-                    ChainPlan::new(&GateLevels::default(), &[])
-                });
-            }
-            plan.as_mut()
-                .expect("initialized chain plan")
-                .exclude(&route);
             attempts += 1;
             logger.cache_attempt(|| {
                 format!("Attempting to use cached proxy for {}{}", target_addr, ctag)
@@ -137,9 +127,7 @@ pub async fn establish_connection(
             .await
             {
                 Ok(stream) => {
-                    plan.as_ref()
-                        .expect("initialized chain plan")
-                        .record_success(&pick);
+                    pick.record_success();
                     logger.attempt(|| {
                         format!(
                             "attempt target={} via={} gate={} path=cache outcome=ok dur={}ms{}",
@@ -170,9 +158,10 @@ pub async fn establish_connection(
                             ctag
                         )
                     });
+                    // The plan is only built once a cached chain has failed, so a
+                    // cache hit costs no node selection.
                     for q in plan
-                        .as_mut()
-                        .expect("initialized chain plan")
+                        .get_or_insert_with(|| ChainPlan::new(gates, &exits))
                         .record_failure(&pick, &error)
                     {
                         logger.proxy_failure(|| {
@@ -221,9 +210,7 @@ pub async fn establish_connection(
         .await
         {
             Ok(stream) => {
-                plan.as_ref()
-                    .expect("initialized chain plan")
-                    .record_success(&pick);
+                pick.record_success();
                 logger.attempt(|| {
                     format!(
                         "attempt target={} via={} gate={} path=gate outcome=ok dur={}ms{}",

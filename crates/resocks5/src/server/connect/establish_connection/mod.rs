@@ -2,6 +2,12 @@ mod dial;
 mod probes;
 mod route;
 #[cfg(test)]
+#[path = "tests/chain_failures.rs"]
+mod tests_chain_failures;
+#[cfg(test)]
+#[path = "tests/chain_protocols.rs"]
+mod tests_chain_protocols;
+#[cfg(test)]
 #[path = "tests/chains.rs"]
 mod tests_chains;
 #[cfg(test)]

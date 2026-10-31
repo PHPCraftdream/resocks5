@@ -18,8 +18,6 @@ pub(super) fn healthy_prefix(gates: &GateLevels, rank: u8) -> Option<ProxyConfig
             break;
         }
         if level_rank > rank {
-            // pick_order ignores a quarantine when nothing is healthy; a probe
-            // must not travel through a node known to be down.
             nodes.push(
                 rotator
                     .pick_order()
@@ -116,20 +114,28 @@ mod tests {
     use super::*;
     use crate::logger::LogConfig;
     use resocks5_net::rating::QuarantinePolicy;
+    use tokio::net::TcpListener;
 
     fn proxy(host: &str, rank: u8) -> ProxyConfig {
         ProxyConfig::socks5(host, 1080).with_gate_level(rank)
     }
 
     fn rotator(proxy: ProxyConfig) -> Arc<ProxyRotator> {
+        rotator_with_policy(
+            proxy,
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_secs(30))
+                .with_max(Duration::from_secs(30)),
+        )
+    }
+
+    fn rotator_with_policy(proxy: ProxyConfig, policy: QuarantinePolicy) -> Arc<ProxyRotator> {
         Arc::new(
             ProxyRotator::try_with_quarantine(
                 vec![proxy],
                 Default::default(),
-                QuarantinePolicy::default()
-                    .with_threshold(1)
-                    .with_initial(Duration::from_secs(30))
-                    .with_max(Duration::from_secs(30)),
+                policy,
                 16,
                 Duration::from_secs(60),
             )
@@ -163,6 +169,99 @@ mod tests {
         rotator.quarantine_now(&outer);
         let gates = GateLevels::new(vec![(9, rotator)]);
         assert!(healthy_prefix(&gates, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn due_chain_probe_forwards_through_healthy_prefix_and_recovers_middle() {
+        let (tx, mut requests) = tokio::sync::mpsc::channel(4);
+        let outer = super::super::tests_chains::spawn_stub(tx).await;
+        let middle_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let middle_addr = middle_listener.local_addr().unwrap();
+        let outer_proxy = super::super::tests_chains::config(outer.addr, 3);
+        let middle = super::super::tests_chains::config(middle_addr, 2);
+        let outer_rotator = rotator(outer_proxy);
+        let middle_rotator = rotator_with_policy(
+            middle.clone(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_millis(50))
+                .with_max(Duration::from_millis(200)),
+        );
+        assert_eq!(
+            middle_rotator.quarantine_now(&middle),
+            Some(Duration::from_millis(50))
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let gates = GateLevels::new(vec![(3, outer_rotator), (2, middle_rotator.clone())]);
+        let prefix = healthy_prefix(&gates, 2).unwrap();
+        let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
+        probe_chain(
+            &prefix,
+            &middle,
+            &middle_rotator,
+            &pool,
+            &logger(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            middle_addr.to_string()
+        );
+        tokio::time::timeout(Duration::from_secs(5), middle_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!middle_rotator.is_quarantined(&middle));
+    }
+
+    #[tokio::test]
+    async fn failed_due_probe_keeps_quarantine_and_doubles_duration() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let (tx, _requests) = tokio::sync::mpsc::channel(4);
+        let outer = super::super::tests_chains::spawn_stub(tx).await;
+        let outer_proxy = super::super::tests_chains::config(outer.addr, 3);
+        let middle = super::super::tests_chains::config(addr, 2);
+        let outer_rotator = rotator(outer_proxy);
+        let middle_rotator = rotator_with_policy(
+            middle.clone(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_millis(50))
+                .with_max(Duration::from_millis(800)),
+        );
+        assert_eq!(
+            middle_rotator.quarantine_now(&middle),
+            Some(Duration::from_millis(50))
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let gates = GateLevels::new(vec![(3, outer_rotator), (2, middle_rotator.clone())]);
+        let prefix = healthy_prefix(&gates, 2).unwrap();
+        let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
+        probe_chain(
+            &prefix,
+            &middle,
+            &middle_rotator,
+            &pool,
+            &logger(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        assert!(middle_rotator.is_quarantined(&middle));
+        assert!(middle_rotator.take_probes().is_empty());
+        assert_eq!(
+            middle_rotator.quarantine_now(&middle),
+            Some(Duration::from_millis(200))
+        );
     }
 
     #[test]

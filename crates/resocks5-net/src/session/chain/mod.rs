@@ -146,6 +146,12 @@ impl ChainPick {
         ProxyConfig::chain(self.hops.iter().map(|hop| hop.proxy.clone()))
             .expect("a chain pick always has an exit")
     }
+    /// Record a success on every hop; needs no plan, so a cached chain can use it.
+    pub fn record_success(&self) {
+        for hop in &self.hops {
+            hop.rotator.record_success(&hop.proxy);
+        }
+    }
     /// Return the final proxy in the chain.
     pub fn exit(&self) -> &Hop {
         self.hops.last().expect("a chain pick always has an exit")
@@ -309,9 +315,7 @@ fn singleton_key(proxy: &Arc<ProxyConfig>) -> ChainKey {
 impl ChainPlan {
     /// Record a successful chain on every hop.
     pub fn record_success(&self, pick: &ChainPick) {
-        for hop in &pick.hops {
-            hop.rotator.record_success(&hop.proxy);
-        }
+        pick.record_success();
     }
     /// Attribute a failure and return newly quarantined nodes.
     pub fn record_failure(&mut self, pick: &ChainPick, err: &ChainError) -> Vec<Quarantined> {

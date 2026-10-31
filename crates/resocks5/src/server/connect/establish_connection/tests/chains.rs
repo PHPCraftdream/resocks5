@@ -1,5 +1,5 @@
 use super::establish_connection;
-use crate::logger::Logger;
+use crate::logger::{LogConfig, Logger};
 use regex::RegexSet;
 use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::{AnyUpstream, HostPort};
@@ -13,10 +13,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::timeout;
 
-struct Stub {
-    addr: SocketAddr,
+pub(super) struct Stub {
+    pub(super) addr: SocketAddr,
     task: JoinHandle<()>,
+}
+impl Stub {
+    async fn stop(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 impl Drop for Stub {
     fn drop(&mut self) {
@@ -24,7 +31,7 @@ impl Drop for Stub {
     }
 }
 
-async fn spawn_stub(tx: mpsc::Sender<String>) -> Stub {
+pub(super) async fn spawn_stub(tx: mpsc::Sender<String>) -> Stub {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -80,7 +87,25 @@ async fn spawn_stub(tx: mpsc::Sender<String>) -> Stub {
     Stub { addr, task }
 }
 
-fn config(addr: SocketAddr, rank: u8) -> ProxyConfig {
+pub(super) async fn spawn_refusing_stub() -> Stub {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut greeting = [0; 3];
+                if socket.read_exact(&mut greeting).await.is_ok() {
+                    let _ = socket.write_all(&[5, 255]).await;
+                }
+            });
+        }
+    });
+    Stub { addr, task }
+}
+pub(super) fn config(addr: SocketAddr, rank: u8) -> ProxyConfig {
     ProxyConfig::socks5(addr.ip().to_string(), addr.port()).with_gate_level(rank)
 }
 
@@ -162,7 +187,7 @@ async fn three_level_chain_reaches_target_in_order() {
     drop((a, b, c, d));
 }
 
-async fn echo_target() -> (SocketAddr, JoinHandle<()>) {
+pub(super) async fn echo_target() -> (SocketAddr, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -188,7 +213,10 @@ async fn echo_target_twice() -> (SocketAddr, JoinHandle<()>) {
     (addr, task)
 }
 
-fn setup_chain(addrs: &[SocketAddr], ranks: &[u8]) -> (Arc<GateLevels>, Arc<ProxyRotator>) {
+pub(super) fn setup_chain(
+    addrs: &[SocketAddr],
+    ranks: &[u8],
+) -> (Arc<GateLevels>, Arc<ProxyRotator>) {
     let gates = ranks
         .iter()
         .zip(addrs)
@@ -201,7 +229,7 @@ fn setup_chain(addrs: &[SocketAddr], ranks: &[u8]) -> (Arc<GateLevels>, Arc<Prox
     (Arc::new(GateLevels::new(gates)), exit)
 }
 
-async fn connect_echo(
+pub(super) async fn connect_echo(
     gates: &Arc<GateLevels>,
     exit: &Arc<ProxyRotator>,
     pool: &Arc<ProxyPool>,
@@ -292,6 +320,11 @@ async fn three_level_sticky_route_is_reused() {
     let cached = exit.get_linked(&sticky_key).unwrap();
     assert_eq!(cached.chain_nodes().len(), 4);
     drop(first);
+    let orders_before: Vec<(u8, u64)> = gates
+        .iter()
+        .map(|(rank, rotator)| (rank, rotator.pick_order_calls()))
+        .chain(std::iter::once((0, exit.pick_order_calls())))
+        .collect();
     let (mut second, mut logs) = connect_echo(
         &gates,
         &exit,
@@ -306,6 +339,12 @@ async fn three_level_sticky_route_is_reused() {
     second.write_all(b"marker!").await.unwrap();
     second.read_exact(&mut echoed).await.unwrap();
     assert_eq!(&echoed, b"marker!");
+    let orders_after: Vec<(u8, u64)> = gates
+        .iter()
+        .map(|(rank, rotator)| (rank, rotator.pick_order_calls()))
+        .chain(std::iter::once((0, exit.pick_order_calls())))
+        .collect();
+    assert_eq!(orders_after, orders_before);
     let hit = tokio::time::timeout(Duration::from_secs(5), logs.recv())
         .await
         .unwrap()
@@ -450,4 +489,269 @@ async fn every_chain_node_capacity_is_held_until_stream_drop() {
         assert!(pool.reserve_permit(&cfg).is_ok());
     }
     target_task.abort();
+}
+
+#[tokio::test]
+async fn sticky_cache_breakage_falls_back_to_new_middle_gate() {
+    timeout(Duration::from_secs(10), async {
+        let (tx, mut rx) = mpsc::channel(128);
+        let outer = spawn_stub(tx.clone()).await;
+        let mut middle = spawn_stub(tx.clone()).await;
+        let inner = spawn_stub(tx.clone()).await;
+        let exit_stub = spawn_stub(tx.clone()).await;
+        let (target, target_task) = echo_target_twice().await;
+        let rank3 = Arc::new(ProxyRotator::new(vec![config(outer.addr, 3)]));
+        let rank2 = Arc::new(ProxyRotator::new(vec![config(middle.addr, 2)]));
+        let rank1 = Arc::new(ProxyRotator::new(vec![config(inner.addr, 1)]));
+        let gates = Arc::new(GateLevels::new(vec![
+            (3, rank3.clone()),
+            (2, rank2),
+            (1, rank1.clone()),
+        ]));
+        let exit = Arc::new(ProxyRotator::new(vec![config(exit_stub.addr, 0)]));
+        let pool = Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(3),
+            8,
+        ));
+        let target_key = HostPort::format(&target.ip().to_string(), target.port());
+        let (mut first, _) = connect_echo(&gates, &exit, &pool, target, Default::default()).await;
+        first.write_all(b"marker!").await.unwrap();
+        let mut echoed = [0u8; 7];
+        first.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"marker!");
+        drop(first);
+        let cached = exit.get_linked(&target_key).unwrap();
+        assert_eq!(cached.chain_nodes().len(), 4);
+        assert_eq!(cached.chain_nodes()[1].port, middle.addr.port());
+
+        let alternate_middle = spawn_stub(tx.clone()).await;
+        let rank2 = Arc::new(ProxyRotator::new(vec![
+            config(middle.addr, 2),
+            config(alternate_middle.addr, 2),
+        ]));
+        let new_gates = Arc::new(GateLevels::new(vec![(3, rank3), (2, rank2), (1, rank1)]));
+        middle.stop().await;
+        let (mut second, mut logs) = connect_echo(
+            &new_gates,
+            &exit,
+            &pool,
+            target,
+            LogConfig {
+                attempts: true,
+                cache_attempts: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        second.write_all(b"marker!").await.unwrap();
+        second.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"marker!");
+        let cached = exit.get_linked(&target_key).unwrap();
+        assert_eq!(cached.chain_nodes().len(), 4);
+        assert_eq!(cached.chain_nodes()[1].port, alternate_middle.addr.port());
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(5), target_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut destinations = Vec::new();
+        for _ in 0..9 {
+            destinations.push(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            destinations,
+            vec![
+                middle.addr.to_string(),
+                inner.addr.to_string(),
+                exit_stub.addr.to_string(),
+                target_key.clone(),
+                middle.addr.to_string(),
+                alternate_middle.addr.to_string(),
+                inner.addr.to_string(),
+                exit_stub.addr.to_string(),
+                target_key,
+            ]
+        );
+        let entries: Vec<String> = std::iter::from_fn(|| logs.try_recv().ok())
+            .filter_map(|entry| match entry {
+                crate::logger::ELog::Log(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert!(entries
+            .iter()
+            .any(|message| { message.contains("path=cache") && message.contains("outcome=fail") }));
+        assert!(entries
+            .iter()
+            .any(|message| { message.contains("path=gate") && message.contains("outcome=ok") }));
+    })
+    .await
+    .expect("sticky cache recovery timed out");
+}
+
+#[tokio::test]
+async fn dead_outer_gates_fall_back_to_direct_exit() {
+    let dead = || async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    };
+    let mut levels = Vec::new();
+    for rank in [3, 2, 1] {
+        let mut candidates = Vec::new();
+        for _ in 0..4 {
+            candidates.push(config(dead().await, rank));
+        }
+        levels.push((rank, Arc::new(ProxyRotator::new(candidates))));
+    }
+    let gates = Arc::new(GateLevels::new(levels));
+    let (exit_tx, _exit_rx) = mpsc::channel(16);
+    let exit_stub = spawn_stub(exit_tx).await;
+    let exit = Arc::new(ProxyRotator::new(vec![config(exit_stub.addr, 0)]));
+    let (target, target_task) = echo_target().await;
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(3),
+        8,
+    ));
+    let network = Arc::new(crate::config::NetworkConfig {
+        handshake_timeout_sec: 2,
+        connect_timeout_sec: 1,
+        ..Default::default()
+    });
+    let (log_tx, mut logs) = mpsc::channel(32);
+    let logger = Arc::new(crate::logger::Logger::new(
+        log_tx,
+        LogConfig {
+            attempts: true,
+            ..Default::default()
+        },
+    ));
+    let mut stream = timeout(
+        Duration::from_secs(8),
+        establish_connection(
+            &HostPort::format(&target.ip().to_string(), target.port()),
+            &gates,
+            &Some(exit),
+            &None,
+            &logger,
+            &Arc::new(RegexSet::empty()),
+            &pool,
+            &network,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    stream.write_all(b"marker!").await.unwrap();
+    let mut echoed = [0; 7];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"marker!");
+    target_task.await.unwrap();
+    let entries: Vec<String> = std::iter::from_fn(|| logs.try_recv().ok())
+        .filter_map(|entry| match entry {
+            crate::logger::ELog::Log(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let failed_gates = entries
+        .iter()
+        .filter(|s| s.contains("path=gate") && s.contains("outcome=fail"))
+        .count();
+    assert!(failed_gates >= 1);
+    assert!(entries
+        .iter()
+        .any(|s| s.contains("path=direct") && s.contains("outcome=ok")));
+    let attempts = entries.iter().filter(|s| s.starts_with("attempt ")).count();
+    assert!(attempts <= network.max_upstream_attempts);
+}
+
+#[tokio::test]
+async fn dead_gates_and_exits_stop_at_attempt_budget() {
+    let dead = || async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    };
+    let mut levels = Vec::new();
+    for rank in [3, 2, 1] {
+        let mut candidates = Vec::new();
+        for _ in 0..4 {
+            candidates.push(config(dead().await, rank));
+        }
+        levels.push((rank, Arc::new(ProxyRotator::new(candidates))));
+    }
+    let gates = Arc::new(GateLevels::new(levels));
+    let mut exits = Vec::new();
+    for _ in 0..4 {
+        let addr = dead().await;
+        exits.push(config(addr, 0));
+    }
+    let exit = Arc::new(ProxyRotator::new(exits));
+    let target = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(3),
+        8,
+    ));
+    let network = Arc::new(crate::config::NetworkConfig {
+        max_upstream_attempts: 3,
+        handshake_timeout_sec: 2,
+        connect_timeout_sec: 1,
+        ..Default::default()
+    });
+    let (log_tx, mut logs) = mpsc::channel(32);
+    let logger = Arc::new(crate::logger::Logger::new(
+        log_tx,
+        LogConfig {
+            attempts: true,
+            ..Default::default()
+        },
+    ));
+    let error = timeout(
+        Duration::from_secs(8),
+        establish_connection(
+            &HostPort::format(&target.ip().to_string(), target.port()),
+            &gates,
+            &Some(exit),
+            &None,
+            &logger,
+            &Arc::new(RegexSet::empty()),
+            &pool,
+            &network,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .err()
+    .expect("all routes must fail");
+    assert!(error.to_string().contains("All 3 upstream attempts"));
+    let entries: Vec<String> = std::iter::from_fn(|| logs.try_recv().ok())
+        .filter_map(|entry| match entry {
+            crate::logger::ELog::Log(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let attempts = entries.iter().filter(|s| s.starts_with("attempt ")).count();
+    assert_eq!(attempts, 3);
+    assert!(attempts <= network.max_upstream_attempts);
 }

@@ -160,6 +160,74 @@ fn group_gate_levels_moves_owned_entries_without_cloning_and_keeps_gaps() {
 }
 
 #[test]
+fn parsed_star_prefix_accepts_255_and_groups_at_exact_rank() {
+    let raw = format!("{}v4:p@10.0.0.255:1080", "*".repeat(255));
+    let (parsed, failed) = parse_proxy_list_checked(&[raw], ProxyProtocol::Socks5);
+    assert!(failed.is_empty());
+    assert_eq!(parsed.len(), 1);
+    let (_, _, gates) = partition_proxy_groups(Vec::new(), parsed);
+    let levels = group_gate_levels(gates);
+    assert_eq!(levels.keys().copied().collect::<Vec<_>>(), vec![255]);
+    assert_eq!(levels[&255][0].host, "10.0.0.255");
+}
+
+#[test]
+fn parsed_v4_and_v6_gates_merge_by_level_preserving_source_order() {
+    let v6 = vec![
+        "**v6a:p@[2001:db8::1]:1080".to_string(),
+        "*v6b:p@[2001:db8::2]:1080".to_string(),
+    ];
+    let v4 = vec![
+        "**v4a:p@10.0.0.1:1080".to_string(),
+        "**v4b:p@10.0.0.2:1080".to_string(),
+    ];
+    let (v6, failed_v6) = parse_proxy_list_checked(&v6, ProxyProtocol::Socks5);
+    let (v4, failed_v4) = parse_proxy_list_checked(&v4, ProxyProtocol::Socks5);
+    assert!(failed_v6.is_empty() && failed_v4.is_empty());
+    let (_, _, gates) = partition_proxy_groups(v6, v4);
+    let levels = group_gate_levels(gates);
+    assert_eq!(levels.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+    let hosts = |rank| {
+        levels[&rank]
+            .iter()
+            .map(|p| p.host.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(hosts(1), vec!["2001:db8::2"]);
+    assert_eq!(hosts(2), vec!["2001:db8::1", "10.0.0.1", "10.0.0.2"]);
+}
+
+#[test]
+fn parsed_three_stars_plus_one_star_yields_exact_levels_one_and_three() {
+    let parsed_v6 = parse_proxy_list_checked(
+        &["***v6:p@[2001:db8::3]:1080".to_string()],
+        ProxyProtocol::Socks5,
+    );
+    let parsed_v4 =
+        parse_proxy_list_checked(&["*v4:p@10.0.0.1:1080".to_string()], ProxyProtocol::Socks5);
+    assert!(parsed_v6.1.is_empty() && parsed_v4.1.is_empty());
+    let (_, _, gates) = partition_proxy_groups(parsed_v6.0, parsed_v4.0);
+    let levels = group_gate_levels(gates);
+    assert_eq!(levels.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
+    assert_eq!(levels[&1][0].host, "10.0.0.1");
+    assert_eq!(levels[&3][0].host, "2001:db8::3");
+}
+
+#[test]
+fn star_prefix_256_is_rejected_with_redacted_failed_line_diagnostic() {
+    let raw = format!("{}alice:s3cret@secret.example:1080", "*".repeat(256));
+    let (parsed, failed) =
+        parse_proxy_list_checked(std::slice::from_ref(&raw), ProxyProtocol::Socks5);
+    assert!(parsed.is_empty());
+    assert_eq!(failed, vec![1]);
+    let msg = skipped_line_message("socks5_v4", failed[0]);
+    assert!(msg.contains("[1]") && msg.contains("skipped (entry redacted)"));
+    for secret in [raw.as_str(), "alice", "s3cret", "secret.example"] {
+        assert!(!msg.contains(secret), "diagnostic leaked {secret:?}: {msg}");
+    }
+}
+
+#[test]
 fn parsed_star_prefixes_group_by_rank_across_ipv4_and_ipv6_lists() {
     let parse = |line| parse_proxy_str(line, ProxyProtocol::Socks5).expect("valid test proxy");
     let (v6, v4, gates) = partition_proxy_groups(
