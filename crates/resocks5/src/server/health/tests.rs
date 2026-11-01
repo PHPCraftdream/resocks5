@@ -348,6 +348,8 @@ async fn the_saver_writes_on_change_and_stays_quiet_otherwise() {
         None,
         log,
     ));
+    // The task creates its interval at the current (paused) time: let it start first.
+    settle().await;
 
     tokio::time::advance(Duration::from_secs(11)).await;
     settle().await;
@@ -387,6 +389,8 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
         Some(initial),
         log,
     ));
+    // The task creates its interval at the current (paused) time: let it start first.
+    settle().await;
     tokio::time::advance(Duration::from_secs(25)).await;
     settle().await;
     assert!(!path.exists());
@@ -408,6 +412,8 @@ async fn a_failing_save_is_logged_once_and_retried() {
         None,
         log,
     ));
+    // The task creates its interval at the current (paused) time: let it start first.
+    settle().await;
 
     for _ in 0..3 {
         tokio::time::advance(Duration::from_secs(10)).await;
