@@ -283,6 +283,17 @@ to build explicit links. `ChainError` provides the underlying `ConnectError` and
 `Connect` is outer TCP, `Hop(i)` is node i tunnelling to node i+1, and
 `Target` is the exit.
 
+`connect_hedged` (feature `pool`) races a candidate list: attempts launch in
+order, and the next one starts beside a slow one after
+`HedgeOptions::hedge_delay` only while no running attempt is past its TCP
+connect, so the target never sees duplicate CONNECTs. The first success is
+returned as `Hedged { stream, winner }`; the rest finish in the background
+and every launched attempt is reported exactly once through `on_attempt`
+(`AttemptReport` with `AttemptOutcome::{Won, LateSuccess, Lost, Failed}` and
+`after_win`), so the caller can feed ratings and quarantine. A zero delay
+means strictly sequential; `HedgeError` carries the attempt count and the
+last error.
+
 `ConnectError::is_upstream_down` treats TCP-connect failures, HTTPS TLS
 handshake failures, auth/method refusal, bad SOCKS5 response versions, and
 TLS errors as hard upstream failures. It excludes destination-dependent
