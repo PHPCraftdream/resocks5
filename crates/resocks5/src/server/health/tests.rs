@@ -461,13 +461,14 @@ async fn start_restores_probes_the_due_ones_and_keeps_saving() {
     save(&path, &saved).unwrap();
     let (log, mut rx) = logger();
 
-    let handle = start(
+    let (handle, found) = start(
         vec![r.clone()],
         path.clone(),
         Duration::from_millis(50),
         Duration::from_secs(2),
         log,
     );
+    assert!(found, "a saved picture was read");
     // Both are held back at once; the background probe frees the reachable one.
     assert!(r.is_quarantined(&dead));
     for _ in 0..100 {
@@ -505,13 +506,14 @@ async fn start_without_a_file_creates_it_and_logs_nothing_about_restoring() {
     let dir = unique_dir("start_none");
     let path = dir.join("health.ktav");
     let (log, mut rx) = logger();
-    let handle = start(
+    let (handle, found) = start(
         vec![r],
         path.clone(),
         Duration::from_millis(30),
         Duration::from_secs(1),
         log,
     );
+    assert!(!found, "nothing was saved yet");
     for _ in 0..100 {
         if path.exists() {
             break;
@@ -531,13 +533,14 @@ async fn start_with_a_broken_file_still_runs_and_overwrites_it() {
     let path = dir.join("health.ktav");
     std::fs::write(&path, "saved_at: nope\n").unwrap();
     let (log, _rx) = logger();
-    let handle = start(
+    let (handle, found) = start(
         vec![r],
         path.clone(),
         Duration::from_millis(30),
         Duration::from_secs(1),
         log,
     );
+    assert!(!found, "an unreadable file is not a picture");
     for _ in 0..100 {
         if load(&path).is_ok() {
             break;

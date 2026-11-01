@@ -53,7 +53,7 @@ async fn probe_due_reports_retrip_for_a_dead_proxy() {
 
     let events = rotator.probe_due(Duration::from_millis(50)).await;
     assert!(
-        matches!(events.as_slice(), [ProbeEvent::StillDown { proxy: p, quarantined_for }] if p.host == proxy.host && *quarantined_for == Duration::from_millis(20))
+        matches!(events.as_slice(), [ProbeEvent::StillDown { proxy: p, quarantined_for, reason }] if p.host == proxy.host && *quarantined_for == Duration::from_millis(20) && !reason.is_empty())
     );
 }
 
@@ -67,7 +67,7 @@ async fn probe_all_quarantines_dead_and_leaves_prequarantined_live_proxy_untouch
 
     let events = rotator.probe_all(Duration::from_millis(50)).await;
     assert!(
-        matches!(events.as_slice(), [ProbeEvent::QuarantinedAtStart { proxy: p, quarantined_for }] if p.host == dead.host && *quarantined_for == Duration::from_millis(20))
+        matches!(events.as_slice(), [ProbeEvent::QuarantinedAtStart { proxy: p, quarantined_for, reason }] if p.host == dead.host && *quarantined_for == Duration::from_millis(20) && reason.contains("no answer"))
     );
     assert!(
         rotator.is_quarantined(&live),
@@ -154,4 +154,21 @@ async fn probe_all_reports_many_dead_upstreams() {
         .iter()
         .all(|event| matches!(event, ProbeEvent::QuarantinedAtStart { .. })));
     assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn a_refused_connect_reports_the_io_error_not_a_timeout() {
+    // A port nobody listens on: bind, learn the port, drop the listener.
+    let (listener, address) = listener().await;
+    drop(listener);
+    let proxy = proxy("127.0.0.1", address.port());
+    let rotator = rotator(vec![proxy.clone()], 3);
+    let events = rotator.probe_all(Duration::from_secs(2)).await;
+    match events.as_slice() {
+        [ProbeEvent::QuarantinedAtStart { reason, .. }] => {
+            assert!(!reason.contains("no answer"), "{reason}");
+            assert!(!reason.is_empty());
+        }
+        other => panic!("unexpected events: {other:?}"),
+    }
 }

@@ -67,10 +67,12 @@ pub(crate) fn spawn_due_probes(
                 resocks5_net::rotator::ProbeEvent::StillDown {
                     proxy,
                     quarantined_for,
+                    reason,
                 } => logger.proxy_failure(|| {
                     format!(
-                        "Upstream {} is still unreachable - quarantined for {}s",
+                        "Upstream {} is still unreachable ({}) - quarantined for {}s",
                         print_cfg(&proxy),
+                        reason,
                         quarantined_for.as_secs()
                     )
                 }),

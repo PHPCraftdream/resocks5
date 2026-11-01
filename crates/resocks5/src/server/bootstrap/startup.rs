@@ -465,7 +465,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
     // Dead upstreams of the previous run go straight to quarantine/probation.
     let health_rotators = all_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
     let health_path = std::path::PathBuf::from(crate::config::HEALTH_PATH);
-    let health_saver = (cfg_main.network.health_save_sec > 0
+    let health = (cfg_main.network.health_save_sec > 0
         && cfg_main.network.quarantine_threshold > 0)
         .then(|| {
             server::health::start(
@@ -477,9 +477,17 @@ pub(super) async fn run_server_inner() -> Result<()> {
             )
         });
 
+    let (health_saver, health_found) = match health {
+        Some((saver, found)) => (Some(saver), found),
+        None => (None, false),
+    };
+
     // In the background: the listener must bind at once, a refused
     // connection makes browsers mark the proxy failed for a long time.
-    if cfg_main.network.quarantine_threshold > 0 {
+    // A saved health picture already says who was dead, and one connect at the
+    // very first instant after a restart can fail for reasons of the host
+    // (network not settled yet), so with a picture the check is skipped.
+    if cfg_main.network.quarantine_threshold > 0 && !health_found {
         let rotators =
             directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
         tokio::spawn(quarantine_unreachable_at_start(
@@ -544,12 +552,14 @@ async fn quarantine_unreachable_at_start(
                 if let resocks5_net::rotator::ProbeEvent::QuarantinedAtStart {
                     proxy,
                     quarantined_for,
+                    reason,
                 } = event
                 {
                     logger.proxy_failure(|| {
                         format!(
-                            "Upstream {} is unreachable at startup - quarantined for {}s",
+                            "Upstream {} is unreachable at startup ({}) - quarantined for {}s",
                             crate::server::print_cfg(&proxy),
+                            reason,
                             quarantined_for.as_secs()
                         )
                     });

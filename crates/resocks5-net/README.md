@@ -305,7 +305,9 @@ weighted ranked candidates; application code owns sticky-route storage.
 
 `ProxyRotator::record_error` classifies an error, updates rating/quarantine,
 and returns the new quarantine duration when hard-failure threshold trips.
-`probe_all` probes every configured proxy. It reports
+`probe_all` probes every configured proxy; a failed connect carries its
+`reason` (the I/O error or the timeout) in `QuarantinedAtStart` and `StillDown`.
+It reports
 `ProbeEvent::QuarantinedAtStart` only for newly quarantined failures when
 quarantine is enabled; `probe_due` reports recovered or still-down due
 proxies. Both return `ProbeEvent` lists.

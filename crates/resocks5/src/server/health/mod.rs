@@ -213,16 +213,18 @@ pub(crate) fn resume(rotators: &[Arc<ProxyRotator>], path: &Path, now: u64) -> R
 }
 
 /// Start-up: put the saved quarantines back, hand the due ones to the
-/// background probes, then keep the file current. The returned task runs
-/// until aborted; save once more after aborting it.
+/// background probes, then keep the file current. Returns the saver task
+/// (runs until aborted; save once more after aborting it) and whether a saved
+/// picture was found: then the start-up reachability check is redundant.
 pub(crate) fn start(
     rotators: Vec<Arc<ProxyRotator>>,
     path: PathBuf,
     every: Duration,
     probe_timeout: Duration,
     logger: Arc<Logger>,
-) -> tokio::task::JoinHandle<()> {
+) -> (tokio::task::JoinHandle<()>, bool) {
     let resumed = resume(&rotators, &path, unix_now());
+    let found = resumed.saved.is_some();
     if let Some(warning) = &resumed.warning {
         println!("warning: {warning}");
     }
@@ -246,7 +248,10 @@ pub(crate) fn start(
         }
     }
     let initial = resumed.saved.map(|_| snapshot(&rotators, unix_now()));
-    tokio::spawn(run_saver(rotators, path, every, initial, logger))
+    (
+        tokio::spawn(run_saver(rotators, path, every, initial, logger)),
+        found,
+    )
 }
 
 /// Replace the file atomically.

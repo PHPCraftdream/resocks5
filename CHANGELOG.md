@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A tunnel that ended with an I/O error now says which end broke it — `failed
+  on client side: …` or `failed on upstream side: …` in the `log.tunnels` line —
+  so resets caused by the client (browser/Proxifier aborts) are told apart from
+  resets by the upstream.
+- The probe log lines carry the reason of the failed connect (`is unreachable at
+  startup (connection refused…)`, `still unreachable (no answer within 3s)`);
+  `ProbeEvent::{StillDown, QuarantinedAtStart}` got a `reason` field.
 - The server remembers which upstreams are dead across restarts: the quarantine
   picture (state, time left, trips) is saved to `resocks5.health.ktav` every
   `network.health_save_sec` seconds (default 30, only when it changed) and on a
@@ -98,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quarantined inner gate is probed through a healthy outer prefix.
 
 ### Changed
+
+- With a saved health picture (`resocks5.health.ktav`) the start-up TCP check of
+  all upstreams is skipped: the file already says who was dead, and a single
+  connect at the very first instant after a restart can fail for reasons of the
+  host (observed: every live upstream "unreachable" for 30 s). The check still
+  runs on the first start, when no file exists.
 
 - CI is segmented by diff: a push or PR runs only the segments its changed files
   need, on ubuntu only, and only the SDK/app tests of the touched modules (feature

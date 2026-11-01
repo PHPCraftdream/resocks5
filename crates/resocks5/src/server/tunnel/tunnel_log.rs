@@ -2,7 +2,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -23,6 +23,8 @@ pub(crate) struct TunnelLabel<'a> {
 pub(crate) struct Counters {
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
+    /// An I/O call on the upstream stream returned an error.
+    upstream_failed: Arc<AtomicBool>,
 }
 
 impl Counters {
@@ -32,6 +34,22 @@ impl Counters {
 
     pub(crate) fn received(&self) -> u64 {
         self.received.load(Ordering::Relaxed)
+    }
+
+    /// Which end broke the tunnel: the upstream stream reported an I/O error,
+    /// otherwise the error came from the client's side.
+    pub(crate) fn failed_side(&self) -> &'static str {
+        if self.upstream_failed.load(Ordering::Relaxed) {
+            "upstream"
+        } else {
+            "client"
+        }
+    }
+
+    fn note<T>(&self, poll: &Poll<io::Result<T>>) {
+        if matches!(poll, Poll::Ready(Err(_))) {
+            self.upstream_failed.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -65,6 +83,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
             let n = (buf.filled().len() - before) as u64;
             self.counters.received.fetch_add(n, Ordering::Relaxed);
         }
+        self.counters.note(&poll);
         poll
     }
 }
@@ -79,19 +98,25 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
         if let Poll::Ready(Ok(n)) = poll {
             self.counters.sent.fetch_add(n as u64, Ordering::Relaxed);
         }
+        self.counters.note(&poll);
         poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        self.counters.note(&poll);
+        poll
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.counters.note(&poll);
+        poll
     }
 }
 
-/// Log a finished tunnel: one `log.tunnels` line for every tunnel, plus a
+/// Log a finished tunnel: one `log.tunnels` line for every tunnel (a failed
+/// one names the side that broke it, `client` or `upstream`), plus a
 /// `log.proxy_failures` warning when the upstream never sent a byte back
 /// although the client did send — the signature of a tunnel that "opened
 /// but does not work".
@@ -110,7 +135,7 @@ pub(crate) fn report(
     };
     let end = match result {
         Ok(end) => (*end).to_string(),
-        Err(e) => format!("failed: {e}"),
+        Err(e) => format!("failed on {} side: {e}", counters.failed_side()),
     };
     label.logger.tunnel(|| {
         format!(
@@ -145,5 +170,124 @@ mod tests {
         a.read_exact(&mut back).await.unwrap();
         assert_eq!(counters.sent(), 5);
         assert_eq!(counters.received(), 3);
+    }
+
+    /// A stream whose every call fails like a reset connection.
+    struct Reset;
+
+    fn reset() -> io::Error {
+        io::Error::from(io::ErrorKind::ConnectionReset)
+    }
+
+    impl AsyncRead for Reset {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(reset()))
+        }
+    }
+
+    impl AsyncWrite for Reset {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(reset()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(reset()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(reset()))
+        }
+    }
+
+    fn tunnel_lines(result: anyhow::Result<&'static str>, counters: &Counters) -> Vec<String> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let logger = Logger::new(
+            tx,
+            crate::logger::LogConfig {
+                tunnels: true,
+                ..crate::logger::LogConfig::default()
+            },
+        );
+        let label = TunnelLabel {
+            logger: &logger,
+            target: "t.example:443",
+            client: Some("alice"),
+        };
+        report(&label, &result, counters, Duration::from_secs(2));
+        let mut lines = Vec::new();
+        while let Ok(crate::logger::ELog::Log(text) | crate::logger::ELog::Error(text)) =
+            rx.try_recv()
+        {
+            lines.push(text);
+        }
+        lines
+    }
+
+    #[tokio::test]
+    async fn every_upstream_call_that_errors_marks_the_upstream_side() {
+        for call in 0..4 {
+            let (mut up, counters) = counted(Reset);
+            assert_eq!(counters.failed_side(), "client", "nothing failed yet");
+            let _ = match call {
+                0 => up.read(&mut [0u8; 4]).await.map(|_| ()),
+                1 => up.write(b"x").await.map(|_| ()),
+                2 => up.flush().await,
+                _ => up.shutdown().await,
+            };
+            assert_eq!(counters.failed_side(), "upstream", "call {call}");
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_calls_leave_the_side_unmarked() {
+        let (a, mut b) = duplex(64);
+        let (mut a, counters) = counted(a);
+        a.write_all(b"hi").await.unwrap();
+        a.flush().await.unwrap();
+        let mut buf = [0u8; 2];
+        b.read_exact(&mut buf).await.unwrap();
+        assert_eq!(counters.failed_side(), "client");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tunnel_names_the_upstream_side() {
+        let (mut up, counters) = counted(Reset);
+        let _ = up.read(&mut [0u8; 4]).await;
+        let lines = tunnel_lines(Err(anyhow::anyhow!("reset")), &counters);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("failed on upstream side: reset after 2.0s"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("[client=alice]"), "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_the_upstream_never_saw_is_the_clients() {
+        let (_up, counters) = counted(Reset);
+        let lines = tunnel_lines(Err(anyhow::anyhow!("reset")), &counters);
+        assert!(
+            lines[0].contains("failed on client side: reset"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_end_keeps_its_plain_wording() {
+        let (_up, counters) = counted(Reset);
+        let lines = tunnel_lines(Ok("closed"), &counters);
+        assert!(
+            lines[0].contains("t.example:443 closed after 2.0s"),
+            "{}",
+            lines[0]
+        );
     }
 }

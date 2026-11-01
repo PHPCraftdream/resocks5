@@ -25,6 +25,8 @@ pub enum ProbeEvent {
         proxy: Arc<ProxyConfig>,
         /// New quarantine duration, when this failure tripped quarantine.
         quarantined_for: Duration,
+        /// Why the connect failed: the I/O error or the timeout.
+        reason: String,
     },
     /// A startup check found an unavailable upstream and quarantined it.
     QuarantinedAtStart {
@@ -32,40 +34,45 @@ pub enum ProbeEvent {
         proxy: Arc<ProxyConfig>,
         /// New quarantine duration.
         quarantined_for: Duration,
+        /// Why the connect failed: the I/O error or the timeout.
+        reason: String,
     },
 }
 
-async fn reachable(proxy: &ProxyConfig, connect_timeout: Duration) -> bool {
+async fn reachable(proxy: &ProxyConfig, connect_timeout: Duration) -> Result<(), String> {
     let address = (proxy.host.as_str(), proxy.port);
-    matches!(
-        timeout(connect_timeout, TcpStream::connect(address)).await,
-        Ok(Ok(_))
-    )
+    match timeout(connect_timeout, TcpStream::connect(address)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!("no answer within {connect_timeout:?}")),
+    }
 }
+
+type CheckResult = Result<(), String>;
 
 fn spawn_checks<F, Fut>(
     proxies: Vec<Arc<ProxyConfig>>,
     check: F,
-) -> JoinSet<(Arc<ProxyConfig>, bool)>
+) -> JoinSet<(Arc<ProxyConfig>, CheckResult)>
 where
     F: Fn(Arc<ProxyConfig>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = bool> + Send + 'static,
+    Fut: Future<Output = CheckResult> + Send + 'static,
 {
     let check = Arc::new(check);
     let mut tasks = JoinSet::new();
     for proxy in proxies {
         let check = Arc::clone(&check);
         tasks.spawn(async move {
-            let ok = check(Arc::clone(&proxy)).await;
-            (proxy, ok)
+            let result = check(Arc::clone(&proxy)).await;
+            (proxy, result)
         });
     }
     tasks
 }
 
-async fn drain_checks<F>(mut tasks: JoinSet<(Arc<ProxyConfig>, bool)>, mut report: F)
+async fn drain_checks<F>(mut tasks: JoinSet<(Arc<ProxyConfig>, CheckResult)>, mut report: F)
 where
-    F: FnMut(Arc<ProxyConfig>, bool),
+    F: FnMut(Arc<ProxyConfig>, CheckResult),
 {
     while let Some(result) = tasks.join_next().await {
         if let Ok((proxy, ok)) = result {
@@ -82,15 +89,19 @@ impl ProxyRotator {
         });
 
         let mut events = Vec::new();
-        drain_checks(tasks, |proxy, ok| {
-            if ok {
+        drain_checks(tasks, |proxy, result| match result {
+            Ok(()) => {
                 self.record_success(&proxy);
                 events.push(ProbeEvent::Recovered { proxy });
-            } else if let Some(quarantined_for) = self.record_hard_failure(&proxy) {
-                events.push(ProbeEvent::StillDown {
-                    proxy,
-                    quarantined_for,
-                });
+            }
+            Err(reason) => {
+                if let Some(quarantined_for) = self.record_hard_failure(&proxy) {
+                    events.push(ProbeEvent::StillDown {
+                        proxy,
+                        quarantined_for,
+                        reason,
+                    });
+                }
             }
         })
         .await;
@@ -104,13 +115,16 @@ impl ProxyRotator {
         });
 
         let mut events = Vec::new();
-        drain_checks(tasks, |proxy, ok| {
-            if !ok && !self.is_quarantined(&proxy) {
-                if let Some(quarantined_for) = self.quarantine_now(&proxy) {
-                    events.push(ProbeEvent::QuarantinedAtStart {
-                        proxy,
-                        quarantined_for,
-                    });
+        drain_checks(tasks, |proxy, result| {
+            if let Err(reason) = result {
+                if !self.is_quarantined(&proxy) {
+                    if let Some(quarantined_for) = self.quarantine_now(&proxy) {
+                        events.push(ProbeEvent::QuarantinedAtStart {
+                            proxy,
+                            quarantined_for,
+                            reason,
+                        });
+                    }
                 }
             }
         })
@@ -138,11 +152,11 @@ mod tests {
             if proxy.port == 30_001 {
                 panic!("synthetic task failure");
             }
-            false
+            Err("down".to_owned())
         });
         let mut completed = 0;
-        drain_checks(tasks, |_, reachable| {
-            assert!(!reachable);
+        drain_checks(tasks, |_, result| {
+            assert_eq!(result, Err("down".to_owned()));
             completed += 1;
         })
         .await;
@@ -162,14 +176,14 @@ mod tests {
             let barrier = Arc::clone(&barrier_for_check);
             async move {
                 barrier.wait().await;
-                false
+                Err("down".to_owned())
             }
         });
         let mut completed = 0;
         timeout(
             Duration::from_secs(2),
             drain_checks(tasks, |_, result| {
-                assert!(!result);
+                assert!(result.is_err());
                 completed += 1;
             }),
         )
