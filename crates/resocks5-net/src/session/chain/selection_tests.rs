@@ -1,8 +1,10 @@
 use super::{ChainPlan, GateLevels};
+use crate::rating::{QuarantinePolicy, RatingPolicy};
 use crate::rotator::ProxyRotator;
 use crate::types::{ChainKey, ProxyConfig};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn p(host: &str) -> ProxyConfig {
     ProxyConfig::socks5(host, 1080)
@@ -14,6 +16,19 @@ fn r(names: &[&str]) -> Arc<ProxyRotator> {
     ))
 }
 
+fn quarantining(proxy: ProxyConfig) -> Arc<ProxyRotator> {
+    Arc::new(
+        ProxyRotator::try_with_quarantine(
+            vec![proxy],
+            RatingPolicy::default(),
+            QuarantinePolicy::default().with_threshold(1),
+            16,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    )
+}
+
 fn key(proxy: ProxyConfig) -> ChainKey {
     ChainKey::new(Arc::new(ProxyConfig::chain([Arc::new(proxy)]).unwrap()))
 }
@@ -22,8 +37,8 @@ fn key(proxy: ProxyConfig) -> ChainKey {
 fn resolve_requires_exact_chain_identity_shape_and_returns_matching_rotators() {
     let gate_proxy = p("gate").with_auth("g-user", "g-pass").with_gate_level(3);
     let exit_proxy = p("exit").with_auth("e-user", "e-pass");
-    let gate = Arc::new(ProxyRotator::new(vec![gate_proxy.clone()]));
-    let exit = Arc::new(ProxyRotator::new(vec![exit_proxy.clone()]));
+    let gate = quarantining(gate_proxy.clone());
+    let exit = quarantining(exit_proxy.clone());
     let levels = GateLevels::new(vec![(3, gate.clone())]);
     let config =
         ProxyConfig::chain([Arc::new(gate_proxy.clone()), Arc::new(exit_proxy.clone())]).unwrap();
@@ -144,8 +159,8 @@ fn resolve_requires_exact_chain_identity_shape_and_returns_matching_rotators() {
         4
     );
 
-    let unaccounted_gate = Arc::new(ProxyRotator::new(vec![gate_proxy]));
-    let unaccounted_exit = Arc::new(ProxyRotator::new(vec![exit_proxy]));
+    let unaccounted_gate = quarantining(gate_proxy);
+    let unaccounted_exit = quarantining(exit_proxy);
     gate.quarantine_now(&resolved.hops()[0].proxy);
     exit.quarantine_now(&resolved.hops()[1].proxy);
     unaccounted_gate.quarantine_now(&resolved.hops()[0].proxy);
