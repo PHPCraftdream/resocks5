@@ -1,6 +1,7 @@
 pub(crate) mod bootstrap;
 mod connect;
 mod handle;
+pub(crate) mod health;
 mod run_server;
 mod tunnel;
 

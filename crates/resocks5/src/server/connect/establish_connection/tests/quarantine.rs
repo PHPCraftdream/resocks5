@@ -484,3 +484,41 @@ async fn a_late_loser_leaves_the_winners_sticky_link() {
         (live.host.as_str(), live.port)
     );
 }
+
+#[tokio::test]
+async fn upstreams_dead_before_a_restart_are_not_tried_after_it() {
+    use crate::server::health;
+    let dead = socks5_config(SocketAddr::from(([192, 0, 2, 1], 9)), false);
+    let live = socks5_config(spawn_socks5_stub().await, false);
+    let long = |proxies: Vec<resocks5_net::types::ProxyConfig>| {
+        Arc::new(
+            ProxyRotator::try_with_quarantine(
+                proxies,
+                Default::default(),
+                QuarantinePolicy::default().with_threshold(1),
+                16,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        )
+    };
+    // The previous run found `dead` down and saved it.
+    let before = long(vec![dead.clone(), live.clone()]);
+    assert!(before.record_hard_failure(&dead).is_some());
+    let dir = std::env::temp_dir().join(format!("resocks5_health_e2e_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("health.ktav");
+    health::save_now(std::slice::from_ref(&before), &path);
+
+    // The new process starts with the memory of it.
+    let after = long(vec![dead.clone(), live.clone()]);
+    let resumed = health::resume(std::slice::from_ref(&after), &path, health::unix_now());
+    assert_eq!(resumed.restored.quarantined, 1);
+    assert!(after.is_quarantined(&dead));
+    // TEST-NET-1 never answers: any attempt on it would cost the hedge delay.
+    for i in 0..6 {
+        let took = request(&after, &format!("r{i}.example.com:443")).await;
+        assert!(took < Duration::from_secs(1), "request waited {took:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

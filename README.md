@@ -447,6 +447,7 @@ the working directory, all auto-created on first launch:
 |------|---------|
 | `resocks5.main.ktav` | server settings: port, auth, logging, pool, network/sand-rating, TLS fragmentation, banned patterns, `allowed_clients` |
 | `resocks5.proxy_list.ktav` | upstream proxies, grouped by transport and IP family |
+| `resocks5.health.ktav` | written by the server, not by hand: which upstreams were dead, so a restart goes straight to background probes instead of rediscovering them (`network.health_save_sec`, `0` = off) |
 | `resocks5.users.ktav` | Пользователи: пароли и флаги — через `resocks5 users …`; `allowed_clients` — вручную при остановленном сервере |
 
 Print the **full field reference** — every option, its default, and behaviour

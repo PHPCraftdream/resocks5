@@ -17,11 +17,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::rating::{QuarantinePolicy, RatingError, RatingPolicy, Ratings};
+use crate::rating::{Health, QuarantinePolicy, RatingError, RatingPolicy, Ratings};
 use crate::types::ProxyConfig;
 
 mod probe;
 pub use probe::ProbeEvent;
+
+/// A saved quarantine record of one upstream; see [`ProxyRotator::health`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct UpstreamHealth {
+    /// The upstream the record belongs to.
+    pub proxy: Arc<ProxyConfig>,
+    /// Its quarantine record.
+    pub health: Health,
+}
+
+impl UpstreamHealth {
+    /// Pair an upstream with its record.
+    #[must_use]
+    pub fn new(proxy: Arc<ProxyConfig>, health: Health) -> Self {
+        Self { proxy, health }
+    }
+}
 
 /// Error returned when a [`ProxyRotator`] cannot be constructed.
 #[derive(Debug, Clone, PartialEq)]
@@ -503,6 +521,33 @@ impl ProxyRotator {
     pub fn is_quarantined(&self, proxy: &ProxyConfig) -> bool {
         self.index_of(proxy)
             .is_some_and(|i| self.ratings.is_quarantined(i))
+    }
+
+    /// Quarantine records of every upstream, in configuration order — what
+    /// to save so a restart can resume without relearning which ones are dead.
+    pub fn health(&self) -> Vec<UpstreamHealth> {
+        self.proxies
+            .iter()
+            .zip(self.ratings.health())
+            .map(|(proxy, health)| UpstreamHealth {
+                proxy: proxy.clone(),
+                health,
+            })
+            .collect()
+    }
+
+    /// Re-create saved quarantines; meant for start-up, it overwrites the
+    /// matching slots. Entries for unknown upstreams and `Alive` ones are
+    /// skipped. Returns how many upstreams were put back into quarantine
+    /// (always `0` without a quarantine policy).
+    pub fn restore_health(&self, entries: &[UpstreamHealth]) -> usize {
+        entries
+            .iter()
+            .filter(|entry| {
+                self.index_of(&entry.proxy)
+                    .is_some_and(|i| self.ratings.restore_health(i, &entry.health))
+            })
+            .count()
     }
 
     /// Record a success for the given proxy in the sand model. Also lifts

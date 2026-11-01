@@ -24,6 +24,10 @@ What's inside:
   `pick_order` and the sticky cache for a doubling backoff while healthy
   upstreams exist; then `take_probes` hands it out for an out-of-band check
   (`record_success` / `record_hard_failure`). Client orders never wait on it. Without it the sand weights alone apply.
+  `ProxyRotator::health` / `restore_health` export and re-create the
+  quarantine picture (`UpstreamHealth`, `rating::{Health, UpstreamState}`) so a
+  restart need not rediscover dead upstreams; it holds durations only — the
+  caller saves it and subtracts the downtime.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
 
 No application concerns leak in: no config-file format, logger, credential

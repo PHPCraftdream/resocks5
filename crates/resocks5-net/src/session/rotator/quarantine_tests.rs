@@ -1,4 +1,5 @@
 use super::*;
+use crate::rating::UpstreamState;
 
 fn proxy(host: &str) -> ProxyConfig {
     ProxyConfig::socks5(host, 1080)
@@ -109,4 +110,90 @@ fn constructors_without_quarantine_never_exclude() {
         assert_eq!(r.record_hard_failure(&p), None);
     }
     assert_eq!(r.pick_order().len(), 2);
+}
+
+fn find(health: &[UpstreamHealth], host: &str) -> UpstreamHealth {
+    health
+        .iter()
+        .find(|entry| entry.proxy.host == host)
+        .cloned()
+        .unwrap()
+}
+
+#[test]
+fn health_lists_every_upstream_in_configuration_order() {
+    let r = rotator(&["a", "b", "c"]);
+    trip(&r, &proxy("b"));
+    let health = r.health();
+    let hosts: Vec<_> = health.iter().map(|e| e.proxy.host.as_str()).collect();
+    assert_eq!(hosts, ["a", "b", "c"]);
+    assert_eq!(health[0].health.state, UpstreamState::Alive);
+    assert_eq!(health[1].health.state, UpstreamState::Quarantined);
+    assert!(health[1].health.remaining > Duration::ZERO);
+    assert_eq!(health[1].health.trips, 1);
+    assert_eq!(health[2].health.state, UpstreamState::Alive);
+}
+
+#[test]
+fn restored_quarantine_keeps_the_dead_out_of_rotation_and_probes_probation() {
+    let before = rotator(&["a", "b", "c"]);
+    trip(&before, &proxy("a"));
+    let saved = before.health();
+    let mut probation = find(&saved, "a");
+    probation.proxy = Arc::new(proxy("b"));
+    probation.health = Health::new(UpstreamState::Probation, Duration::ZERO, 2, 3);
+
+    let after = rotator(&["a", "b", "c"]);
+    let applied = after.restore_health(&[find(&saved, "a"), probation, find(&saved, "c")]);
+    assert_eq!(applied, 2);
+    assert!(after.is_quarantined(&proxy("a")));
+    assert!(after.is_quarantined(&proxy("b")));
+    assert!(!after.is_quarantined(&proxy("c")));
+    for _ in 0..50 {
+        let order = after.pick_order();
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].host, "c");
+    }
+    let probes = after.take_probes();
+    assert_eq!(probes.len(), 1);
+    assert_eq!(probes[0].host, "b");
+}
+
+#[test]
+fn restore_skips_unknown_upstreams_and_keeps_trips_for_the_backoff() {
+    let r = rotator(&["a"]);
+    let stranger = UpstreamHealth::new(
+        Arc::new(proxy("zzz")),
+        Health::new(UpstreamState::Quarantined, Duration::from_secs(5), 1, 3),
+    );
+    let known = UpstreamHealth::new(
+        Arc::new(proxy("a")),
+        Health::new(UpstreamState::Quarantined, Duration::from_secs(5), 3, 3),
+    );
+    assert_eq!(r.restore_health(&[stranger, known]), 1);
+    assert_eq!(r.health()[0].health.trips, 3);
+}
+
+#[test]
+fn a_success_lifts_a_restored_quarantine() {
+    let r = rotator(&["a", "b"]);
+    let saved = UpstreamHealth::new(
+        Arc::new(proxy("a")),
+        Health::new(UpstreamState::Probation, Duration::ZERO, 2, 3),
+    );
+    assert_eq!(r.restore_health(&[saved]), 1);
+    r.record_success(&proxy("a"));
+    assert!(!r.is_quarantined(&proxy("a")));
+    assert_eq!(r.health()[0].health.trips, 0);
+}
+
+#[test]
+fn restore_without_a_quarantine_policy_applies_nothing() {
+    let r = ProxyRotator::new(vec![proxy("a")]);
+    let saved = UpstreamHealth::new(
+        Arc::new(proxy("a")),
+        Health::new(UpstreamState::Probation, Duration::ZERO, 1, 3),
+    );
+    assert_eq!(r.restore_health(&[saved]), 0);
+    assert!(!r.is_quarantined(&proxy("a")));
 }

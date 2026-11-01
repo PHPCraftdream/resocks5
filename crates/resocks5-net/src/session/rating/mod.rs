@@ -11,12 +11,14 @@
 //! upstream from the selection order for a backoff period after repeated hard
 //! failures (see [`Ratings::on_hard_failure`]), while healthy upstreams exist.
 
+pub mod health;
 pub mod policy;
 pub mod quarantine;
 pub mod rng;
 pub mod sand;
 pub mod select;
 
+pub use health::{Health, UpstreamState};
 pub use policy::{RatingError, RatingPolicy};
 pub use quarantine::QuarantinePolicy;
 pub use rng::SmallRng;

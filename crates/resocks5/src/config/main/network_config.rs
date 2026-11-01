@@ -154,6 +154,15 @@ pub struct NetworkConfig {
     #[serde(default = "default_hedge_delay_ms")]
     pub hedge_delay_ms: u64,
 
+    /// Seconds between saves of the upstream health picture (which are
+    /// quarantined, for how long) to `resocks5.health.ktav`; it is also saved
+    /// on a clean shutdown. At start the file is read back, so dead upstreams
+    /// go straight to the background probes instead of being rediscovered by
+    /// client requests. `0` disables saving and loading. Has no effect while
+    /// `quarantine_threshold` is `0`.
+    #[serde(default = "default_health_save_sec")]
+    pub health_save_sec: u64,
+
     /// Recover the original hostname from the client's first payload
     /// when the CONNECT target is a bare IP literal.
     ///
@@ -234,6 +243,9 @@ fn default_quarantine_max_sec() -> u64 {
 fn default_hedge_delay_ms() -> u64 {
     2000
 }
+fn default_health_save_sec() -> u64 {
+    30
+}
 fn default_recover_host_from_payload() -> bool {
     true
 }
@@ -260,6 +272,7 @@ impl Default for NetworkConfig {
             quarantine_initial_sec: default_quarantine_initial_sec(),
             quarantine_max_sec: default_quarantine_max_sec(),
             hedge_delay_ms: default_hedge_delay_ms(),
+            health_save_sec: default_health_save_sec(),
             recover_host_from_payload: default_recover_host_from_payload(),
         }
     }
@@ -295,6 +308,7 @@ mod tests {
         assert_eq!(d.quarantine_initial_sec, 30);
         assert_eq!(d.quarantine_max_sec, 600);
         assert_eq!(d.hedge_delay_ms, 2000);
+        assert_eq!(d.health_save_sec, 30);
         assert!(d.recover_host_from_payload);
     }
 
@@ -327,6 +341,7 @@ mod tests {
         assert_eq!(default_quarantine_initial_sec(), d.quarantine_initial_sec);
         assert_eq!(default_quarantine_max_sec(), d.quarantine_max_sec);
         assert_eq!(default_hedge_delay_ms(), d.hedge_delay_ms);
+        assert_eq!(default_health_save_sec(), d.health_save_sec);
         assert_eq!(
             default_recover_host_from_payload(),
             d.recover_host_from_payload

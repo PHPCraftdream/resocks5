@@ -154,6 +154,18 @@ pub(super) fn group_gate_levels<P: GateSplit>(
     }
     levels
 }
+/// Every rotator: all gate levels, then v6 and v4 exits.
+pub(super) fn all_rotators(
+    gates: &GateLevels,
+    exits: &[Option<Arc<ProxyRotator>>],
+) -> Vec<Arc<ProxyRotator>> {
+    gates
+        .iter()
+        .map(|(_, rotator)| Arc::clone(rotator))
+        .chain(exits.iter().filter_map(Option::as_ref).map(Arc::clone))
+        .collect()
+}
+
 /// Rotators dialed directly by the pool path: outermost gate, then exits.
 pub(super) fn directly_dialed_rotators(
     gates: &GateLevels,
@@ -450,6 +462,21 @@ pub(super) async fn run_server_inner() -> Result<()> {
         });
     }
 
+    // Dead upstreams of the previous run go straight to quarantine/probation.
+    let health_rotators = all_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
+    let health_path = std::path::PathBuf::from(crate::config::HEALTH_PATH);
+    let health_saver = (cfg_main.network.health_save_sec > 0
+        && cfg_main.network.quarantine_threshold > 0)
+        .then(|| {
+            server::health::start(
+                health_rotators.clone(),
+                health_path.clone(),
+                Duration::from_secs(cfg_main.network.health_save_sec),
+                Duration::from_secs(cfg_main.network.connect_timeout_sec.clamp(1, 3)),
+                logger.clone(),
+            )
+        });
+
     // In the background: the listener must bind at once, a refused
     // connection makes browsers mark the proxy failed for a long time.
     if cfg_main.network.quarantine_threshold > 0 {
@@ -486,6 +513,11 @@ pub(super) async fn run_server_inner() -> Result<()> {
         Some(allowed_clients),
     )
     .await;
+
+    if let Some(saver) = health_saver {
+        saver.abort();
+        server::health::save_now(&health_rotators, &health_path);
+    }
 
     // Flush whatever is still queued — run_server's own shutdown lines
     // included — before the runtime tears down: drop the last

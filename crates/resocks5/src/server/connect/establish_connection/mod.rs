@@ -24,3 +24,4 @@ mod tests_quarantine;
 mod tests_unit;
 
 pub use dial::establish_connection;
+pub(crate) use route::spawn_due_probes;

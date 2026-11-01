@@ -17,6 +17,9 @@ resocks5.main.ktav, resocks5.proxy_list.ktav и resocks5.users.ktav в теку�
 каталоге запуска, независимо от расположения бинарника. Нужен upstream
 либо хотя бы один включённый direct-пользователь. Gate-аккаунты с более высоким
 уровнем идут первыми; выходные upstream остаются последним уровнем.
+Сервер сам ведёт resocks5.health.ktav: какие upstream были мертвы. После
+перезапуска они сразу уходят в фоновую проверку, а не ловят клиентские запросы
+(network.health_save_sec, 0 отключает).
 
 Есть auth, каскадные IP-фильтры, banned_patterns, таймауты и лимиты,
 TCP keepalive, pre-connect pool, recovery SNI/Host, TLS fragmentation и логи.

@@ -46,7 +46,7 @@ pub(super) fn record_proxy_failure(
         });
     }
 }
-pub(super) fn spawn_due_probes(
+pub(crate) fn spawn_due_probes(
     rotator: &Arc<ProxyRotator>,
     logger: &Arc<Logger>,
     connect_timeout: std::time::Duration,

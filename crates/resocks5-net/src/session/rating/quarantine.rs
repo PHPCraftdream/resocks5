@@ -197,6 +197,38 @@ impl Cell {
         length
     }
 
+    /// Persistable view: state, quarantine time left, trips, failure streak.
+    pub(super) fn snapshot(&self, now: Instant) -> (State, Duration, u32, u32) {
+        let state = self.state(now);
+        let left = match (state, self.until) {
+            (State::Quarantined, Some(until)) => until.saturating_duration_since(now),
+            _ => Duration::ZERO,
+        };
+        (state, left, self.trips, self.consecutive)
+    }
+
+    /// Re-create a saved quarantine: `Quarantined` for `left` more (capped by
+    /// the policy maximum), anything else non-healthy on probation at once.
+    pub(super) fn restore(
+        &mut self,
+        quarantined: bool,
+        left: Duration,
+        trips: u32,
+        consecutive: u32,
+        now: Instant,
+        policy: &QuarantinePolicy,
+    ) {
+        let left = if quarantined {
+            left.min(policy.max)
+        } else {
+            Duration::ZERO
+        };
+        self.lease_until = None;
+        self.trips = trips.max(1);
+        self.consecutive = consecutive.max(policy.threshold);
+        self.until = Some(now.checked_add(left).unwrap_or(now));
+    }
+
     /// A success proves the upstream alive: forget everything.
     pub(super) fn success(&mut self) {
         *self = Cell::default();

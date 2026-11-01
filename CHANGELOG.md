@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The server remembers which upstreams are dead across restarts: the quarantine
+  picture (state, time left, trips) is saved to `resocks5.health.ktav` every
+  `network.health_save_sec` seconds (default 30, only when it changed) and on a
+  clean shutdown, and read back at start. Dead upstreams return quarantined, or
+  on probation when their time ran out meanwhile, so client requests do not
+  rediscover them — the background probes decide. `0` disables it; passwords
+  are never written; an unreadable file is ignored with a warning.
+- SDK: `ProxyRotator::health` / `restore_health`, `UpstreamHealth`,
+  `rating::{Health, UpstreamState}`, `Ratings::health` / `restore_health` — a
+  wall-clock-free snapshot of the quarantine bookkeeping to save and put back.
 - SDK: `connect::connect_hedged` (feature `pool`) with `HedgeOptions`,
   `AttemptReport`/`AttemptOutcome`, `Hedged`, `HedgeError` — the ordered hedged
   race over a candidate list (next attempt only while none is past TCP connect,

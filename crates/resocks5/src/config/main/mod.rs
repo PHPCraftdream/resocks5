@@ -8,6 +8,6 @@ mod tls_fragment_config;
 pub use auth_config::AuthConfig;
 pub use file_log_config::FileLogConfig;
 pub use main_config::MainConfig;
-pub use main_path::MAIN_PATH;
+pub use main_path::{HEALTH_PATH, MAIN_PATH};
 pub use network_config::NetworkConfig;
 pub use tls_fragment_config::TlsFragmentConfig;

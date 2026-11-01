@@ -654,3 +654,19 @@ async fn shutdown_drain_gives_up_on_never_completing_drain() {
         start.elapsed()
     );
 }
+
+#[test]
+fn all_rotators_lists_every_gate_level_then_exits() {
+    use resocks5_net::chain::GateLevels;
+    use resocks5_net::rotator::ProxyRotator;
+    let rotator = |host: &str| Arc::new(ProxyRotator::new(vec![ProxyConfig::socks5(host, 1080)]));
+    let gates = GateLevels::new(vec![(1, rotator("gate-low")), (3, rotator("gate-high"))]);
+    let exits = [Some(rotator("exit-v6")), None, Some(rotator("exit-v4"))];
+    let hosts = super::startup::all_rotators(&gates, &exits)
+        .iter()
+        .flat_map(|r| r.all_proxies())
+        .map(|p| p.host.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(hosts, vec!["gate-high", "gate-low", "exit-v6", "exit-v4"]);
+    assert!(super::startup::all_rotators(&GateLevels::default(), &[None, None]).is_empty());
+}

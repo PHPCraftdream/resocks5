@@ -8,6 +8,9 @@
 //! resocks5.users.ktav       — users (managed by CLI; do not edit by hand)
 //! ```
 //!
+//! A fourth file, `resocks5.health.ktav`, is written by the server itself:
+//! the saved quarantine picture of the upstreams (never edit it by hand).
+//!
 //! Old layouts (`resocks5.conf` + `socks5_ipv4_list.txt` /
 //! `socks5_ipv6_list.txt`) are migrated automatically on first launch
 //! when the new files don't exist yet.
@@ -28,7 +31,7 @@ pub use main::FileLogConfig;
 pub use main::MainConfig;
 pub use main::NetworkConfig;
 pub use main::TlsFragmentConfig;
-pub use main::MAIN_PATH;
+pub use main::{HEALTH_PATH, MAIN_PATH};
 pub use proxy_list::ProxyListConfig;
 pub use proxy_list::PROXY_LIST_PATH;
 pub(crate) use users::users_file;

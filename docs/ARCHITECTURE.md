@@ -190,6 +190,16 @@ is the hard layer on top:
 Failures that land while an upstream is already quarantined (requests that
 started before the trip) are ignored, so they cannot inflate the backoff.
 
+The picture survives restarts. `ProxyRotator::health` exports each upstream's
+state, quarantine time left (a duration, never a wall-clock time), trips and
+failure streak; `restore_health` puts them back (`Quarantined` for the
+remainder, anything else non-healthy on probation at once, remainder capped by
+`quarantine_max_sec`). The application owns the file and the clock:
+`server/health` saves `resocks5.health.ktav` when the picture changes and at
+shutdown, and at start subtracts the downtime from each remaining time before
+restoring, then starts the due probes. Sand weights are not persisted — they
+decay within seconds anyway.
+
 ### Code map
 
 | Concern | File |
@@ -345,6 +355,10 @@ with sensible defaults:
   and IP family
 - `resocks5.users.ktav` — client users; managed by `resocks5 users …`,
   never edit by hand
+
+The server also writes `resocks5.health.ktav` itself (the saved quarantine
+picture of the upstreams, see `network.health_save_sec`); it is not
+configuration.
 
 `resocks5 config` prints the authoritative field reference. KTAV supports
 `##`-prefixed comment lines, but `resocks5` itself never writes them — the
