@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SDK: `connect::connect_hedged` (feature `pool`) with `HedgeOptions`,
+  `AttemptReport`/`AttemptOutcome`, `Hedged`, `HedgeError` — the ordered hedged
+  race over a candidate list (next attempt only while none is past TCP connect,
+  late attempts stop before CONNECT, losers drain in the background and are
+  reported through `on_attempt`). The server's direct race now uses it.
 - Parallel fallback attempt (`network.hedge_delay_ms`, default 2000): an upstream
   attempt whose TCP connect is still pending after this delay no longer holds
   the request — the next candidate starts beside it and the first success wins.

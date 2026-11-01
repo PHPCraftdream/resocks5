@@ -121,4 +121,13 @@ fn pool_api_is_send() {
         Duration::from_secs(1),
         None,
     ));
+    let candidates = vec![std::sync::Arc::new(proxy.clone())];
+    future_is_send(resocks5_net::connect::connect_hedged(
+        &candidates,
+        "example.com:80",
+        &std::sync::Arc::new(pool),
+        None,
+        &resocks5_net::connect::HedgeOptions::default(),
+        |_| {},
+    ));
 }

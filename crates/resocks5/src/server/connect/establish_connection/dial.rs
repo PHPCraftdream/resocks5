@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,7 +11,7 @@ use crate::config::NetworkConfig;
 use crate::logger::Logger;
 use crate::server::print_cfg;
 use resocks5_net::chain::{ChainPlan, GateLevels};
-use resocks5_net::connect::connect_proxy_on;
+use resocks5_net::connect::{connect_hedged, AttemptOutcome, AttemptReport, HedgeOptions};
 use resocks5_net::pool::{AnyUpstream, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ChainKey, ProxyConfig};
@@ -300,85 +299,35 @@ pub async fn establish_connection(
     }
 
     let hedge_delay = Duration::from_millis(network.hedge_delay_ms);
-    let mut pending = candidates.into_iter();
-    let mut launched: Vec<Candidate> = Vec::new();
-    let mut running: Attempts = tokio::task::JoinSet::new();
-    let race = Arc::new(RaceState::default());
-    let mut hedge_at = tokio::time::Instant::now();
-    let launch = |running: &mut Attempts, launched: &mut Vec<Candidate>, candidate: Candidate| {
-        let id = launched.len();
-        let target = target_addr.to_string();
-        let pool = pool.clone();
-        let tls = tls_connector.cloned();
-        let proxy = candidate.proxy.clone();
-        let race = race.clone();
-        running.spawn(async move {
-            let t0 = Instant::now();
-            let result = race_attempt(
-                &race,
-                &target,
-                &proxy,
-                &pool,
-                handshake_timeout,
-                tls.as_ref(),
-            )
-            .await;
-            (id, result, t0.elapsed())
-        });
-        launched.push(candidate);
-    };
-    loop {
-        if running.is_empty() {
-            match pending.next() {
-                Some(candidate) => {
-                    attempts += 1;
-                    launch(&mut running, &mut launched, candidate);
-                    hedge_at = tokio::time::Instant::now() + hedge_delay;
-                }
-                None => break,
-            }
-        }
-        let can_hedge = !hedge_delay.is_zero() && pending.len() > 0;
-        tokio::select! {
-            joined = running.join_next() => {
-                let Some(Ok((id, result, elapsed))) = joined else {
-                    continue;
-                };
-                let outcome = settle_attempt(&launched[id], result, elapsed, true, target_addr, logger, &ctag);
-                if let Some(stream) = outcome {
-                    race.won.store(true, Ordering::Release);
-                    let launched = Arc::new(launched);
-                    let logger = logger.clone();
-                    let target = target_addr.to_string();
-                    let ctag = ctag.clone();
-                    tokio::spawn(async move {
-                        while let Some(joined) = running.join_next().await {
-                            if let Ok((id, result, elapsed)) = joined {
-                                drop(settle_attempt(&launched[id], result, elapsed, false, &target, &logger, &ctag));
-                            }
-                        }
-                    });
-                    return Ok(stream);
-                }
-            }
-            _ = tokio::time::sleep_until(hedge_at), if can_hedge => {
-                hedge_at = tokio::time::Instant::now() + hedge_delay;
-                // An attempt talking to the target holds the race.
-                if race.handshaking.load(Ordering::Acquire) == 0 {
-                    if let Some(candidate) = pending.next() {
-                        attempts += 1;
-                        launch(&mut running, &mut launched, candidate);
-                    }
-                }
-            }
-        }
+    let proxies: Vec<_> = candidates
+        .iter()
+        .map(|candidate| candidate.proxy.clone())
+        .collect();
+    let candidates = Arc::new(candidates);
+    let logger = logger.clone();
+    let target = target_addr.to_owned();
+    let ctag = ctag.clone();
+    match connect_hedged(
+        &proxies,
+        target_addr,
+        pool,
+        tls_connector,
+        &HedgeOptions::default()
+            .with_hedge_delay(hedge_delay)
+            .with_handshake_timeout(handshake_timeout),
+        move |report: &AttemptReport| {
+            report_attempt(&candidates[report.index], report, &target, &logger, &ctag);
+        },
+    )
+    .await
+    {
+        Ok(hedged) => Ok(hedged.stream),
+        Err(error) => Err(anyhow!(
+            "All {} upstream attempts to {} failed",
+            attempts + error.attempts,
+            target_addr
+        )),
     }
-
-    Err(anyhow!(
-        "All {} upstream attempts to {} failed",
-        attempts,
-        target_addr
-    ))
 }
 
 /// One upstream a request may race through.
@@ -389,100 +338,55 @@ struct Candidate {
     cached: bool,
 }
 
-type Attempts = tokio::task::JoinSet<(usize, anyhow::Result<AnyUpstream>, std::time::Duration)>;
-
-/// Shared by the attempts of one race.
-#[derive(Default)]
-pub(super) struct RaceState {
-    /// Set once an attempt won.
-    pub(super) won: AtomicBool,
-    /// Attempts past their TCP connect, talking to the target.
-    pub(super) handshaking: AtomicUsize,
-}
-
-/// An attempt that reached its upstream after the race was already won;
-/// it stops before asking the upstream for the target.
-#[derive(Debug)]
-pub(super) struct RaceLost;
-
-impl std::fmt::Display for RaceLost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("race already won by another upstream")
-    }
-}
-
-impl std::error::Error for RaceLost {}
-
-/// One direct attempt: TCP connect to the upstream, then — unless the race
-/// is already won — the protocol handshake to the target.
-pub(super) async fn race_attempt(
-    race: &RaceState,
-    target_addr: &str,
-    proxy: &ProxyConfig,
-    pool: &ProxyPool,
-    handshake_timeout: Duration,
-    tls_connector: Option<&TlsConnector>,
-) -> anyhow::Result<AnyUpstream> {
-    let stream = pool.acquire(proxy).await.map_err(anyhow::Error::new)?;
-    if race.won.load(Ordering::Acquire) {
-        return Err(RaceLost.into());
-    }
-    race.handshaking.fetch_add(1, Ordering::AcqRel);
-    let result = connect_proxy_on(stream, target_addr, proxy, handshake_timeout, tls_connector)
-        .await
-        .map_err(anyhow::Error::new);
-    race.handshaking.fetch_sub(1, Ordering::AcqRel);
-    result
-}
-
-/// Log a finished race attempt and feed it into the ratings. Returns the
-/// stream on success (the caller either uses it or drops it).
-///
-/// `in_race` is false for attempts that finish after another one won: they
-/// still feed the ratings but leave the target's sticky link alone.
-fn settle_attempt(
+fn report_attempt(
     candidate: &Candidate,
-    result: anyhow::Result<AnyUpstream>,
-    elapsed: std::time::Duration,
-    in_race: bool,
+    report: &AttemptReport,
     target_addr: &str,
     logger: &Arc<Logger>,
     ctag: &str,
-) -> Option<AnyUpstream> {
+) {
     let Candidate {
         rotator,
         proxy,
         cached,
     } = candidate;
     let path = if *cached { "cache" } else { "direct" };
-    let ms = elapsed.as_millis();
-    match result {
-        Ok(stream) => {
+    let ms = report.elapsed.as_millis();
+    match &report.outcome {
+        AttemptOutcome::Won => {
             logger.attempt(|| {
                 format!(
-                    "attempt target={} via={} path={} outcome={} dur={}ms{}",
+                    "attempt target={} via={} path={} outcome=ok dur={}ms{}",
                     target_addr,
                     print_cfg(proxy),
                     path,
-                    if in_race { "ok" } else { "ok-late" },
                     ms,
                     ctag
                 )
             });
             rotator.record_success(proxy);
-            if !in_race {
-                return None;
-            }
-            if *cached {
+            if !report.after_win && *cached {
                 logger.cache_hit(|| format!("Cache used for {}{}", target_addr, ctag));
-            } else {
+            } else if !report.after_win {
                 rotator.link_proxy(target_addr.to_string(), proxy.clone());
                 logger
                     .cache_write(|| format!("Cache written for {} directly{}", target_addr, ctag));
             }
-            Some(stream)
         }
-        Err(e) if e.is::<RaceLost>() => {
+        AttemptOutcome::LateSuccess => {
+            logger.attempt(|| {
+                format!(
+                    "attempt target={} via={} path={} outcome=ok-late dur={}ms{}",
+                    target_addr,
+                    print_cfg(proxy),
+                    path,
+                    ms,
+                    ctag
+                )
+            });
+            rotator.record_success(proxy);
+        }
+        AttemptOutcome::Lost => {
             logger.attempt(|| {
                 format!(
                     "attempt target={} via={} path={} outcome=lost dur={}ms{}",
@@ -493,9 +397,8 @@ fn settle_attempt(
                     ctag
                 )
             });
-            None
         }
-        Err(e) => {
+        AttemptOutcome::Failed(error) => {
             logger.attempt(|| {
                 format!(
                     "attempt target={} via={} path={} outcome=fail dur={}ms err={}{}",
@@ -503,16 +406,20 @@ fn settle_attempt(
                     print_cfg(proxy),
                     path,
                     ms,
-                    e,
+                    error,
                     ctag
                 )
             });
             if *cached {
                 logger.proxy_failure(|| {
-                    format!("Cached proxy failed: {} - {}{}", e, print_cfg(proxy), ctag)
+                    format!(
+                        "Cached proxy failed: {} - {}{}",
+                        error,
+                        print_cfg(proxy),
+                        ctag
+                    )
                 });
-                // After the win the link already names the winner.
-                if in_race {
+                if !report.after_win {
                     rotator.unlink_proxy(target_addr);
                 }
             } else {
@@ -520,16 +427,25 @@ fn settle_attempt(
                     format!(
                         "Failed direct: {} - {} - {}{}",
                         target_addr,
-                        e,
+                        error,
                         print_cfg(proxy),
                         ctag,
                     )
                 });
             }
-            if should_record_failure(&e) {
-                record_proxy_failure(rotator, proxy, &e, logger, ctag);
+            if should_record_connect_failure(error) {
+                record_proxy_failure(rotator, proxy, error, logger, ctag);
             }
-            None
         }
+        _ => logger.attempt(|| {
+            format!(
+                "attempt target={} via={} path={} outcome=unknown dur={}ms{}",
+                target_addr,
+                print_cfg(proxy),
+                path,
+                ms,
+                ctag
+            )
+        }),
     }
 }

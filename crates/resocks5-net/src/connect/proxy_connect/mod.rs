@@ -3,3 +3,5 @@
 pub mod connect_http_proxy;
 pub mod connect_proxy;
 pub mod connect_socks5_proxy;
+#[cfg(feature = "pool")]
+pub mod hedged;

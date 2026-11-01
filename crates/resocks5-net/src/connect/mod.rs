@@ -61,6 +61,10 @@ pub use dial::{dial, dial_chain, dial_plain, ChainError, ChainStage, DialOptions
 pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};
 pub use host_port::HostPort;
 pub use parse_proxy_str::{parse_proxy_str, ParseProxyError};
+#[cfg(feature = "pool")]
+pub use proxy_connect::hedged::{
+    connect_hedged, AttemptOutcome, AttemptReport, HedgeError, HedgeOptions, Hedged,
+};
 pub use recover_host::{parse_http_host, parse_sni};
 pub use tls_fragment::{send_possibly_fragmented, FragmentSpec};
 #[cfg(feature = "tls")]

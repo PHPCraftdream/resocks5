@@ -5,6 +5,7 @@ use resocks5_net::types::ProxyConfig;
 use resocks5_net::ConnectError;
 use std::sync::Arc;
 
+#[cfg(test)]
 pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
     if err
         .downcast_ref::<resocks5_net::pool::AtCapacity>()
@@ -15,6 +16,10 @@ pub(super) fn should_record_failure(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ConnectError>()
         .is_none_or(ConnectError::counts_against_upstream)
 }
+
+pub(super) fn should_record_connect_failure(err: &ConnectError) -> bool {
+    err.counts_against_upstream()
+}
 #[cfg(test)]
 pub(super) fn is_hard_failure(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ConnectError>()
@@ -23,26 +28,22 @@ pub(super) fn is_hard_failure(err: &anyhow::Error) -> bool {
 pub(super) fn record_proxy_failure(
     rotator: &ProxyRotator,
     proxy: &Arc<ProxyConfig>,
-    err: &anyhow::Error,
+    error: &ConnectError,
     logger: &Logger,
     ctag: &str,
 ) {
-    if !should_record_failure(err) {
+    if !should_record_connect_failure(error) {
         return;
     }
-    if let Some(error) = err.downcast_ref::<ConnectError>() {
-        if let Some(length) = rotator.record_error(proxy, error) {
-            logger.proxy_failure(|| {
-                format!(
-                    "Upstream {} is unreachable - quarantined for {}s{}",
-                    print_cfg(proxy),
-                    length.as_secs(),
-                    ctag
-                )
-            });
-        }
-    } else {
-        rotator.record_failure(proxy);
+    if let Some(length) = rotator.record_error(proxy, error) {
+        logger.proxy_failure(|| {
+            format!(
+                "Upstream {} is unreachable - quarantined for {}s{}",
+                print_cfg(proxy),
+                length.as_secs(),
+                ctag
+            )
+        });
     }
 }
 pub(super) fn spawn_due_probes(

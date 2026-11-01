@@ -484,31 +484,3 @@ async fn a_late_loser_leaves_the_winners_sticky_link() {
         (live.host.as_str(), live.port)
     );
 }
-
-#[tokio::test]
-async fn an_attempt_reaching_its_upstream_after_the_win_stops_there() {
-    let (addr, accepts, greetings) = spawn_observed_stub(Duration::ZERO).await;
-    let proxy = socks5_config(addr, false);
-    let pool = ProxyPool::new(Default::default(), Duration::from_secs(1), 4);
-    let race = RaceState::default();
-    race.won.store(true, Ordering::SeqCst);
-    let err = race_attempt(
-        &race,
-        "x.example.com:443",
-        &proxy,
-        &pool,
-        Duration::from_secs(1),
-        None,
-    )
-    .await
-    .err()
-    .expect("a lost race yields no stream");
-    assert!(err.is::<RaceLost>(), "unexpected error: {err}");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(accepts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        greetings.load(Ordering::SeqCst),
-        0,
-        "spoke to the upstream after the win"
-    );
-}
