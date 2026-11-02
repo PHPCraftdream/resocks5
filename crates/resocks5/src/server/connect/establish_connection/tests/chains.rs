@@ -621,7 +621,11 @@ async fn dead_outer_gates_fall_back_to_direct_exit() {
         Duration::from_secs(3),
         8,
     ));
+    // Windows answers a refused loopback connect only after ~2 s, so every
+    // dead gate costs the whole connect timeout: keep the budget small. Three
+    // gate attempts plus the one reserved for the direct exit.
     let network = Arc::new(crate::config::NetworkConfig {
+        max_upstream_attempts: 4,
         handshake_timeout_sec: 2,
         connect_timeout_sec: 1,
         ..Default::default()
