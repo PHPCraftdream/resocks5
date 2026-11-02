@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-02
+
 ### Added
 
 - A tunnel that ended with an I/O error now says which end broke it — `failed
@@ -104,27 +106,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   startup check cover only the outermost gate level and the exit proxies, and a
   quarantined inner gate is probed through a healthy outer prefix.
 
-### Changed
-
-- With a saved health picture (`resocks5.health.ktav`) the start-up TCP check of
-  all upstreams is skipped: the file already says who was dead, and a single
-  connect at the very first instant after a restart can fail for reasons of the
-  host (observed: every live upstream "unreachable" for 30 s). The check still
-  runs on the first start, when no file exists.
-
-- CI is segmented by diff: a push or PR runs only the segments its changed files
-  need, on ubuntu only, and only the SDK/app tests of the touched modules (feature
-  matrix, lean clippy/doc, lint, MSRV, docs, license checks, installers, portable
-  builds are selected the same way). The full run, with every segment and the
-  whole workspace on Linux, macOS and Windows, is explicit: `[ci: full]` in a
-  commit message or PR title, a manual run from Actions, a `v*` tag, or a change
-  to the CI definition. A single `ci result` check summarises the run for branch
-  protection. See `CONTRIBUTING.md`.
-
-## [0.3.1] - 2026-10-29
-
-### Added
-
 - `resocks5-net`: `connect::dial_chain` — a pool-free multi-hop dial that
   follows `ProxyConfig::gate` links (any depth, SOCKS5 / HTTP CONNECT / HTTPS
   at every hop, one TCP connection, per-hop handshake timeout, optional total
@@ -170,6 +151,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode (`users direct` / `users pool`) is documented and covered by tests.
 
 ### Changed
+
+- With a saved health picture (`resocks5.health.ktav`) the start-up TCP check of
+  all upstreams is skipped: the file already says who was dead, and a single
+  connect at the very first instant after a restart can fail for reasons of the
+  host (observed: every live upstream "unreachable" for 30 s). The check still
+  runs on the first start, when no file exists.
+
+- CI is segmented by diff: a push or PR runs only the segments its changed files
+  need, on ubuntu only, and only the SDK/app tests of the touched modules (feature
+  matrix, lean clippy/doc, lint, MSRV, docs, license checks, installers, portable
+  builds are selected the same way). The full run, with every segment and the
+  whole workspace on Linux, macOS and Windows, is explicit: `[ci: full]` in a
+  commit message or PR title, a manual run from Actions, a `v*` tag, or a change
+  to the CI definition. A single `ci result` check summarises the run for branch
+  protection. See `CONTRIBUTING.md`.
 
 - CI: the release workflow no longer publishes the `resocks5` binary crate to
   crates.io (the 0.3.0 note about `cargo install resocks5` was never realised:
@@ -807,8 +803,8 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.1...HEAD
-[0.3.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...v0.3.1
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.1.0...v0.1.1
