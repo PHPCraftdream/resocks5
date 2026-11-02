@@ -4,11 +4,13 @@
 
 use std::time::Duration;
 
-use resocks5_net::connect::{connect_proxy_once, dial, parse_proxy_str, DialOptions};
+use resocks5_net::connect::{
+    connect_proxy_once, dial, dial_chain_over, parse_proxy_str, DialOptions,
+};
 use resocks5_net::progress::FlushProgress;
-use resocks5_net::types::ProxyProtocol;
+use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 /// No-auth SOCKS5 stub for one connection: accepts CONNECT, writes `ok`.
 async fn socks5_stub() -> u16 {
@@ -50,6 +52,50 @@ async fn dial_example() {
         .expect("valid proxy line");
     let opts = DialOptions::new().with_total_timeout(Duration::from_secs(15));
     let stream = dial(&proxy, "example.com", 80, &opts, None).await.unwrap();
+    read_ok(stream).await;
+}
+
+/// `connect::dial_chain_over` example: two SOCKS5 nodes served by one stub
+/// that answers a handshake per layer, the last one followed by `ok`.
+#[tokio::test]
+async fn dial_chain_over_example() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        for _ in 0..2 {
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            s.read_exact(&mut head).await.unwrap();
+            let rest = match head[3] {
+                0x01 => 6,
+                0x04 => 18,
+                _ => s.read_u8().await.unwrap() as usize + 2,
+            };
+            let mut tail = vec![0u8; rest];
+            s.read_exact(&mut tail).await.unwrap();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        }
+        s.write_all(b"ok").await.unwrap();
+        let _ = s.read(&mut [0u8; 1]).await;
+    });
+
+    let proxy =
+        ProxyConfig::socks5("exit.example", 1080).with_gate(ProxyConfig::socks5("127.0.0.1", port));
+    let outer = proxy.outermost();
+    let base = TcpStream::connect((outer.host.as_str(), outer.port))
+        .await
+        .unwrap();
+    let opts = DialOptions::new()
+        .with_handshake_timeout(Duration::from_secs(10))
+        .with_total_timeout(Duration::from_secs(15));
+    let stream = dial_chain_over(base, &proxy, "example.com", 80, &opts, None)
+        .await
+        .unwrap();
     read_ok(stream).await;
 }
 

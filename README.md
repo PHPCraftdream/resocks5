@@ -159,7 +159,7 @@ to keep flowing when they misbehave," that's the case resocks5 is built for.
 Linux-архивы — полностью статические (musl), без зависимостей от системных
 библиотек; Windows-бинарник собран со статическим CRT и не требует
 Visual C++ Redistributable. Статические Linux-архивы и arm64 выпускаются
-начиная с релиза после 0.3.0; в 0.3.0 и ранее был только glibc-архив x86_64
+начиная с 0.4.0; в 0.3.0 и ранее был только glibc-архив x86_64
 (установщик сам выберет подходящий архив релиза, на musl/Alpine старый релиз
 не поддерживается).
 
@@ -561,7 +561,8 @@ The networking core is published as a separate crate,
 [`resocks5-net`](crates/resocks5-net) — inbound smart-port framing, upstream
 connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credential
 storage, logging and routing policy stay in the host application.
-Add it from crates.io (the inbound `server` module needs 0.3 or newer), or as a
+Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
+existing stream, `dial_chain_over`, needs 0.4.1), or as a
 git dependency to follow unreleased changes:
 
 ```toml
@@ -581,7 +582,7 @@ use std::time::Duration;
 use resocks5_net::connect::{connect_proxy, parse_proxy_str};
 use resocks5_net::pool::{PoolConfig, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::{ProxyProtocol, IP};
+use resocks5_net::types::ProxyProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -589,7 +590,7 @@ async fn main() -> anyhow::Result<()> {
     // Parse upstream lines: "user:pass@host:port" (credentials optional).
     let proxies = ["user:pass@198.51.100.7:1080"]
         .into_iter()
-        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5, IP::V4).ok())
+        .filter_map(|s| parse_proxy_str(s, ProxyProtocol::Socks5).ok())
         .collect::<Vec<_>>();
 
     // Weighted-random rotator (sand-rating uses defaults from RatingPolicy)
@@ -622,6 +623,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+Multi-hop chains (`ProxyConfig::gate`) are dialed with `dial_chain` (own TCP),
+`connect_chain` (pooled) or `dial_chain_over` (a stream you already own, for
+example from Tor), all with per-hop `ChainStage` error attribution; see the
+[SDK README](crates/resocks5-net/README.md).
 
 The library entry point is [`resocks5_net`](crates/resocks5-net/src/lib.rs);
 the top-level modules include `server`, `connect`, `error`, `progress`, `pool`,

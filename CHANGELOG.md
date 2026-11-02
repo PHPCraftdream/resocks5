@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: SOCKS5 rejects empty targets and zero ports before writing,
   and rejects nonzero reserved reply bytes and empty bound domains, including
   replies from upstream servers.
+- Docs: `resocks5-net` README gains an "Over an existing stream" example for
+  `dial_chain_over` (mirrored by a test and the `dial_chain_over` example), the
+  new `ProtocolViolation` variants are listed, and `docs/ARCHITECTURE.md`
+  describes the three chain entry points.
+
+### Fixed
+
+- README: the "Use as a library" example no longer uses the removed `IP` type
+  and the old `parse_proxy_str` signature, so it compiles against 0.4.
+- README and `docs/REFERENCE.md`: static Linux archives and arm64 builds ship
+  from 0.4.0 (they said "after 0.3.0").
 
 ## [0.4.0] - 2026-11-02
 

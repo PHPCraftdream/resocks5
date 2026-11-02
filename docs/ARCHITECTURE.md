@@ -252,6 +252,13 @@ whole tunnel lifetime for every node. Startup probes and the pre-connect
 pool apply only to the outermost gate level and exits; a probe for an inner
 quarantined gate traverses the healthy outer prefix.
 
+The SDK exposes the hop walk without any of this policy: `dial_chain` opens its
+own TCP connection, `connect_chain` adds pool accounting, and `dial_chain_over`
+runs the same hops over a stream the caller already owns (for example one from
+Tor), connected to `ProxyConfig::outermost()`. All three attribute errors by
+`ChainStage`. Every SOCKS5 reply is validated strictly: a non-zero reserved byte
+or an empty bound domain is a `ProtocolViolation` counted against the upstream.
+
 `server/connect/establish_connection` obtains picks from the plan and passes
 complete-chain configs to `connect_chain`. `ChainPlan::record_failure` and
 `ChainPlan::record_success` account for outcomes. `ChainStage::Connect` attributes

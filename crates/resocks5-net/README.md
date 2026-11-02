@@ -253,6 +253,36 @@ let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 # }
 ```
 
+### Over an existing stream
+
+`dial_chain_over` runs the hops of a chain over a stream you already own, for
+example one returned by Tor. The stream must be connected to the chain's
+outermost node (`proxy.outermost()`); nothing is dialed and no DNS lookup
+happens. `total_timeout` is the remaining budget of your own deadline.
+
+```text
+use std::time::Duration;
+
+use resocks5_net::connect::{dial_chain_over, DialOptions};
+use resocks5_net::types::ProxyConfig;
+use tokio::net::TcpStream;
+
+# async fn run(deadline: tokio::time::Instant) -> Result<(), Box<dyn std::error::Error>> {
+let proxy = ProxyConfig::socks5("exit.example", 1080)
+    .with_gate(ProxyConfig::socks5("198.51.100.7", 1080));
+// Stand-in for a Tor stream: any owned AsyncRead + AsyncWrite works.
+let outer = proxy.outermost();
+let base = TcpStream::connect((outer.host.as_str(), outer.port)).await?;
+
+let opts = DialOptions::new()
+    .with_handshake_timeout(Duration::from_secs(10))
+    .with_total_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+let stream = dial_chain_over(base, &proxy, "example.com", 80, &opts, None).await?;
+# drop(stream);
+# Ok(())
+# }
+```
+
 ### Errors
 
 Connect and pool calls return `resocks5_net::ConnectError`
@@ -264,6 +294,7 @@ and, with `pool`, `AtCapacity` — no message parsing needed.
 `Protocol` carries a structured `ProtocolViolation` (e.g.
 `Socks5BadVersion { got }`, `Socks5UnknownAddressType { got }`,
 `Socks5DomainTooLong { len }`, `Socks5CredentialsTooLong`,
+`Socks5BadReserved { got }`, `Socks5EmptyBoundDomain`,
 `HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
 with the offending byte or length; its `Display` still prints the
 legacy message text. A peer that answers the greeting with a
