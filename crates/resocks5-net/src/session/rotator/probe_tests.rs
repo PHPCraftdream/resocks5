@@ -163,7 +163,9 @@ async fn a_refused_connect_reports_the_io_error_not_a_timeout() {
     drop(listener);
     let proxy = proxy("127.0.0.1", address.port());
     let rotator = rotator(vec![proxy.clone()], 3);
-    let events = rotator.probe_all(Duration::from_secs(2)).await;
+    // Windows refuses a loopback connect only after ~2 s; the timeout must
+    // outlast that or the probe reports "no answer" instead of the refusal.
+    let events = rotator.probe_all(Duration::from_secs(10)).await;
     match events.as_slice() {
         [ProbeEvent::QuarantinedAtStart { reason, .. }] => {
             assert!(!reason.contains("no answer"), "{reason}");
