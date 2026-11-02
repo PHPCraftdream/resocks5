@@ -283,6 +283,20 @@ to build explicit links. `ChainError` provides the underlying `ConnectError` and
 `Connect` is outer TCP, `Hop(i)` is node i tunnelling to node i+1, and
 `Target` is the exit.
 
+`dial_chain_over` runs that chain on a caller-supplied owning stream (for
+example, a Tor stream) already connected to `proxy.outermost()`; it performs
+no TCP dial or DNS lookup and returns `AnyUpstream::Gate`. Supply `total_timeout`
+as the relative remaining budget (`deadline.saturating_duration_since(now)`);
+each hop uses `handshake_timeout`, and `connect_timeout` is ignored. `ChainError`
+attributes TLS preflight errors to `Connect`, intermediate tunnels to `Hop(i)`,
+and the exit tunnel to `Target`. It is not cancel-safe: on error or cancellation
+the owning stream is dropped, though dropping a shared/cloned handle may not
+close the underlying transport. `ProxyConfig::outermost()` returns the first
+node; `nodes()` lists nodes outermost first and `self` last. SOCKS5 rejects an
+empty target host or zero port before writing, and rejects a nonzero reserved
+reply byte or empty bound domain; SOCKS5 upstreams used by the `resocks5`
+server are checked too.
+
 `connect_hedged` (feature `pool`) races a candidate list: attempts launch in
 order, and the next one starts beside a slow one after
 `HedgeOptions::hedge_delay` only while no running attempt is past its TCP

@@ -4,6 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+use crate::connect::host_port::HostPort;
 use crate::error::{ConnectError, ProtocolViolation};
 use crate::types::ProxyProtocol;
 
@@ -57,6 +58,9 @@ pub async fn socks5_handshake<S>(
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
+    if host.is_empty() || port == 0 {
+        return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
+    }
     if let Some((username, password)) = auth {
         stream.write_all(&[0x05, 0x01, 0x02]).await?;
         stream.flush().await?;
@@ -161,6 +165,13 @@ where
             response: String::new(),
         });
     }
+    if resp_header[2] != 0x00 {
+        return Err(ConnectError::Protocol(
+            ProtocolViolation::Socks5BadReserved {
+                got: resp_header[2],
+            },
+        ));
+    }
     match resp_header[3] {
         0x01 => {
             stream.read_exact(&mut [0u8; 6]).await?;
@@ -168,6 +179,11 @@ where
         0x03 => {
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
+            if len_buf[0] == 0 {
+                return Err(ConnectError::Protocol(
+                    ProtocolViolation::Socks5EmptyBoundDomain,
+                ));
+            }
             let mut skip = vec![0u8; len_buf[0] as usize + 2];
             stream.read_exact(&mut skip).await?;
         }
@@ -378,6 +394,141 @@ mod tests {
         .unwrap();
         assert_eq!(head, [0x05, 0x01, 0x00, 0x01]);
         assert_eq!(addr, vec![0x01, 1, 2, 3, 4, 0x01, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn strict_reply_errors_are_typed_and_classified() {
+        use crate::error::{ConnectError, ProtocolViolation};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (reply, expected) in [([0x05, 0x00, 0x01, 0x01], 1), ([0x05, 0x05, 0x01, 0x01], 2)]
+            {
+                let (client, mut server) = duplex(128);
+                let peer = tokio::spawn(async move {
+                    let mut greeting = [0; 3];
+                    server.read_exact(&mut greeting).await.unwrap();
+                    server.write_all(&[0x05, 0x00]).await.unwrap();
+                    let mut request = [0; 4];
+                    server.read_exact(&mut request).await.unwrap();
+                    let mut address = [0; 6];
+                    server.read_exact(&mut address).await.unwrap();
+                    server.write_all(&reply).await.unwrap();
+                });
+                let error = super::socks5_handshake(client, "1.2.3.4", 80, None)
+                    .await
+                    .unwrap_err();
+                match expected {
+                    1 => assert!(matches!(
+                        error,
+                        ConnectError::Protocol(ProtocolViolation::Socks5BadReserved { got: 1 })
+                    )),
+                    _ => assert!(matches!(
+                        error,
+                        ConnectError::ProxyRejected { code: Some(5), .. }
+                    )),
+                }
+                assert!(!error.is_upstream_down());
+                assert!(error.counts_against_upstream());
+                peer.await.unwrap();
+            }
+        })
+        .await
+        .expect("strict reply exchange timed out");
+    }
+
+    #[tokio::test]
+    async fn empty_bound_domain_rejected_without_waiting_for_address() {
+        use crate::error::{ConnectError, ProtocolViolation};
+        let (client, mut server) = duplex(128);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let peer = tokio::spawn(async move {
+            let mut greeting = [0; 3];
+            server.read_exact(&mut greeting).await.unwrap();
+            server.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut request = [0; 4];
+            server.read_exact(&mut request).await.unwrap();
+            let mut address = [0; 6];
+            server.read_exact(&mut address).await.unwrap();
+            server.write_all(&[0x05, 0, 0, 3, 0]).await.unwrap();
+            let _ = release_rx.await;
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::socks5_handshake(client, "1.2.3.4", 80, None),
+        )
+        .await
+        .expect("handshake waited for missing address")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectError::Protocol(ProtocolViolation::Socks5EmptyBoundDomain)
+        ));
+        assert!(!error.is_upstream_down());
+        assert!(error.counts_against_upstream());
+        let _ = release_tx.send(());
+        assert!(tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("peer timeout")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_targets_write_no_bytes() {
+        use crate::error::ConnectError;
+        for (host, port) in [("", 80), ("valid.invalid", 0)] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (client, mut server) = duplex(128);
+                let peer = tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    server.read_to_end(&mut bytes).await.unwrap();
+                    bytes
+                });
+                let error = super::socks5_handshake(client, host, port, None)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, ConnectError::InvalidTarget(_)));
+                assert!(peer.await.unwrap().is_empty());
+            })
+            .await
+            .expect("invalid target EOF check timed out");
+        }
+    }
+
+    #[tokio::test]
+    async fn success_reply_shapes_preserve_payload() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (atyp, bound) in [
+                (1, vec![0; 6]),
+                (3, vec![3, b'f', b'o', b'o', 0, 80]),
+                (4, vec![0; 18]),
+            ] {
+                let (client, mut server) = duplex(128);
+                let peer = tokio::spawn(async move {
+                    let mut greeting = [0; 3];
+                    server.read_exact(&mut greeting).await.unwrap();
+                    server.write_all(&[0x05, 0x00]).await.unwrap();
+                    let mut request = [0; 4];
+                    server.read_exact(&mut request).await.unwrap();
+                    let mut address = [0; 6];
+                    server.read_exact(&mut address).await.unwrap();
+                    server.write_all(&[0x05, 0, 0, atyp]).await.unwrap();
+                    server.write_all(&bound).await.unwrap();
+                    server.write_all(b"payload").await.unwrap();
+                });
+                let mut stream = super::socks5_handshake(client, "1.2.3.4", 80, None)
+                    .await
+                    .unwrap();
+                let mut payload = [0; 7];
+                stream.read_exact(&mut payload).await.unwrap();
+                assert_eq!(&payload, b"payload");
+                peer.await.unwrap();
+            }
+        })
+        .await
+        .expect("successful reply exchange timed out");
     }
 }
 

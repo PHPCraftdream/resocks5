@@ -66,6 +66,34 @@ fn dial_futures_are_send() {
     ));
 }
 
+#[allow(dead_code)]
+fn chain_over_tcp_future_is_send(tcp: tokio::net::TcpStream) {
+    let proxy = ProxyConfig::socks5("127.0.0.1", 1080);
+    let opts = DialOptions::new();
+    future_is_send(resocks5_net::connect::dial_chain_over(
+        tcp,
+        &proxy,
+        "example.com",
+        80,
+        &opts,
+        None,
+    ));
+}
+
+#[allow(dead_code)]
+fn chain_over_duplex_future_is_send() {
+    let proxy = ProxyConfig::socks5("127.0.0.1", 1080);
+    let opts = DialOptions::new();
+    let (duplex, _) = tokio::io::duplex(64);
+    future_is_send(resocks5_net::connect::dial_chain_over(
+        duplex,
+        &proxy,
+        "example.com",
+        80,
+        &opts,
+        None,
+    ));
+}
 /// The way a consumer really uses it: an owning `async move` block handed
 /// to `tokio::spawn`, which needs `Send + 'static`.
 #[allow(dead_code)]

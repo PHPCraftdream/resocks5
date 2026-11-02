@@ -47,7 +47,7 @@ impl GateLevels {
     /// `chain` is ordered outermost first; gate levels must match the configured
     /// ranks and the final node must match one of the supplied exit rotators.
     pub fn resolve(&self, exits: &[Arc<ProxyRotator>], chain: &ProxyConfig) -> Option<ChainPick> {
-        let nodes = chain.chain_nodes();
+        let nodes = chain.nodes();
         if nodes.len() != self.levels.len() + 1 {
             return None;
         }

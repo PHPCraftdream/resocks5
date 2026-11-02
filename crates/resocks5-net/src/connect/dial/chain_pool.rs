@@ -46,7 +46,7 @@ pub async fn connect_chain(
             ConnectError::InvalidTarget(target_addr.to_owned()),
         )
     })?;
-    let nodes = chain.chain_nodes();
+    let nodes = chain.nodes();
     check_tls(&nodes, tls_connector).map_err(|e| ChainError::new(ChainStage::Connect, e))?;
 
     if nodes.len() == 1 {

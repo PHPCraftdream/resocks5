@@ -24,14 +24,7 @@ impl ProxyConfig {
 
     /// Borrow this chain's nodes, outermost first and exit last.
     pub fn chain_nodes(&self) -> Vec<&ProxyConfig> {
-        let mut nodes = Vec::new();
-        let mut current = Some(self);
-        while let Some(node) = current {
-            nodes.push(node);
-            current = node.gate.as_deref();
-        }
-        nodes.reverse();
-        nodes
+        self.nodes()
     }
 
     /// Return the number of nodes in this chain.
@@ -95,7 +88,7 @@ impl Eq for ChainKey {}
 
 impl Hash for ChainKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let nodes = self.0.chain_nodes();
+        let nodes = self.0.nodes();
         nodes.len().hash(state);
         for node in nodes {
             (

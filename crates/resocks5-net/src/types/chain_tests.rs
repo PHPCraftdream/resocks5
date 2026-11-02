@@ -107,6 +107,42 @@ fn chain_builder_orders_one_through_three_nodes() {
 }
 
 #[test]
+fn accessors_preserve_nodes_order_ports_and_outer_identity() {
+    for len in 1..=3 {
+        let mut chain = node("node-0", 1000, 0).as_ref().clone();
+        for index in 1..len {
+            chain = node(&format!("node-{index}"), 1000 + index as u16, 0)
+                .as_ref()
+                .clone()
+                .with_gate(chain);
+        }
+        let outermost = chain.outermost();
+        let nodes = chain.nodes();
+        let chain_nodes = chain.chain_nodes();
+        assert_eq!(nodes.len(), len);
+        assert_eq!(chain_nodes.len(), len);
+        assert!(nodes
+            .iter()
+            .zip(&chain_nodes)
+            .all(|(a, b)| std::ptr::eq(*a, *b)));
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|n| (n.host.as_str(), n.port))
+                .collect::<Vec<_>>(),
+            (0..len)
+                .map(|i| (format!("node-{i}"), 1000 + i as u16))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(h, p)| (h.as_str(), *p))
+                .collect::<Vec<_>>()
+        );
+        assert!(std::ptr::eq(*nodes.last().unwrap(), &chain));
+        assert!(std::ptr::eq(*nodes.first().unwrap(), outermost));
+    }
+}
+
+#[test]
 fn chain_key_identity_includes_fields_order_length_and_gate_level() {
     let outer = node("outer", 1, 1);
     let exit = node("exit", 2, 0);

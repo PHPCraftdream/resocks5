@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net`: `connect::dial_chain_over` runs a proxy chain over an owning
+  stream already connected to `ProxyConfig::outermost()`, without dialing or DNS;
+  it uses a caller-supplied remaining total-timeout budget.
+- `resocks5-net`: `ProxyConfig::outermost()` and `nodes()` expose the chain's
+  outermost node and its nodes in outermost-first order.
+
+### Changed
+
+- `resocks5-net`: SOCKS5 rejects empty targets and zero ports before writing,
+  and rejects nonzero reserved reply bytes and empty bound domains, including
+  replies from upstream servers.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added

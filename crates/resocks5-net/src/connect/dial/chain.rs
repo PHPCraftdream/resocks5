@@ -1,9 +1,14 @@
 //! Pool-free multi-hop dial: follows the `ProxyConfig::gate` links.
 
 use std::fmt;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 
 use super::{dial_inner, DialOptions};
@@ -140,20 +145,151 @@ pub async fn dial_chain(
 ) -> Result<AnyUpstream, ChainError> {
     let progress = AtomicUsize::new(ChainStage::Connect.encode());
     let run = chain_inner(proxy, host, port, opts, tls_connector, &progress);
+    with_total_timeout(proxy, opts, &progress, run, false).await
+}
+
+async fn with_total_timeout<F>(
+    proxy: &ProxyConfig,
+    opts: &DialOptions,
+    progress: &AtomicUsize,
+    run: F,
+    fail_if_elapsed: bool,
+) -> Result<AnyUpstream, ChainError>
+where
+    F: std::future::Future<Output = Result<AnyUpstream, ChainError>>,
+{
     match opts.total_timeout {
         None => run.await,
-        Some(total) => match timeout(total, run).await {
-            Ok(r) => r,
-            Err(_) => Err(ChainError::new(
-                ChainStage::decode(progress.load(Ordering::Relaxed)),
-                ConnectError::Timeout {
-                    stage: Stage::Total,
-                    kind: TimeoutKind::Total,
-                    endpoint: format!("{}:{}", proxy.host, proxy.port),
-                    after: total,
-                },
-            )),
+        Some(total) => {
+            if fail_if_elapsed && total.is_zero() {
+                return Err(total_timeout_error(proxy, progress, total));
+            }
+            match timeout(total, run).await {
+                Ok(r) => r,
+                Err(_) => Err(total_timeout_error(proxy, progress, total)),
+            }
+        }
+    }
+}
+
+fn total_timeout_error(proxy: &ProxyConfig, progress: &AtomicUsize, total: Duration) -> ChainError {
+    ChainError::new(
+        ChainStage::decode(progress.load(Ordering::Relaxed)),
+        ConnectError::Timeout {
+            stage: Stage::Total,
+            kind: TimeoutKind::Total,
+            endpoint: format!("{}:{}", proxy.host, proxy.port),
+            after: total,
         },
+    )
+}
+
+/// Run the chain over an owning transport already connected to
+/// `proxy.outermost()`. The result is always [`AnyUpstream::Gate`]; no TCP or
+/// DNS dialing occurs. On error or cancellation the owning stream is dropped,
+/// but dropping a shared or cloned handle may not close the underlying
+/// transport. `total_timeout` is the caller's relative remaining budget,
+/// computed as `deadline.saturating_duration_since(now)`; zero fails before
+/// any stream bytes are written. `connect_timeout` is ignored, and each hop
+/// uses `handshake_timeout`. TLS preflight errors use [`ChainStage::Connect`].
+/// The adapter cannot expose a TCP socket (`as_tcp` returns `None`) and
+/// `set_nodelay` is a no-op.
+///
+/// cancel-safe: NO.
+pub async fn dial_chain_over<S>(
+    stream: S,
+    proxy: &ProxyConfig,
+    host: &str,
+    port: u16,
+    opts: &DialOptions,
+    tls_connector: Option<&TlsConnector>,
+) -> Result<AnyUpstream, ChainError>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let progress = AtomicUsize::new(ChainStage::Connect.encode());
+    let run = async {
+        let nodes = proxy.nodes();
+        check_tls(&nodes, tls_connector).map_err(|e| ChainError::new(ChainStage::Connect, e))?;
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let stream: BoxedUpstream = Box::new(OverStream(Mutex::new(stream)));
+        let stream = run_chain_hops(
+            &nodes,
+            &HostPort::format(host, port),
+            stream,
+            opts.handshake_timeout,
+            tls_connector,
+            |stage| progress.store(stage.encode(), Ordering::Relaxed),
+        )
+        .await
+        .map_err(|(stage, error)| ChainError::new(stage, error))?;
+        Ok(AnyUpstream::Gate(stream))
+    };
+    with_total_timeout(proxy, opts, &progress, run, true).await
+}
+
+// The mutex makes a non-Sync transport usable by the erased Sync wrapper; it is never contended.
+struct OverStream<S>(Mutex<S>);
+
+impl<S: AsyncRead + Unpin> AsyncRead for OverStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(
+            self.get_mut()
+                .0
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for OverStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(
+            self.get_mut()
+                .0
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(
+            self.get_mut()
+                .0
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(
+            self.get_mut()
+                .0
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> crate::connect::AsyncReadWrite for OverStream<S> {
+    fn as_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        None
+    }
+    fn set_nodelay(&self, _: bool) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -188,13 +324,7 @@ async fn chain_inner(
     }
 
     // Outermost node first, `proxy` last.
-    let mut nodes = vec![proxy];
-    let mut cur = proxy;
-    while let Some(outer) = cur.gate.as_deref() {
-        nodes.push(outer);
-        cur = outer;
-    }
-    nodes.reverse();
+    let nodes = proxy.nodes();
 
     check_tls(&nodes, tls_connector).map_err(|e| ChainError::new(ChainStage::Connect, e))?;
 

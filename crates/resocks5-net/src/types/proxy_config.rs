@@ -135,6 +135,27 @@ impl ProxyConfig {
         self.is_gate = level > 0;
         self
     }
+
+    /// Borrow the chain's nodes, outermost first and exit last.
+    pub fn nodes(&self) -> Vec<&ProxyConfig> {
+        let mut nodes = Vec::new();
+        let mut current = Some(self);
+        while let Some(node) = current {
+            nodes.push(node);
+            current = node.gate.as_deref();
+        }
+        nodes.reverse();
+        nodes
+    }
+
+    /// Return the outermost gate, or this entry when ungated.
+    pub fn outermost(&self) -> &ProxyConfig {
+        let mut current = self;
+        while let Some(outer) = current.gate.as_deref() {
+            current = outer;
+        }
+        current
+    }
 }
 
 impl fmt::Debug for ProxyConfig {

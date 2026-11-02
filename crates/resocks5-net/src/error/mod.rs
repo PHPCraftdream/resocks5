@@ -78,6 +78,13 @@ pub enum ProtocolViolation {
         /// The ATYP byte the proxy sent.
         got: u8,
     },
+    /// The reserved byte of a SOCKS5 CONNECT reply was not zero.
+    Socks5BadReserved {
+        /// The reserved byte the proxy sent.
+        got: u8,
+    },
+    /// A SOCKS5 CONNECT reply used a zero-length bound domain.
+    Socks5EmptyBoundDomain,
     /// The domain part of the target exceeded the 255-byte SOCKS5 limit.
     Socks5DomainTooLong {
         /// Domain length in bytes.
@@ -111,6 +118,12 @@ impl fmt::Display for ProtocolViolation {
             }
             ProtocolViolation::Socks5UnknownAddressType { .. } => {
                 write!(f, "[SOCKS5] Unknown address type in response")
+            }
+            ProtocolViolation::Socks5BadReserved { .. } => {
+                write!(f, "[SOCKS5] Invalid reserved byte in response")
+            }
+            ProtocolViolation::Socks5EmptyBoundDomain => {
+                write!(f, "[SOCKS5] Empty bound domain in response")
             }
             ProtocolViolation::Socks5DomainTooLong { .. } => {
                 write!(f, "[SOCKS5] Domain name too long")
