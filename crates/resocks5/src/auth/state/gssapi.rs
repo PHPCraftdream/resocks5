@@ -22,16 +22,17 @@ pub(super) fn configured_acceptor(
     use resocks5_net::gssapi::Protection;
 
     let Some(service) = cfg.gssapi_service.as_deref() else {
-        if cfg.gssapi_min_protection.is_some() {
-            bail!("auth.gssapi_min_protection is set without auth.gssapi_service");
+        if cfg.gssapi_protection.is_some() {
+            bail!("auth.gssapi_protection is set without auth.gssapi_service");
         }
         return Ok(None);
     };
-    let min = match cfg.gssapi_min_protection.as_deref() {
-        None | Some("integrity") => Protection::Integrity,
+    let level = match cfg.gssapi_protection.as_deref() {
+        None | Some("none") => Protection::None,
+        Some("integrity") => Protection::Integrity,
         Some("confidentiality") => Protection::Confidential,
         Some(other) => bail!(
-            "auth.gssapi_min_protection: unknown value {other:?} (integrity or confidentiality)"
+            "auth.gssapi_protection: unknown value {other:?} (none, integrity or confidentiality)"
         ),
     };
     #[cfg(feature = "gssapi-system")]
@@ -43,12 +44,12 @@ pub(super) fn configured_acceptor(
             SystemBackend::new().with_acceptor(service)
         };
         Ok(Some(
-            resocks5_net::gssapi::GssAcceptor::new(backend.shared()).with_min_protection(min),
+            resocks5_net::gssapi::GssAcceptor::new(backend.shared()).with_protection(level),
         ))
     }
     #[cfg(not(feature = "gssapi-system"))]
     {
-        let _ = (service, min);
+        let _ = (service, level);
         bail!(
             "auth.gssapi_service is set but this build has no Kerberos backend \
              (build with the `gssapi-system` feature)"
@@ -58,7 +59,7 @@ pub(super) fn configured_acceptor(
 
 #[cfg(not(feature = "gssapi"))]
 pub(super) fn refuse_without_support(cfg: &AuthConfig) -> Result<()> {
-    if cfg.gssapi_service.is_some() || cfg.gssapi_min_protection.is_some() {
+    if cfg.gssapi_service.is_some() || cfg.gssapi_protection.is_some() {
         bail!(
             "auth.gssapi_service is set but this build has no GSSAPI support \
              (build with the `gssapi-system` feature)"

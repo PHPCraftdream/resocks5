@@ -7,16 +7,19 @@
 //! protection negotiation, message protection) over the [`GssBackend`] trait;
 //! the mechanism itself is the backend's business.
 //!
-//! * Client: [`client_gssapi`] with [`GssCredentials`]. It asks for the
-//!   strongest protection ([`Protection::Confidential`]) and accepts anything
-//!   from its configured minimum up.
+//! * Client: [`client_gssapi`] with [`GssCredentials`]. It asks for no
+//!   per-message protection ([`Protection::None`]) and accepts what the server
+//!   answers, from its configured minimum up.
 //! * Server: [`server_gssapi`] with a [`GssAcceptor`]; it returns the
 //!   authenticated peer name (the Kerberos principal) and a [`GssSession`] for
 //!   the protected request and reply.
 //!
-//! Scope: protection covers the SOCKS request and reply (RFC 1961 §5); once the
-//! tunnel is open the data flows unprotected, as in common implementations.
-//! The strength of the authentication is that of the backend's mechanism.
+//! Scope: what is protected is the authentication — the context exchange is
+//! mutual and the mechanism (Kerberos) proves both peers. By default the SOCKS
+//! request and reply are not additionally protected ([`Protection::None`], the
+//! level `curl --socks5-gssapi` and Dante's `clear` speak, so those clients
+//! work); levels 1 and 2 (RFC 1961 §5: protected request and reply) are opt-in.
+//! The tunnel data afterwards is always unprotected.
 //!
 //! ```text
 //! let creds = GssCredentials::new(backend, "socks@proxy.example.com");
@@ -47,10 +50,16 @@ const MTYP_PROTECTION: u8 = 2;
 const MTYP_DATA: u8 = 3;
 const MTYP_ABORT: u8 = 0xFF;
 
-/// Per-message protection level of RFC 1961 §4 (levels 1 and 2; the
-/// "selective" level 3 is not offered).
+/// Per-message protection level: RFC 1961 §4 levels 1 and 2 (the "selective"
+/// level 3 is not offered) and level 0, the de-facto "no per-message
+/// protection" of curl and Dante's `clear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Protection {
+    /// Level 0, not in the RFC but spoken by common clients (`curl
+    /// --socks5-gssapi`): the context still authenticates both peers
+    /// (Kerberos mutual authentication), but the SOCKS request and reply are
+    /// not protected and not encapsulated. Weaker; opt-in on both sides.
+    None = 0,
     /// Level 1: every message carries an integrity check.
     Integrity = 1,
     /// Level 2: every message is integrity-protected and encrypted.
@@ -60,6 +69,7 @@ pub enum Protection {
 impl Protection {
     fn from_byte(byte: u8) -> Option<Self> {
         match byte {
+            0 => Some(Self::None),
             1 => Some(Self::Integrity),
             2 => Some(Self::Confidential),
             _ => None,
@@ -136,25 +146,27 @@ pub struct GssCredentials {
 }
 
 impl GssCredentials {
-    /// Authenticate to `service` through `backend`; asks for
-    /// [`Protection::Confidential`] and accepts [`Protection::Integrity`] up.
+    /// Authenticate to `service` through `backend`; asks for no per-message
+    /// protection and accepts any answer (a server that wants protection gets
+    /// it).
     pub fn new(backend: Arc<dyn GssBackend>, service: impl Into<String>) -> Self {
         Self {
             backend,
             service: service.into(),
-            want: Protection::Confidential,
-            min: Protection::Integrity,
+            want: Protection::None,
+            min: Protection::None,
         }
     }
 
-    /// The level to ask the server for (default the strongest).
+    /// The level to ask the server for (default none).
     #[must_use]
     pub fn with_requested_protection(mut self, level: Protection) -> Self {
         self.want = level;
         self
     }
 
-    /// The weakest level to accept from the server (default integrity).
+    /// The weakest level to accept from the server (default none): set it to
+    /// require a protected request and reply.
     #[must_use]
     pub fn with_min_protection(mut self, level: Protection) -> Self {
         self.min = level;
@@ -174,24 +186,27 @@ impl std::fmt::Debug for GssCredentials {
 #[derive(Clone)]
 pub struct GssAcceptor {
     backend: Arc<dyn GssBackend>,
-    min: Protection,
+    protection: Protection,
 }
 
 impl GssAcceptor {
-    /// Accept through `backend`; a client may ask for any level, the server
-    /// agrees to its request but never below [`Protection::Integrity`].
+    /// Accept through `backend`, with no per-message protection of the SOCKS
+    /// request and reply (authentication is still mutual): the level common
+    /// clients such as `curl --socks5-gssapi` speak. See
+    /// [`with_protection`](Self::with_protection).
     pub fn new(backend: Arc<dyn GssBackend>) -> Self {
         Self {
             backend,
-            min: Protection::Integrity,
+            protection: Protection::None,
         }
     }
 
-    /// The weakest level the server agrees to: a client asking for less is
-    /// answered with this one (default integrity).
+    /// The per-message protection level the server answers, whatever the
+    /// client asks (RFC 1961 lets the server decide; a client that finds it
+    /// too weak closes the connection). Default [`Protection::None`].
     #[must_use]
-    pub fn with_min_protection(mut self, level: Protection) -> Self {
-        self.min = level;
+    pub fn with_protection(mut self, level: Protection) -> Self {
+        self.protection = level;
         self
     }
 }
@@ -215,6 +230,13 @@ impl GssSession {
         self.protection
     }
 
+    /// Whether SOCKS messages are protected: false only for
+    /// [`Protection::None`], where they travel plain and `seal`/`open` are not
+    /// used.
+    pub fn is_protected(&self) -> bool {
+        self.protection != Protection::None
+    }
+
     /// Protect `data` as one encapsulated message (RFC 1961 §5): the complete
     /// frame, ready to write.
     ///
@@ -223,6 +245,9 @@ impl GssSession {
     /// A backend failure, or [`GssapiError::BadFrame`] when the token does not
     /// fit a frame.
     pub fn seal(&mut self, data: &[u8]) -> Result<Vec<u8>, GssapiError> {
+        if !self.is_protected() {
+            return Err(GssapiError::NotEstablished);
+        }
         let token = self
             .ctx
             .wrap(data, self.protection == Protection::Confidential)?;
@@ -235,6 +260,9 @@ impl GssSession {
     ///
     /// [`GssapiError::Integrity`] when it does not verify.
     pub fn open(&mut self, token: &[u8]) -> Result<Vec<u8>, GssapiError> {
+        if !self.is_protected() {
+            return Err(GssapiError::NotEstablished);
+        }
         self.ctx.unwrap(token)
     }
 
@@ -430,14 +458,15 @@ where
         .ok_or_else(|| GssapiError::Backend("no authenticated peer name".to_owned()))?;
     let ask = read_frame(stream, MTYP_PROTECTION).await?;
     let asked = match ctx.unwrap(&ask)?.as_slice() {
-        [byte] if *byte != 0 => *byte,
+        [byte] => *byte,
         _ => return Err(GssapiError::BadFrame),
     };
-    // Agree to what was asked (level 3, "selective", is answered with 2),
-    // never below the server's minimum.
-    let agreed = Protection::from_byte(asked.min(2))
-        .ok_or(GssapiError::BadFrame)?
-        .max(acceptor.min);
+    // The server's configured level; the client's request is only checked to be
+    // a level byte (0, 1, 2 or the "selective" 3).
+    if asked > 3 {
+        return Err(GssapiError::BadFrame);
+    }
+    let agreed = acceptor.protection;
     let answer = ctx.wrap(&[agreed as u8], false)?;
     write_frame(stream, MTYP_PROTECTION, &answer).await?;
     Ok((

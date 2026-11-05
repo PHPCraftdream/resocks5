@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use resocks5_net::gssapi::system::SystemBackend;
-use resocks5_net::gssapi::GssAcceptor;
+use resocks5_net::gssapi::{GssAcceptor, Protection};
 use resocks5_net::server::{accept_with, AuthMethods, NoSecrets, Reply, ServerOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -34,7 +34,9 @@ async fn main() -> anyhow::Result<()> {
     println!("READY {}", listener.local_addr()?);
 
     let (mut client, _) = timeout(Duration::from_secs(60), listener.accept()).await??;
-    let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service).shared());
+    // curl has no per-message protection: it takes level 0 (and refuses any other).
+    let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service).shared())
+        .with_protection(Protection::None);
     let options = ServerOptions::new(Instant::now() + Duration::from_secs(20), false, true);
     let methods = AuthMethods::<NoSecrets>::gssapi(&acceptor);
     let request = accept_with(&mut client, &options, &methods).await?;
@@ -44,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         request.target(),
         request.auth_method()
     );
+    // Level 0: the reply below is plain SOCKS5.
     request.reply(&mut client, Reply::Established).await?;
     // The tunnel is plain: the client's HTTP request head, then our answer.
     let mut head = Vec::new();

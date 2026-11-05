@@ -168,7 +168,7 @@ auth: { allow_anonymous: false }
 | Поле | Тип | Default | Значение |
 |------|-----|---------|----------|
 | `auth.gssapi_service` | optional String | отсутствует | Принимать клиентов GSSAPI (SOCKS5 метод 0x01): host-based имя сервиса `socks@proxy.example.com` (принципал `socks/proxy.example.com@REALM` в keytab) или `*` — любой принципал из keytab. Нужна сборка с фичей `gssapi-system`; без неё сервер с этой настройкой не стартует. |
-| `auth.gssapi_min_protection` | optional String | отсутствует | Слабейшая защита сообщений SOCKS-запроса/ответа, на которую соглашается сервер: `integrity` (по умолчанию) или `confidentiality`. Требует `auth.gssapi_service`. |
+| `auth.gssapi_protection` | optional String | отсутствует | Защита SOCKS-запроса и ответа для клиентов GSSAPI: `none` (по умолчанию: защищена только аутентификация — так говорят `curl --socks5-gssapi` и Dante `clear`), `integrity` или `confidentiality` (уровни 1 и 2 RFC 1961, клиент должен их поддерживать). Данные туннеля не защищаются никогда. Требует `auth.gssapi_service`. |
 | `auth.allow_anonymous` | bool | true | Разрешить SOCKS5 без имени/пароля и HTTP CONNECT без Proxy-Authorization. Наличие пользователей само по себе не отключает anonymous. |
 
 - Пустые users + `true`: можно anonymous, но нужен upstream-маршрут.
@@ -205,9 +205,11 @@ HMAC challenge-response над K (SOCKS5 метод 0x80): Argon2 считает
 принципал. Принципал входит в аккаунт с тем же именем (`users add-gssapi
 alice@EXAMPLE.COM`): enabled, direct и allowed_clients действуют как обычно;
 принципал без включённого аккаунта и с IP вне правила получает отказ. SOCKS
-запрос и ответ идут как защищённые сообщения (RFC 1961: целостность,
-конфиденциальность по запросу клиента); данные туннеля после ответа не
-защищаются. Клиент для GSSAPI — `resocks5-net` (`ProxyConfig::with_gssapi`) или
+защищена аутентификация (Kerberos взаимный: клиент и сервер доказывают друг
+другу подлинность), а SOCKS-запрос и ответ по умолчанию не защищаются
+отдельно (`auth.gssapi_protection: none`); уровни целостности и
+конфиденциальности (RFC 1961) включаются настройкой. Данные туннеля не
+защищаются никогда. Клиент для GSSAPI — `resocks5-net` (`ProxyConfig::with_gssapi`) или
 любой клиент со стандартным SOCKS5 GSSAPI (например, `curl --socks5-gssapi`;
 совместимость со сторонними клиентами проверяется только на соответствие RFC).
 В релизных бинарниках GSSAPI нет: нужна сборка `--features gssapi-system` и

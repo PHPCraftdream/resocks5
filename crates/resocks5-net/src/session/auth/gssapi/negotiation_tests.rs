@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Instant};
 
 use super::mock::MockBackend;
-use super::{GssAcceptor, GssCredentials};
+use super::{GssAcceptor, GssCredentials, Protection};
 use crate::connect::{dial_tcp, DialOptions};
 use crate::secure_auth::{
     DecoyKey, KdfParams, SecretStore, SecureCredentials, StoredUser, UserSecret,
@@ -46,6 +46,8 @@ struct Server {
     secure: bool,
     gssapi: bool,
     anonymous: bool,
+    /// Fixed GSSAPI protection level, if any.
+    level: Option<Protection>,
 }
 
 type Outcome = Result<(AuthMethod, Option<String>), ServerError>;
@@ -58,7 +60,10 @@ async fn serve(server: Server) -> (u16, tokio::task::JoinHandle<Outcome>) {
         let (mut socket, _) = listener.accept().await.unwrap();
         let store = OneUser(UserSecret::from_password("pw", WEAK).unwrap());
         let decoy = DecoyKey::generate().unwrap();
-        let acceptor = GssAcceptor::new(MockBackend::new(KEY).with_service(SERVICE).shared());
+        let mut acceptor = GssAcceptor::new(MockBackend::new(KEY).with_service(SERVICE).shared());
+        if let Some(level) = server.level {
+            acceptor = acceptor.with_protection(level);
+        }
         let options = ServerOptions::new(
             Instant::now() + Duration::from_secs(10),
             server.anonymous,
@@ -112,6 +117,7 @@ const BOTH: Server = Server {
     secure: true,
     gssapi: true,
     anonymous: false,
+    level: None,
 };
 
 /// With both enabled on both sides GSSAPI wins; the server sees the principal
@@ -233,6 +239,7 @@ async fn anonymous_is_chosen_last() {
         gssapi: false,
         secure: false,
         anonymous: true,
+        level: None,
     })
     .await;
     let mut socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -274,6 +281,70 @@ async fn a_bad_ticket_fails_the_dial_with_a_typed_error() {
     let error = dial(&proxy).await.unwrap_err();
     assert!(
         matches!(error, ConnectError::Gssapi(GssapiError::Aborted)),
+        "{error:?}"
+    );
+    assert!(server.await.unwrap().is_err());
+}
+
+/// By default the SOCKS request and reply are plain (level 0, the curl case):
+/// only the authentication is protected, and the tunnel works. Mutation:
+/// wrapping the reply when level 0 was agreed breaks the client's read.
+#[tokio::test]
+async fn the_default_serves_plain_socks_messages() {
+    let (port, server) = serve(Server {
+        secure: false,
+        ..BOTH
+    })
+    .await;
+    echo(
+        dial(&client(port, false, true, "alice@TEST"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let (method, user) = server.await.unwrap().unwrap();
+    assert_eq!(method, AuthMethod::Gssapi);
+    assert_eq!(user.as_deref(), Some("alice@TEST"));
+}
+
+/// A server set to protect (integrity, confidentiality) is served with
+/// protected request and reply by a default client, which adapts to the
+/// answer. Mutation: not wrapping at levels 1 or 2 breaks one of the dials.
+#[tokio::test]
+async fn a_protecting_server_gets_protected_messages() {
+    for level in [Protection::Integrity, Protection::Confidential] {
+        let (port, server) = serve(Server {
+            secure: false,
+            level: Some(level),
+            ..BOTH
+        })
+        .await;
+        echo(
+            dial(&client(port, false, true, "alice@TEST"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(server.await.unwrap().unwrap().0, AuthMethod::Gssapi);
+    }
+}
+
+/// A client that requires protection does not use an unprotecting server: the
+/// dial fails with the typed error before any request is sent.
+#[tokio::test]
+async fn a_client_requiring_protection_does_not_use_a_plain_server() {
+    let (port, server) = serve(Server {
+        secure: false,
+        ..BOTH
+    })
+    .await;
+    let backend = MockBackend::new(KEY).with_principal("alice@TEST").shared();
+    let proxy = ProxyConfig::socks5("127.0.0.1", port).with_gssapi(
+        GssCredentials::new(backend, SERVICE).with_min_protection(Protection::Integrity),
+    );
+    let error = dial(&proxy).await.unwrap_err();
+    assert!(
+        matches!(error, ConnectError::Gssapi(GssapiError::ProtectionTooWeak)),
         "{error:?}"
     );
     assert!(server.await.unwrap().is_err());

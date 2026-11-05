@@ -83,6 +83,7 @@ cargo test -p resocks5-net --features gssapi-system --locked -- --ignored --test
 # Interoperability: a third-party client (curl) against our server over real
 # Kerberos. A curl built without GSS-API is a CI image problem, so it fails
 # loudly instead of skipping.
+curl --version
 curl --version | grep -qi "gss" || { echo "kdc-test: this curl has no GSS-API" >&2; exit 1; }
 cargo build -p resocks5-net --features gssapi-system --example gssapi_interop_server --locked
 port=1081

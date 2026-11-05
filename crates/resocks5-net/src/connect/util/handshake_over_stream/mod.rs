@@ -180,7 +180,8 @@ where
                     crate::GssapiError::Io(kind) => io(kind),
                     other => ConnectError::Gssapi(other),
                 })?;
-            return Ok((stream, Some(session)));
+            // Level 0: authenticated, but the request and reply are plain.
+            return Ok((stream, session.is_protected().then_some(session)));
         }
         let credentials = strong.secure.expect("offered only when configured");
         crate::secure_auth::client_authenticate(&mut stream, credentials)

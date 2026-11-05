@@ -16,7 +16,7 @@ use crate::auth::AuthState;
 use crate::config::{AllowedClients, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::gssapi::mock::MockBackend;
-use resocks5_net::gssapi::{client_gssapi, GssAcceptor, GssCredentials, METHOD};
+use resocks5_net::gssapi::{client_gssapi, GssAcceptor, GssCredentials, Protection, METHOD};
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::server::ServerError;
 use tokio::io::AsyncWriteExt;
@@ -45,7 +45,9 @@ struct Outcome {
 /// server with `users`; the client CONNECTs to a banned target, so an
 /// authenticated, mapped client ends in "Banned target address".
 async fn connect_as(principal: &str, kdc_key: [u8; 32], users: Vec<User>) -> Outcome {
-    let acceptor = GssAcceptor::new(MockBackend::new(KEY).with_service(SERVICE).shared());
+    // Protected request and reply: the tests read and write sealed messages.
+    let acceptor = GssAcceptor::new(MockBackend::new(KEY).with_service(SERVICE).shared())
+        .with_protection(Protection::Confidential);
     let auth = Arc::new(
         AuthState::build(
             &crate::config::AuthConfig {
@@ -78,7 +80,8 @@ async fn connect_as(principal: &str, kdc_key: [u8; 32], users: Vec<User>) -> Out
     let credentials = GssCredentials::new(
         MockBackend::new(kdc_key).with_principal(principal).shared(),
         SERVICE,
-    );
+    )
+    .with_requested_protection(Protection::Confidential);
 
     timeout(Duration::from_secs(15), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

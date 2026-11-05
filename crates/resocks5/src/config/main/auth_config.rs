@@ -30,10 +30,13 @@ pub struct AuthConfig {
     /// strongest it has: GSSAPI, then secure auth, then anonymous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gssapi_service: Option<String>,
-    /// The weakest per-message protection the server agrees to for GSSAPI
-    /// clients: `integrity` (default) or `confidentiality`.
+    /// Per-message protection of the SOCKS request and reply for GSSAPI
+    /// clients: `none` (default: only the authentication is protected, which
+    /// is what `curl --socks5-gssapi` and Dante's `clear` speak), `integrity`
+    /// or `confidentiality` (RFC 1961 levels 1 and 2; the client must support
+    /// them). The tunnel data is never protected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gssapi_min_protection: Option<String>,
+    pub gssapi_protection: Option<String>,
 }
 
 impl Default for AuthConfig {
@@ -41,7 +44,7 @@ impl Default for AuthConfig {
         Self {
             allow_anonymous: default_allow_anonymous(),
             gssapi_service: None,
-            gssapi_min_protection: None,
+            gssapi_protection: None,
         }
     }
 }

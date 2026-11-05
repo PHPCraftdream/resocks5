@@ -279,6 +279,11 @@ where
     let (mut session, principal) = crate::gssapi::server_gssapi(stream, acceptor)
         .await
         .map_err(gss_error)?;
+    if !session.is_protected() {
+        // Level 0: the request and reply are plain SOCKS5 on the stream.
+        let request = socks_request(stream, Some(principal), None, None).await?;
+        return Ok(request.authenticated_with(AuthMethod::Gssapi, None));
+    }
     let request = session.read_message(stream).await.map_err(gss_error)?;
     let mut memory = Memory {
         input: std::io::Cursor::new(request),

@@ -43,13 +43,25 @@ fn creds(principal: &str) -> GssCredentials {
     GssCredentials::new(client_backend(principal), SERVICE)
 }
 
+/// A client that requires a protected request and reply, and a server that
+/// provides it at `level`.
+fn protected(principal: &str) -> GssCredentials {
+    creds(principal)
+        .with_requested_protection(Protection::Confidential)
+        .with_min_protection(Protection::Integrity)
+}
+
+fn protected_server(level: Protection) -> GssAcceptor {
+    GssAcceptor::new(server_backend()).with_protection(level)
+}
+
 /// The server learns the client's principal, both sides agree on the
 /// strongest level, and a message round-trips in each direction. Mutation:
 /// returning the service name as the peer (or no name) fails the principal.
 #[tokio::test]
 async fn a_context_is_established_and_messages_round_trip() {
-    let acceptor = GssAcceptor::new(server_backend());
-    let (client, server) = run(&creds("alice@TEST"), &acceptor).await;
+    let acceptor = protected_server(Protection::Confidential);
+    let (client, server) = run(&protected("alice@TEST"), &acceptor).await;
     let mut client = client.unwrap();
     let (mut server, principal) = server.unwrap();
     assert_eq!(principal, "alice@TEST");
@@ -75,38 +87,6 @@ async fn a_context_is_established_and_messages_round_trip() {
         client.read_message(&mut b).await.unwrap(),
         b"\x05\x00\x00\x01\0\0\0\0\0\0"
     );
-}
-
-/// The client asks for the strongest level and the server agrees; a client
-/// asking for integrity only is answered with integrity (the server's
-/// minimum is integrity). Mutation: ignoring the request always answers 2.
-#[tokio::test]
-async fn the_agreed_level_follows_the_request() {
-    let acceptor = GssAcceptor::new(server_backend());
-    let weak = creds("alice@TEST").with_requested_protection(Protection::Integrity);
-    let (client, server) = run(&weak, &acceptor).await;
-    assert_eq!(client.unwrap().protection(), Protection::Integrity);
-    assert_eq!(server.unwrap().0.protection(), Protection::Integrity);
-}
-
-/// A server whose minimum is confidentiality lifts a weaker request to it; a
-/// client whose minimum is confidentiality refuses a server that agrees to
-/// less. Mutation: no minimum check accepts the weak level.
-#[tokio::test]
-async fn minimum_protection_is_enforced_on_both_sides() {
-    let strict_server =
-        GssAcceptor::new(server_backend()).with_min_protection(Protection::Confidential);
-    let weak = creds("alice@TEST").with_requested_protection(Protection::Integrity);
-    let (client, server) = run(&weak, &strict_server).await;
-    assert_eq!(client.unwrap().protection(), Protection::Confidential);
-    assert_eq!(server.unwrap().0.protection(), Protection::Confidential);
-
-    let lenient_server = GssAcceptor::new(server_backend());
-    let strict_client = creds("alice@TEST")
-        .with_requested_protection(Protection::Integrity)
-        .with_min_protection(Protection::Confidential);
-    let (client, _) = run(&strict_client, &lenient_server).await;
-    assert_eq!(client.unwrap_err(), GssapiError::ProtectionTooWeak);
 }
 
 /// A ticket from another KDC, or for another service, is refused: the client
@@ -160,8 +140,8 @@ async fn a_rogue_server_fails_mutual_authentication() {
 /// MAC check, no sequence check, no direction.
 #[tokio::test]
 async fn protected_messages_resist_tampering_replay_and_reflection() {
-    let acceptor = GssAcceptor::new(server_backend());
-    let (client, server) = run(&creds("alice@TEST"), &acceptor).await;
+    let acceptor = protected_server(Protection::Confidential);
+    let (client, server) = run(&protected("alice@TEST"), &acceptor).await;
     let (mut client, (mut server, _)) = (client.unwrap(), server.unwrap());
 
     let frame = client.seal(b"first").unwrap();
@@ -251,8 +231,8 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tap<S> {
 /// no password input anywhere in this protocol.
 #[tokio::test]
 async fn the_wire_carries_only_tokens() {
-    let acceptor = GssAcceptor::new(server_backend());
-    let credentials = creds("alice@TEST");
+    let acceptor = protected_server(Protection::Confidential);
+    let credentials = protected("alice@TEST");
     let (client, server) = duplex(4096);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let request: &[u8] = b"\x05\x01\x00\x03\x0bexample.com\x01\xbb";
@@ -281,4 +261,56 @@ async fn the_wire_carries_only_tokens() {
         !wire.windows(request.len()).any(|w| w == request),
         "the request travels encrypted at level 2"
     );
+}
+
+/// By default only the authentication is protected: the context is mutual,
+/// the principal is known, and the SOCKS messages are not protected (level 0,
+/// what `curl --socks5-gssapi` speaks); the session refuses to seal. Mutation:
+/// a default of 1 or 2 breaks clients without per-message protection; sealing
+/// at level 0 would invent a frame such a client cannot read.
+#[tokio::test]
+async fn by_default_only_the_authentication_is_protected() {
+    let acceptor = GssAcceptor::new(server_backend());
+    let (client, server) = run(&creds("alice@TEST"), &acceptor).await;
+    let mut client = client.unwrap();
+    let (mut server, principal) = server.unwrap();
+    assert_eq!(principal, "alice@TEST", "still authenticated");
+    assert_eq!(client.protection(), Protection::None);
+    assert_eq!(server.protection(), Protection::None);
+    assert!(!client.is_protected() && !server.is_protected());
+    assert_eq!(client.seal(b"x").unwrap_err(), GssapiError::NotEstablished);
+    assert_eq!(server.open(b"x").unwrap_err(), GssapiError::NotEstablished);
+}
+
+/// A client asking for the strongest level (as curl does) still gets what the
+/// server is configured for, level 0 by default. Mutation: mirroring the
+/// request hands curl a level it refuses.
+#[tokio::test]
+async fn the_server_answers_its_level_whatever_is_asked() {
+    for (asked, level) in [
+        (Protection::Confidential, Protection::None),
+        (Protection::None, Protection::Integrity),
+        (Protection::Integrity, Protection::Confidential),
+    ] {
+        let acceptor = protected_server(level);
+        let credentials = creds("alice@TEST").with_requested_protection(asked);
+        let (client, server) = run(&credentials, &acceptor).await;
+        assert_eq!(client.unwrap().protection(), level, "asked {asked:?}");
+        assert_eq!(server.unwrap().0.protection(), level, "asked {asked:?}");
+    }
+}
+
+/// A client that requires protection refuses a server that answers less:
+/// no silent downgrade for it. Mutation: a client without the minimum check
+/// accepts an unprotected session it was told to refuse.
+#[tokio::test]
+async fn a_client_requiring_protection_refuses_less() {
+    for (server_level, min) in [
+        (Protection::None, Protection::Integrity),
+        (Protection::Integrity, Protection::Confidential),
+    ] {
+        let credentials = creds("alice@TEST").with_min_protection(min);
+        let (client, _server) = run(&credentials, &protected_server(server_level)).await;
+        assert_eq!(client.unwrap_err(), GssapiError::ProtectionTooWeak);
+    }
 }

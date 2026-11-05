@@ -45,14 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before any connect).
 - `resocks5-net`: GSSAPI authentication for SOCKS5 (`gssapi` module, feature
   `gssapi`, RFC 1961, method 0x01): the context exchange, abort, protection-level
-  negotiation (the client asks for confidentiality, accepts its configured
-  minimum or better) and protected SOCKS request/reply are implemented over the
+  negotiation and, optionally, protected SOCKS request/reply are implemented over the
   `GssBackend` / `GssContext` traits; no password or credential crosses the wire.
   `ProxyConfig::with_gssapi(GssCredentials)` on the client,
   `server::accept_with(stream, options, &AuthMethods)` on the server, where
   `IncomingRequest::auth_method()` tells how the client authenticated and
-  `username()` is the principal for GSSAPI. Protection covers the request and
-  reply; the tunnel data afterwards is unprotected. Ships with a test-only
+  `username()` is the principal for GSSAPI. By default only the authentication is
+  protected (level 0, which `curl --socks5-gssapi` and Dante's `clear` speak: the
+  context is mutual, the SOCKS request and reply are not wrapped); levels 1 and 2
+  (`GssAcceptor::with_protection`, `GssCredentials::with_min_protection`) wrap
+  them. The tunnel data is never protected. Ships with a test-only
   mock mechanism (`gssapi::mock`); the Kerberos backend is a separate feature.
 - `resocks5-net`: methods adapt on the fly, strongest first. A client with several
   strong methods configured (GSSAPI, secure auth) offers them all in that order and
@@ -103,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
   the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
   system Kerberos backend; not in the release binaries). `auth.gssapi_service`
-  (and `auth.gssapi_min_protection`) enable it; `users add-gssapi <principal>`
+  (and `auth.gssapi_protection`) enable it; `users add-gssapi <principal>`
   creates a password-less account named like the principal (`hash: gssapi`) to
   which that principal maps; a SOCKS5 upstream entry may end in
   `;gssapi=<service@host>`. Methods adapt on the fly, strongest first: the server

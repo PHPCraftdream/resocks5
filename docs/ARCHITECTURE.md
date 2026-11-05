@@ -375,8 +375,10 @@ GSSAPI the SDK runs the RFC 1961 exchange over the system Kerberos backend and
 returns the principal; `AuthState::gssapi_account` maps it to the enabled,
 IP-admitted account of the same name (`hash: gssapi`, created with
 `users add-gssapi`) and `IncomingRequest::set_identity` makes everything
-downstream see that account. The SOCKS request and reply travel as protected
-messages (the reply through `IncomingRequest::reply`); tunnel data is plain.
+downstream see that account. Only the authentication is protected by default (level 0, what curl and Dante
+speak); with `auth.gssapi_protection` of `integrity` or `confidentiality` the SOCKS
+request and reply travel as protected messages (the reply through
+`IncomingRequest::reply`). Tunnel data is always plain.
 Upstreams use the same negotiation: `ProxyConfig::with_gssapi` and
 `with_secure_auth` both set means both are offered, GSSAPI first.
 

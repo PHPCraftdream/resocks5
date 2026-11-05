@@ -175,15 +175,19 @@ mod tests {
         std::env::var("GSS_TEST_PRINCIPAL").expect("GSS_TEST_PRINCIPAL (set by kdc-test.sh)")
     }
 
-    /// A real Kerberos exchange: the server learns the client's principal,
-    /// both agree on confidentiality, and a protected message round-trips.
+    /// A real Kerberos exchange with protected messages enabled (level 2): the
+    /// server learns the client's principal and a protected message
+    /// round-trips.
     /// Mutation: a backend that does not verify the ticket, or reports the
     /// service as the peer, fails the principal.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a KDC: run by the gssapi-system CI job"]
     async fn a_real_kerberos_exchange() {
-        let credentials = GssCredentials::new(SystemBackend::new().shared(), service());
-        let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service()).shared());
+        let credentials = GssCredentials::new(SystemBackend::new().shared(), service())
+            .with_requested_protection(Protection::Confidential)
+            .with_min_protection(Protection::Confidential);
+        let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service()).shared())
+            .with_protection(Protection::Confidential);
         let (client, server) = duplex(16 * 1024);
         let (client, server) = tokio::join!(
             async move {
