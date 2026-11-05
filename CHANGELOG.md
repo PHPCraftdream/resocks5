@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
   returns the bare `TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (HTTPS is refused
   before any connect).
+- `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
+  and clears `user`/`password` at this node and every solely owned gate, and
+  reports a shared gate it left untouched. Opt-in: `ProxyConfig` has no `Drop`.
 
 ### Changed
 
