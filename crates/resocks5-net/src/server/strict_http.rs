@@ -46,6 +46,35 @@ fn valid_authority_host(host: &str) -> bool {
     true
 }
 
+/// 1-5 ASCII digits: the strict `Host` port shape.
+fn valid_port_digits(port: &str) -> bool {
+    !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Strict `Host` grammar: `uri-host [ ":" port ]`, mirroring the CONNECT
+/// authority rules with a 1-5 digit port; a bare IPv6 without brackets
+/// has no valid port separator and fails.
+fn valid_host_value(value: &str) -> bool {
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return match after.strip_prefix(':') {
+            Some(port) => valid_port_digits(port),
+            None => after.is_empty(),
+        };
+    }
+    match value.split_once(':') {
+        Some((host, port)) => {
+            !host.is_empty() && valid_authority_host(host) && valid_port_digits(port)
+        }
+        None => !value.is_empty() && valid_authority_host(value),
+    }
+}
+
 /// Validate the already-split HTTP CONNECT request against RFC 9112.
 ///
 /// `request_line` is the request line text; `headers` are the raw header
@@ -120,6 +149,7 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
 
     let mut host_count = 0usize;
     let mut host_value_empty = false;
+    let mut host_value: Option<&[u8]> = None;
     let mut proxy_auth_count = 0usize;
     for line in headers {
         if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
@@ -151,6 +181,7 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
             b"host" => {
                 host_count += 1;
                 host_value_empty = value.trim_ascii().is_empty();
+                host_value = Some(value.trim_ascii());
             }
             b"proxy-authorization" => proxy_auth_count += 1,
             _ => {}
@@ -165,6 +196,12 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
     }
     if host_value_empty {
         return Err(bad("strict HTTP: empty Host header"));
+    }
+    // Exactly one non-empty Host value must be `uri-host [ ":" port ]`.
+    if let Some(host) = host_value {
+        if !std::str::from_utf8(host).is_ok_and(valid_host_value) {
+            return Err(bad("strict HTTP: invalid Host header"));
+        }
     }
     if proxy_auth_count > 1 {
         return Err(bad("strict HTTP: duplicate Proxy-Authorization header"));

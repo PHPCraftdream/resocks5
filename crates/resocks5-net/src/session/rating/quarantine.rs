@@ -149,6 +149,15 @@ pub(super) enum State {
     Probation,
 }
 
+/// End of a period that starts at `now`: `now + length`, or a far-future
+/// stand-in when `Instant` cannot represent the sum (e.g. `Duration::MAX`).
+fn deadline(now: Instant, length: Duration) -> Instant {
+    const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    now.checked_add(length)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
+}
+
 /// Per-upstream quarantine bookkeeping.
 #[derive(Debug, Default)]
 pub(super) struct Cell {
@@ -191,7 +200,7 @@ impl Cell {
         }
         self.trips = self.trips.saturating_add(1);
         let length = policy.duration_for(self.trips);
-        self.until = Some(now.checked_add(length).unwrap_or(now));
+        self.until = Some(deadline(now, length));
         Some(length)
     }
 
@@ -203,7 +212,7 @@ impl Cell {
         self.consecutive = self.consecutive.max(policy.threshold);
         self.trips = self.trips.saturating_add(1);
         let length = policy.duration_for(self.trips);
-        self.until = Some(now.checked_add(length).unwrap_or(now));
+        self.until = Some(deadline(now, length));
         length
     }
 
@@ -236,7 +245,7 @@ impl Cell {
         self.lease_until = None;
         self.trips = trips.max(1);
         self.consecutive = consecutive.max(policy.threshold);
-        self.until = Some(now.checked_add(left).unwrap_or(now));
+        self.until = Some(deadline(now, left));
     }
 
     /// A success proves the upstream alive: forget everything.
@@ -437,5 +446,75 @@ mod tests {
             .with_initial(Duration::ZERO)
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn hard_failure_with_unrepresentable_deadline_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::MAX)
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        assert_eq!(c.hard_failure(t0, &p), Some(Duration::MAX));
+        assert_eq!(c.state(t0), State::Quarantined);
+    }
+
+    #[test]
+    fn retrip_with_unrepresentable_deadline_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        // Seed a high trip count without waiting out the doublings.
+        c.restore(true, Duration::from_secs(30), 100, 1, t0, &p);
+        let length = c.trip_now(t0, &p);
+        assert_eq!(length, Duration::MAX);
+        assert_eq!(c.state(t0), State::Quarantined);
+        assert_eq!(c.state(t0 + Duration::from_secs(1)), State::Quarantined);
+    }
+
+    #[test]
+    fn restore_with_unrepresentable_left_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(3)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        c.restore(true, Duration::MAX, 1, 3, t0, &p);
+        assert_eq!(c.state(t0), State::Quarantined);
+        // At least a year left; the exact cap is the platform's Instant range.
+        assert!(c.snapshot(t0).1 >= Duration::from_secs(365 * 24 * 3600));
+    }
+
+    #[test]
+    fn normal_deadlines_are_exact() {
+        let p = QuarantinePolicy::default();
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        for _ in 0..3 {
+            c.hard_failure(t0, &p);
+        }
+        assert_eq!(
+            c.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(30), 1, 3)
+        );
+
+        let mut r = Cell::default();
+        r.restore(true, Duration::from_secs(100), 2, 3, t0, &p);
+        assert_eq!(
+            r.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(100), 2, 3)
+        );
+
+        let mut q = Cell::default();
+        assert_eq!(q.trip_now(t0, &p), Duration::from_secs(30));
+        assert_eq!(
+            q.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(30), 1, 3)
+        );
     }
 }

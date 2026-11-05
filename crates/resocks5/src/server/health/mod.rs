@@ -18,14 +18,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::users_file::{sibling_path, write_atomic};
+use crate::config::users_file::{sibling_path, write_atomic, UsersFileLock};
 use crate::logger::Logger;
+use resocks5_net::pool::ProxyPool;
 use resocks5_net::rating::{Health, UpstreamState};
 use resocks5_net::rotator::{ProxyRotator, UpstreamHealth};
 use resocks5_net::types::ProxyConfig;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod writer_tests;
 
 pub(crate) const STATE_ALIVE: &str = "alive";
 pub(crate) const STATE_QUARANTINED: &str = "quarantined";
@@ -241,13 +244,22 @@ pub(crate) fn resume(groups: &[HealthGroup], path: &Path, now: u64) -> Resumed {
     }
 }
 
-/// Handle to the running saver. The module is the health file's only writer
-/// while the server runs; [`HealthSaver::finish`] is the only supported
-/// shutdown: it stops the loop and writes the last snapshot itself, so two
-/// writers never race over the same temp file.
+/// Handle to the running saver. The module holds the health file's
+/// cross-process lock for the whole run and is its only writer;
+/// [`HealthSaver::finish`] is the only supported shutdown: it stops the
+/// loop and writes the last snapshot itself, so two writers never race
+/// over the same temp file, and the lock is released only after that
+/// final write. `task` is `None` when persistence was disabled at
+/// start-up; `finish` then does nothing.
 pub(crate) struct HealthSaver {
     stop: Arc<tokio::sync::Notify>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Held for the saver's lifetime: no other process may clean up or
+    /// write the health file (or its temp) in the meantime.
+    lock: Option<UsersFileLock>,
+    /// Best-effort shutdown reports go through the logger's non-blocking
+    /// channel: a full stderr pipe must not stall the exit.
+    logger: Arc<Logger>,
 }
 
 /// Budget for each shutdown step (stop hand-off, final write). A blocking
@@ -255,32 +267,58 @@ pub(crate) struct HealthSaver {
 /// snapshot is lost on purpose instead of racing a second writer.
 const FINISH_BUDGET: Duration = Duration::from_secs(3);
 
+/// Budget for acquiring the health file's cross-process lock at start-up.
+/// A live holder keeps it for the whole server run: losing the race means
+/// another instance owns the file and this process runs read-only.
+const LOCK_BUDGET: Duration = Duration::from_millis(200);
+
 impl HealthSaver {
     /// Stop protocol: signal stop, wait for the loop to end (bounded), then
     /// write one final snapshot through the same offloaded path. Waiting for
-    /// the loop first is what keeps the final write the only writer.
+    /// the loop first is what keeps the final write the only writer; the
+    /// cross-process lock is released only after it. When persistence was
+    /// disabled at start-up this is a no-op. Writer failures are reported
+    /// through the logger's non-blocking channel, never through stderr.
     pub(crate) async fn finish(self, groups: &[HealthGroup], path: &Path) {
-        self.stop.notify_one();
-        let mut task = self.task;
+        let Self {
+            stop,
+            task,
+            lock,
+            logger,
+        } = self;
+        // Nothing was ever written: shutdown stays a no-op.
+        let Some(mut task) = task else {
+            return;
+        };
+        stop.notify_one();
         match tokio::time::timeout(FINISH_BUDGET, &mut task).await {
             Ok(Ok(())) => {}
             // The writer task itself died (panic): like a save error.
-            Ok(Err(error)) => eprintln!("warning: health writer task failed: {error:#}"),
+            Ok(Err(error)) => {
+                logger.proxy_failure(|| format!("health writer task failed: {error:#}"))
+            }
             Err(_) => {
                 task.abort();
-                eprintln!(
-                    "warning: the health writer did not stop in {FINISH_BUDGET:?}; continuing without a final snapshot"
-                );
+                logger.proxy_failure(|| {
+                    format!(
+                        "the health writer did not stop in {FINISH_BUDGET:?}; continuing without a final snapshot"
+                    )
+                });
                 return;
             }
         }
-        save_final(groups, path).await;
+        save_final(groups, path, &logger).await;
+        drop(lock);
     }
 }
 
 /// Start-up: put the saved quarantines back, hand the due ones to the
-/// background probes, then keep the file current. Returns the saver handle —
-/// call [`HealthSaver::finish`] at shutdown — and whether a saved picture
+/// background probes, then keep the file current. The health file's
+/// cross-process lock is taken first: a second instance in the same
+/// directory loses the race and runs with persistence disabled — its
+/// saver does nothing and [`HealthSaver::finish`] is a no-op (the
+/// restore read still happened). Returns the saver handle — call
+/// [`HealthSaver::finish`] at shutdown — and whether a saved picture
 /// was found: then the start-up reachability check is redundant.
 ///
 /// `groups` covers every rotator (snapshot/restore/save), but only `direct` —
@@ -291,6 +329,7 @@ impl HealthSaver {
 pub(crate) fn start(
     groups: Vec<HealthGroup>,
     direct: Vec<Arc<ProxyRotator>>,
+    pool: Arc<ProxyPool>,
     path: PathBuf,
     every: Duration,
     probe_timeout: Duration,
@@ -301,7 +340,27 @@ pub(crate) fn start(
     if let Some(warning) = &resumed.warning {
         println!("warning: {warning}");
     }
-    if resumed.saved.is_some() {
+    // Before any cleanup or write: without it a second instance would
+    // delete the running writer's temp mid-write (flock/LockFileEx via
+    // the shared users-file sentinel; released by the OS on death).
+    let lock = match UsersFileLock::acquire_with_timeout(&path, LOCK_BUDGET) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            logger.proxy_failure(|| {
+                format!(
+                    "health file {} is locked by another process; persistence is disabled: {error:#}",
+                    path.display()
+                )
+            });
+            None
+        }
+    };
+    // The baseline is the state as it is on disk right after the restore,
+    // taken BEFORE any probe below can change a health cell: otherwise an
+    // early probe result would be its own baseline and the first round
+    // would see "no change" while the file still holds the old picture.
+    let initial = found.then(|| snapshot(&groups, unix_now()));
+    if found {
         let restored = resumed.restored;
         logger.lifecycle(|| {
             format!(
@@ -312,38 +371,69 @@ pub(crate) fn start(
                 restored.probation
             )
         });
+        // Post-restore probes for the directly dialed rotators only
+        // (the dispatch rework hooks in here).
         for rotator in &direct {
             crate::server::connect::establish_connection::spawn_due_probes(
                 rotator,
+                &pool,
                 &logger,
                 probe_timeout,
             );
         }
     }
-    let initial = resumed.saved.map(|_| snapshot(&groups, unix_now()));
-    // Single-owner window: no saver runs yet, so a temp left by a crashed
-    // previous run can be reclaimed. `write_atomic` creates its temp with
-    // `create_new` and every later save would fail on it otherwise.
-    remove_stale_temp(&path, &logger);
+    // Single-owner window: under the lock a temp left by a crashed
+    // previous run can be reclaimed. `write_atomic` creates its temp
+    // with `create_new` and every later save would fail on it otherwise.
+    if lock.is_some() {
+        remove_stale_temp(&path, &logger);
+    }
     let stop = Arc::new(tokio::sync::Notify::new());
+    let task = lock.is_some().then(|| {
+        tokio::spawn(run_saver(
+            groups,
+            path,
+            every,
+            initial,
+            Arc::clone(&logger),
+            Arc::clone(&stop),
+        ))
+    });
     (
         HealthSaver {
-            stop: Arc::clone(&stop),
-            task: tokio::spawn(run_saver(groups, path, every, initial, logger, stop)),
+            stop,
+            task,
+            lock,
+            logger,
         },
         found,
     )
 }
 
-/// Remove a stale `<path>.tmp` left by a crashed previous run. Only ever
-/// called for the health file, before the saver exists. The users file's
-/// temp is a deliberate crash-recovery copy and is never touched here.
-fn remove_stale_temp(path: &Path, logger: &Logger) {
+/// Remove the health's own leftover `<path>.tmp` (`Ok(false)` when there
+/// was none). Callers hold the health file's cross-process lock, so no
+/// other writer can own this temp. The users file's temp is a deliberate
+/// crash-recovery copy with its own semantics and is never touched here.
+fn reclaim_own_temp(path: &Path) -> Result<bool> {
     let temp = sibling_path(path, ".tmp");
     match std::fs::remove_file(&temp) {
-        Ok(()) => logger.lifecycle(|| format!("health: removed stale temp {}", temp.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => eprintln!("warning: could not remove {}: {error}", temp.display()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(anyhow::Error::new(error).context(format!("remove {}", temp.display()))),
+    }
+}
+
+/// Start-up cleanup, only after the lock is held: a temp left by a
+/// crashed previous run (or kept by a failed Windows commit) would fail
+/// every save at the `create_new`.
+fn remove_stale_temp(path: &Path, logger: &Logger) {
+    let temp = sibling_path(path, ".tmp");
+    match reclaim_own_temp(path) {
+        Ok(true) => logger.lifecycle(|| format!("health: removed stale temp {}", temp.display())),
+        Ok(false) => {}
+        Err(error) => {
+            logger.proxy_failure(|| format!("could not remove {}: {error:#}", temp.display()))
+        }
     }
 }
 
@@ -354,26 +444,40 @@ pub(crate) fn save(path: &Path, file: &HealthFile) -> Result<()> {
 
 /// One health-file write: the ktav serialization and the I/O run on the
 /// blocking pool, so no async worker sits on storage. A panicked writer is
-/// reported like a save error.
+/// reported like a save error. The health's own temp is reclaimed before
+/// EVERY attempt: Windows keeps it behind on a failed commit, and
+/// `write_atomic` creates the temp with `create_new` — without the
+/// reclaim one kept temp would fail every later save. A failed removal
+/// is a save error like any other.
 async fn save_offloaded(path: PathBuf, file: HealthFile) -> Result<()> {
-    match tokio::task::spawn_blocking(move || save(&path, &file)).await {
+    match tokio::task::spawn_blocking(move || {
+        reclaim_own_temp(&path)?;
+        save(&path, &file)
+    })
+    .await
+    {
         Ok(result) => result,
         Err(error) => Err(anyhow::Error::new(error).context("health writer task failed")),
     }
 }
 
 /// The shutdown snapshot: the same offloaded write as a round, bounded by
-/// [`FINISH_BUDGET`]. Failures and timeouts only warn — losing the last
-/// picture beats blocking the exit.
-async fn save_final(groups: &[HealthGroup], path: &Path) {
+/// [`FINISH_BUDGET`]. Failures and timeouts are reported through the
+/// logger's non-blocking channel — losing the last picture beats
+/// blocking the exit on a full stderr pipe.
+async fn save_final(groups: &[HealthGroup], path: &Path, logger: &Logger) {
     let file = snapshot(groups, unix_now());
     match tokio::time::timeout(FINISH_BUDGET, save_offloaded(path.to_path_buf(), file)).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("warning: could not save {}: {error:#}", path.display()),
-        Err(_) => eprintln!(
-            "warning: saving {} timed out; continuing without the final snapshot",
-            path.display()
-        ),
+        Ok(Err(error)) => {
+            logger.proxy_failure(|| format!("could not save {}: {error:#}", path.display()))
+        }
+        Err(_) => logger.proxy_failure(|| {
+            format!(
+                "saving {} timed out; continuing without the final snapshot",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -387,7 +491,8 @@ pub(crate) fn save_now(groups: &[HealthGroup], path: &Path) {
 }
 
 /// Save every `every` while the picture changes; a failure is logged once
-/// per streak and retried on the next round. `stop` ends the loop: it is
+/// per streak and retried on the next round. A missing baseline counts as
+/// a change, so the first round always writes. `stop` ends the loop: it is
 /// selected against the tick, so no round save starts after it fired and the
 /// caller can write the final snapshot alone.
 pub(crate) async fn run_saver(

@@ -745,3 +745,217 @@ async fn a_healthy_cached_chain_is_still_a_cache_hit() {
         .unwrap();
     assert!(matches!(hit, crate::logger::ELog::Log(ref msg) if msg.contains("Cache used for")));
 }
+
+/// Same exit endpoint configured in BOTH groups, a healthy counting gate,
+/// and the cached G->E chain linked on v4: exactly the shape where
+/// resolving the cached chain against all exits would land the exit hop
+/// on a foreign rotator. One rotator's copy of E is hard-failed
+/// (threshold 1, 60 s so no probe interferes). `budget` sets
+/// max_upstream_attempts.
+struct DualExit {
+    target: String,
+    gate_cfg: resocks5_net::types::ProxyConfig,
+    exit_cfg: resocks5_net::types::ProxyConfig,
+    gate_accepts: Arc<AtomicUsize>,
+    exit_accepts: Arc<AtomicUsize>,
+    gate_rotator: Arc<ProxyRotator>,
+    gates: Arc<GateLevels>,
+    v6: Arc<ProxyRotator>,
+    v4: Arc<ProxyRotator>,
+    logger: Arc<Logger>,
+    logs: mpsc::Receiver<crate::logger::ELog>,
+    banned: Arc<RegexSet>,
+    pool: Arc<ProxyPool>,
+    network: Arc<NetworkConfig>,
+}
+
+async fn dual_exit(quarantine_v6: bool, budget: usize) -> DualExit {
+    let target = "shared-exit.example.com:443".to_string();
+    let (gate_addr, gate_accepts) = spawn_counting_chained_stub().await;
+    let (exit_addr, exit_accepts) = spawn_counting_chained_stub().await;
+    let gate_cfg = socks5_config(gate_addr, true);
+    let exit_cfg = socks5_config(exit_addr, false);
+    let quarantined = |proxies: Vec<resocks5_net::types::ProxyConfig>| {
+        Arc::new(
+            ProxyRotator::try_with_quarantine(
+                proxies,
+                Default::default(),
+                QuarantinePolicy::default()
+                    .with_threshold(1)
+                    .with_initial(Duration::from_secs(60))
+                    .with_max(Duration::from_secs(60)),
+                16,
+                Duration::from_secs(60),
+            )
+            .unwrap(),
+        )
+    };
+    let (v6, v4) = (
+        quarantined(vec![exit_cfg.clone()]),
+        quarantined(vec![exit_cfg.clone()]),
+    );
+    let (dead, alive) = if quarantine_v6 {
+        (&v6, &v4)
+    } else {
+        (&v4, &v6)
+    };
+    assert!(dead.record_hard_failure(&exit_cfg).is_some());
+    assert!(dead.is_quarantined(&exit_cfg));
+    assert!(!alive.is_quarantined(&exit_cfg));
+    let gate_rotator = Arc::new(ProxyRotator::new(vec![gate_cfg.clone()]));
+    let cached = Arc::new(
+        resocks5_net::types::ProxyConfig::chain([
+            Arc::new(gate_cfg.clone()),
+            Arc::new(exit_cfg.clone()),
+        ])
+        .unwrap(),
+    );
+    v4.link_proxy(target.clone(), cached);
+    let (log_tx, logs) = mpsc::channel(32);
+    let logger = Arc::new(Logger::new(
+        log_tx,
+        LogConfig {
+            cache_hits: true,
+            ..Default::default()
+        },
+    ));
+    DualExit {
+        target,
+        gate_accepts,
+        exit_accepts,
+        gate_rotator: gate_rotator.clone(),
+        gates: Arc::new(GateLevels::new(vec![(1, gate_rotator)])),
+        v6,
+        v4,
+        gate_cfg,
+        exit_cfg,
+        logger,
+        logs,
+        banned: Arc::new(RegexSet::empty()),
+        pool: Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(2),
+            4,
+        )),
+        network: Arc::new(NetworkConfig {
+            connect_timeout_sec: 2,
+            handshake_timeout_sec: 2,
+            max_upstream_attempts: budget,
+            ..Default::default()
+        }),
+    }
+}
+
+async fn request_dual(fx: &DualExit) -> Result<(), anyhow::Error> {
+    establish_connection(
+        &fx.target,
+        &fx.gates,
+        &Some(fx.v6.clone()),
+        &Some(fx.v4.clone()),
+        &fx.logger,
+        &fx.banned,
+        &fx.pool,
+        &fx.network,
+        None,
+        None,
+    )
+    .await
+    .map(drop)
+}
+
+/// The v6 copy of the shared exit is quarantined, the v4 copy healthy and
+/// holding the cached G->E chain: the cache must be resolved through its
+/// OWNING rotator and served despite the foreign quarantine.
+/// Mutation caught: resolving against all exits (exit hop lands on the
+/// quarantined v6 rotator) plus an exit-hop admission check drops the
+/// working cache — unlink, a gates-phase plan walk (pick_order_calls()
+/// becomes 1) and "Cache written" instead of the cache hit.
+#[tokio::test]
+async fn a_quarantined_foreign_exit_copy_keeps_the_cached_route_serving() {
+    let mut fx = dual_exit(true, 10).await;
+    request_dual(&fx)
+        .await
+        .expect("the healthy v4 cache must serve the target");
+    assert_eq!(fx.gate_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.exit_accepts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fx.gate_rotator.pick_order_calls(),
+        0,
+        "a cache hit must not walk the plan"
+    );
+    let hit = tokio::time::timeout(Duration::from_secs(5), fx.logs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(hit, crate::logger::ELog::Log(ref msg) if msg.contains("Cache used for")));
+    assert!(
+        fx.v6.is_quarantined(&fx.exit_cfg),
+        "the foreign copy stays quarantined"
+    );
+    assert!(
+        fx.v4.get_linked(&fx.target).is_some(),
+        "the cache must not be unlinked"
+    );
+}
+
+/// Inverse: the v4 copy of the shared exit is quarantined, so `get_linked`
+/// hides the cached chain and the normal plan serves through the healthy
+/// v6 copy — only the owning rotator's quarantine state decides.
+/// Mutation caught: losing the get_linked quarantine screening (or the
+/// whole cached-chain admission) dials the cached chain on the dead v4
+/// copy: the link then stays on v4 and v6 is never linked.
+#[tokio::test]
+async fn a_quarantined_owning_exit_copy_serves_through_the_plan() {
+    let fx = dual_exit(false, 10).await;
+    request_dual(&fx)
+        .await
+        .expect("the healthy v6 copy must serve the target");
+    assert_eq!(fx.gate_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.exit_accepts.load(Ordering::SeqCst), 0);
+    assert!(
+        fx.v4.get_linked(&fx.target).is_none(),
+        "the dead v4 copy stays hidden"
+    );
+    let linked = fx
+        .v6
+        .get_linked(&fx.target)
+        .expect("the plan served through v6 and linked the target");
+    let gate = linked
+        .gate
+        .as_ref()
+        .expect("the serving chain keeps its gate");
+    assert_eq!(
+        (gate.host.as_str(), gate.port),
+        (fx.gate_cfg.host.as_str(), fx.gate_cfg.port)
+    );
+}
+
+/// The foreign-quarantine scenario under a budget of 1: the cache hit
+/// itself is the one permitted attempt and must succeed.
+/// Mutation caught: the cache drop of the resolve-all-exits mutation
+/// spends its single attempt nowhere in the cached phase; the gates phase
+/// is skipped on the spent budget and the hedged phase dials the healthy
+/// copy directly — gate accepts 0, exit accepts 1.
+#[tokio::test]
+async fn a_quarantined_foreign_exit_copy_serves_the_cache_within_budget_one() {
+    let mut fx = dual_exit(true, 1).await;
+    request_dual(&fx)
+        .await
+        .expect("the cached chain is the one allowed attempt");
+    assert_eq!(
+        fx.gate_accepts.load(Ordering::SeqCst),
+        1,
+        "the one attempt is the cached chain through the gate"
+    );
+    assert_eq!(fx.exit_accepts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fx.gate_rotator.pick_order_calls(),
+        0,
+        "no plan may be walked on the spent budget"
+    );
+    let hit = tokio::time::timeout(Duration::from_secs(5), fx.logs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(hit, crate::logger::ELog::Log(ref msg) if msg.contains("Cache used for")));
+}

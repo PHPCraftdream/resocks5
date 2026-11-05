@@ -90,17 +90,24 @@ pub async fn establish_connection(
                 }
                 continue;
             }
-            let Some(pick) = gates.resolve(&exits, &cached_proxy) else {
+            // Resolve through the owning rotator only: the same exit
+            // endpoint may be configured in several groups, and matching it
+            // against all of them would borrow the quarantine and the
+            // success bookkeeping of a foreign rotator's copy of the exit.
+            let Some(pick) = gates.resolve(std::slice::from_ref(rotator), &cached_proxy) else {
                 rotator.unlink_proxy(target_addr);
                 continue;
             };
             // resolve matches nodes by identity only: a chain whose gate is
             // quarantined must not be dialed while the plan offers healthy
-            // alternatives. Drop the stale chain and fall through to the
-            // normal plan without spending an attempt.
+            // alternatives. The exit hop is not re-checked: get_linked
+            // already hid a quarantined exit of this rotator. Drop the
+            // stale chain and fall through to the normal plan without
+            // spending an attempt.
             if pick
                 .hops()
                 .iter()
+                .take(pick.hops().len().saturating_sub(1))
                 .any(|hop| hop.rotator.is_quarantined(&hop.proxy))
             {
                 rotator.unlink_proxy(target_addr);

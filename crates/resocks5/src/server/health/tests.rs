@@ -6,7 +6,7 @@ use resocks5_net::types::ProxyConfig;
 
 const NOW: u64 = 1_000_000;
 
-fn rotator(proxies: Vec<ProxyConfig>) -> Arc<ProxyRotator> {
+pub(super) fn rotator(proxies: Vec<ProxyConfig>) -> Arc<ProxyRotator> {
     Arc::new(
         ProxyRotator::try_with_quarantine(
             proxies,
@@ -22,11 +22,20 @@ fn rotator(proxies: Vec<ProxyConfig>) -> Arc<ProxyRotator> {
     )
 }
 
-fn p(host: &str) -> ProxyConfig {
+/// A fresh pool with free permits: `start` reserves one per direct probe.
+pub(super) fn test_pool() -> Arc<resocks5_net::pool::ProxyPool> {
+    Arc::new(resocks5_net::pool::ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        4,
+    ))
+}
+
+pub(super) fn p(host: &str) -> ProxyConfig {
     ProxyConfig::socks5(host, 1080)
 }
 
-fn unique_dir(tag: &str) -> PathBuf {
+pub(super) fn unique_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "resocks5_health_{}_{}_{}",
@@ -42,7 +51,7 @@ fn entry(upstream: &str, gate: u8, state: &str, remaining_sec: u64, trips: u32) 
     grouped(upstream, gate, "", state, remaining_sec, trips)
 }
 
-fn grouped(
+pub(super) fn grouped(
     upstream: &str,
     gate: u8,
     group: &str,
@@ -61,21 +70,21 @@ fn grouped(
     }
 }
 
-fn group(name: &str, rotator: Arc<ProxyRotator>) -> HealthGroup {
+pub(super) fn group(name: &str, rotator: Arc<ProxyRotator>) -> HealthGroup {
     HealthGroup {
         name: name.to_owned(),
         rotator,
     }
 }
 
-fn file(entries: Vec<HealthEntry>) -> HealthFile {
+pub(super) fn file(entries: Vec<HealthEntry>) -> HealthFile {
     HealthFile {
         saved_at: NOW,
         upstreams: entries,
     }
 }
 
-fn logger() -> (
+pub(super) fn logger() -> (
     Arc<Logger>,
     tokio::sync::mpsc::Receiver<crate::logger::ELog>,
 ) {
@@ -511,7 +520,7 @@ async fn settle() {
 /// sleeps (≤ 2 s total), which under a paused clock auto-advances time —
 /// every paused call site keeps ≥ 10 s of ticker slack, so no tick fires.
 /// Never a way to wait for a tick — ticks come from `advance`.
-async fn until(mut check: impl FnMut() -> bool) {
+pub(super) async fn until(mut check: impl FnMut() -> bool) {
     for _ in 0..100 {
         if check() {
             return;
@@ -640,7 +649,7 @@ async fn a_failing_save_is_logged_once_and_retried() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn drain(rx: &mut tokio::sync::mpsc::Receiver<crate::logger::ELog>) -> Vec<String> {
+pub(super) fn drain(rx: &mut tokio::sync::mpsc::Receiver<crate::logger::ELog>) -> Vec<String> {
     let mut lines = Vec::new();
     while let Ok(line) = rx.try_recv() {
         match line {
@@ -656,7 +665,8 @@ async fn the_final_snapshot_writes_a_loadable_file() {
     let path = dir.join("health.ktav");
     let r = rotator(vec![p("a")]);
     r.record_hard_failure(&p("a"));
-    save_final(&[group("v4", r)], &path).await;
+    let (log, _rx) = logger();
+    save_final(&[group("v4", r)], &path, &log).await;
     let loaded = load(&path).unwrap().unwrap();
     assert_eq!(loaded.upstreams[0].state, STATE_QUARANTINED);
     assert!(loaded.saved_at > 0);
@@ -667,9 +677,11 @@ async fn the_final_snapshot_writes_a_loadable_file() {
 async fn a_final_snapshot_into_a_missing_directory_only_warns() {
     let dir = unique_dir("save_final_bad");
     let r = rotator(vec![p("a")]);
+    let (log, _rx) = logger();
     save_final(
         &[group("v4", r)],
         &dir.join("no_such_dir").join("health.ktav"),
+        &log,
     )
     .await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -694,6 +706,7 @@ async fn start_restores_probes_the_due_ones_and_keeps_saving() {
     let (saver, found) = start(
         vec![group("v4", r.clone())],
         vec![r.clone()],
+        test_pool(),
         path.clone(),
         Duration::from_millis(50),
         Duration::from_secs(2),
@@ -744,6 +757,7 @@ async fn start_without_a_file_creates_it_and_logs_nothing_about_restoring() {
     let (saver, found) = start(
         vec![group("v4", r.clone())],
         Vec::new(),
+        test_pool(),
         path.clone(),
         Duration::from_millis(30),
         Duration::from_secs(1),
@@ -762,41 +776,9 @@ async fn start_without_a_file_creates_it_and_logs_nothing_about_restoring() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-async fn start_with_a_broken_file_still_runs_and_overwrites_it() {
-    let r = rotator(vec![p("a")]);
-    let dir = unique_dir("start_bad");
-    let path = dir.join("health.ktav");
-    std::fs::write(&path, "saved_at: nope\n").unwrap();
-    let (log, _rx) = logger();
-    let (saver, found) = start(
-        vec![group("v4", r.clone())],
-        Vec::new(),
-        path.clone(),
-        Duration::from_millis(30),
-        Duration::from_secs(1),
-        log,
-    );
-    assert!(!found, "an unreadable file is not a picture");
-    for _ in 0..100 {
-        // The blocking writer replaces the file concurrently: only a readable
-        // file counts, not one that is momentarily absent.
-        if matches!(load(&path), Ok(Some(_))) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        load(&path).unwrap().is_some(),
-        "the broken file is replaced"
-    );
-    saver.finish(&[group("v4", r)], &path).await;
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A listener that counts accepted connections; a reachability probe only
 /// needs the TCP handshake, so one count equals one direct probe.
-async fn counting_listener() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+pub(super) async fn counting_listener() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let hits = Arc::new(AtomicUsize::new(0));
@@ -844,6 +826,7 @@ async fn start_probes_only_the_directly_dialed_rotators() {
             group("v4", exit_rotator.clone()),
         ],
         vec![exit_rotator.clone()],
+        test_pool(),
         path.clone(),
         Duration::from_secs(60),
         Duration::from_secs(2),
@@ -896,6 +879,7 @@ async fn a_stale_temp_from_a_crashed_run_is_reclaimed_instead_of_blocking_saves(
     let (saver, found) = start(
         vec![group("v4", r.clone())],
         Vec::new(),
+        test_pool(),
         path.clone(),
         Duration::from_millis(30),
         Duration::from_secs(1),
@@ -931,6 +915,7 @@ async fn finish_writes_the_final_snapshot_without_waiting_for_a_tick() {
     let (saver, found) = start(
         vec![group("v4", r.clone())],
         Vec::new(),
+        test_pool(),
         path.clone(),
         Duration::from_secs(3600),
         Duration::from_secs(1),
@@ -960,6 +945,7 @@ async fn repeated_finish_cycles_leave_a_valid_file_and_no_temp() {
         let (saver, found) = start(
             vec![group("v4", r.clone())],
             Vec::new(),
+            test_pool(),
             path.clone(),
             Duration::from_millis(20),
             Duration::from_secs(1),

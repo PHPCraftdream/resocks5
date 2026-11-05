@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise, a single `Host`, token header names, no obs-fold, one
   `Proxy-Authorization`); the default stays permissive.
 - `resocks5-net`: optional feature `zeroize` wipes inbound credentials on drop.
+- `resocks5-net`: `ProxyRotator::probe_due_with` and `probe_all_with` take a
+  per-probe reservation hook (`Fn(&ProxyConfig) -> Option<guard>`): `None` defers
+  the probe (no connection, no health change, no event), `Some(guard)` holds the
+  guard for the probe. `probe_due` / `probe_all` are unchanged.
 
 ### Changed
 
@@ -54,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   group.
 - CI: a change under `crates/resocks5-net/src/session/chain/` runs the SDK `chain::`
   tests and the app `server::` tests instead of only building them.
+- `resocks5-net`: strict HTTP validates the `Host` value as `uri-host [":" port]`
+  (a path, userinfo or broken percent escape is rejected); the default stays
+  permissive. A `Lost` hedge report carries `after_win == true` once a win is
+  published.
+- `resocks5`: direct probes and chain probes reserve a pool permit for the tested
+  endpoint, so probes respect `max_per_upstream`; at capacity a probe is deferred,
+  never counted as down. A chain probe runs under an absolute deadline from its
+  claim, its result is discarded when it settles after its lease, and only an
+  upstream's refusal of the final CONNECT quarantines the tested gate (prefix
+  auth, TLS or greeting failures do not).
+- `resocks5`: the health file is guarded by a cross-process lock
+  (`resocks5.health.ktav.lock`, never deleted): a second instance in the same
+  directory runs with health persistence disabled and one warning instead of
+  deleting the running writer's temp; shutdown reports go through the log
+  channel.
 
 ### Fixed
 
@@ -85,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docs: `docs/ARCHITECTURE.md` describes the quarantine layer next to sand-rating and
   the startup snapshot of users; the `progress` rustdoc example returns
   `WriteZero` on `Ok(0)`, and the `dial_chain_over` example bounds its read.
+- `resocks5`: a cached chain is resolved through the rotator that owns the cache, so
+  an identical exit endpoint in another group (v6 vs v4) no longer drops a working
+  route.
+- `resocks5`: the health writer reclaims its own `.tmp` before every write (a kept
+  Windows recovery temp no longer blocks later saves), and the saver baseline is
+  taken before post-restore probes run.
+- `resocks5-net`: a quarantine whose deadline is not representable as an `Instant`
+  (huge configured maximum) stays quarantined instead of dropping to probation at
+  once.
 
 ## [0.4.1] - 2026-11-02
 

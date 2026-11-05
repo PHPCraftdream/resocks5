@@ -339,16 +339,16 @@ pub(super) async fn run_server_inner() -> Result<()> {
     };
     // A probe owns its slot long enough to finish one full upstream
     // attempt: one TCP connect plus one handshake per gate level plus the
-    // final handshake to the tested node — the same `probe_deadline`
-    // formula the probe itself runs under (minus its 1 s margin), with a
-    // 5 s margin before the probe is re-issued, so a probe can never
-    // outlive its lease (audit V08).
-    let probe_lease = crate::server::connect::establish_connection::probe_deadline(
+    // final handshake to the tested node — the worst-case
+    // `probe_deadline` budget the probe itself runs under, plus the
+    // shared margin before the probe is re-issued, so a probe can never
+    // outlive its lease (audit V08). The probe settlement side fences on
+    // the same helper, so the two budgets cannot diverge (review P2 №4).
+    let probe_lease = crate::server::connect::establish_connection::probe_lease(
         std::time::Duration::from_secs(cfg_main.network.connect_timeout_sec),
         std::time::Duration::from_secs(cfg_main.network.handshake_timeout_sec),
         gate_groups.len(),
-    )
-    .saturating_add(std::time::Duration::from_secs(5));
+    );
     let quarantine_policy = resocks5_net::rating::QuarantinePolicy::default()
         .with_threshold(cfg_main.network.quarantine_threshold)
         .with_initial(std::time::Duration::from_secs(
@@ -498,6 +498,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
             server::health::start(
                 health_rotators.clone(),
                 directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]),
+                pool.clone(),
                 health_path.clone(),
                 Duration::from_secs(cfg_main.network.health_save_sec),
                 Duration::from_secs(cfg_main.network.connect_timeout_sec.clamp(1, 3)),
@@ -520,6 +521,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
             directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
         tokio::spawn(quarantine_unreachable_at_start(
             rotators,
+            pool.clone(),
             logger.clone(),
             Duration::from_secs(cfg_main.network.connect_timeout_sec.clamp(1, 3)),
         ));
@@ -568,14 +570,21 @@ pub(super) async fn run_server_inner() -> Result<()> {
 /// them back once they answer.
 async fn quarantine_unreachable_at_start(
     rotators: Vec<Arc<ProxyRotator>>,
+    pool: Arc<resocks5_net::pool::ProxyPool>,
     logger: Arc<logger::Logger>,
     timeout: Duration,
 ) {
     let mut checks = tokio::task::JoinSet::new();
     for rotator in rotators {
+        let pool = pool.clone();
         let logger = logger.clone();
         checks.spawn(async move {
-            for event in rotator.probe_all(timeout).await {
+            // At capacity (our own load) the start-up check defers: the
+            // upstream is neither probed nor quarantined (review P2 №5).
+            for event in rotator
+                .probe_all_with(timeout, move |proxy| pool.reserve_permit(proxy).ok())
+                .await
+            {
                 if let resocks5_net::rotator::ProbeEvent::QuarantinedAtStart {
                     proxy,
                     quarantined_for,

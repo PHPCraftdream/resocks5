@@ -423,7 +423,11 @@ and returns the new quarantine duration when hard-failure threshold trips.
 It reports
 `ProbeEvent::QuarantinedAtStart` only for newly quarantined failures when
 quarantine is enabled; `probe_due` reports recovered or still-down due
-proxies. Both return `ProbeEvent` lists.
+proxies. Both return `ProbeEvent` lists. `probe_due_with` and `probe_all_with`
+take a reservation hook (`Fn(&ProxyConfig) -> Option<guard>`) that lets the
+host bound probes by its own capacity: `None` defers the probe without a
+connection or a health change, `Some(guard)` holds the guard (for example a
+pool permit) while the probe runs.
 
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
 `error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`

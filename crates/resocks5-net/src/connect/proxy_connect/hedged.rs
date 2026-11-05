@@ -82,7 +82,9 @@ pub struct AttemptReport {
     pub elapsed: Duration,
     /// Candidate's final outcome.
     pub outcome: AttemptOutcome,
-    /// Whether another candidate had already won at settlement.
+    /// Whether another candidate had already won at settlement. A `Lost`
+    /// outcome is caused by such a win, so it reports `after_win == true`
+    /// whenever the win was already published.
     pub after_win: bool,
 }
 
@@ -235,9 +237,10 @@ fn hedge_deadline(opts: &HedgeOptions, pending_len: usize) -> Option<tokio::time
 /// arms no hedge timer and behaves as "never hedge".
 ///
 /// Every normally completed launched attempt is reported exactly once. The
-/// winner and failures observed before it have `after_win == false`; the
-/// detached drain reports remaining results with `after_win == true`. A
-/// callback panic unwinds the caller and may prevent later callbacks.
+/// winner and failures observed before it have `after_win == false`; a
+/// `Lost` observed after a win was published reports `after_win == true`,
+/// as do the remaining results the detached drain reports. A callback
+/// panic unwinds the caller and may prevent later callbacks.
 /// Unlaunched candidates produce no reports. Dropping this future before a
 /// winner cancels its coordinator and aborts its `JoinSet`; after a winner the
 /// drain is detached and continues independently.
@@ -322,7 +325,7 @@ where
                         let AttemptReport { outcome: AttemptOutcome::Failed(error), .. } = report else { unreachable!() };
                         last = Some(error);
                     }
-                    Err(AttemptFailure::Lost) => callback(&AttemptReport { index: finished.index, proxy: launched[finished.index].clone(), elapsed: finished.elapsed, outcome: AttemptOutcome::Lost, after_win: false }),
+                    Err(AttemptFailure::Lost) => callback(&AttemptReport { index: finished.index, proxy: launched[finished.index].clone(), elapsed: finished.elapsed, outcome: AttemptOutcome::Lost, after_win: race.won.load(Ordering::Acquire) }),
                 }
             }
             _ = async {
