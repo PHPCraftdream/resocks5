@@ -7,7 +7,9 @@ use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::kdf::{derive_key, KdfParams, UserSecret, KEY_LEN};
 use super::wire::{client_proof, encode_params, server_proof, NONCE_LEN};
-use super::{client_authenticate, server_authenticate, DecoyKey, SecretStore, SecureCredentials};
+use super::{
+    client_authenticate, server_authenticate, DecoyKey, SecretStore, SecureCredentials, StoredUser,
+};
 use crate::error::SecureAuthError;
 
 /// Cheap parameters so the tests do not pay for 19 MiB of Argon2id each.
@@ -17,22 +19,50 @@ const WEAK: KdfParams = KdfParams {
     parallelism: 1,
 };
 
-struct Store(HashMap<String, UserSecret>);
+struct Store(Mutex<HashMap<String, StoredUser>>);
 
 impl Store {
     fn with(user: &str, password: &str) -> Self {
         let mut map = HashMap::new();
         map.insert(
             user.to_owned(),
-            UserSecret::from_password(password, WEAK).unwrap(),
+            StoredUser::Secret(UserSecret::from_password(password, WEAK).unwrap()),
         );
-        Self(map)
+        Self(Mutex::new(map))
+    }
+
+    fn init(user: &str) -> Self {
+        let mut map = HashMap::new();
+        map.insert(user.to_owned(), StoredUser::Init);
+        Self(Mutex::new(map))
+    }
+
+    fn secret(&self, user: &str) -> Option<UserSecret> {
+        match self.0.lock().unwrap().get(user) {
+            Some(StoredUser::Secret(secret)) => Some(secret.clone()),
+            _ => None,
+        }
     }
 }
 
 impl SecretStore for Store {
-    async fn lookup(&self, user: &str) -> Option<UserSecret> {
-        self.0.get(user).cloned()
+    async fn lookup(&self, user: &str) -> Option<StoredUser> {
+        self.0.lock().unwrap().get(user).cloned()
+    }
+
+    async fn claim(&self, user: &str, secret: UserSecret) -> bool {
+        let mut map = self.0.lock().unwrap();
+        match map.get(user) {
+            Some(StoredUser::Init) => {
+                map.insert(user.to_owned(), StoredUser::Secret(secret));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn enrollment_floor(&self) -> KdfParams {
+        WEAK
     }
 }
 
@@ -104,8 +134,8 @@ async fn the_right_password_authenticates_both_ways() {
 async fn neither_the_password_nor_the_key_crosses_the_wire() {
     let password = "p4ssw0rd-never-on-the-wire";
     let store = Store::with("alice", password);
-    let key = *store.0["alice"].key();
-    let salt = store.0["alice"].salt.clone();
+    let key = *store.secret("alice").unwrap().key();
+    let salt = store.secret("alice").unwrap().salt;
     let credentials = creds("alice", password);
     let (mut client, mut server, log) = recorded_pair();
     let (client_result, server_result) = tokio::join!(
@@ -433,5 +463,214 @@ fn debug_prints_nothing_secret() {
     ] {
         assert!(!text.contains("topsecretpw"));
         assert!(!text.contains("alice"));
+    }
+}
+
+// ─── init: first-time enrollment ─────────────────────────────────────────
+
+fn enrolling(user: &str, password: &str) -> SecureCredentials {
+    creds(user, password)
+        .allow_enrollment(true)
+        .with_enrollment_kdf(WEAK)
+}
+
+/// The first client of an `init` user sets the secret; afterwards the same
+/// password logs in normally and another one is denied. Mutations: not
+/// storing the claimed secret, or storing it but not proving it, fails here.
+#[tokio::test]
+async fn the_first_client_sets_the_secret() {
+    let store = Store::init("bob");
+    let first = enrolling("bob", "bobs-first-password");
+    let (mut client, mut server) = duplex(4096);
+    let (c, s) = tokio::join!(
+        client_authenticate(&mut client, &first),
+        server_authenticate(&mut server, &store, decoy()),
+    );
+    c.unwrap();
+    assert_eq!(s.unwrap(), "bob");
+    let stored = store.secret("bob").expect("the secret was written");
+    let expected = derive_key(b"bobs-first-password", &stored.salt, &stored.params).unwrap();
+    assert_eq!(
+        stored.key(),
+        &*expected,
+        "the stored key is the password-derived one"
+    );
+
+    // A normal login with the same password (a fresh client, no cache).
+    let again = creds("bob", "bobs-first-password");
+    let (mut client, mut server) = duplex(4096);
+    let (c, s) = tokio::join!(
+        client_authenticate(&mut client, &again),
+        server_authenticate(&mut server, &store, decoy()),
+    );
+    c.unwrap();
+    s.unwrap();
+    // Any other password is now denied: the init window is closed.
+    let other = enrolling("bob", "someone-else");
+    let (mut client, mut server) = duplex(4096);
+    let (c, s) = tokio::join!(
+        client_authenticate(&mut client, &other),
+        server_authenticate(&mut server, &store, decoy()),
+    );
+    assert_eq!(c.unwrap_err(), SecureAuthError::Denied);
+    assert_eq!(s.unwrap_err(), SecureAuthError::Denied);
+}
+
+/// During enrollment neither the password nor the key crosses the wire.
+/// Mutation: sending the sealed payload unencrypted puts the key in the log.
+#[tokio::test]
+async fn enrollment_puts_neither_password_nor_key_on_the_wire() {
+    let password = "enroll-secret-pw-42";
+    let store = Store::init("bob");
+    let credentials = enrolling("bob", password);
+    let (mut client, mut server, log) = recorded_pair();
+    let (c, s) = tokio::join!(
+        client_authenticate(&mut client, &credentials),
+        server_authenticate(&mut server, &store, decoy()),
+    );
+    c.unwrap();
+    s.unwrap();
+    let key = *store.secret("bob").unwrap().key();
+    let wire = log.lock().unwrap().clone();
+    assert!(wire.len() > 100);
+    assert!(
+        !contains(&wire, password.as_bytes()),
+        "password on the wire"
+    );
+    assert!(!contains(&wire, &key), "key on the wire");
+}
+
+/// A client that was not told to enroll refuses an `init` offer and the
+/// server stores nothing. Mutation: enrolling by default (a man in the
+/// middle could then pose as an enrolled user's server) passes the exchange.
+#[tokio::test]
+async fn a_client_enrolls_only_when_told_to() {
+    let store = Store::init("bob");
+    let credentials = creds("bob", "pw-for-bob");
+    let (mut client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let result = server_authenticate(&mut server, &store, decoy()).await;
+        (result, store.secret("bob").is_none())
+    });
+    let error = client_authenticate(&mut client, &credentials)
+        .await
+        .unwrap_err();
+    assert_eq!(error, SecureAuthError::EnrollmentNotAllowed);
+    drop(client);
+    let (result, nothing_stored) = server_task.await.unwrap();
+    assert!(result.is_err());
+    assert!(
+        nothing_stored,
+        "no secret may be stored without an enrollment"
+    );
+}
+
+/// Two first logins at once: exactly one wins, the other is denied, and the
+/// stored secret is the winner's. Mutation: a non-atomic claim lets both win.
+#[tokio::test]
+async fn of_two_concurrent_first_logins_exactly_one_wins() {
+    let store = Arc::new(Store::init("bob"));
+    let mut tasks = Vec::new();
+    for password in ["first-pw-aaaa", "second-pw-bbbb"] {
+        let store = Arc::clone(&store);
+        tasks.push(tokio::spawn(async move {
+            let credentials = enrolling("bob", password);
+            let (mut client, mut server) = duplex(4096);
+            let (c, s) = tokio::join!(
+                client_authenticate(&mut client, &credentials),
+                server_authenticate(&mut server, &*store, decoy()),
+            );
+            (password, c.is_ok(), s.is_ok())
+        }));
+    }
+    let mut winners = Vec::new();
+    for task in tasks {
+        let (password, client_ok, server_ok) = task.await.unwrap();
+        assert_eq!(client_ok, server_ok, "both sides agree on {password}");
+        if client_ok {
+            winners.push(password);
+        }
+    }
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one first login wins: {winners:?}"
+    );
+    let stored = store.secret("bob").unwrap();
+    let expected = derive_key(winners[0].as_bytes(), &stored.salt, &stored.params).unwrap();
+    assert_eq!(
+        stored.key(),
+        &*expected,
+        "the stored secret is the winner's"
+    );
+}
+
+/// A server refuses an enrollment derived more cheaply than its floor.
+/// Mutation: no floor check stores a cheap key.
+#[tokio::test]
+async fn an_enrollment_below_the_floor_is_refused() {
+    struct StrictStore(Store);
+    impl SecretStore for StrictStore {
+        async fn lookup(&self, user: &str) -> Option<StoredUser> {
+            self.0.lookup(user).await
+        }
+        async fn claim(&self, user: &str, secret: UserSecret) -> bool {
+            self.0.claim(user, secret).await
+        }
+        fn enrollment_floor(&self) -> KdfParams {
+            KdfParams {
+                memory_kib: 128,
+                ..WEAK
+            }
+        }
+    }
+    let store = StrictStore(Store::init("bob"));
+    // WEAK costs 64 KiB, below the 128 KiB floor.
+    let credentials = enrolling("bob", "pw-for-bob");
+    let (mut client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let result = server_authenticate(&mut server, &store, decoy()).await;
+        (result, store.0.secret("bob").is_none())
+    });
+    let _ = client_authenticate(&mut client, &credentials).await;
+    drop(client);
+    let (result, nothing_stored) = server_task.await.unwrap();
+    assert_eq!(result.unwrap_err(), SecureAuthError::KdfTooWeak);
+    assert!(nothing_stored);
+}
+
+/// A tampered sealed enrollment does not decrypt and nothing is stored; a
+/// degenerate (all-zero) public key is refused. Mutation: skipping the AEAD
+/// tag check or the contributory check stores attacker-chosen material.
+#[tokio::test]
+async fn tampered_or_degenerate_enrollments_are_refused() {
+    for degenerate in [false, true] {
+        let store = Arc::new(Store::init("bob"));
+        let (mut attacker, mut server) = duplex(4096);
+        let server_task = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { server_authenticate(&mut server, &*store, decoy()).await }
+        });
+        let mut hello = vec![1u8, 3];
+        hello.extend_from_slice(b"bob");
+        hello.extend_from_slice(&[1u8; NONCE_LEN]);
+        attacker.write_all(&hello).await.unwrap();
+        let mut offer = [0u8; 2 + 32 + NONCE_LEN];
+        attacker.read_exact(&mut offer).await.unwrap();
+        assert_eq!(
+            &offer[..2],
+            &[1, 1],
+            "an init user is offered an enrollment"
+        );
+        let public = if degenerate { [0u8; 32] } else { [9u8; 32] };
+        let sealed = [0x55u8; 1 + 16 + 6 + 32 + 16];
+        let mut message = vec![1u8];
+        message.extend_from_slice(&public);
+        message.extend_from_slice(&u16::try_from(sealed.len()).unwrap().to_be_bytes());
+        message.extend_from_slice(&sealed);
+        attacker.write_all(&message).await.unwrap();
+        let error = server_task.await.unwrap().unwrap_err();
+        assert_eq!(error, SecureAuthError::Crypto, "degenerate={degenerate}");
+        assert!(store.secret("bob").is_none(), "nothing may be stored");
     }
 }

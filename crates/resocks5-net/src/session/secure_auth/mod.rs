@@ -30,7 +30,9 @@
 //! # What this does and does not give
 //!
 //! The password and `K` never cross the wire, and the server's decoy answers
-//! hide which user names exist. A passive observer who records one exchange can
+//! hide which user names exist. A user still waiting for its first secret is
+//! enrolled by the first client that authenticates as it (see the `init`
+//! module docs): the password is not sent then either. A passive observer who records one exchange can
 //! still try passwords offline (a challenge-response without a PAKE allows that),
 //! which the Argon2id cost slows down; use strong passwords. A client refuses
 //! parameters weaker than its floor ([`SecureCredentials::with_min_kdf`]), so a
@@ -38,6 +40,7 @@
 //! proof.
 
 mod client;
+mod init;
 mod kdf;
 mod server;
 #[cfg(test)]
@@ -46,7 +49,7 @@ mod wire;
 
 pub use client::{client_authenticate, SecureCredentials};
 pub use kdf::{derive_key, KdfParams, UserSecret, KEY_LEN, SALT_LEN};
-pub use server::{server_authenticate, DecoyKey, SecretStore};
+pub use server::{server_authenticate, DecoyKey, SecretStore, StoredUser};
 
 /// The private-use SOCKS5 authentication method number for this protocol.
 pub const METHOD: u8 = 0x80;

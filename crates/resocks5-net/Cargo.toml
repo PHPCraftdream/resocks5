@@ -56,7 +56,17 @@ test-instrumentation = ["rotator"]
 # method 0x80, a mutual HMAC-SHA256 challenge-response keyed by an Argon2id-derived
 # key (`secure_auth`). The server stores the derived key (not the password); the
 # client derives it from the password and proves knowledge of it.
-secure-auth = ["dep:argon2", "dep:hmac", "dep:sha2", "dep:subtle", "dep:getrandom", "dep:zeroize"]
+secure-auth = [
+    "dep:argon2",
+    "dep:hmac",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:getrandom",
+    "dep:zeroize",
+    "dep:x25519-dalek",
+    "dep:chacha20poly1305",
+]
 # Clear-text credentials. OFF by default: without `cleartext-client` the crate
 # never sends a password in clear text (SOCKS5 RFC 1929 UNAME/PASSWD, HTTP Basic
 # to a plain-HTTP proxy) — a dial that would is refused with
@@ -103,6 +113,9 @@ crossbeam-queue = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }

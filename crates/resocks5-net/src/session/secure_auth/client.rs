@@ -4,9 +4,11 @@ use std::sync::Mutex;
 
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroizing;
 
-use super::kdf::{derive_key, KdfParams, KEY_LEN};
+use super::init::{self, PUBLIC_LEN};
+use super::kdf::{derive_key, KdfParams, UserSecret, KEY_LEN};
 use super::wire::{client_proof, decode_params, random_nonce, server_proof, NONCE_LEN, PROOF_LEN};
 use super::VERSION;
 use crate::error::SecureAuthError;
@@ -19,6 +21,8 @@ pub struct SecureCredentials {
     user: String,
     password: Zeroizing<String>,
     min_kdf: KdfParams,
+    allow_enrollment: bool,
+    enrollment_kdf: KdfParams,
     cached: Mutex<Option<Cached>>,
 }
 
@@ -35,8 +39,28 @@ impl SecureCredentials {
             user: user.into(),
             password: Zeroizing::new(password.into()),
             min_kdf: KdfParams::DEFAULT,
+            allow_enrollment: false,
+            enrollment_kdf: KdfParams::DEFAULT,
             cached: Mutex::new(None),
         }
+    }
+
+    /// Enroll when the server says the user is waiting for its first secret
+    /// (`init`). Off by default: a man in the middle could otherwise claim
+    /// "init" to an already enrolled client and pose as its server. Turn it on
+    /// for the first-time setup only.
+    #[must_use]
+    pub fn allow_enrollment(mut self, allow: bool) -> Self {
+        self.allow_enrollment = allow;
+        self
+    }
+
+    /// The key-derivation cost of a new enrollment (default
+    /// [`KdfParams::DEFAULT`]; the server refuses one below its own floor).
+    #[must_use]
+    pub fn with_enrollment_kdf(mut self, params: KdfParams) -> Self {
+        self.enrollment_kdf = params;
+        self
     }
 
     /// Refuse a server that offers a KDF cheaper than `floor` (a downgrade
@@ -140,6 +164,12 @@ where
     if head[1] == 0xFF {
         return Err(SecureAuthError::Refused);
     }
+    if head[1] == 1 {
+        if !credentials.allow_enrollment {
+            return Err(SecureAuthError::EnrollmentNotAllowed);
+        }
+        return enroll(stream, credentials, user, &cnonce).await;
+    }
     if head[1] != 0 {
         return Err(SecureAuthError::BadVersion);
     }
@@ -189,5 +219,80 @@ where
     if !bool::from(expected.ct_eq(&theirs)) {
         return Err(SecureAuthError::ServerProofMismatch);
     }
+    Ok(())
+}
+
+/// The client side of a first-time enrollment (status 1 after the hello).
+async fn enroll<S>(
+    stream: &mut S,
+    credentials: &SecureCredentials,
+    user: &[u8],
+    cnonce: &[u8; NONCE_LEN],
+) -> Result<(), SecureAuthError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut offer = [0u8; PUBLIC_LEN + NONCE_LEN];
+    stream.read_exact(&mut offer).await.map_err(io)?;
+    let mut server_pub = [0u8; PUBLIC_LEN];
+    server_pub.copy_from_slice(&offer[..PUBLIC_LEN]);
+    let mut snonce = [0u8; NONCE_LEN];
+    snonce.copy_from_slice(&offer[PUBLIC_LEN..]);
+
+    let client_secret = EphemeralSecret::random();
+    let client_pub = PublicKey::from(&client_secret).to_bytes();
+    let shared = client_secret.diffie_hellman(&PublicKey::from(server_pub));
+    if !shared.was_contributory() {
+        return Err(SecureAuthError::Crypto);
+    }
+
+    // A fresh salt and the key, on the blocking pool (Argon2id).
+    let password = Zeroizing::new(credentials.password.to_string());
+    let params = credentials.enrollment_kdf;
+    let secret = tokio::task::spawn_blocking(move || UserSecret::from_password(&password, params))
+        .await
+        .map_err(|_| SecureAuthError::Kdf)??;
+    let sealed = init::seal(
+        &secret,
+        shared.as_bytes(),
+        &init::Transcript {
+            user,
+            cnonce,
+            snonce: &snonce,
+            client_pub: &client_pub,
+            server_pub: &server_pub,
+        },
+    )?;
+    let sealed_len = u16::try_from(sealed.len()).map_err(|_| SecureAuthError::BadLength)?;
+    let mut message = Vec::with_capacity(1 + PUBLIC_LEN + 2 + sealed.len());
+    message.push(VERSION);
+    message.extend_from_slice(&client_pub);
+    message.extend_from_slice(&sealed_len.to_be_bytes());
+    message.extend_from_slice(&sealed);
+    stream.write_all(&message).await.map_err(io)?;
+    stream.flush().await.map_err(io)?;
+
+    let mut reply = [0u8; 2];
+    stream.read_exact(&mut reply).await.map_err(io)?;
+    if reply[0] != VERSION {
+        return Err(SecureAuthError::BadVersion);
+    }
+    match reply[1] {
+        0 => {}
+        1 => return Err(SecureAuthError::Denied),
+        _ => return Err(SecureAuthError::BadVersion),
+    }
+    let mut theirs = [0u8; PROOF_LEN];
+    stream.read_exact(&mut theirs).await.map_err(io)?;
+    let expected = server_proof(secret.key(), user, cnonce, &snonce);
+    if !bool::from(expected.ct_eq(&theirs)) {
+        return Err(SecureAuthError::ServerProofMismatch);
+    }
+    // The enrolled key serves the following logins without a new derivation.
+    *credentials.cached.lock().expect("key cache poisoned") = Some(Cached {
+        salt: secret.salt.clone(),
+        params: secret.params,
+        key: Zeroizing::new(*secret.key()),
+    });
     Ok(())
 }

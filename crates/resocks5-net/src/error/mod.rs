@@ -173,6 +173,11 @@ pub enum SecureAuthError {
     Denied,
     /// The server refused the exchange outright.
     Refused,
+    /// The server asked for a first-time enrollment but this client was not
+    /// told to enroll (a man in the middle could otherwise pose as the server).
+    EnrollmentNotAllowed,
+    /// A sealed enrollment did not decrypt or the key exchange was degenerate.
+    Crypto,
     /// The stream failed or ended during the exchange.
     Io(io::ErrorKind),
 }
@@ -188,6 +193,10 @@ impl fmt::Display for SecureAuthError {
             Self::ServerProofMismatch => "[SECURE-AUTH] the server did not prove it holds the key",
             Self::Denied => "[SECURE-AUTH] authentication denied",
             Self::Refused => "[SECURE-AUTH] exchange refused by the server",
+            Self::EnrollmentNotAllowed => {
+                "[SECURE-AUTH] the server asked for an enrollment this client does not allow"
+            }
+            Self::Crypto => "[SECURE-AUTH] enrollment decryption or key exchange failed",
             Self::Io(_) => "[SECURE-AUTH] I/O error during the exchange",
         })
     }
