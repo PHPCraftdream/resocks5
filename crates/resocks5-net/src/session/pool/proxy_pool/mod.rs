@@ -1,10 +1,11 @@
 //! ## Lifecycle
 //!
 //! - At startup `spawn_refill_for(proxy)` launches one task per unique
-//!   `(host, port)` upstream (creation is atomic — concurrent callers
-//!   race through a single `DashMap::entry`, so exactly one task per
-//!   key exists). Each task keeps its own queue topped up to
-//!   `spare_per_proxy`.
+//!   `(host, port)` upstream (creation is serialized under the
+//!   `refill_tasks` lock — queue publication, task spawn and handle
+//!   registration happen together, so exactly one task per key exists
+//!   and a concurrent `forget` can always abort it). Each task keeps
+//!   its own queue topped up to `spare_per_proxy`.
 //! - On `checkout`, we pop one socket. If its age exceeds
 //!   `max_session_age_sec` (defends against silent idle-disconnects on
 //!   the proxy side), or a non-blocking probe shows the peer already
@@ -73,6 +74,8 @@ mod error;
 pub use crate::connect::UpstreamStream;
 pub use error::AtCapacity;
 
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod tests;
 
@@ -157,7 +160,11 @@ pub struct ProxyPool {
     /// endpoint's task — otherwise a forgotten endpoint would keep
     /// opening sockets forever. `Drop` aborts all of them. A `std`
     /// Mutex suffices: the guard is only ever held synchronously,
-    /// never across an await.
+    /// never across an await. Lock order: this mutex is taken
+    /// BEFORE `pools`/`upstream_caps` everywhere, and `spawn_refill_for`
+    /// and `forget` hold it across queue publication and handle
+    /// registration together — a queue is never observable without
+    /// its task being registered (and abortable).
     refill_tasks:
         std::sync::Mutex<std::collections::HashMap<ProxyKey, tokio::task::JoinHandle<()>>>,
 }
@@ -374,6 +381,12 @@ impl ProxyPool {
     /// queued spares), its per-upstream cap semaphore, and abort its
     /// refill task. Idempotent — an unknown `(host, port)` is a no-op.
     ///
+    /// Runs under the same `refill_tasks` lock as `spawn_refill_for`
+    /// (fixed order: `refill_tasks` before `pools`/`upstream_caps`),
+    /// so it can never observe a queue whose task is not yet
+    /// registered: either the endpoint is not there at all, or the
+    /// task to abort is.
+    ///
     /// Tradeoff: permits already handed out for this endpoint keep
     /// their own `Arc<Semaphore>` clone and release normally when
     /// their connections drop; but the cap map entry is gone, so the
@@ -385,25 +398,33 @@ impl ProxyPool {
     /// drops; there is no automatic shrinking.
     pub fn forget(&self, proxy: &ProxyConfig) {
         let key = (proxy.host.clone(), proxy.port);
-        self.pools.remove(&key);
-        self.upstream_caps.remove(&key);
-        if let Some(handle) = self
+        // Serialize against `spawn_refill_for`: hold the lock across
+        // all three removals so a queue is never removed without its
+        // registered task being aborted in the same step.
+        let mut tasks = self
             .refill_tasks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key)
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.pools.remove(&key);
+        self.upstream_caps.remove(&key);
+        if let Some(handle) = tasks.remove(&key) {
             handle.abort();
         }
     }
 
     /// Launch a long-lived refill task for `proxy`. Idempotent: if a
     /// task is already running for the same `(host, port)`, this is a
-    /// no-op. Creation is atomic — concurrent callers race through a
-    /// single `DashMap::entry`, so exactly one constructs the
-    /// `ProxySpares` and spawns; at most one refill task per
-    /// `(host, port)` exists for the pool's lifetime. The task handle
-    /// is retained and aborted when the pool drops.
+    /// no-op. Creation is serialized under the `refill_tasks` lock
+    /// (fixed order: `refill_tasks` before `pools`/`upstream_caps`):
+    /// the winner of the `DashMap::entry` race constructs the
+    /// `ProxySpares`, spawns and registers the handle while still
+    /// holding the lock, so a concurrent `forget` either misses the
+    /// endpoint entirely or aborts a fully registered generation — a
+    /// late registration can never replace the next generation's
+    /// handle (dropping a `JoinHandle` detaches the task, it does not
+    /// abort it). At most one refill task per `(host, port)` exists
+    /// for the pool's lifetime. The task handle is retained and
+    /// aborted when the pool drops.
     pub fn spawn_refill_for(&self, proxy: Arc<ProxyConfig>) {
         if !self.config.enabled {
             return;
@@ -415,6 +436,18 @@ impl ProxyPool {
             .max(1)
             .min(self.max_per_upstream);
         let max_age = Duration::from_secs(self.config.max_session_age_sec);
+        // Lifecycle serialization: take the `refill_tasks` lock
+        // BEFORE the `pools` entry check and hold it across entry
+        // creation, `tokio::spawn` and handle registration (all
+        // synchronous — no `.await`, nothing that blocks a worker
+        // for long). Without this, a `forget` landing between queue
+        // publication and handle registration finds no handle to
+        // abort, and this late registration then replaces the NEXT
+        // generation's handle, detaching its task.
+        let mut tasks = self
+            .refill_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Race-safe get-or-create: DashMap serialises the entry, so
         // whichever caller lands first constructs the ProxySpares and
         // spawns the refill task; losers read the same Arc back and
@@ -515,24 +548,46 @@ impl ProxyPool {
                 }
             }
         });
-        self.refill_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key, handle);
+        // Register under the SAME lock hold that published the
+        // queue. A replaced handle must be aborted explicitly:
+        // dropping a JoinHandle detaches the task instead of
+        // aborting it. Under the lock above this cannot trigger
+        // today; it keeps the invariant obvious if insert ever sees
+        // a stale entry.
+        if let Some(old) = tasks.insert(key, handle) {
+            old.abort();
+        }
     }
     /// Introspection for tests: `(pools has key, caps has key,
     /// refill task running)` for this endpoint.
     #[cfg(test)]
     fn endpoint_state(&self, proxy: &ProxyConfig) -> (bool, bool, bool) {
         let key = (proxy.host.clone(), proxy.port);
+        // Mutex first, per the documented lock order.
+        let registered = self
+            .refill_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&key);
         (
             self.pools.contains_key(&key),
             self.upstream_caps.contains_key(&key),
-            self.refill_tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&key),
+            registered,
         )
+    }
+
+    /// Introspection for tests: `true` when the refill task
+    /// registered for this endpoint (if any) has finished; `true`
+    /// when none is registered.
+    #[cfg(test)]
+    fn refill_task_finished(&self, proxy: &ProxyConfig) -> bool {
+        let key = (proxy.host.clone(), proxy.port);
+        self.refill_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|handle| handle.is_finished())
+            .unwrap_or(true)
     }
 }
 

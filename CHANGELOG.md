@@ -38,6 +38,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submitted username, and `Debug` of `IncomingRequest` no longer prints the
   username or the pipeline bytes (`has_username`, `has_credentials` and
   `pipeline_len` instead).
+- `resocks5-net`: `ProxyRotator` (and every constructor) now deduplicates identical
+  upstreams (same endpoint, protocol, account and gate level) at construction,
+  keeping the first occurrence; `len()` and `all_proxies()` describe unique
+  upstreams. Before, events landed on the last duplicate while the first stayed
+  selectable after a quarantine.
+- `resocks5-net`: `connect_hedged` makes the TCP-ready to handshake step
+  exclusive: a launched attempt that reaches its upstream while another one is
+  handshaking waits and sends nothing, so the target never sees two CONNECTs;
+  a `hedge_delay` too large for the monotonic clock means "never hedge".
+- `resocks5-net`: `dial_chain` without a gate reports `ChainStage::Target` when the
+  total timeout expires after the TCP connect (it said `Connect`).
+- `resocks5`: `resocks5.health.ktav` records carry a `group` (`v6`, `v4`,
+  `gate<rank>`); files from older builds still load and apply to every matching
+  group.
+- CI: a change under `crates/resocks5-net/src/session/chain/` runs the SDK `chain::`
+  tests and the app `server::` tests instead of only building them.
+
+### Fixed
+
+- `resocks5-net`: `ChainPlan` ends at once when every candidate of a layer is
+  dead; it no longer walks the whole gate odometer (a product of the layer
+  sizes, synchronously) after the only exit failed.
+- `resocks5-net`: `connect_hedged` no longer panics on `Duration::MAX`-sized hedge
+  delays (checked instant arithmetic, no timer for a single candidate).
+- `resocks5-net`: quarantine back-off reaches the configured maximum for tiny
+  initial values (the exponent was capped at 20 doublings).
+- `resocks5-net`: `ProxyPool::forget` and `spawn_refill_for` are serialized under one
+  lock, so a refill task can no longer be orphaned or detached by a racing
+  `forget`.
+- `resocks5-net`: strict HTTP validation rejects authorities with a path, userinfo,
+  query, fragment or a broken percent escape, and control bytes in header
+  values; with `zeroize`, `take_username` wipes the raw identity bytes before
+  freeing them.
+- `resocks5`: a cached chain whose gate is quarantined is no longer dialed, and
+  queued sticky routes count against `max_upstream_attempts`.
+- `resocks5`: probes of inner gates no longer blame the tested gate for prefix or
+  capacity failures, run under a deadline shorter than their lease, and the
+  lease covers the chain depth.
+- `resocks5`: the health restore probes only directly dialed upstreams (outermost
+  gate and exits), so a live inner gate is not re-quarantined by a direct
+  connect; endpoints in different routing groups keep separate health.
+- `resocks5`: the health file is written off the async workers, the shutdown stops
+  the writer before the final snapshot (no racing second writer), and a stale
+  `.tmp` from a crashed run no longer blocks every later save.
+- Docs: `docs/ARCHITECTURE.md` describes the quarantine layer next to sand-rating and
+  the startup snapshot of users; the `progress` rustdoc example returns
+  `WriteZero` on `Ok(0)`, and the `dial_chain_over` example bounds its read.
 
 ## [0.4.1] - 2026-11-02
 

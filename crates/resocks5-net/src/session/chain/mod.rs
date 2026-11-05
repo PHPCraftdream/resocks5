@@ -5,7 +5,8 @@
 //! consist of exits alone. Connect failures implicate the first hop; hard
 //! failures at a gate handshake implicate that gate, while ambiguous handshake
 //! failures softly penalize both adjacent hops. Target failures implicate the
-//! exit. Only explicit complete-chain exclusions are retained.
+//! exit. A layer whose candidates are all marked dead ends the plan at once.
+//! Only explicit complete-chain exclusions are retained.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -122,6 +123,8 @@ struct Candidate {
 }
 struct Layer {
     candidates: Vec<Candidate>,
+    /// Candidates not yet marked dead; zero means no chain can exist.
+    live: usize,
     index: usize,
 }
 
@@ -173,6 +176,9 @@ pub struct ChainPlan {
     seen: HashSet<ChainKey>,
     dead: HashSet<ChainKey>,
     done: bool,
+    /// Test-only count of `next_pick` loop iterations for work-bound oracles.
+    #[cfg(test)]
+    steps: u64,
 }
 
 impl ChainPlan {
@@ -180,14 +186,18 @@ impl ChainPlan {
     pub fn new(gates: &GateLevels, exits: &[Arc<ProxyRotator>]) -> Self {
         let mut layers: Vec<_> = gates
             .iter()
-            .map(|(_, rotator)| Layer {
-                candidates: deduplicate(
+            .map(|(_, rotator)| {
+                let candidates = deduplicate(
                     rotator
                         .pick_order()
                         .into_iter()
                         .map(|proxy| (rotator.clone(), proxy)),
-                ),
-                index: 0,
+                );
+                Layer {
+                    live: candidates.len(),
+                    candidates,
+                    index: 0,
+                }
             })
             .collect();
         let mut candidates = Vec::new();
@@ -206,7 +216,9 @@ impl ChainPlan {
                 }
             }
         }
+        let live = candidates.len();
         layers.push(Layer {
+            live,
             candidates,
             index: 0,
         });
@@ -216,12 +228,15 @@ impl ChainPlan {
             seen: HashSet::new(),
             dead: HashSet::new(),
             done,
+            #[cfg(test)]
+            steps: 0,
         }
     }
 
     /// Return the next unseen candidate chain.
     fn next_pick(&mut self) -> Option<ChainPick> {
         while !self.done {
+            self.count_step();
             let dead_layer = self
                 .layers
                 .iter()
@@ -239,9 +254,35 @@ impl ChainPlan {
         None
     }
 
+    /// Deterministic work counter for the exhaustion work-bound tests.
+    #[cfg(test)]
+    fn count_step(&mut self) {
+        self.steps += 1;
+    }
+    #[cfg(not(test))]
+    fn count_step(&mut self) {}
+
     /// Exclude every combination containing this singleton proxy, now and later.
+    ///
+    /// When the last live candidate of any layer dies, the plan is exhausted:
+    /// every remaining combination would contain a dead node.
     pub fn mark_dead(&mut self, proxy: &ProxyConfig) {
-        self.dead.insert(singleton_key(&Arc::new(proxy.clone())));
+        let key = singleton_key(&Arc::new(proxy.clone()));
+        if !self.dead.insert(key.clone()) {
+            return;
+        }
+        for layer in &mut self.layers {
+            if layer
+                .candidates
+                .iter()
+                .any(|candidate| candidate.key == key)
+            {
+                layer.live -= 1;
+                if layer.live == 0 {
+                    self.done = true;
+                }
+            }
+        }
     }
     /// Exclude a complete chain identity from future results.
     pub fn exclude(&mut self, key: &ChainKey) {

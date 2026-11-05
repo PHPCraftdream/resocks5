@@ -302,7 +302,10 @@ async fn chain_inner(
     progress: &AtomicUsize,
 ) -> Result<AnyUpstream, ChainError> {
     if proxy.gate.is_none() {
-        return dial_inner(proxy, host, port, opts, tls_connector)
+        // TCP acquired: a total expiry from here on reports the target
+        // handshake, not the connect.
+        let on_tcp = || progress.store(ChainStage::Target.encode(), Ordering::Relaxed);
+        return dial_inner(proxy, host, port, opts, tls_connector, on_tcp)
             .await
             .map_err(|e| {
                 let stage = if matches!(

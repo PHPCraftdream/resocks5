@@ -155,6 +155,9 @@ pub(super) fn group_gate_levels<P: GateSplit>(
     levels
 }
 /// Every rotator: all gate levels, then v6 and v4 exits.
+///
+/// Test-only since health saving needs each rotator's group name.
+#[cfg(test)]
 pub(super) fn all_rotators(
     gates: &GateLevels,
     exits: &[Option<Arc<ProxyRotator>>],
@@ -334,7 +337,18 @@ pub(super) async fn run_server_inner() -> Result<()> {
         min_weight: cfg_main.network.sand_min_weight,
         success_factor: cfg_main.network.sand_success_factor,
     };
-    // A probe owns its slot long enough to finish one full upstream attempt.
+    // A probe owns its slot long enough to finish one full upstream
+    // attempt: one TCP connect plus one handshake per gate level plus the
+    // final handshake to the tested node — the same `probe_deadline`
+    // formula the probe itself runs under (minus its 1 s margin), with a
+    // 5 s margin before the probe is re-issued, so a probe can never
+    // outlive its lease (audit V08).
+    let probe_lease = crate::server::connect::establish_connection::probe_deadline(
+        std::time::Duration::from_secs(cfg_main.network.connect_timeout_sec),
+        std::time::Duration::from_secs(cfg_main.network.handshake_timeout_sec),
+        gate_groups.len(),
+    )
+    .saturating_add(std::time::Duration::from_secs(5));
     let quarantine_policy = resocks5_net::rating::QuarantinePolicy::default()
         .with_threshold(cfg_main.network.quarantine_threshold)
         .with_initial(std::time::Duration::from_secs(
@@ -343,13 +357,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
         .with_max(std::time::Duration::from_secs(
             cfg_main.network.quarantine_max_sec,
         ))
-        .with_probe_lease(std::time::Duration::from_secs(
-            cfg_main
-                .network
-                .connect_timeout_sec
-                .saturating_add(cfg_main.network.handshake_timeout_sec)
-                .saturating_add(5),
-        ));
+        .with_probe_lease(probe_lease);
     let new_rotator = |proxies| {
         ProxyRotator::try_with_quarantine(
             proxies,
@@ -463,13 +471,33 @@ pub(super) async fn run_server_inner() -> Result<()> {
     }
 
     // Dead upstreams of the previous run go straight to quarantine/probation.
-    let health_rotators = all_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]);
+    // Every rotator is saved and restored, each under its routing group's
+    // name, so one endpoint in two groups keeps two health cells. Only the
+    // directly dialed rotators (outermost gate + exits) get the post-restore
+    // probes: an inner gate is reachable only through its prefix, and a
+    // direct probe would falsely re-quarantine it.
+    let mut health_rotators: Vec<server::health::HealthGroup> = gate_levels
+        .iter()
+        .map(|(rank, rotator)| server::health::HealthGroup {
+            name: format!("gate{rank}"),
+            rotator: Arc::clone(rotator),
+        })
+        .collect();
+    for (name, rotator) in [("v6", &v6_rotator), ("v4", &v4_rotator)] {
+        if let Some(rotator) = rotator {
+            health_rotators.push(server::health::HealthGroup {
+                name: name.to_owned(),
+                rotator: Arc::clone(rotator),
+            });
+        }
+    }
     let health_path = std::path::PathBuf::from(crate::config::HEALTH_PATH);
     let health = (cfg_main.network.health_save_sec > 0
         && cfg_main.network.quarantine_threshold > 0)
         .then(|| {
             server::health::start(
                 health_rotators.clone(),
+                directly_dialed_rotators(&gate_levels, &[v6_rotator.clone(), v4_rotator.clone()]),
                 health_path.clone(),
                 Duration::from_secs(cfg_main.network.health_save_sec),
                 Duration::from_secs(cfg_main.network.connect_timeout_sec.clamp(1, 3)),
@@ -523,8 +551,7 @@ pub(super) async fn run_server_inner() -> Result<()> {
     .await;
 
     if let Some(saver) = health_saver {
-        saver.abort();
-        server::health::save_now(&health_rotators, &health_path);
+        saver.finish(&health_rotators, &health_path).await;
     }
 
     // Flush whatever is still queued — run_server's own shutdown lines

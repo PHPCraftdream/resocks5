@@ -2,6 +2,7 @@ use super::dial::*;
 use super::route::*;
 use super::tests_unit::{socks5_config, spawn_socks5_stub, test_logger};
 use crate::config::NetworkConfig;
+use crate::logger::{LogConfig, Logger};
 use regex::RegexSet;
 use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 fn timeout(stage: Stage, kind: TimeoutKind) -> ConnectError {
     ConnectError::Timeout {
@@ -508,11 +510,15 @@ async fn upstreams_dead_before_a_restart_are_not_tried_after_it() {
     let dir = std::env::temp_dir().join(format!("resocks5_health_e2e_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("health.ktav");
-    health::save_now(std::slice::from_ref(&before), &path);
+    let group = |rotator: &Arc<ProxyRotator>| health::HealthGroup {
+        name: "v4".to_owned(),
+        rotator: Arc::clone(rotator),
+    };
+    health::save_now(&[group(&before)], &path);
 
     // The new process starts with the memory of it.
     let after = long(vec![dead.clone(), live.clone()]);
-    let resumed = health::resume(std::slice::from_ref(&after), &path, health::unix_now());
+    let resumed = health::resume(&[group(&after)], &path, health::unix_now());
     assert_eq!(resumed.restored.quarantined, 1);
     assert!(after.is_quarantined(&dead));
     // TEST-NET-1 never answers: any attempt on it would cost the hedge delay.
@@ -521,4 +527,208 @@ async fn upstreams_dead_before_a_restart_are_not_tried_after_it() {
         assert!(took < Duration::from_secs(1), "request waited {took:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SOCKS5 stub that answers every handshake round on a socket with
+/// success — safe as a chain gate — and counts accepted TCP connections.
+async fn spawn_counting_chained_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                loop {
+                    let mut greet = [0u8; 3];
+                    if sock.read_exact(&mut greet).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                        return;
+                    }
+                    let mut head = [0u8; 4];
+                    if sock.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = match head[3] {
+                        0x01 => 4,
+                        0x03 => {
+                            let mut l = [0u8; 1];
+                            if sock.read_exact(&mut l).await.is_err() {
+                                return;
+                            }
+                            l[0] as usize
+                        }
+                        0x04 => 16,
+                        _ => return,
+                    };
+                    let mut rest = vec![0u8; len + 2];
+                    if sock.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+#[tokio::test]
+async fn a_cached_chain_with_a_quarantined_gate_is_not_dialed() {
+    // V05: get_linked only screens the exit and resolve matches nodes
+    // identity-only, so the sticky G_bad->E chain used to be dialed even
+    // though the plan offers the healthy G_good. Admission must drop the
+    // chain (unlink, no attempt spent) and let the gates phase serve.
+    // Mutation caught: removing the per-hop quarantine check makes the
+    // cached chain dial G_bad (bad_accepts == 1) and relink it.
+    let target = "sticky.example.com:443";
+    let (bad_addr, bad_accepts) = spawn_counting_chained_stub().await;
+    let (good_addr, good_accepts) = spawn_counting_chained_stub().await;
+    let exit_addr = spawn_socks5_stub().await;
+    let bad = socks5_config(bad_addr, true);
+    let good = socks5_config(good_addr, true);
+    let exit_cfg = socks5_config(exit_addr, false);
+    let gate_rotator = Arc::new(ProxyRotator::new(vec![bad.clone(), good.clone()]));
+    let gates = Arc::new(GateLevels::new(vec![(1, gate_rotator.clone())]));
+    let exit = Arc::new(ProxyRotator::new(vec![exit_cfg.clone()]));
+    let cached = Arc::new(
+        resocks5_net::types::ProxyConfig::chain([
+            Arc::new(bad.clone()),
+            Arc::new(exit_cfg.clone()),
+        ])
+        .unwrap(),
+    );
+    exit.link_proxy(target.to_string(), cached);
+    // Quarantine the gate out of band: the state get_linked cannot see.
+    assert!(gate_rotator.record_hard_failure(&bad).is_some());
+    let logger = test_logger();
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        4,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 2,
+        handshake_timeout_sec: 2,
+        max_upstream_attempts: 4,
+        ..Default::default()
+    });
+    let stream = establish_connection(
+        target,
+        &gates,
+        &None,
+        &Some(exit.clone()),
+        &logger,
+        &banned,
+        &pool,
+        &network,
+        None,
+        None,
+    )
+    .await
+    .expect("the healthy gate alternative must serve the target");
+    drop(stream);
+    assert_eq!(
+        bad_accepts.load(Ordering::SeqCst),
+        0,
+        "the quarantined gate was dialed"
+    );
+    assert!(
+        good_accepts.load(Ordering::SeqCst) >= 1,
+        "the healthy gate alternative was not dialed"
+    );
+    let relinked = exit
+        .get_linked(target)
+        .expect("the serving chain is cached");
+    let gate = relinked
+        .gate
+        .as_ref()
+        .expect("the serving chain keeps its gate");
+    assert_eq!(
+        (gate.host.as_str(), gate.port),
+        (good.host.as_str(), good.port)
+    );
+    assert!(
+        gate_rotator.is_quarantined(&bad),
+        "the quarantine must outlive the request"
+    );
+}
+
+#[tokio::test]
+async fn a_healthy_cached_chain_is_still_a_cache_hit() {
+    // V05 positive control: without a quarantine the sticky chain is
+    // dialed as before — a cache hit, no plan walk, the alternative gate
+    // untouched. Mutation caught: an admission check that unlinks or
+    // falls through unconditionally makes pick_order_calls() >= 1 and
+    // loses the "Cache used for" log.
+    let target = "sticky.example.com:443";
+    let (bad_addr, bad_accepts) = spawn_counting_chained_stub().await;
+    let (good_addr, good_accepts) = spawn_counting_chained_stub().await;
+    let exit_addr = spawn_socks5_stub().await;
+    let bad = socks5_config(bad_addr, true);
+    let good = socks5_config(good_addr, true);
+    let exit_cfg = socks5_config(exit_addr, false);
+    let gate_rotator = Arc::new(ProxyRotator::new(vec![bad.clone(), good.clone()]));
+    let gates = Arc::new(GateLevels::new(vec![(1, gate_rotator.clone())]));
+    let exit = Arc::new(ProxyRotator::new(vec![exit_cfg.clone()]));
+    let cached = Arc::new(
+        resocks5_net::types::ProxyConfig::chain([
+            Arc::new(bad.clone()),
+            Arc::new(exit_cfg.clone()),
+        ])
+        .unwrap(),
+    );
+    exit.link_proxy(target.to_string(), cached);
+    let (log_tx, mut logs) = mpsc::channel(32);
+    let logger = Arc::new(Logger::new(
+        log_tx,
+        LogConfig {
+            cache_hits: true,
+            ..Default::default()
+        },
+    ));
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        4,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 2,
+        handshake_timeout_sec: 2,
+        ..Default::default()
+    });
+    let stream = establish_connection(
+        target,
+        &gates,
+        &None,
+        &Some(exit),
+        &logger,
+        &banned,
+        &pool,
+        &network,
+        None,
+        None,
+    )
+    .await
+    .expect("the cached chain is healthy");
+    drop(stream);
+    assert_eq!(bad_accepts.load(Ordering::SeqCst), 1);
+    assert_eq!(good_accepts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        gate_rotator.pick_order_calls(),
+        0,
+        "a cache hit must not walk the plan"
+    );
+    let hit = tokio::time::timeout(Duration::from_secs(5), logs.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(hit, crate::logger::ELog::Log(ref msg) if msg.contains("Cache used for")));
 }

@@ -16,6 +16,36 @@ fn is_tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+/// Authority-host bytes: RFC 3986 unreserved + sub-delims; `%XX` escapes are
+/// checked separately. Dotted quads need no extra range check here.
+fn is_authority_host_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte)
+}
+
+/// True when every byte is an authority-host byte and every `%` opens a
+/// two-hex-digit escape.
+fn valid_authority_host(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let Some(hex) = bytes.get(i + 1..i + 3) else {
+                return false;
+            };
+            if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+                return false;
+            }
+            i += 3;
+        } else {
+            if !is_authority_host_byte(bytes[i]) {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
 /// Validate the already-split HTTP CONNECT request against RFC 9112.
 ///
 /// `request_line` is the request line text; `headers` are the raw header
@@ -71,6 +101,10 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
         if h.contains(':') {
             return Err(bad("strict HTTP: bare IPv6 authority"));
         }
+        // CONNECT authorities carry no path, userinfo, query, or fragment.
+        if !valid_authority_host(h) {
+            return Err(bad("strict HTTP: invalid authority host"));
+        }
         port_text = port;
     }
     if port_text.is_empty() || port_text.len() > 5 || !port_text.bytes().all(|b| b.is_ascii_digit())
@@ -106,6 +140,11 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
         }
         if !name.iter().all(|&b| is_tchar(b)) {
             return Err(bad("strict HTTP: invalid header field name"));
+        }
+        // RFC 9112 field values: CTL bytes are invalid; HTAB and SP are the
+        // only bytes below 0x20 because CRLF never reaches this validator.
+        if value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+            return Err(bad("strict HTTP: invalid header field value"));
         }
         let lower = name.to_ascii_lowercase();
         match lower.as_slice() {

@@ -1,10 +1,11 @@
 //! Ordered hedged connections through a candidate set of upstream proxies.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::connect::connect_proxy::{connect_proxy_on, TlsConnector};
@@ -22,6 +23,7 @@ mod tests;
 #[non_exhaustive]
 pub struct HedgeOptions {
     /// Delay before launching another candidate while no handshake is active.
+    /// A delay too large for the monotonic clock behaves as "never hedge".
     pub hedge_delay: Duration,
     /// Timeout for each proxy-protocol handshake.
     pub handshake_timeout: Duration,
@@ -119,7 +121,10 @@ impl std::error::Error for HedgeError {}
 #[derive(Default)]
 struct RaceState {
     won: AtomicBool,
-    handshaking: AtomicUsize,
+    /// Exclusive handshake admission: locked by the one attempt talking to
+    /// its upstream, so a TCP-ready sibling waits instead of sending a
+    /// second CONNECT to the target.
+    handshake_slot: Mutex<()>,
 }
 
 struct Finished {
@@ -146,10 +151,12 @@ async fn attempt(
     if race.won.load(Ordering::Acquire) {
         return Err(AttemptFailure::Lost);
     }
-    race.handshaking.fetch_add(1, Ordering::AcqRel);
+    // Exclusive handshake admission: a TCP-ready sibling waits here with its
+    // socket and sends nothing until the slot is its own.
+    let _slot = race.handshake_slot.lock().await;
+    // The holder publishes its win before freeing the slot, so a waiter that
+    // acquires it after a success observes `won` and never handshakes.
     if race.won.load(Ordering::Acquire) {
-        let old = race.handshaking.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(old > 0);
         return Err(AttemptFailure::Lost);
     }
     let result = connect_proxy_on(
@@ -159,11 +166,13 @@ async fn attempt(
         timeout,
         tls_connector.as_deref(),
     )
-    .await
-    .map_err(AttemptFailure::Failed);
-    let old = race.handshaking.fetch_sub(1, Ordering::AcqRel);
-    debug_assert!(old > 0);
-    result
+    .await;
+    if result.is_ok() {
+        // Publish before dropping the slot so the next waiter sees the win.
+        race.won.store(true, Ordering::Release);
+    }
+    drop(_slot);
+    result.map_err(AttemptFailure::Failed)
 }
 
 fn report(
@@ -203,10 +212,27 @@ async fn drain(
     }
 }
 
+/// Next hedge-tick deadline. `None` arms no timer: a delay too large for the
+/// monotonic clock behaves as "never hedge" instead of panicking on overflow.
+fn hedge_deadline(opts: &HedgeOptions, pending_len: usize) -> Option<tokio::time::Instant> {
+    if opts.hedge_delay.is_zero() || pending_len == 0 {
+        return None;
+    }
+    tokio::time::Instant::now().checked_add(opts.hedge_delay)
+}
+
 /// Connect through candidates in input order. Zero delay selects sequential
 /// operation; otherwise another candidate launches after each delay only while
 /// no handshake is active. The next launches immediately when all active
 /// attempts fail.
+///
+/// Handshake admission is exclusive: a launched attempt that reaches its
+/// upstream while another attempt is talking to it waits with its acquired
+/// socket and sends nothing. If the holder succeeds, the waiter is reported
+/// `Lost` and closes its socket; only a failed holder lets the waiter start
+/// its own handshake, so the target never sees duplicate CONNECTs. A
+/// `hedge_delay` too large for the monotonic clock (e.g. `Duration::MAX`)
+/// arms no hedge timer and behaves as "never hedge".
 ///
 /// Every normally completed launched attempt is reported exactly once. The
 /// winner and failures observed before it have `after_win == false`; the
@@ -253,7 +279,8 @@ where
     let mut running = JoinSet::new();
     let mut launched = Vec::<Arc<ProxyConfig>>::new();
     let mut last = None;
-    let mut hedge_at = tokio::time::Instant::now();
+    // Some(deadline) arms the hedge timer; `None` arms nothing.
+    let mut hedge_at = None;
 
     loop {
         if running.is_empty() {
@@ -274,7 +301,7 @@ where
                 opts.handshake_timeout,
                 tls.clone(),
             );
-            hedge_at = tokio::time::Instant::now() + opts.hedge_delay;
+            hedge_at = hedge_deadline(opts, pending.len());
         }
         tokio::select! {
             joined = running.join_next() => {
@@ -298,9 +325,16 @@ where
                     Err(AttemptFailure::Lost) => callback(&AttemptReport { index: finished.index, proxy: launched[finished.index].clone(), elapsed: finished.elapsed, outcome: AttemptOutcome::Lost, after_win: false }),
                 }
             }
-            _ = tokio::time::sleep_until(hedge_at), if !opts.hedge_delay.is_zero() && pending.len() > 0 => {
-                hedge_at = tokio::time::Instant::now() + opts.hedge_delay;
-                if race.handshaking.load(Ordering::Acquire) == 0 {
+            _ = async {
+                match hedge_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if !opts.hedge_delay.is_zero() && pending.len() > 0 => {
+                hedge_at = hedge_deadline(opts, pending.len());
+                // A tick does not launch beside a handshaking attempt.
+                let slot_busy = race.handshake_slot.try_lock().is_err();
+                if !slot_busy {
                     if let Some((index, proxy)) = pending.next() {
                         launch(&mut running, &mut launched, index, proxy, race.clone(), target.clone(), pool.clone(), opts.handshake_timeout, tls.clone());
                     }

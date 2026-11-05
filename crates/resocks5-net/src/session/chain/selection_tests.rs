@@ -1,4 +1,4 @@
-use super::{ChainPlan, GateLevels};
+use super::{singleton_key, ChainPlan, GateLevels};
 use crate::rating::{QuarantinePolicy, RatingPolicy};
 use crate::rotator::ProxyRotator;
 use crate::types::{ChainKey, ProxyConfig};
@@ -363,4 +363,120 @@ fn singleton_identity_fields_remain_distinct_except_is_gate_and_gate_link() {
     let mut is_gate_only = p("host");
     is_gate_only.is_gate = true;
     assert_eq!(key(p("host")), key(is_gate_only));
+}
+
+#[test]
+fn fully_dead_exit_layer_ends_plan_without_sweeping_gates() {
+    // Mutation caught: removing layer exhaustion re-adds the pre-fix odometer
+    // sweep (80 iterations on the 81-combo case below, bound is sum = 13).
+    let gates = GateLevels::new(vec![(2, r(&["a0", "a1"])), (1, r(&["b0", "b1"]))]);
+    let mut plan = ChainPlan::new(&gates, &[r(&["e"])]);
+    assert_eq!(plan.next().unwrap().exit().proxy.host, "e");
+    plan.mark_dead(&p("e"));
+    let before = plan.steps;
+    assert!(plan.next().is_none());
+    let spent = plan.steps - before;
+    assert!(spent <= 2 + 2 + 1, "work after exhaustion: {spent}");
+
+    let gates = GateLevels::new(vec![
+        (9, r(&["a0", "a1", "a2"])),
+        (7, r(&["b0", "b1", "b2"])),
+        (5, r(&["c0", "c1", "c2"])),
+        (3, r(&["d0", "d1", "d2"])),
+    ]);
+    let mut plan = ChainPlan::new(&gates, &[r(&["e"])]);
+    assert_eq!(plan.next().unwrap().exit().proxy.host, "e");
+    plan.mark_dead(&p("e"));
+    let before = plan.steps;
+    assert!(plan.next().is_none());
+    let spent = plan.steps - before;
+    assert!(spent <= 3 + 3 + 3 + 3 + 1, "work after exhaustion: {spent}");
+}
+
+#[test]
+fn one_dead_exit_keeps_remaining_exits_in_original_order() {
+    // Positive control against over-eager exhaustion: one dead exit must not
+    // end a plan whose exit layer still has live candidates.
+    let rotators = [r(&["x"]), r(&["y"]), r(&["z"])];
+    let mut plan = ChainPlan::new(&GateLevels::default(), &rotators);
+    assert_eq!(plan.next().unwrap().exit().proxy.host, "x");
+    plan.mark_dead(&p("x"));
+    let rest: Vec<_> = plan.collect();
+    let remaining: Vec<_> = rest
+        .iter()
+        .map(|pick| pick.exit().proxy.host.as_str())
+        .collect();
+    assert_eq!(remaining, ["y", "z"]);
+    assert!(rest.iter().all(|pick| pick.hops().len() == 1));
+}
+
+#[test]
+fn fully_dead_gate_layer_ends_the_plan() {
+    // Mutation caught: gate layers skipping the exhaustion check — the deep
+    // variant sweeps ~26 odometer states pre-fix, over the sum = 10 bound.
+    let gates = GateLevels::new(vec![
+        (4, r(&["a0", "a1", "a2"])),
+        (3, r(&["b0", "b1", "b2"])),
+        (2, r(&["c0", "c1", "c2"])),
+    ]);
+    let mut plan = ChainPlan::new(&gates, &[r(&["e"])]);
+    assert_eq!(plan.next().unwrap().exit().proxy.host, "e");
+    for host in ["c0", "c1", "c2"] {
+        plan.mark_dead(&p(host));
+    }
+    let before = plan.steps;
+    assert!(plan.next().is_none());
+    let spent = plan.steps - before;
+    assert!(spent <= 3 + 3 + 3 + 1, "work after exhaustion: {spent}");
+
+    let outer = GateLevels::new(vec![(2, r(&["a0", "a1"])), (1, r(&["g"]))]);
+    let mut plan = ChainPlan::new(&outer, &[r(&["e"])]);
+    plan.mark_dead(&p("a0"));
+    plan.mark_dead(&p("a1"));
+    assert!(plan.next().is_none());
+}
+
+#[test]
+fn partially_dead_gate_layer_still_enumerates_through_the_live_gate() {
+    // Guards both directions: the plan must not exhaust on a partial death,
+    // and no produced chain may contain the dead gate candidate.
+    let gates = GateLevels::new(vec![(2, r(&["a0", "a1"])), (1, r(&["b0", "b1"]))]);
+    let mut plan = ChainPlan::new(&gates, &[r(&["e"])]);
+    let first = plan.next().unwrap();
+    let dead_gate = first.hops()[0].proxy.clone();
+    plan.mark_dead(&dead_gate);
+    let rest: Vec<_> = plan.collect();
+    assert_eq!(rest.len(), 2);
+    assert!(rest
+        .iter()
+        .all(|pick| pick.hops()[0].proxy.host != dead_gate.host));
+    let gate_hosts: HashSet<_> = rest
+        .iter()
+        .map(|pick| pick.hops()[0].proxy.host.clone())
+        .collect();
+    assert_eq!(gate_hosts.len(), 1);
+    assert_eq!(rest[0].hops()[1].proxy.host, first.hops()[1].proxy.host);
+    assert_ne!(rest[1].hops()[1].proxy.host, rest[0].hops()[1].proxy.host);
+    assert!(rest.iter().all(|pick| pick.exit().proxy.host == "e"));
+}
+
+#[test]
+fn exclude_and_mark_dead_stay_independent_sets() {
+    // Regression pin: exclusion stays in `seen`, death stays in `dead`; one
+    // must never trigger the other's pruning or exhaustion path.
+    let gates = GateLevels::new(vec![(1, r(&["a0", "a1"]))]);
+    let mut plan = ChainPlan::new(&gates, &[r(&["x"]), r(&["y"])]);
+    let excluded = plan.next().unwrap().key();
+    plan.exclude(&excluded);
+    plan.mark_dead(&p("x"));
+    let rest: Vec<_> = plan.by_ref().collect();
+    assert_eq!(rest.len(), 2);
+    assert!(rest
+        .iter()
+        .all(|pick| pick.hops().iter().all(|hop| hop.proxy.host != "x")));
+    assert!(rest.iter().all(|pick| pick.key() != excluded));
+    assert_eq!(plan.dead.len(), 1);
+    assert!(plan.dead.contains(&singleton_key(&Arc::new(p("x")))));
+    assert_eq!(plan.seen.len(), 1);
+    assert!(plan.seen.contains(&excluded));
 }

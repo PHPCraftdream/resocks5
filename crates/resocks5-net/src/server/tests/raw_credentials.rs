@@ -555,3 +555,47 @@ async fn raw_zeroize_wipes_raw_byte_vectors() {
     .await
     .expect("bounded raw_zeroize_wipes_raw_byte_vectors");
 }
+
+/// `take_username` must wipe the raw identity bytes before they are freed:
+/// the witness records what its `Drop` sees, so the assertion reads live
+/// memory only. Mutation: removing the in-place wipe inside `discard_wiped`
+/// lets the buffer arrive at `Drop` unwiped and fails the all-zero assertion.
+#[cfg(feature = "zeroize")]
+#[test]
+fn take_username_zeroizes_raw_bytes_before_free() {
+    // A Vec stand-in whose Drop records the bytes it still held (and how
+    // often it dropped); `discard_wiped` wipes through `Zeroize` first.
+    struct Witness {
+        bytes: Vec<u8>,
+        observed: std::rc::Rc<std::cell::RefCell<(usize, Vec<u8>)>>,
+    }
+    impl zeroize::Zeroize for Witness {
+        fn zeroize(&mut self) {
+            self.bytes.zeroize();
+        }
+    }
+    impl Drop for Witness {
+        fn drop(&mut self) {
+            let mut seen = self.observed.borrow_mut();
+            seen.0 += 1;
+            seen.1 = self.bytes.clone();
+        }
+    }
+
+    let observed = std::rc::Rc::new(std::cell::RefCell::new((0usize, Vec::new())));
+    let mut slot = Some(Witness {
+        bytes: b"raw-secret".to_vec(),
+        observed: std::rc::Rc::clone(&observed),
+    });
+    discard_wiped(&mut slot);
+    assert!(slot.is_none());
+    let seen = observed.borrow().clone();
+    assert_eq!(seen.0, 1, "the witness must drop exactly once");
+    assert_eq!(seen.1.len(), 10, "the witness must capture the buffer");
+    assert!(seen.1.iter().all(|&b| b == 0), "bytes must arrive zeroized");
+
+    // An already-empty slot is a no-op: no second drop, nothing wiped.
+    discard_wiped(&mut slot);
+    assert!(slot.is_none());
+    assert_eq!(observed.borrow().0, 1, "an empty slot must drop nothing");
+}

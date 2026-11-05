@@ -801,3 +801,31 @@ async fn over_https_without_connector_fails_before_writing_bytes() {
     let mut b = [0];
     assert_eq!(timeout(GUARD, peer.read(&mut b)).await.unwrap().unwrap(), 0);
 }
+
+#[tokio::test]
+async fn without_gate_total_timeout_after_tcp_reports_target_stage() {
+    let (l, port) = bind().await;
+    let _stub = silent_stub(l);
+    let o = opts()
+        .with_handshake_timeout(Duration::from_secs(5))
+        .with_total_timeout(Duration::from_millis(300));
+    let err = chain_err(
+        &ProxyConfig::socks5("127.0.0.1", port),
+        "example.com",
+        80,
+        &o,
+    )
+    .await;
+    assert_eq!(err.stage(), ChainStage::Target);
+    assert!(
+        matches!(
+            err.error(),
+            ConnectError::Timeout {
+                stage: Stage::Total,
+                kind: TimeoutKind::Total,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}

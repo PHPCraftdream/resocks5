@@ -397,8 +397,10 @@ server are checked too.
 `connect_hedged` (feature `pool`) races a candidate list: attempts launch in
 order, and the next one starts beside a slow one after
 `HedgeOptions::hedge_delay` only while no running attempt is past its TCP
-connect, so the target never sees duplicate CONNECTs. The first success is
-returned as `Hedged { stream, winner }`; the rest finish in the background
+connect, so the target never sees duplicate CONNECTs: an attempt that reaches
+its upstream while another one is handshaking waits and sends nothing, and is
+reported `Lost` if that one succeeds. A delay too large for the monotonic clock
+means never hedge. The first success is returned as `Hedged { stream, winner }`; the rest finish in the background
 and every launched attempt is reported exactly once through `on_attempt`
 (`AttemptReport` with `AttemptOutcome::{Won, LateSuccess, Lost, Failed}` and
 `after_win`), so the caller can feed ratings and quarantine. A zero delay

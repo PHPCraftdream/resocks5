@@ -50,6 +50,7 @@ runs only that, on ubuntu. Nothing needs to be written in the commit message.
 |---------------|-----------|
 | SDK core: `crates/resocks5-net/src/{lib.rs,connect,error,types}`, `session/{pool,progress.rs}`, `tests/` | all SDK tests in every feature-matrix row, lean clippy/doc, and all app tests |
 | `crates/resocks5-net/src/session/rating`, `rotator` | SDK tests of `rating::` / `rotator::` in every matrix row; app `server::` tests |
+| `crates/resocks5-net/src/session/chain` | SDK tests of `chain::` in every matrix row; app `server::` tests |
 | `crates/resocks5-net/src/server` | SDK `server::` tests; app `server::` and `http_proxy::` tests |
 | SDK examples, fixtures | test builds of every matrix row (`--no-run`) |
 | `crates/resocks5/src/{main.rs,config}` | all app tests |

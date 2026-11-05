@@ -50,12 +50,13 @@ fn rating_index_checks_identity_on_hash_collision() {
 }
 
 #[test]
-fn rating_index_preserves_last_duplicate_slot() {
+fn duplicate_identity_collapses_onto_the_first_slot() {
     let proxy = make_proxy("one", 1000);
     let rotator = ProxyRotator::new(vec![proxy.clone(), proxy.clone(), proxy.clone()]);
-    assert_eq!(rotator.index_of(&proxy), Some(2));
+    assert_eq!(rotator.len(), 1);
+    assert_eq!(rotator.index_of(&proxy), Some(0));
     let hash = upstream_hash(&rotator.identity_hasher, &proxy);
-    assert_eq!(rotator.by_identity[&hash].len(), 1);
+    assert_eq!(rotator.by_identity[&hash], vec![0]);
 }
 
 #[test]

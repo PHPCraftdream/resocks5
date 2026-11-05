@@ -127,7 +127,7 @@ pub async fn dial(
     opts: &DialOptions,
     tls_connector: Option<&TlsConnector>,
 ) -> Result<AnyUpstream, ConnectError> {
-    let run = dial_inner(proxy, host, port, opts, tls_connector);
+    let run = dial_inner(proxy, host, port, opts, tls_connector, || {});
     match opts.total_timeout {
         None => run.await,
         Some(total) => match timeout(total, run).await {
@@ -172,6 +172,7 @@ async fn dial_inner(
     port: u16,
     opts: &DialOptions,
     tls_connector: Option<&TlsConnector>,
+    on_tcp: impl FnOnce(),
 ) -> Result<AnyUpstream, ConnectError> {
     let host = host
         .strip_prefix('[')
@@ -198,6 +199,7 @@ async fn dial_inner(
 
     let tcp = tcp_dial(proxy, opts.connect_timeout).await?;
     let mut stream = UpstreamStream::from_tcp(tcp);
+    on_tcp();
     let hs = opts.handshake_timeout;
     let hs_timeout = |kind| ConnectError::Timeout {
         stage: Stage::Handshake,

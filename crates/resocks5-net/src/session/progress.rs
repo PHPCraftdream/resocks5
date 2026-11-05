@@ -84,6 +84,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 ///             let MyBuffer { pending, inner } = &mut *self;
 ///             let contiguous = pending.make_contiguous();
 ///             let written = match Pin::new(inner).poll_write(cx, contiguous) {
+///                 // Ok(0) accepts nothing: `drain(..0)` would leave the
+///                 // buffer untouched and this loop would spin forever.
+///                 Poll::Ready(Ok(0)) => {
+///                     return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+///                 }
 ///                 Poll::Ready(Ok(n)) => n,
 ///                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
 ///                 Poll::Pending => return Poll::Pending,

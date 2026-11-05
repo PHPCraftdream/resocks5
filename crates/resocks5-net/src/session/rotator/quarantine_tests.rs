@@ -197,3 +197,52 @@ fn restore_without_a_quarantine_policy_applies_nothing() {
     assert_eq!(r.restore_health(&[saved]), 0);
     assert!(!r.is_quarantined(&proxy("a")));
 }
+
+#[test]
+fn duplicate_upstreams_collapse_onto_one_slot() {
+    let r = ProxyRotator::try_with_quarantine(
+        vec![proxy("a"), proxy("a"), proxy("b")],
+        RatingPolicy::default(),
+        QuarantinePolicy::default().with_threshold(1),
+        DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+        DEFAULT_STICKY_CACHE_TTL,
+    )
+    .unwrap();
+    assert_eq!(r.len(), 2);
+    let hosts: Vec<_> = r.all_proxies().iter().map(|p| p.host.as_str()).collect();
+    assert_eq!(hosts, ["a", "b"]);
+
+    // One hard failure quarantines every alias of "a": the healthy "b"
+    // stays alone in the order until a success lifts the quarantine.
+    let dead = proxy("a");
+    assert_eq!(r.record_hard_failure(&dead), Some(Duration::from_secs(30)));
+    assert!(r.is_quarantined(&dead));
+    for _ in 0..100 {
+        let order = r.pick_order();
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].host, "b");
+    }
+    r.record_success(&dead);
+    assert!(!r.is_quarantined(&dead));
+    assert_eq!(r.pick_order().len(), 2);
+}
+
+#[test]
+fn near_duplicates_with_different_accounts_or_gate_levels_stay_distinct() {
+    let mut alice = proxy("a");
+    alice.user = Some("alice".to_string());
+    alice.password = Some("pw-a".to_string());
+    let mut alice_rekeyed = alice.clone();
+    alice_rekeyed.password = Some("pw-b".to_string());
+    let gated = proxy("a").with_gate_level(1);
+    let r = ProxyRotator::new(vec![alice, alice_rekeyed, gated]);
+    assert_eq!(r.len(), 3);
+}
+
+#[test]
+fn single_upstream_survives_dedup_unchanged() {
+    let r = ProxyRotator::new(vec![proxy("a")]);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r.get_next().host, "a");
+    assert_eq!(r.pick_order().len(), 1);
+}

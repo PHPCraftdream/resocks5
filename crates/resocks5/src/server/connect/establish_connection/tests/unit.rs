@@ -10,6 +10,7 @@ use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ChainKey, ProxyConfig};
 use resocks5_net::ConnectError;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -696,5 +697,228 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         v4.pick_order_calls(),
         v4_orders_before,
         "budget exhaustion must skip building the direct order"
+    );
+}
+
+/// SOCKS5 stub that answers every handshake round on a socket with
+/// success — safe as a chain gate — and counts accepted TCP connections.
+async fn spawn_counting_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                loop {
+                    let mut greet = [0u8; 3];
+                    if sock.read_exact(&mut greet).await.is_err() {
+                        return;
+                    }
+                    if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                        return;
+                    }
+                    let mut head = [0u8; 4];
+                    if sock.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = match head[3] {
+                        0x01 => 4,
+                        0x03 => {
+                            let mut l = [0u8; 1];
+                            if sock.read_exact(&mut l).await.is_err() {
+                                return;
+                            }
+                            l[0] as usize
+                        }
+                        0x04 => 16,
+                        _ => return,
+                    };
+                    let mut rest = vec![0u8; len + 2];
+                    if sock.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let _ = sock
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+/// SOCKS5 stub that answers the method negotiation with protocol garbage:
+/// a chain through it fails fast at hop 0 without touching the inner proxy
+/// (no dead port, so no Windows refused-connect delay).
+async fn spawn_counting_garbage_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut greet = [0u8; 3];
+                if sock.read_exact(&mut greet).await.is_err() {
+                    return;
+                }
+                let _ = sock.write_all(&[0xde, 0xad]).await;
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+#[tokio::test]
+async fn queued_sticky_routes_stay_within_one_launch_budget() {
+    // V04: budget 3. Two ordinary sticky caches (one per rotator) are
+    // queued without spending attempts; the gates phase used to reserve a
+    // single direct slot, so two chain attempts plus both queued
+    // candidates reached 4 wire attempts. The reserve must grow with the
+    // queue and the hedged slice must stay inside the remaining budget.
+    // Mutations caught: dropping the reserve growth makes gate_dials == 2
+    // and 4 wire attempts; dropping only the reserve growth (clamp kept)
+    // makes gate_dials == 2.
+    let target = "example.com:443";
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        4,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 2,
+        handshake_timeout_sec: 2,
+        max_upstream_attempts: 3,
+        hedge_delay_ms: 100,
+        ..Default::default()
+    });
+    let (gate1, gate1_accepts) = spawn_counting_garbage_stub().await;
+    let (gate2, gate2_accepts) = spawn_counting_garbage_stub().await;
+    // TEST-NET-1 never answers: the first hedged candidate stays pending
+    // past the hedge delay, so the second one launches beside it.
+    let slow = socks5_config(SocketAddr::from(([192, 0, 2, 1], 9)), false);
+    let (fast_addr, fast_accepts) = spawn_counting_stub().await;
+    let fast = socks5_config(fast_addr, false);
+    let v6 = Arc::new(ProxyRotator::new(vec![slow.clone()]));
+    let v4 = Arc::new(ProxyRotator::new(vec![fast.clone()]));
+    v6.link_proxy(target.to_string(), Arc::new(slow.clone()));
+    v4.link_proxy(target.to_string(), Arc::new(fast.clone()));
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![
+            socks5_config(gate1, true),
+            socks5_config(gate2, true),
+        ])),
+    )]));
+    let (log_tx, mut logs) = tokio::sync::mpsc::channel(64);
+    let logger = Arc::new(Logger::new(
+        log_tx,
+        crate::logger::LogConfig {
+            attempts: true,
+            ..Default::default()
+        },
+    ));
+    let stream = establish_connection(
+        target,
+        &gates,
+        &Some(v6),
+        &Some(v4),
+        &logger,
+        &banned,
+        &pool,
+        &network,
+        None,
+        None,
+    )
+    .await
+    .expect("the healthy queued upstream must serve the target");
+    drop(stream);
+    let gate_dials = gate1_accepts.load(Ordering::SeqCst) + gate2_accepts.load(Ordering::SeqCst);
+    assert_eq!(
+        gate_dials, 1,
+        "one gate-chain attempt is all the budget owes the gates phase"
+    );
+    assert_eq!(
+        fast_accepts.load(Ordering::SeqCst),
+        1,
+        "the second queued candidate must launch beside the first"
+    );
+    // The abandoned sticky attempt reports after its connect timeout (2 s).
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let mut wire_attempts = 0;
+    while let Ok(entry) = logs.try_recv() {
+        if let crate::logger::ELog::Log(line) = entry {
+            if line.starts_with("attempt ") {
+                wire_attempts += 1;
+            }
+        }
+    }
+    assert!(
+        wire_attempts <= 3,
+        "{wire_attempts} wire attempts exceed max_upstream_attempts"
+    );
+}
+
+#[tokio::test]
+async fn spent_budget_truncates_the_queued_sticky_slice() {
+    // V04 clamp half: with the budget spent by a failed cached chain, the
+    // queued sticky candidate must not launch at all. Without the clamp
+    // the hedged phase launched it — 2 wire attempts at a cap of 1 — and
+    // the call wrongly succeeded. Mutation caught: removing the truncate
+    // makes the result Ok instead of the exhaustion error.
+    let target = "example.com:443";
+    let banned = Arc::new(RegexSet::empty());
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        4,
+    ));
+    let network = Arc::new(NetworkConfig {
+        connect_timeout_sec: 2,
+        handshake_timeout_sec: 2,
+        max_upstream_attempts: 1,
+        ..Default::default()
+    });
+    let (gate_addr, gate_accepts) = spawn_counting_garbage_stub().await;
+    let gate = socks5_config(gate_addr, true);
+    let inner = socks5_config(spawn_socks5_stub().await, false);
+    let sticky = socks5_config(spawn_socks5_stub().await, false);
+    let mut composite = inner.clone();
+    composite.gate = Some(Arc::new(gate.clone()));
+    let v6 = Arc::new(ProxyRotator::new(vec![sticky.clone()]));
+    let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
+    v6.link_proxy(target.to_string(), Arc::new(sticky.clone()));
+    v4.link_proxy(target.to_string(), Arc::new(composite));
+    let gates = Arc::new(GateLevels::new(vec![(
+        1,
+        Arc::new(ProxyRotator::new(vec![gate.clone()])),
+    )]));
+    let error = establish_connection(
+        target,
+        &gates,
+        &Some(v6),
+        &Some(v4),
+        &test_logger(),
+        &banned,
+        &pool,
+        &network,
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("the spent budget must leave no launch for the hedged phase");
+    assert!(
+        error.to_string().contains("All 1 upstream attempts"),
+        "expected the exhaustion error, got: {error}"
+    );
+    assert_eq!(
+        gate_accepts.load(Ordering::SeqCst),
+        1,
+        "the single attempt is the failing cached chain"
     );
 }
