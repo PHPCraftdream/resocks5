@@ -95,33 +95,13 @@ impl Restored {
     }
 }
 
+/// Wall-clock seconds. The quarantine countdown (`remaining_sec`) is measured
+/// on the std monotonic clock, which a paused tokio clock does not move, so the
+/// tests keep the real clock here too: both stay (nearly) still together.
 pub(crate) fn unix_now() -> u64 {
-    #[cfg(test)]
-    let now = test_unix_now();
-    #[cfg(not(test))]
-    let now = real_unix_now();
-    now
-}
-
-fn real_unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// Test clock: the real unix time at the first call on this thread plus the
-/// time elapsed on the tokio clock since then, so a paused clock that is
-/// advanced moves `saved_at` exactly like the `Instant`-based countdown.
-#[cfg(test)]
-fn test_unix_now() -> u64 {
-    thread_local! {
-        static ORIGIN: (u64, tokio::time::Instant) = (real_unix_now(), tokio::time::Instant::now());
-    }
-    ORIGIN.with(|(base, at)| {
-        base + tokio::time::Instant::now()
-            .saturating_duration_since(*at)
-            .as_secs()
-    })
 }
 
 fn upstream_label(proxy: &ProxyConfig) -> String {

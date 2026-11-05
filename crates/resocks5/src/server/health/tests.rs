@@ -589,7 +589,7 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
     let path = dir.join("health.ktav");
     let r = rotator(vec![p("a")]);
     r.record_hard_failure(&p("a"));
-    // Same clock as the saver (the test unix clock follows the tokio clock).
+    // Same clock as the saver.
     let initial = snapshot(&[group("v4", r.clone())], unix_now());
     let (log, _rx) = logger();
     let skips = arm_skip_counter(&path);
