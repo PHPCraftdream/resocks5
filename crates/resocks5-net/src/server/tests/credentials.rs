@@ -494,6 +494,9 @@ async fn zeroize_wipes_credentials_and_requests() {
 
         // (b) Request wipe clears identity, keeps the pipeline.
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:1".into(),
             username: Some("wipe-user-1".to_owned()),
@@ -514,6 +517,9 @@ async fn zeroize_wipes_credentials_and_requests() {
 
         // (c) A partially drained request still drops without panicking.
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:2".into(),
             username: Some("wipe-user-1".to_owned()),
@@ -541,6 +547,9 @@ const _: () = {
 /// Drain one host reply from a duplex, after a clean flush and writer drop.
 async fn reply_wire(protocol: Protocol, reply: Reply) -> Vec<u8> {
     let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username_raw: None,
         credentials: None,
         protocol,
@@ -629,6 +638,9 @@ async fn reply_flush_delivers_the_whole_message_for_every_pair() {
                 (Protocol::Http, http_bytes),
             ] {
                 let req = IncomingRequest {
+                    auth: crate::server::AuthMethod::Anonymous,
+                    #[cfg(feature = "gssapi")]
+                    gss: None,
                     username_raw: None,
                     credentials: None,
                     protocol,
@@ -757,6 +769,9 @@ async fn reply_writes_drain_through_a_four_byte_duplex_with_a_concurrent_reader(
             (Protocol::Http, Reply::TimedOut, EXPECT_HTTP_504),
         ] {
             let req = IncomingRequest {
+                auth: crate::server::AuthMethod::Anonymous,
+                #[cfg(feature = "gssapi")]
+                gss: None,
                 username_raw: None,
                 credentials: None,
                 protocol,
@@ -795,6 +810,9 @@ async fn reply_to_closed_peer_fails_with_io_error() {
                 Reply::Overloaded,
             ] {
                 let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
                     username_raw: None,
                     credentials: None,
                     protocol,

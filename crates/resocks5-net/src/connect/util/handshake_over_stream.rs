@@ -61,8 +61,8 @@ where
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
-    let stream = socks5_greeting(stream, Socks5Auth::from_pair(auth)).await?;
-    socks5_connect_request(stream, host, port).await
+    let (stream, mut gss) = socks5_greeting(stream, Socks5Auth::from_pair(auth)).await?;
+    socks5_connect_request(stream, host, port, &mut gss).await
 }
 
 /// How a SOCKS5 greeting authenticates.
@@ -72,10 +72,36 @@ pub(crate) enum Socks5Auth<'a> {
     None,
     /// RFC 1929 UNAME/PASSWD (method 0x02): the password in clear text.
     Cleartext(&'a str, &'a str),
-    /// Secure auth (method 0x80): the password never crosses the wire.
+    /// Strong authentication, nothing weaker: every configured method is
+    /// offered, strongest first, and the server picks (see [`Strong`]).
     #[cfg(feature = "secure-auth")]
-    Secure(&'a crate::secure_auth::SecureCredentials),
+    Strong(Strong<'a>),
 }
+
+/// The strong methods a client can offer, in order of preference: GSSAPI
+/// (0x01) before secure auth (0x80). Neither sends a password; anonymous and
+/// clear-text are never offered alongside them.
+#[cfg(feature = "secure-auth")]
+#[derive(Clone, Copy)]
+pub(crate) struct Strong<'a> {
+    #[cfg(feature = "gssapi")]
+    pub(crate) gssapi: Option<&'a crate::gssapi::GssCredentials>,
+    pub(crate) secure: Option<&'a crate::secure_auth::SecureCredentials>,
+}
+
+/// The GSSAPI session of a greeting, when the server chose method 0x01: the
+/// CONNECT request and reply then travel as protected messages.
+#[cfg(feature = "gssapi")]
+pub(crate) type Gss = Option<crate::gssapi::GssSession>;
+#[cfg(not(feature = "gssapi"))]
+pub(crate) type Gss = ();
+
+#[cfg(feature = "gssapi")]
+fn no_gss() -> Gss {
+    None
+}
+#[cfg(not(feature = "gssapi"))]
+fn no_gss() -> Gss {}
 
 impl<'a> Socks5Auth<'a> {
     pub(crate) fn from_pair(pair: Option<(&'a str, &'a str)>) -> Self {
@@ -91,7 +117,8 @@ impl<'a> Socks5Auth<'a> {
 /// sub-negotiation.
 ///
 /// On success the stream sits right after the method-selection (or
-/// auth-status) reply, ready for [`socks5_connect_request`]. A stall in
+/// auth-status) reply, ready for [`socks5_connect_request`] (with the returned
+/// GSSAPI session, when one was negotiated). A stall in
 /// this phase means the upstream never answered its own protocol: the
 /// CONNECT request has not been sent, so the destination cannot be the
 /// cause. Producers bound this phase with
@@ -99,15 +126,31 @@ impl<'a> Socks5Auth<'a> {
 pub(crate) async fn socks5_greeting<S>(
     mut stream: S,
     auth: Socks5Auth<'_>,
-) -> Result<S, ConnectError>
+) -> Result<(S, Gss), ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
     #[cfg(feature = "secure-auth")]
-    if let Socks5Auth::Secure(credentials) = auth {
-        stream
-            .write_all(&[0x05, 0x01, crate::secure_auth::METHOD])
-            .await?;
+    if let Socks5Auth::Strong(strong) = auth {
+        // Offer every configured strong method, strongest first; the server's
+        // choice decides the exchange. Nothing weaker is ever offered.
+        let mut offered: Vec<u8> = Vec::new();
+        #[cfg(feature = "gssapi")]
+        if strong.gssapi.is_some() {
+            offered.push(crate::gssapi::METHOD);
+        }
+        if strong.secure.is_some() {
+            offered.push(crate::secure_auth::METHOD);
+        }
+        if offered.is_empty() {
+            return Err(ConnectError::MethodUnsupported {
+                got: 0xFF,
+                with_auth: true,
+            });
+        }
+        let mut greeting = vec![0x05, u8::try_from(offered.len()).unwrap_or(u8::MAX)];
+        greeting.extend_from_slice(&offered);
+        stream.write_all(&greeting).await?;
         stream.flush().await?;
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
@@ -116,23 +159,37 @@ where
                 ProtocolViolation::Socks5BadVersion { got: response[0] },
             ));
         }
-        if response[1] != crate::secure_auth::METHOD {
+        let chosen = response[1];
+        if !offered.contains(&chosen) {
             return Err(ConnectError::MethodUnsupported {
-                got: response[1],
+                got: chosen,
                 with_auth: true,
             });
         }
+        let io = |kind| ConnectError::Io {
+            stage: Stage::Handshake,
+            endpoint: None,
+            source: std::io::Error::from(kind),
+        };
+        #[cfg(feature = "gssapi")]
+        if chosen == crate::gssapi::METHOD {
+            let credentials = strong.gssapi.expect("offered only when configured");
+            let session = crate::gssapi::client_gssapi(&mut stream, credentials)
+                .await
+                .map_err(|error| match error {
+                    crate::GssapiError::Io(kind) => io(kind),
+                    other => ConnectError::Gssapi(other),
+                })?;
+            return Ok((stream, Some(session)));
+        }
+        let credentials = strong.secure.expect("offered only when configured");
         crate::secure_auth::client_authenticate(&mut stream, credentials)
             .await
             .map_err(|error| match error {
-                crate::SecureAuthError::Io(kind) => ConnectError::Io {
-                    stage: Stage::Handshake,
-                    endpoint: None,
-                    source: std::io::Error::from(kind),
-                },
+                crate::SecureAuthError::Io(kind) => io(kind),
                 other => ConnectError::SecureAuth(other),
             })?;
-        return Ok(stream);
+        return Ok((stream, no_gss()));
     }
     let auth = match auth {
         Socks5Auth::Cleartext(user, password) => Some((user, password)),
@@ -208,11 +265,12 @@ where
             });
         }
     }
-    Ok(stream)
+    Ok((stream, no_gss()))
 }
 
 /// Send the SOCKS5 CONNECT request for `host:port` (RFC 1928 §5) and read
-/// the reply through the end of the bound address.
+/// the reply through the end of the bound address. With a GSSAPI session the
+/// request and the reply are protected messages (RFC 1961 §5).
 ///
 /// On success the stream sits right after the CONNECT reply, ready for
 /// payload. A stall waiting for the reply may still be the destination's
@@ -223,10 +281,40 @@ pub(crate) async fn socks5_connect_request<S>(
     mut stream: S,
     host: &str,
     port: u16,
+    gss: &mut Gss,
 ) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
+    let req = connect_request_bytes(host, port)?;
+    #[cfg(feature = "gssapi")]
+    if let Some(session) = gss.as_mut() {
+        let gss_error = |error: crate::GssapiError| match error {
+            crate::GssapiError::Io(kind) => ConnectError::Io {
+                stage: Stage::Handshake,
+                endpoint: None,
+                source: std::io::Error::from(kind),
+            },
+            other => ConnectError::Gssapi(other),
+        };
+        session
+            .write_message(&mut stream, &req)
+            .await
+            .map_err(gss_error)?;
+        let reply = session.read_message(&mut stream).await.map_err(gss_error)?;
+        read_connect_reply(&mut reply.as_slice()).await?;
+        return Ok(stream);
+    }
+    #[cfg(not(feature = "gssapi"))]
+    let () = *gss;
+    stream.write_all(&req).await?;
+    stream.flush().await?;
+    read_connect_reply(&mut stream).await?;
+    Ok(stream)
+}
+
+/// The CONNECT request for `host:port`.
+fn connect_request_bytes(host: &str, port: u16) -> Result<Vec<u8>, ConnectError> {
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
@@ -249,8 +337,14 @@ where
     req.extend_from_slice(&[0x05, 0x01, 0x00, atyp]);
     req.extend_from_slice(&addr_bytes);
     req.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&req).await?;
-    stream.flush().await?;
+    Ok(req)
+}
+
+/// Read a CONNECT reply through the end of the bound address.
+async fn read_connect_reply<R>(stream: &mut R) -> Result<(), ConnectError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut resp_header = [0u8; 4];
     stream.read_exact(&mut resp_header).await?;
     if resp_header[0] != 0x05 {
@@ -300,7 +394,7 @@ where
             ))
         }
     }
-    Ok(stream)
+    Ok(())
 }
 
 /// [`socks5_handshake`] bounded by an ABSOLUTE `deadline`, with a typed
@@ -373,12 +467,18 @@ where
         endpoint: endpoint.to_owned(),
         after,
     };
-    let stream = match tokio::time::timeout_at(deadline, socks5_greeting(stream, auth)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err(timed_out(TimeoutKind::Socks5Greeting)),
-    };
-    match tokio::time::timeout_at(deadline, socks5_connect_request(stream, host, port)).await {
+    let (stream, mut gss) =
+        match tokio::time::timeout_at(deadline, socks5_greeting(stream, auth)).await {
+            Ok(Ok(greeted)) => greeted,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(timed_out(TimeoutKind::Socks5Greeting)),
+        };
+    match tokio::time::timeout_at(
+        deadline,
+        socks5_connect_request(stream, host, port, &mut gss),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(timed_out(TimeoutKind::Socks5Handshake)),
     }

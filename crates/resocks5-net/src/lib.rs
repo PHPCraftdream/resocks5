@@ -46,7 +46,8 @@
 #![warn(missing_docs)]
 
 pub use error::{
-    socks5_rep_description, ConnectError, ProtocolViolation, SecureAuthError, Stage, TimeoutKind,
+    socks5_rep_description, ConnectError, GssapiError, ProtocolViolation, SecureAuthError, Stage,
+    TimeoutKind,
 };
 
 /// May this build send credentials in clear text (feature `cleartext-client`)?
@@ -62,6 +63,9 @@ pub(crate) const CLEARTEXT_SERVER: bool = cfg!(any(test, feature = "cleartext-se
 pub mod chain;
 pub mod connect;
 pub mod error;
+#[cfg(feature = "gssapi")]
+#[path = "session/gssapi/mod.rs"]
+pub mod gssapi;
 #[cfg(feature = "pool")]
 #[path = "session/pool/mod.rs"]
 pub mod pool;

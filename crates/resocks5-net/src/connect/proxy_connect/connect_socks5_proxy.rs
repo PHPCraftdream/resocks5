@@ -22,8 +22,21 @@ use crate::types::ProxyConfig;
 /// configured, else the clear-text pair when both parts are set, else none.
 pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Socks5Auth<'_> {
     #[cfg(feature = "secure-auth")]
-    if let Some(credentials) = proxy.secure_auth.as_deref() {
-        return Socks5Auth::Secure(credentials);
+    {
+        let secure = proxy.secure_auth.as_deref();
+        #[cfg(feature = "gssapi")]
+        let gssapi = proxy.gssapi.as_deref();
+        #[cfg(feature = "gssapi")]
+        let any = secure.is_some() || gssapi.is_some();
+        #[cfg(not(feature = "gssapi"))]
+        let any = secure.is_some();
+        if any {
+            return Socks5Auth::Strong(crate::connect::handshake_over_stream::Strong {
+                #[cfg(feature = "gssapi")]
+                gssapi,
+                secure,
+            });
+        }
     }
     Socks5Auth::from_pair(socks5_pair(proxy))
 }

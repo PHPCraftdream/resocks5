@@ -38,7 +38,7 @@ pub use prefixed::Prefixed;
 mod secure;
 mod strict_http;
 #[cfg(feature = "secure-auth")]
-pub use secure::accept_secure;
+pub use secure::{accept_secure, accept_with, AuthMethods, NoSecrets};
 
 /// Independent authentication capabilities and the host-supplied absolute deadline.
 ///
@@ -103,10 +103,30 @@ pub enum Protocol {
     Http,
 }
 
+/// How an inbound client authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthMethod {
+    /// No authentication (SOCKS5 method 0x00, or HTTP without credentials).
+    Anonymous,
+    /// A clear-text password (SOCKS5 0x02, HTTP Basic); only with
+    /// `cleartext-server`.
+    ClearText,
+    /// Secure auth (SOCKS5 method 0x80): `username()` is the user name.
+    Secure,
+    /// GSSAPI (SOCKS5 method 0x01): `username()` is the authenticated
+    /// principal (for Kerberos, `name@REALM`).
+    Gssapi,
+}
+
 /// An authenticated, unresolved request and the exact payload already consumed.
 pub struct IncomingRequest {
     protocol: Protocol,
     target: String,
+    auth: AuthMethod,
+    /// The GSSAPI session whose protection the SOCKS reply travels under.
+    #[cfg(feature = "gssapi")]
+    gss: Option<std::sync::Mutex<crate::gssapi::GssSession>>,
     username: Option<String>,
     username_raw: Option<Vec<u8>>,
     credentials: Option<Credentials>,
@@ -118,6 +138,7 @@ impl fmt::Debug for IncomingRequest {
         f.debug_struct("IncomingRequest")
             .field("protocol", &self.protocol)
             .field("target", &self.target)
+            .field("auth", &self.auth)
             .field("has_username", &self.username.is_some())
             .field("has_credentials", &self.credentials.is_some())
             .field("pipeline_len", &self.pipeline.len())
@@ -134,6 +155,27 @@ impl IncomingRequest {
     pub fn target(&self) -> &str {
         &self.target
     }
+    /// How the client authenticated.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth
+    }
+
+    /// Record how the client authenticated (and, for GSSAPI, the session the
+    /// reply is protected under).
+    #[cfg(feature = "secure-auth")]
+    pub(crate) fn authenticated_with(
+        mut self,
+        auth: AuthMethod,
+        #[cfg(feature = "gssapi")] gss: Option<crate::gssapi::GssSession>,
+    ) -> Self {
+        self.auth = auth;
+        #[cfg(feature = "gssapi")]
+        {
+            self.gss = gss.map(std::sync::Mutex::new);
+        }
+        self
+    }
+
     /// Verified username, including an empty HTTP username if the closure accepts it.
     /// Anonymous acceptance is always `None`, never a synthetic empty identity.
     pub fn username(&self) -> Option<&str> {
@@ -184,6 +226,16 @@ impl IncomingRequest {
         reply: Reply,
     ) -> Result<(), ServerError> {
         let bytes = reply_bytes(self.protocol, reply);
+        #[cfg(feature = "gssapi")]
+        if let Some(gss) = &self.gss {
+            let framed = gss
+                .lock()
+                .expect("gss session lock")
+                .seal(bytes)
+                .map_err(|error| ServerError::Protocol(error.to_string()))?;
+            stream.write_all(&framed).await?;
+            return stream.flush().await.map_err(ServerError::Io);
+        }
         stream.write_all(bytes).await?;
         stream.flush().await.map_err(ServerError::Io)
     }
@@ -500,6 +552,13 @@ where
     Ok(IncomingRequest {
         protocol: Protocol::Socks5,
         target,
+        auth: if username.is_some() {
+            AuthMethod::ClearText
+        } else {
+            AuthMethod::Anonymous
+        },
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username,
         username_raw,
         credentials: retained,
@@ -791,6 +850,13 @@ where
     Ok(IncomingRequest {
         protocol: Protocol::Http,
         target: target.to_owned(),
+        auth: if username.is_some() {
+            AuthMethod::ClearText
+        } else {
+            AuthMethod::Anonymous
+        },
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username,
         username_raw: None,
         credentials: retained,

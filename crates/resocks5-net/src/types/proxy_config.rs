@@ -55,6 +55,12 @@ pub struct ProxyConfig {
     /// the wire. Set with [`ProxyConfig::with_secure_auth`].
     #[cfg(feature = "secure-auth")]
     pub secure_auth: Option<Arc<crate::secure_auth::SecureCredentials>>,
+    /// GSSAPI credentials (SOCKS5 method 0x01, RFC 1961). When set (alone or
+    /// with `secure_auth`) the greeting offers the strong methods — GSSAPI
+    /// first — and the server picks; no password crosses the wire. Set with
+    /// [`ProxyConfig::with_gssapi`].
+    #[cfg(feature = "gssapi")]
+    pub gssapi: Option<Arc<crate::gssapi::GssCredentials>>,
     /// The number of leading `*` markers; 0 denotes an ordinary/exit proxy.
     /// `is_gate == (gate_level > 0)`.
     pub gate_level: u8,
@@ -84,6 +90,8 @@ impl ProxyConfig {
             password: None,
             #[cfg(feature = "secure-auth")]
             secure_auth: None,
+            #[cfg(feature = "gssapi")]
+            gssapi: None,
             is_gate: false,
             gate_level: 0,
             gate: None,
@@ -116,6 +124,15 @@ impl ProxyConfig {
         self
     }
 
+    /// Authenticate to this SOCKS5 proxy with GSSAPI (method 0x01, RFC 1961).
+    /// Can be combined with [`ProxyConfig::with_secure_auth`]: both are offered,
+    /// GSSAPI first, and the server chooses.
+    #[cfg(feature = "gssapi")]
+    pub fn with_gssapi(mut self, credentials: crate::gssapi::GssCredentials) -> Self {
+        self.gssapi = Some(Arc::new(credentials));
+        self
+    }
+
     /// Overwrite the clear-text `user` and `password` with zeros and clear
     /// them, here and at every gate this value solely owns; drop the
     /// secure-auth credentials (their password is wiped when the last copy
@@ -132,6 +149,10 @@ impl ProxyConfig {
             #[cfg(feature = "secure-auth")]
             {
                 node.secure_auth = None;
+                #[cfg(feature = "gssapi")]
+                {
+                    node.gssapi = None;
+                }
             }
             match node.gate.as_mut() {
                 None => return true,

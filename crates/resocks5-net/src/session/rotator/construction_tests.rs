@@ -9,6 +9,8 @@ fn make_proxy(host: &str, port: u16) -> ProxyConfig {
         password: None,
         #[cfg(feature = "secure-auth")]
         secure_auth: None,
+        #[cfg(feature = "gssapi")]
+        gssapi: None,
         is_gate: false,
         gate_level: 0,
         gate: None,

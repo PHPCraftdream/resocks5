@@ -43,6 +43,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
   returns the bare `TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (HTTPS is refused
   before any connect).
+- `resocks5-net`: GSSAPI authentication for SOCKS5 (`gssapi` module, feature
+  `gssapi`, RFC 1961, method 0x01): the context exchange, abort, protection-level
+  negotiation (the client asks for confidentiality, accepts its configured
+  minimum or better) and protected SOCKS request/reply are implemented over the
+  `GssBackend` / `GssContext` traits; no password or credential crosses the wire.
+  `ProxyConfig::with_gssapi(GssCredentials)` on the client,
+  `server::accept_with(stream, options, &AuthMethods)` on the server, where
+  `IncomingRequest::auth_method()` tells how the client authenticated and
+  `username()` is the principal for GSSAPI. Protection covers the request and
+  reply; the tunnel data afterwards is unprotected. Ships with a test-only
+  mock mechanism (`gssapi::mock`); the Kerberos backend is a separate feature.
+- `resocks5-net`: methods adapt on the fly, strongest first. A client with several
+  strong methods configured (GSSAPI, secure auth) offers them all in that order and
+  never anything weaker (no anonymous, no clear text, no downgrade if the server
+  answers another method); `accept_with` picks the strongest the server has enabled
+  and the client offers: GSSAPI, then secure auth, then anonymous (if allowed).
 - `resocks5-net`: `testing::MockUpstream` (feature `test-instrumentation`): a
   scripted SOCKS5 / HTTP CONNECT upstream on `127.0.0.1:0` for tests — `Script`
   (tunnel with echo, refuse with a REP/status, silent greeting, silent CONNECT,

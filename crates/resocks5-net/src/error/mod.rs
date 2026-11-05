@@ -204,6 +204,50 @@ impl fmt::Display for SecureAuthError {
 
 impl std::error::Error for SecureAuthError {}
 
+/// Why a GSSAPI exchange (SOCKS5 method 0x01, RFC 1961, see `gssapi`) failed.
+/// Never carries a token or key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GssapiError {
+    /// A message had an unexpected version byte.
+    BadVersion,
+    /// A message had an unexpected type, length or an empty token where one is
+    /// required.
+    BadFrame,
+    /// The peer sent the abort message (0xFF): it refused the client.
+    Aborted,
+    /// The GSSAPI backend failed (bad ticket, unknown service, clock skew, ...).
+    Backend(String),
+    /// The peer agreed to a weaker per-message protection than the minimum
+    /// this side accepts.
+    ProtectionTooWeak,
+    /// A protected message did not verify or decrypt.
+    Integrity,
+    /// The context was used before it was established.
+    NotEstablished,
+    /// The stream failed or ended during the exchange.
+    Io(io::ErrorKind),
+}
+
+impl fmt::Display for GssapiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadVersion => f.write_str("[GSSAPI] unexpected version"),
+            Self::BadFrame => f.write_str("[GSSAPI] malformed message"),
+            Self::Aborted => f.write_str("[GSSAPI] the server refused the client"),
+            Self::Backend(reason) => write!(f, "[GSSAPI] backend error: {reason}"),
+            Self::ProtectionTooWeak => {
+                f.write_str("[GSSAPI] the agreed protection level is below the minimum")
+            }
+            Self::Integrity => f.write_str("[GSSAPI] a protected message failed verification"),
+            Self::NotEstablished => f.write_str("[GSSAPI] the context is not established"),
+            Self::Io(_) => f.write_str("[GSSAPI] I/O error during the exchange"),
+        }
+    }
+}
+
+impl std::error::Error for GssapiError {}
+
 /// The typed error returned by every public connect/pool entry point.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -274,6 +318,8 @@ pub enum ConnectError {
     CleartextCredentialsRefused,
     /// The secure-auth exchange (SOCKS5 method 0x80) with the upstream failed.
     SecureAuth(SecureAuthError),
+    /// The GSSAPI exchange (SOCKS5 method 0x01) with the upstream failed.
+    Gssapi(GssapiError),
     /// An HTTPS upstream was requested but the crate was built without
     /// the `tls` feature.
     TlsFeatureMissing {
@@ -413,6 +459,7 @@ impl fmt::Display for ConnectError {
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
             ConnectError::SecureAuth(error) => write!(f, "{}", error),
+            ConnectError::Gssapi(error) => write!(f, "{}", error),
             ConnectError::CleartextCredentialsRefused => f.write_str(
                 "refusing to send credentials in clear text (feature `cleartext-client` is off)",
             ),

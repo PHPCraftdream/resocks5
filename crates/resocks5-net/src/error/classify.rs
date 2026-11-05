@@ -22,7 +22,8 @@ impl ConnectError {
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
             ConnectError::AuthFailed { .. }
             | ConnectError::MethodUnsupported { .. }
-            | ConnectError::SecureAuth(_) => true,
+            | ConnectError::SecureAuth(_)
+            | ConnectError::Gssapi(_) => true,
             ConnectError::Protocol(
                 ProtocolViolation::Socks5BadVersion { .. }
                 | ProtocolViolation::Socks5BadAuthVersion { .. },
@@ -85,6 +86,7 @@ impl ConnectError {
             | ConnectError::InvalidTarget(_)
             | ConnectError::CleartextCredentialsRefused
             | ConnectError::SecureAuth(_)
+            | ConnectError::Gssapi(_)
             | ConnectError::TlsFeatureMissing { .. } => Reply::GeneralFailure,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => Reply::UpstreamUnavailable,

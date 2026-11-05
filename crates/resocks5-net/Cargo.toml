@@ -67,6 +67,13 @@ secure-auth = [
     "dep:x25519-dalek",
     "dep:chacha20poly1305",
 ]
+# GSSAPI authentication for SOCKS5 (RFC 1961, method 0x01): the context
+# exchange, protection-level negotiation and message protection are
+# implemented here over the `gssapi::GssBackend` trait; no password and no
+# credential ever crosses the wire. Needs a backend: the test mock ships with
+# `test-instrumentation`, a Kerberos one with `gssapi-system`. Implies
+# `secure-auth` (the server negotiates between the two strong methods).
+gssapi = ["secure-auth"]
 # Clear-text credentials. OFF by default: without `cleartext-client` the crate
 # never sends a password in clear text (SOCKS5 RFC 1929 UNAME/PASSWD, HTTP Basic
 # to a plain-HTTP proxy) — a dial that would is refused with
