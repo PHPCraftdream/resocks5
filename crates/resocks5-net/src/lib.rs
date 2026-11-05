@@ -77,4 +77,7 @@ pub mod rotator;
 #[path = "session/secure_auth/mod.rs"]
 pub mod secure_auth;
 pub mod server;
+#[cfg(feature = "test-instrumentation")]
+#[path = "session/testing/mod.rs"]
+pub mod testing;
 pub mod types;
