@@ -57,6 +57,45 @@ fn parse_proxy_list(list_name: &str, list: &[String], proto: ProxyProtocol) -> V
         println!("{}", skipped_line_message(list_name, *line_no));
     }
     parsed
+        .into_iter()
+        .map(|config| {
+            if cleartext_upstream_credentials(&config) {
+                println!("{}", cleartext_upstream_message(list_name, &config));
+            }
+            secure_upstream_auth(config)
+        })
+        .collect()
+}
+
+/// Credentials are stored as written, but never sent in clear text: a SOCKS5
+/// upstream with a user and password authenticates with secure auth (method
+/// 0x80), so the password stays in this process. HTTPS upstreams send Basic
+/// inside TLS and are left as they are.
+pub(super) fn secure_upstream_auth(config: ProxyConfig) -> ProxyConfig {
+    let credentials = match (&config.user, &config.password) {
+        (Some(user), Some(password)) if config.protocol == ProxyProtocol::Socks5 => Some(
+            resocks5_net::secure_auth::SecureCredentials::new(user.as_str(), password.as_str()),
+        ),
+        _ => None,
+    };
+    match credentials {
+        Some(credentials) => config.with_secure_auth(credentials),
+        None => config,
+    }
+}
+
+/// Plain HTTP upstream with credentials: Basic would cross the network in
+/// clear text, so the dial refuses it. Use an `https` upstream or SOCKS5.
+pub(super) fn cleartext_upstream_credentials(config: &ProxyConfig) -> bool {
+    config.protocol == ProxyProtocol::Http && config.user.is_some() && config.password.is_some()
+}
+
+/// Names the list and host only, never the credentials.
+pub(super) fn cleartext_upstream_message(list_name: &str, config: &ProxyConfig) -> String {
+    format!(
+        "warning: {list_name}: http upstream {}:{} has credentials but would send them in clear          text — its dials are refused; use an https or socks5 upstream",
+        config.host, config.port
+    )
 }
 
 /// Pure part of [`parse_proxy_list`]: parsed configs plus the 1-based

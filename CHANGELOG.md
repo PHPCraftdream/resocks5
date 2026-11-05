@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the others are denied. A user filtered by `allowed_clients` is answered like a
   wrong password and cannot claim an init account.
 
+- `resocks5` (**breaking**): upstream credentials stay in
+  `resocks5.proxy_list.ktav` as written but are never sent in clear text. A SOCKS5
+  upstream with `user:pass` authenticates with secure auth (method 0x80), so it
+  must be an upstream that speaks it (another resocks5 or a `resocks5-net` client);
+  a username/password-only SOCKS5 server is refused without receiving the
+  password. HTTPS upstreams send Basic inside TLS as before; a plain HTTP upstream
+  with credentials is reported at startup and its dials are refused. The app no
+  longer enables `cleartext-client`.
+
 ### Removed
 
 - `resocks5`: the server-side password verify path and its in-memory password

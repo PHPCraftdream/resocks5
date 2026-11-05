@@ -479,10 +479,15 @@ socks5_v4: [
   alice:s3cret@198.51.100.7:1080
   *gateuser:gatepass@203.0.113.9:1080
 ]
-http_v4:  [ user:pass@198.51.100.20:8080 ]
+http_v4:  [ 198.51.100.20:8080 ]            # no credentials: Basic would be clear text
 https_v4: [ user:pass@198.51.100.30:443 ]
 ## …and the corresponding *_v6 arrays for IPv6 upstreams.
 ```
+
+Credentials stay in this file but never cross the network in clear text: a
+SOCKS5 upstream with `user:pass` is authenticated with secure auth (the
+upstream must speak it, e.g. another resocks5), an HTTPS upstream gets Basic
+inside TLS, and a plain HTTP upstream with credentials is refused.
 
 One node at each rank contributes one gate, ordered from highest to lowest,
 then one ordinary exit and the target. Missing ranks are allowed. One star
