@@ -95,7 +95,7 @@ until grep -q '^READY' "$root/interop.out" 2>/dev/null; do
     [ "$tries" -lt 30 ] || { echo "kdc-test: interop server did not start" >&2; cat "$root/interop.err" >&2; exit 1; }
     sleep 1
 done
-body=$(curl -sS --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks     "http://target.test:80/" 2> "$root/curl.err") || {
+body=$(curl -sS -v --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks     "http://target.test:80/" 2> "$root/curl.err") || {
     echo "kdc-test: curl failed" >&2
     cat "$root/curl.err" "$root/interop.out" "$root/interop.err" >&2
     exit 1
