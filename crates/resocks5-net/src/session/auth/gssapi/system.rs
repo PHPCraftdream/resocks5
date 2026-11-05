@@ -151,7 +151,7 @@ impl GssBackend for SystemBackend {
 /// Real Kerberos: needs a KDC, a keytab and a ticket. Run by the
 /// `gssapi-system` CI job (`.github/checks/kdc-test.sh`), which sets
 /// `KRB5_CONFIG`, `KRB5CCNAME` (a TGT for `GSS_TEST_PRINCIPAL`) and
-/// `KRB5_KTNAME` (the key of `socks/localhost`).
+/// `KRB5_KTNAME` (the key of `socks/kdc.test.local`) and `GSS_TEST_SERVICE`.
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -167,7 +167,9 @@ mod tests {
     use crate::types::ProxyConfig;
     use crate::GssapiError;
 
-    const SERVICE: &str = "socks@localhost";
+    fn service() -> String {
+        std::env::var("GSS_TEST_SERVICE").expect("GSS_TEST_SERVICE (set by kdc-test.sh)")
+    }
 
     fn principal() -> String {
         std::env::var("GSS_TEST_PRINCIPAL").expect("GSS_TEST_PRINCIPAL (set by kdc-test.sh)")
@@ -180,8 +182,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a KDC: run by the gssapi-system CI job"]
     async fn a_real_kerberos_exchange() {
-        let credentials = GssCredentials::new(SystemBackend::new().shared(), SERVICE);
-        let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(SERVICE).shared());
+        let credentials = GssCredentials::new(SystemBackend::new().shared(), service());
+        let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service()).shared());
         let (client, server) = duplex(16 * 1024);
         let (client, server) = tokio::join!(
             async move {
@@ -212,7 +214,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a KDC: run by the gssapi-system CI job"]
     async fn an_unknown_service_fails() {
-        let credentials = GssCredentials::new(SystemBackend::new().shared(), "nosuch@localhost");
+        let credentials =
+            GssCredentials::new(SystemBackend::new().shared(), "nosuch@kdc.test.local");
         let (mut client, _server) = duplex(4096);
         let error = client_gssapi(&mut client, &credentials).await.unwrap_err();
         assert!(matches!(error, GssapiError::Backend(_)), "{error:?}");
@@ -227,7 +230,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(SERVICE).shared());
+            let acceptor = GssAcceptor::new(SystemBackend::new().with_acceptor(service()).shared());
             let options = ServerOptions::new(Instant::now() + Duration::from_secs(20), false, true);
             let methods = AuthMethods::<NoSecrets>::gssapi(&acceptor);
             let request = accept_with(&mut socket, &options, &methods).await.unwrap();
@@ -240,8 +243,10 @@ mod tests {
             socket.write_all(&ping).await.unwrap();
             (request.auth_method(), request.username().map(str::to_owned))
         });
-        let proxy = ProxyConfig::socks5("127.0.0.1", port)
-            .with_gssapi(GssCredentials::new(SystemBackend::new().shared(), SERVICE));
+        let proxy = ProxyConfig::socks5("127.0.0.1", port).with_gssapi(GssCredentials::new(
+            SystemBackend::new().shared(),
+            service(),
+        ));
         let mut tunnel = timeout(
             Duration::from_secs(30),
             dial_tcp(&proxy, "example.test", 443, &DialOptions::new()),

@@ -1,15 +1,20 @@
 #!/bin/sh
 # Real-Kerberos tests of the `gssapi-system` backend: starts a throwaway MIT KDC
-# in a temp directory (realm TEST.LOCAL, principals alice and socks/localhost),
+# in a temp directory (realm TEST.LOCAL, principals alice and
+# socks/kdc.test.local; that name is mapped to 127.0.0.1 in /etc/hosts, which
+# needs sudo: a dotted name that no resolver search domain can rewrite),
 # gets alice a ticket, and runs the `#[ignore]`d tests of
 # crates/resocks5-net/src/session/auth/gssapi/system.rs against it.
 #
 # Needs krb5-kdc, krb5-admin-server (kdb5_util, kadmin.local, krb5kdc), the
 # Kerberos client tools (kinit) and libkrb5-dev. Run by the `gssapi-system` job
-# of .github/workflows/ci.yml; nothing outside the temp directory is touched.
+# of .github/workflows/ci.yml; apart from the /etc/hosts line nothing outside
+# the temp directory is touched.
 set -eu
 
 PATH="$PATH:/usr/sbin:/sbin"
+host=kdc.test.local
+grep -q " $host" /etc/hosts || echo "127.0.0.1 $host" | sudo tee -a /etc/hosts > /dev/null
 root=$(mktemp -d)
 kdc_pid=
 cleanup() {
@@ -31,6 +36,9 @@ cat > "$KRB5_CONFIG" <<EOF
     dns_canonicalize_hostname = false
     rdns = false
     udp_preference_limit = 1
+[domain_realm]
+    .test.local = TEST.LOCAL
+    test.local = TEST.LOCAL
 [realms]
     TEST.LOCAL = {
         kdc = 127.0.0.1:8888
@@ -54,8 +62,8 @@ EOF
 
 kdb5_util create -s -r TEST.LOCAL -P master-password > /dev/null
 kadmin.local -r TEST.LOCAL -q "addprinc -pw alice-password alice" > /dev/null
-kadmin.local -r TEST.LOCAL -q "addprinc -randkey socks/localhost" > /dev/null
-kadmin.local -r TEST.LOCAL -q "ktadd -k $root/keytab socks/localhost" > /dev/null
+kadmin.local -r TEST.LOCAL -q "addprinc -randkey socks/$host" > /dev/null
+kadmin.local -r TEST.LOCAL -q "ktadd -k $root/keytab socks/$host" > /dev/null
 
 krb5kdc -n -P "$root/kdc.pid" &
 kdc_pid=$!
@@ -69,4 +77,5 @@ done
 klist
 
 export GSS_TEST_PRINCIPAL=alice@TEST.LOCAL
+export GSS_TEST_SERVICE="socks@$host"
 cargo test -p resocks5-net --features gssapi-system --locked -- --ignored --test-threads=1 gssapi::system
