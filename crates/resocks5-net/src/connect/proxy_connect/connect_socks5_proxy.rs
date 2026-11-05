@@ -3,6 +3,7 @@
 #[cfg(feature = "pool")]
 use std::time::Duration;
 
+use crate::connect::handshake_over_stream::Socks5Auth;
 #[cfg(feature = "pool")]
 use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 #[cfg(feature = "pool")]
@@ -17,8 +18,17 @@ use crate::error::ConnectError;
 use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
 
-/// Credentials of `proxy` for the SOCKS5 sub-negotiation, if both are set.
-pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Option<(&str, &str)> {
+/// How the SOCKS5 greeting to `proxy` authenticates: secure auth when
+/// configured, else the clear-text pair when both parts are set, else none.
+pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Socks5Auth<'_> {
+    #[cfg(feature = "secure-auth")]
+    if let Some(credentials) = proxy.secure_auth.as_deref() {
+        return Socks5Auth::Secure(credentials);
+    }
+    Socks5Auth::from_pair(socks5_pair(proxy))
+}
+
+fn socks5_pair(proxy: &ProxyConfig) -> Option<(&str, &str)> {
     match (&proxy.user, &proxy.password) {
         (Some(user), Some(password)) => Some((user.as_str(), password.as_str())),
         _ => None,

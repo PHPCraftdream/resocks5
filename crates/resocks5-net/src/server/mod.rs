@@ -34,7 +34,11 @@ mod prefixed;
 
 pub use prefixed::Prefixed;
 
+#[cfg(feature = "secure-auth")]
+mod secure;
 mod strict_http;
+#[cfg(feature = "secure-auth")]
+pub use secure::accept_secure;
 
 /// Independent authentication capabilities and the host-supplied absolute deadline.
 ///
@@ -417,6 +421,21 @@ where
     } else {
         (None, None)
     };
+    socks_request(stream, username, username_raw, retained).await
+}
+
+/// The SOCKS5 request after authentication: `CONNECT` and its target.
+///
+/// cancel-safe: NO — exact reads and replies may be partial.
+pub(super) async fn socks_request<S>(
+    stream: &mut S,
+    username: Option<String>,
+    username_raw: Option<Vec<u8>>,
+    retained: Option<Credentials>,
+) -> Result<IncomingRequest, ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut header = [0; 4];
     stream.read_exact(&mut header).await?;
     if header[0] != 5 {

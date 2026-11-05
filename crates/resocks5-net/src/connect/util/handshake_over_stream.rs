@@ -61,8 +61,29 @@ where
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
-    let stream = socks5_greeting(stream, auth).await?;
+    let stream = socks5_greeting(stream, Socks5Auth::from_pair(auth)).await?;
     socks5_connect_request(stream, host, port).await
+}
+
+/// How a SOCKS5 greeting authenticates.
+#[derive(Clone, Copy)]
+pub(crate) enum Socks5Auth<'a> {
+    /// Method 0x00.
+    None,
+    /// RFC 1929 UNAME/PASSWD (method 0x02): the password in clear text.
+    Cleartext(&'a str, &'a str),
+    /// Secure auth (method 0x80): the password never crosses the wire.
+    #[cfg(feature = "secure-auth")]
+    Secure(&'a crate::secure_auth::SecureCredentials),
+}
+
+impl<'a> Socks5Auth<'a> {
+    pub(crate) fn from_pair(pair: Option<(&'a str, &'a str)>) -> Self {
+        match pair {
+            Some((user, password)) => Self::Cleartext(user, password),
+            None => Self::None,
+        }
+    }
 }
 
 /// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3) and,
@@ -77,11 +98,46 @@ where
 /// [`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind).
 pub(crate) async fn socks5_greeting<S>(
     mut stream: S,
-    auth: Option<(&str, &str)>,
+    auth: Socks5Auth<'_>,
 ) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
+    #[cfg(feature = "secure-auth")]
+    if let Socks5Auth::Secure(credentials) = auth {
+        stream
+            .write_all(&[0x05, 0x01, crate::secure_auth::METHOD])
+            .await?;
+        stream.flush().await?;
+        let mut response = [0u8; 2];
+        stream.read_exact(&mut response).await?;
+        if response[0] != 0x05 {
+            return Err(ConnectError::Protocol(
+                ProtocolViolation::Socks5BadVersion { got: response[0] },
+            ));
+        }
+        if response[1] != crate::secure_auth::METHOD {
+            return Err(ConnectError::MethodUnsupported {
+                got: response[1],
+                with_auth: true,
+            });
+        }
+        crate::secure_auth::client_authenticate(&mut stream, credentials)
+            .await
+            .map_err(|error| match error {
+                crate::SecureAuthError::Io(kind) => ConnectError::Io {
+                    stage: Stage::Handshake,
+                    endpoint: None,
+                    source: std::io::Error::from(kind),
+                },
+                other => ConnectError::SecureAuth(other),
+            })?;
+        return Ok(stream);
+    }
+    let auth = match auth {
+        Socks5Auth::Cleartext(user, password) => Some((user, password)),
+        _ => None,
+    };
     if auth.is_some() && !crate::CLEARTEXT_CLIENT {
         // RFC 1929 sends the password as is: refused before any byte.
         return Err(ConnectError::CleartextCredentialsRefused);
@@ -281,7 +337,16 @@ where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
     let after = deadline.saturating_duration_since(tokio::time::Instant::now());
-    socks5_handshake_bounded(stream, host, port, auth, deadline, endpoint, after).await
+    socks5_handshake_bounded(
+        stream,
+        host,
+        port,
+        Socks5Auth::from_pair(auth),
+        deadline,
+        endpoint,
+        after,
+    )
+    .await
 }
 
 /// The deadline-bounded SOCKS5 handshake with an explicit `after` (the budget
@@ -291,7 +356,7 @@ pub(crate) async fn socks5_handshake_bounded<S>(
     stream: S,
     host: &str,
     port: u16,
-    auth: Option<(&str, &str)>,
+    auth: Socks5Auth<'_>,
     deadline: tokio::time::Instant,
     endpoint: &str,
     after: std::time::Duration,

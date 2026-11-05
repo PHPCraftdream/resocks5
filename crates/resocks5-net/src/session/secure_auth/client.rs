@@ -1,5 +1,6 @@
 //! The client side of the exchange.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use subtle::ConstantTimeEq;
@@ -23,10 +24,20 @@ pub struct SecureCredentials {
     min_kdf: KdfParams,
     allow_enrollment: bool,
     enrollment_kdf: KdfParams,
-    cached: Mutex<Option<Cached>>,
+    /// Process-unique id: the derived keys live in [`KEY_CACHE`] under it, so
+    /// the credentials themselves stay free of interior mutability (they sit
+    /// inside `ProxyConfig`, which is hashed as part of chain keys).
+    id: u64,
 }
 
+/// Derived keys of live credentials, by credentials id. Bounded; entries go
+/// when their credentials are dropped.
+static KEY_CACHE: Mutex<Vec<Cached>> = Mutex::new(Vec::new());
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+const KEY_CACHE_CAP: usize = 1024;
+
 struct Cached {
+    owner: u64,
     salt: Vec<u8>,
     params: KdfParams,
     key: Zeroizing<[u8; KEY_LEN]>,
@@ -41,7 +52,7 @@ impl SecureCredentials {
             min_kdf: KdfParams::DEFAULT,
             allow_enrollment: false,
             enrollment_kdf: KdfParams::DEFAULT,
-            cached: Mutex::new(None),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -80,7 +91,25 @@ impl SecureCredentials {
     /// Whether a derived key is already cached.
     #[cfg(test)]
     pub(crate) fn is_cached(&self) -> bool {
-        self.cached.lock().unwrap().is_some()
+        KEY_CACHE
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|cached| cached.owner == self.id)
+    }
+
+    fn remember(&self, salt: &[u8], params: KdfParams, key: &[u8; KEY_LEN]) {
+        let mut cache = KEY_CACHE.lock().expect("key cache poisoned");
+        cache.retain(|cached| cached.owner != self.id);
+        if cache.len() >= KEY_CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push(Cached {
+            owner: self.id,
+            salt: salt.to_vec(),
+            params,
+            key: Zeroizing::new(*key),
+        });
     }
 
     /// The key for `salt`/`params`: the cached one, or derived (on the blocking
@@ -90,7 +119,12 @@ impl SecureCredentials {
         salt: &[u8],
         params: &KdfParams,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, SecureAuthError> {
-        if let Some(cached) = self.cached.lock().expect("key cache poisoned").as_ref() {
+        if let Some(cached) = KEY_CACHE
+            .lock()
+            .expect("key cache poisoned")
+            .iter()
+            .find(|cached| cached.owner == self.id)
+        {
             if cached.salt == salt && cached.params == *params {
                 return Ok(cached.key.clone());
             }
@@ -101,12 +135,16 @@ impl SecureCredentials {
             tokio::task::spawn_blocking(move || derive_key(&password, &salt_owned, &params_owned))
                 .await
                 .map_err(|_| SecureAuthError::Kdf)??;
-        *self.cached.lock().expect("key cache poisoned") = Some(Cached {
-            salt: salt.to_vec(),
-            params: *params,
-            key: key.clone(),
-        });
+        self.remember(salt, *params, &key);
         Ok(key)
+    }
+}
+
+impl Drop for SecureCredentials {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = KEY_CACHE.lock() {
+            cache.retain(|cached| cached.owner != self.id);
+        }
     }
 }
 
@@ -289,10 +327,6 @@ where
         return Err(SecureAuthError::ServerProofMismatch);
     }
     // The enrolled key serves the following logins without a new derivation.
-    *credentials.cached.lock().expect("key cache poisoned") = Some(Cached {
-        salt: secret.salt.clone(),
-        params: secret.params,
-        key: Zeroizing::new(*secret.key()),
-    });
+    credentials.remember(&secret.salt, secret.params, secret.key());
     Ok(())
 }

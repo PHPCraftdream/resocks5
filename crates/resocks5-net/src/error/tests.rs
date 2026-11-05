@@ -23,6 +23,8 @@ fn http_proxy_config(host: &str, port: u16) -> ProxyConfig {
         port,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -37,6 +39,8 @@ fn socks5_proxy_config(host: &str, port: u16) -> ProxyConfig {
         port,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -664,6 +668,8 @@ async fn https_without_connector_yields_tls_variant_with_legacy_text() {
         port: 443,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -693,6 +699,8 @@ async fn https_in_lean_build_yields_tls_feature_missing() {
         port: 443,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
         is_gate: false,
         gate_level: 0,
         gate: None,

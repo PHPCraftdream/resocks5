@@ -50,6 +50,11 @@ pub struct ProxyConfig {
     pub user: Option<String>,
     /// Optional password, paired with [`user`](ProxyConfig::user).
     pub password: Option<String>,
+    /// Secure-auth credentials (SOCKS5 method 0x80): when set, the greeting
+    /// uses them instead of `user`/`password`, and the password never crosses
+    /// the wire. Set with [`ProxyConfig::with_secure_auth`].
+    #[cfg(feature = "secure-auth")]
+    pub secure_auth: Option<Arc<crate::secure_auth::SecureCredentials>>,
     /// The number of leading `*` markers; 0 denotes an ordinary/exit proxy.
     /// `is_gate == (gate_level > 0)`.
     pub gate_level: u8,
@@ -77,6 +82,8 @@ impl ProxyConfig {
             port,
             user: None,
             password: None,
+            #[cfg(feature = "secure-auth")]
+            secure_auth: None,
             is_gate: false,
             gate_level: 0,
             gate: None,
@@ -96,6 +103,17 @@ impl ProxyConfig {
     /// Shortcut for [`ProxyConfig::new`] with [`ProxyProtocol::Https`].
     pub fn https(host: impl Into<String>, port: u16) -> Self {
         Self::new(ProxyProtocol::Https, host, port)
+    }
+
+    /// Authenticate to this SOCKS5 proxy with secure auth (method 0x80): the
+    /// user name is kept in `user` (the upstream's identity), the password
+    /// only inside the credentials, never in `password` and never on the wire.
+    #[cfg(feature = "secure-auth")]
+    pub fn with_secure_auth(mut self, credentials: crate::secure_auth::SecureCredentials) -> Self {
+        self.user = Some(credentials.user().to_owned());
+        self.password = None;
+        self.secure_auth = Some(Arc::new(credentials));
+        self
     }
 
     /// Set username and password.
