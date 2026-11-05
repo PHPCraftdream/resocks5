@@ -601,3 +601,55 @@ fn take_username_zeroizes_raw_bytes_before_free() {
     assert!(slot.is_none());
     assert_eq!(observed.borrow().0, 1, "an empty slot must drop nothing");
 }
+
+/// The extracted decode helper returns the exact pair for valid and invalid
+/// UTF-8: text-only for a valid field, lossy text plus the exact submitted
+/// bytes for a non-UTF-8 field. Mutation: any regression that drops or
+/// corrupts the raw bytes (or mangles the lossy text) fails these assertions.
+#[test]
+fn decode_raw_field_returns_exact_pairs() {
+    assert_eq!(
+        decode_raw_field(b"plain".to_vec()),
+        ("plain".to_owned(), None)
+    );
+    let (text, raw) = decode_raw_field(b"ab\xff".to_vec());
+    assert_eq!(text, "ab\u{fffd}");
+    assert_eq!(raw.as_deref(), Some(b"ab\xff".as_slice()));
+}
+
+/// `drop_secret` must wipe rejected credential bytes before they are freed:
+/// the witness records what its `Drop` sees, so the assertion reads live
+/// memory only. Mutation: dropping without the in-place wipe lets the buffer
+/// arrive at `Drop` unwiped and fails the all-zero assertion.
+#[cfg(feature = "zeroize")]
+#[test]
+fn drop_secret_zeroizes_rejected_bytes_before_free() {
+    struct Witness {
+        bytes: Vec<u8>,
+        observed: std::rc::Rc<std::cell::RefCell<(usize, Vec<u8>)>>,
+    }
+    impl zeroize::Zeroize for Witness {
+        // Overwrite in place and keep the length: a wholesale `Vec::zeroize`
+        // would also clear the length, leaving nothing to observe.
+        fn zeroize(&mut self) {
+            self.bytes.iter_mut().for_each(|b| *b = 0);
+        }
+    }
+    impl Drop for Witness {
+        fn drop(&mut self) {
+            let mut seen = self.observed.borrow_mut();
+            seen.0 += 1;
+            seen.1 = self.bytes.clone();
+        }
+    }
+
+    let observed = std::rc::Rc::new(std::cell::RefCell::new((0usize, Vec::new())));
+    drop_secret(Witness {
+        bytes: b"rejected-secret".to_vec(),
+        observed: std::rc::Rc::clone(&observed),
+    });
+    let seen = observed.borrow().clone();
+    assert_eq!(seen.0, 1, "the witness must drop exactly once");
+    assert_eq!(seen.1.len(), 15, "the witness must capture the buffer");
+    assert!(seen.1.iter().all(|&b| b == 0), "bytes must arrive zeroized");
+}

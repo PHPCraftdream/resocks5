@@ -99,7 +99,7 @@ impl AuthState {
         }
 
         // Compute the new hash outside the write lock — Argon2id takes
-        // ~15 ms and we don't want it blocking concurrent read-side
+        // ~50 ms and we don't want it blocking concurrent read-side
         // verify calls during that window.
         let Ok(new_hash) = compute_hash(password) else {
             return Prepared::Done(false);

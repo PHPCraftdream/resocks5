@@ -483,7 +483,9 @@ retains the original gate meaning; gates without an ordinary exit cannot
 form a route. The complete chain is sticky per target. Ordinary-route
 fallback bypasses gates and selects only ordinary exits; it does not connect
 directly to the target. All attempts share `network.max_upstream_attempts`,
-with at least one attempt reserved for fallback. `network.max_per_upstream`
+with at least one attempt reserved for fallback; cached chains are admitted
+under the same reserve, except that a budget of 1 still serves the sticky
+cache first. `network.max_per_upstream`
 limits each node's permits for the whole tunnel lifetime. Startup probes
 and the pre-connect pool cover only the outermost gate level and exits;
 probes for inner quarantined gates traverse the healthy outer prefix.

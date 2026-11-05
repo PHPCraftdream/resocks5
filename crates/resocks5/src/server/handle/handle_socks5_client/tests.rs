@@ -247,7 +247,7 @@ use crate::config::{NetworkConfig, TlsFragmentConfig};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 
-fn test_logger() -> Arc<crate::logger::Logger> {
+pub(super) fn test_logger() -> Arc<crate::logger::Logger> {
     let (tx, _rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
     Arc::new(crate::logger::Logger::new(
         tx,
@@ -258,7 +258,9 @@ fn test_logger() -> Arc<crate::logger::Logger> {
 /// Minimal no-auth SOCKS5 stub. After CONNECT succeeds it writes
 /// `banner` to the tunnel (if non-empty), then records everything the
 /// client sends. The log starts with the requested target ("host:port").
-async fn spawn_socks5_stub(banner: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+pub(super) async fn spawn_socks5_stub(
+    banner: &'static [u8],
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -325,7 +327,7 @@ async fn serve_stub_client(
     Some(())
 }
 
-fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
+pub(super) fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
     resocks5_net::types::ProxyConfig::socks5("127.0.0.1", addr.port())
 }
 
@@ -675,9 +677,11 @@ async fn client_closed_before_payload_ends_cleanly() {
 
     let mut success = [0u8; 10];
     client.read_exact(&mut success).await.unwrap();
-    // The EOF lands during the grace read, so no upstream is ever
-    // dialed; the observable contract is a clean Ok(()) and an
-    // untouched stub.
+    // The EOF lands during the grace read. R3-I: a client EOF no
+    // longer aborts the session — the IP fallback is dialed, the FIN
+    // is propagated upstream, and the (silent, banner-less) stub then
+    // closes it: the observable contract is a clean Ok(()) with
+    // exactly one dial of the CONNECT target.
     drop(client);
 
     let result = tokio::time::timeout(Duration::from_secs(8), task)
@@ -686,9 +690,15 @@ async fn client_closed_before_payload_ends_cleanly() {
         .unwrap();
     assert!(result.is_ok(), "expected Ok(()), got: {result:?}");
     let targets = up_log.lock().unwrap().clone();
-    assert!(
-        targets.is_empty(),
-        "no upstream may be dialed when the client closed first, targets: {targets:?}"
+    assert_eq!(
+        targets.first().map(String::as_str),
+        Some("203.0.113.9:443"),
+        "the IP fallback must be dialed for a half-closed client, targets: {targets:?}"
+    );
+    assert_eq!(
+        targets.len(),
+        1,
+        "only the CONNECT target may be dialed, targets: {targets:?}"
     );
 }
 
@@ -791,7 +801,7 @@ async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
     );
 }
 
-async fn recovery_request() -> resocks5_net::server::IncomingRequest {
+pub(super) async fn recovery_request() -> resocks5_net::server::IncomingRequest {
     let (mut peer, mut stream) = tokio::io::duplex(128);
     peer.write_all(&[5, 1, 0, 5, 1, 0, 1, 203, 0, 113, 9, 1, 187])
         .await

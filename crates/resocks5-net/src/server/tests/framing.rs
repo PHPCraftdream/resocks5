@@ -141,6 +141,40 @@ async fn basic_uses_first_header_first_colon_and_redacts_credentials() {
     assert_eq!(result.unwrap().username(), Some("")); // Verified empty identity is not anonymous.
 }
 
+/// DT-06 pin: Proxy-Authorization token strictness is intentional. STANDARD
+/// base64 requires canonical padding, and only a single SP may separate
+/// scheme and token — every shape here answers 407 without authenticating.
+/// Mutation: switching the decoder to a padding-tolerant engine or splitting
+/// the scheme on any whitespace would authenticate a row and fail the test.
+#[tokio::test]
+async fn proxy_authorization_token_strictness_is_pinned() {
+    timeout(Duration::from_secs(10), async {
+        // Hand-derived oracle: "u:pa" is 4 bytes -> canonical "dTpwYQ==";
+        // the unpadded 6-char form "dTpwYQ" must fail the decode.
+        for value in [
+            "Basic dTpwYQ",    // unpadded token
+            "Basic dTpwYQ  ",  // unpadded token with trailing OWS (trimmed, still unpadded)
+            "Basic\tdTpwOm0=", // TAB instead of SP between scheme and token
+            "basic\tdTpwOm0=", // same, lowercase scheme
+        ] {
+            let bytes = format!("CONNECT h:443 HTTP/1.1\r\nProxy-Authorization: {value}\r\n\r\n");
+            let (result, reply, calls) = parse(bytes.as_bytes(), true, true, true).await;
+            let error = result.unwrap_err();
+            assert!(matches!(error, ServerError::Authentication(_)), "{value}");
+            assert_eq!(reply, EXPECT_HTTP_407, "{value}");
+            assert_eq!(calls, 0, "{value}");
+        }
+        // Control: the canonical padded token still authenticates.
+        let bytes = b"CONNECT h:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpwOm0=\r\n\r\n";
+        let (result, reply, calls) = parse(bytes, true, true, true).await;
+        assert!(result.is_ok());
+        assert!(reply.is_empty());
+        assert_eq!(calls, 1);
+    })
+    .await
+    .expect("bounded proxy-authorization token strictness pins");
+}
+
 #[tokio::test]
 async fn malformed_targets_frames_and_legacy_rsv_behavior() {
     timeout(Duration::from_secs(10), async {
@@ -202,6 +236,40 @@ async fn malformed_targets_frames_and_legacy_rsv_behavior() {
     })
     .await
     .expect("bounded malformed framing table");
+}
+
+/// DT-08 pin: the permissive target grammar is intentional. SOCKS5
+/// DOMAINNAME and non-strict HTTP CONNECT accept `@`, `/`, `%` in the host
+/// (the check is only control/whitespace bytes plus the host:port split);
+/// strict HTTP mode is the stricter grammar and rejects the same shapes.
+/// Mutation: adding RFC authority-host grammar (or `@`/`/`/`%` bans) to the
+/// permissive path makes every row here fail.
+#[tokio::test]
+async fn permissive_targets_accept_at_slash_percent_in_host() {
+    timeout(Duration::from_secs(10), async {
+        for domain in ["a@b", "a/b", "a%41b", "@bad.example", "ex%zzample"] {
+            let bytes = socks_request(domain.as_bytes());
+            let (result, reply, calls) = parse(&bytes, true, false, true).await;
+            let req = result.unwrap_or_else(|error| panic!("domain {domain:?} rejected: {error}"));
+            assert_eq!(req.target(), &format!("{domain}:443"), "{domain}");
+            assert_eq!(reply, [5, 0], "{domain}");
+            assert_eq!(calls, 0, "{domain}");
+        }
+        for target in [
+            "user@example.com:443",
+            "example.com/path:443",
+            "ex%zzample.com:443",
+        ] {
+            let bytes = format!("CONNECT {target} HTTP/1.1\r\nHost: h\r\n\r\n");
+            let (result, reply, calls) = parse(bytes.as_bytes(), true, false, true).await;
+            let req = result.unwrap_or_else(|error| panic!("target {target:?} rejected: {error}"));
+            assert_eq!(req.target(), target);
+            assert!(reply.is_empty(), "{target}");
+            assert_eq!(calls, 0);
+        }
+    })
+    .await
+    .expect("bounded permissive host character pins");
 }
 
 #[tokio::test]

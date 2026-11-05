@@ -30,9 +30,11 @@ const REDACTED: &str = "<redacted>";
 /// to construct a chain from outermost node through its exit.
 ///
 /// The [`Debug`](std::fmt::Debug) output is redacted: `user` and `password`
-/// values are replaced with a placeholder, recursively through
-/// [`gate`](ProxyConfig::gate), so debug-logging a `ProxyConfig` never
-/// leaks proxy credentials.
+/// values are replaced with a placeholder at every node of the
+/// [`gate`](ProxyConfig::gate) chain, so debug-logging a `ProxyConfig`
+/// never leaks proxy credentials. The chain is rendered as a flat list
+/// (`gate: [...]`, outermost gate first) instead of by recursion, so a
+/// long chain cannot overflow the stack in `Debug`.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ProxyConfig {
@@ -158,6 +160,41 @@ impl ProxyConfig {
     }
 }
 
+/// Prints one node's own fields without following its gate link; the
+/// chain is rendered by [`GateChainDebug`] instead, so a long chain
+/// cannot put one formatter frame per node on the stack.
+struct NodeDebug<'a>(&'a ProxyConfig);
+
+impl fmt::Debug for NodeDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("protocol", &self.0.protocol)
+            .field("host", &self.0.host)
+            .field("port", &self.0.port)
+            .field("user", &self.0.user.as_ref().map(|_| REDACTED))
+            .field("password", &self.0.password.as_ref().map(|_| REDACTED))
+            .field("gate_level", &self.0.gate_level)
+            .field("is_gate", &self.0.is_gate)
+            .finish()
+    }
+}
+
+/// Prints the gate chain as a flat list, outermost gate first, without
+/// recursing through [`ProxyConfig`]'s own `Debug` impl.
+struct GateChainDebug<'a>(&'a ProxyConfig);
+
+impl fmt::Debug for GateChainDebug<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `nodes()` is outermost-first with `self` (the exit) LAST: the
+        // gates are everything before it.
+        let nodes = self.0.nodes();
+        let gates = &nodes[..nodes.len() - 1];
+        f.debug_list()
+            .entries(gates.iter().copied().map(NodeDebug))
+            .finish()
+    }
+}
+
 impl fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyConfig")
@@ -168,7 +205,7 @@ impl fmt::Debug for ProxyConfig {
             .field("password", &self.password.as_ref().map(|_| REDACTED))
             .field("gate_level", &self.gate_level)
             .field("is_gate", &self.is_gate)
-            .field("gate", &self.gate)
+            .field("gate", &GateChainDebug(self))
             .finish()
     }
 }
@@ -222,7 +259,7 @@ mod tests {
         assert!(rendered.contains("port: 1080"));
         assert!(rendered.contains("gate_level: 1"));
         assert!(rendered.contains("is_gate: true"));
-        assert!(rendered.contains("gate: Some(ProxyConfig"));
+        assert!(rendered.contains("gate: [ProxyConfig"));
         // Three chained configs, two credential fields each, all redacted.
         assert_eq!(rendered.matches(REDACTED).count(), 6);
     }
@@ -316,5 +353,56 @@ mod tests {
         assert!(g.is_gate);
         assert_eq!(c.gate_level, 0);
         assert!(!c.is_gate);
+    }
+
+    /// Mutation caught: reverting `Debug` to the recursive
+    /// `gate: Some(...)` rendering makes `gate: ` appear once per nested
+    /// node instead of exactly once.
+    #[test]
+    fn debug_renders_the_gate_chain_flat_not_nested() {
+        let inner = config("203.0.113.3", 1082, None, None);
+        let mid = config("203.0.113.2", 1081, None, None)
+            .as_gate()
+            .with_gate(inner);
+        let root = config("203.0.113.1", 1080, None, None)
+            .as_gate()
+            .with_gate(mid);
+        let rendered = format!("{root:?}");
+        assert_eq!(rendered.matches("gate: ").count(), 1, "{rendered}");
+        assert!(rendered.contains("gate: [ProxyConfig"), "{rendered}");
+        // Every node exactly once: the exit is the printed struct itself,
+        // the list holds the gates only (outermost first).
+        for host in ["203.0.113.1", "203.0.113.2", "203.0.113.3"] {
+            assert_eq!(rendered.matches(host).count(), 1, "{host}: {rendered}");
+        }
+        assert!(
+            rendered.find("203.0.113.3").unwrap() < rendered.find("203.0.113.2").unwrap(),
+            "outermost gate first: {rendered}"
+        );
+    }
+
+    /// 64 nodes (the [`crate::types::MAX_CHAIN_NODES`] limit), built via
+    /// `with_gate`, which does not validate. Mutation caught: making
+    /// `Debug` recurse over the gate chain again overflows this 256 KiB
+    /// stack at 64 nodes, or at minimum breaks the flat-rendering
+    /// assertion inside.
+    #[test]
+    fn debug_of_max_depth_chain_is_iterative_on_a_small_stack() {
+        let mut cfg = ProxyConfig::socks5("chain-host", 1);
+        for _ in 1..64 {
+            cfg = ProxyConfig::socks5("chain-host", 1).with_gate(cfg);
+        }
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let rendered = format!("{cfg:?}");
+                assert_eq!(rendered.matches("gate: ").count(), 1, "{rendered}");
+                assert!(rendered.contains("gate: [ProxyConfig"), "{rendered}");
+                assert_eq!(cfg.chain_len(), 64);
+            })
+            .expect("spawn 256 KiB thread");
+        handle
+            .join()
+            .expect("Debug of a 64-node chain must not overflow");
     }
 }

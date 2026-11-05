@@ -17,8 +17,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# Least privilege: nothing here pushes, so the workflow token is read-only;
+# the one job that needs `contents: write` (the GitHub Release) declares it.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,6 +65,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -144,8 +148,13 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # The only job that writes: creating the GitHub Release.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: assets
@@ -170,10 +179,12 @@ jobs:
   # release, so a v* push always corresponds to a new (never-before-seen)
   # resocks5-net version — no separate SDK tag or trigger needed.
   #
-  # The dry-run always runs (no secret needed — it's a plain packaging +
-  # build sanity check). The upload supports two auth modes, picked by the
-  # repo VARIABLE `CRATES_IO_AUTH` (Settings → Secrets and variables →
-  # Actions → Variables):
+  # Packaging and the verification build run first, with no secret in the
+  # environment — build scripts and proc macros never see the upload token.
+  # The upload steps then publish the already verified package with
+  # `--no-verify` (nothing is compiled while the token is set). The upload
+  # supports two auth modes, picked by the repo VARIABLE `CRATES_IO_AUTH`
+  # (Settings → Secrets and variables → Actions → Variables):
   #
   #   unset / anything but "oidc"  →  API token (the default). Upload skips
   #     cleanly (a notice, not a failure) until the CARGO_REGISTRY_TOKEN
@@ -205,17 +216,26 @@ jobs:
       HAS_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
         with:
-          key: publish-resocks5-net
-      - name: Dry-run (packaging + build sanity, no upload)
-        run: cargo publish -p resocks5-net --locked --dry-run
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # No rust-cache: a once-per-release job has nothing to reuse, and no
+      # build state should carry into the token-bearing steps.
+      - name: Package and verify (no secrets in the environment)
+        run: cargo package -p resocks5-net --locked
+      - name: Check the produced .crate
+        run: |
+          crate=$(ls target/package/resocks5-net-*.crate)
+          echo "verifying $crate"
+          test -f "$crate"
+          tar -tzf "$crate" | grep -F 'Cargo.toml.orig'
+          tar -tzf "$crate" | grep -F 'src/lib.rs'
+          tar -tzf "$crate" | grep -F 'README.md'
       - name: Publish (API token)
         if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN == 'true' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p resocks5-net --locked
+        run: cargo publish -p resocks5-net --no-verify --locked
       - name: Upload skipped (no credentials configured)
         if: ${{ vars.CRATES_IO_AUTH != 'oidc' && env.HAS_CARGO_REGISTRY_TOKEN != 'true' }}
         run: echo "::notice::crates.io upload skipped - add the CARGO_REGISTRY_TOKEN secret, or set the CRATES_IO_AUTH variable to 'oidc' once a trusted publisher is configured."
@@ -227,7 +247,7 @@ jobs:
         if: ${{ vars.CRATES_IO_AUTH == 'oidc' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
-        run: cargo publish -p resocks5-net --locked
+        run: cargo publish -p resocks5-net --no-verify --locked
 
   # Multi-arch container image → ghcr.io/<owner>/resocks5.
   # Built with Buildx + QEMU so a single ubuntu runner emits both linux/amd64
@@ -240,6 +260,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3

@@ -43,6 +43,26 @@ pub struct Ratings {
     inner: Mutex<Inner>,
 }
 
+/// Opaque ownership token of one probation slot: what a probe outcome is
+/// bound to. [`Ratings::take_probe_claims`] issues one claim per granted
+/// probe lease; every success, trip, restore and newer lease changes the
+/// slot's generation, and [`Ratings::record_success_for`] /
+/// [`Ratings::record_hard_failure_for`] then drop outcomes whose claim no
+/// longer matches instead of rating a slot somebody else owns now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeClaim {
+    index: usize,
+    token: u64,
+}
+
+impl ProbeClaim {
+    /// The rated slot this claim belongs to.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
 impl Ratings {
     /// Create `n` fresh upstreams, all starting at weight 1.0.
     ///
@@ -150,6 +170,50 @@ impl Ratings {
         inner.quarantine[i].hard_failure(now, &self.quarantine)
     }
 
+    /// Apply a probe's success only while `claim` still owns the slot:
+    /// under one lock acquisition the claim's generation is checked
+    /// against the slot's; a reset, re-trip, restore or newer lease in
+    /// between makes the outcome stale and nothing is changed. Returns
+    /// `true` when the success was applied.
+    pub fn record_success_for(&self, claim: &ProbeClaim) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if claim.index >= inner.cells.len() {
+            return false;
+        }
+        if inner.quarantine[claim.index].generation() != claim.token {
+            return false;
+        }
+        let now = Instant::now();
+        if self.policy.enabled() {
+            inner.cells[claim.index].observe_success(now, &self.policy);
+        }
+        inner.quarantine[claim.index].success();
+        true
+    }
+
+    /// Apply a probe's hard failure only while `claim` still owns the
+    /// slot (same generation gate as [`Ratings::record_success_for`],
+    /// under the same lock). Returns the new quarantine length when the
+    /// applied failure (re-)tripped the quarantine; `None` when the claim
+    /// was stale (nothing changed) or the applied failure did not trip.
+    pub fn record_hard_failure_for(&self, claim: &ProbeClaim) -> Option<Duration> {
+        let mut inner = self.inner.lock().unwrap();
+        if claim.index >= inner.cells.len() {
+            return None;
+        }
+        if inner.quarantine[claim.index].generation() != claim.token {
+            return None;
+        }
+        let now = Instant::now();
+        if self.policy.enabled() {
+            inner.cells[claim.index].observe_failure(now, &self.policy);
+        }
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        inner.quarantine[claim.index].hard_failure(now, &self.quarantine)
+    }
+
     /// Quarantine upstream `i` right away, without waiting for the failure
     /// threshold: for an explicit health check that found it down (e.g. at
     /// startup). Returns the quarantine length; `None` without a quarantine
@@ -161,6 +225,26 @@ impl Ratings {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         let cell = inner.quarantine.get_mut(i)?;
+        Some(cell.trip_now(now, &self.quarantine))
+    }
+
+    /// [`Ratings::quarantine_now`] unless the upstream is already tripped
+    /// (quarantined or on probation) — one lock acquisition, so a
+    /// concurrent [`Ratings::on_hard_failure`] cannot slip between the
+    /// check and the trip and double the backoff on one piece of
+    /// evidence. Returns the quarantine length when THIS call did the
+    /// quarantining; `None` when the upstream was already tripped or the
+    /// index is unknown.
+    pub fn quarantine_now_unless_tripped(&self, i: usize) -> Option<Duration> {
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let cell = inner.quarantine.get_mut(i)?;
+        if cell.is_tripped() {
+            return None;
+        }
         Some(cell.trip_now(now, &self.quarantine))
     }
 
@@ -286,7 +370,23 @@ impl Ratings {
         self.take_probes_at(Instant::now())
     }
 
+    /// [`Ratings::take_probes`] with ownership: each returned
+    /// [`ProbeClaim`] carries the generation of the slot at lease-grant
+    /// time. Report the outcome with [`Ratings::record_success_for`] /
+    /// [`Ratings::record_hard_failure_for`]; outcomes whose slot changed
+    /// hands meanwhile are dropped. Empty without a quarantine.
+    pub fn take_probe_claims(&self) -> Vec<ProbeClaim> {
+        self.take_probe_claims_at(Instant::now())
+    }
+
     fn take_probes_at(&self, now: Instant) -> Vec<usize> {
+        self.take_probe_claims_at(now)
+            .into_iter()
+            .map(|claim| claim.index)
+            .collect()
+    }
+
+    fn take_probe_claims_at(&self, now: Instant) -> Vec<ProbeClaim> {
         if !self.quarantine.enabled() {
             return Vec::new();
         }
@@ -295,7 +395,10 @@ impl Ratings {
             .quarantine
             .iter_mut()
             .enumerate()
-            .filter_map(|(i, c)| c.try_lease(now, &self.quarantine).then_some(i))
+            .filter_map(|(i, c)| {
+                c.try_lease(now, &self.quarantine)
+                    .map(|token| ProbeClaim { index: i, token })
+            })
             .collect()
     }
 }
@@ -614,5 +717,109 @@ mod quarantine_tests {
             Ratings::try_with_quarantine(2, RatingPolicy::default(), bad),
             Err(RatingError::InvalidPolicy(msg)) if msg.contains("initial")
         ));
+    }
+
+    // Finding E: a claim carries the slot's generation. An ordinary
+    // request success resets the slot, renewed failures re-quarantine it,
+    // a fresh probe claims it — and the old probe's late outcome must
+    // then change nothing, while the fresh claim still applies.
+    // Mutations: drop the generation comparison (the stale calls apply:
+    // P1's success clears P2's quarantine / P1's failure re-trips) or
+    // skip the generation bump in success() (the old claim stays valid).
+    #[test]
+    fn stale_probe_claims_change_nothing_after_reset_and_retrip() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        let old = r.take_probe_claims_at(t1).pop().unwrap();
+        // A normal (fail-open) request succeeds: the slot resets ...
+        r.on_success(0);
+        // ... and fresh hard failures quarantine it again.
+        for _ in 0..3 {
+            r.on_hard_failure_at(0, t1);
+        }
+        assert_eq!(r.health_at(t1)[0].trips, 1);
+        let t2 = t1 + Duration::from_secs(31);
+        let fresh = r.take_probe_claims_at(t2).pop().unwrap();
+        assert_ne!(old, fresh, "the new lease must own a new generation");
+        // The slot is leased to the fresh claim only.
+        assert!(r.take_probe_claims_at(t2).is_empty());
+
+        // P1's late success: stale — dropped, the new quarantine stands.
+        assert!(!r.record_success_for(&old));
+        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Quarantined);
+        assert_eq!(r.health_at(t2)[0].trips, 1);
+        // P1's late hard failure: stale too — dropped.
+        assert_eq!(r.record_hard_failure_for(&old), None);
+        assert_eq!(r.health_at(t2)[0].trips, 1);
+        // P2's ownership is intact: its success applies.
+        assert!(r.record_success_for(&fresh));
+        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Alive);
+        assert_eq!(r.health_at(t2)[0].trips, 0);
+    }
+
+    // Finding E, direct path: a fresh claim's hard failure still
+    // requarantines (doubled length), and soft failures never invalidate
+    // a claim. Mutations: gating the claim path off entirely (returns
+    // None) or bumping the generation on soft failures (claim stale).
+    #[test]
+    fn fresh_claim_failure_requarantines_and_soft_failures_do_not_invalidate() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        let claim = r.take_probe_claims_at(t1).pop().unwrap();
+        r.on_failure(0);
+        r.on_failure(0);
+        assert_eq!(
+            r.record_hard_failure_for(&claim),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    // Finding H3, deterministic half: quarantining an already-tripped
+    // upstream must be a no-op — one piece of evidence, one trip.
+    // Mutation: unconditional trip_now (check dropped): the second
+    // call returns Some and trips becomes 2.
+    #[test]
+    fn quarantine_now_unless_tripped_is_a_noop_for_a_tripped_upstream() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        assert_eq!(
+            r.quarantine_now_unless_tripped(0),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(r.quarantine_now_unless_tripped(0), None);
+        assert_eq!(r.quarantine_now_unless_tripped(9), None);
+        assert_eq!(r.health_at(t0)[0].trips, 1);
+        assert_eq!(r.health_at(t0)[1].trips, 0);
+    }
+
+    // Finding H3, race half: with the check and the trip in ONE lock
+    // acquisition, exactly one of many concurrent callers quarantines
+    // and trips == 1. Mutation: splitting it back into is_quarantined +
+    // quarantine_now (two acquisitions) lets several callers trip under
+    // contention.
+    #[test]
+    fn concurrent_quarantine_trips_only_once() {
+        let r = std::sync::Arc::new(ratings(1));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let r = std::sync::Arc::clone(&r);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                r.quarantine_now_unless_tripped(0)
+            }));
+        }
+        let applied = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|result| result.is_some())
+            .count();
+        assert_eq!(applied, 1, "exactly one caller does the quarantining");
+        assert_eq!(r.health()[0].trips, 1);
     }
 }

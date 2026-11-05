@@ -50,6 +50,11 @@ pub(super) fn ipv4_literal_port(target: &str) -> Option<&str> {
 /// chance to greet first. A server-speaks-first protocol (SSH, SMTP,
 /// FTP) does, and we fall back to plain forwarding by IP; otherwise we
 /// keep waiting for the client as before.
+///
+/// A client that only `shutdown(write)`s after the early 200 (a clean
+/// EOF with no payload) keeps the session: the recovery READ ends, the
+/// IP fallback is dialed, the FIN is propagated upstream and the
+/// greeting is relayed (`RecoveryPeek::ServerFirst`).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_and_tunnel_http(
     mut client_stream: TcpStream,
@@ -125,7 +130,7 @@ pub(super) async fn recover_and_tunnel_http(
     };
 
     let buf = match peeked {
-        RecoveryPeek::ClientClosed => return Ok(()), // client closed before sending
+        RecoveryPeek::ClientClosed => return Ok(()), // nothing to relay (failed client / no upstream)
         RecoveryPeek::ServerFirst(upstream, banner) => {
             // Server-speaks-first protocol: skip recovery entirely (an
             // empty client read carries no host to recover), relay the

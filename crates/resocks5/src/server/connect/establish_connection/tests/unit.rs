@@ -702,7 +702,7 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
 
 /// SOCKS5 stub that answers every handshake round on a socket with
 /// success — safe as a chain gate — and counts accepted TCP connections.
-async fn spawn_counting_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+pub(super) async fn spawn_counting_stub() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
@@ -752,7 +752,7 @@ async fn spawn_counting_stub() -> (SocketAddr, Arc<AtomicUsize>) {
 /// SOCKS5 stub that answers the method negotiation with protocol garbage:
 /// a chain through it fails fast at hop 0 without touching the inner proxy
 /// (no dead port, so no Windows refused-connect delay).
-async fn spawn_counting_garbage_stub() -> (SocketAddr, Arc<AtomicUsize>) {
+pub(super) async fn spawn_counting_garbage_stub() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));

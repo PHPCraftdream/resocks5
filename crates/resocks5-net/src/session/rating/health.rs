@@ -54,7 +54,7 @@ impl Ratings {
         self.health_at(Instant::now())
     }
 
-    fn health_at(&self, now: Instant) -> Vec<Health> {
+    pub(super) fn health_at(&self, now: Instant) -> Vec<Health> {
         let inner = self.inner.lock().unwrap();
         inner
             .quarantine

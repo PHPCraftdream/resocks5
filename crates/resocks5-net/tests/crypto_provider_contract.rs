@@ -44,6 +44,16 @@ fn process_crypto_provider_contract() {
          rustls call — the contract below assumes a fresh process"
     );
 
+    // Oracle matrix, one leg per process run (this binary runs alone):
+    // - normal graph (env unset) + Ok -> pass;
+    // - normal graph (env unset) + Err -> FAIL, even when the message
+    //   matches: an unexpected panic must not masquerade as the
+    //   documented no-provider behaviour;
+    // - no-provider graph (env set) + Err with the exact documented
+    //   message -> pass;
+    // - no-provider graph (env set) + Ok -> FAIL (checked in the Ok
+    //   leg below).
+    //
     // This workspace's graph: `ring` is the sole built-in and
     // `custom-provider` is off, so an uninstalled process takes case 2 of
     // the documented contract — rustls auto-selects ring, auto-installs
@@ -69,6 +79,17 @@ fn process_crypto_provider_contract() {
             drop(connector);
         }
         Err(payload) => {
+            // Symmetry with the Ok leg: the panic is the documented
+            // behaviour only in a graph that EXPECTS it (env set); an
+            // unexpected panic with an identical message must fail the
+            // normal-graph run.
+            assert!(
+                std::env::var_os(EXPECT_PANIC_ENV).is_some(),
+                "make_tls_connector panicked with the documented \
+                 no-provider message, but the expected-panic env var is \
+                 not set: an unexpected panic in the normal graph must \
+                 fail, not pass"
+            );
             let message = payload
                 .downcast_ref::<String>()
                 .map(String::as_str)

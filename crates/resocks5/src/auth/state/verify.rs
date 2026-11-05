@@ -9,7 +9,22 @@ use super::claim::{ClaimOutcome, Prepared};
 use super::AuthState;
 use crate::auth::params::argon2_instance;
 
+/// SEC-03: fixed dummy the equalised rejection path compares the
+/// candidate HMAC against. Arbitrary public constant — the outcome is
+/// ignored; only the cost profile must match the known-name path.
+const DUMMY_HMAC: [u8; 32] = *b"RESOCKS5-EQUALISED-REJECT-DUMMYX";
+
 impl AuthState {
+    /// SEC-03: unknown/disabled names used to return before ANY work,
+    /// so response time leaked "name exists and is enabled". The
+    /// rejection now runs the same cheap HMAC over the same inputs and
+    /// compares it, constant-time (`subtle::ConstantTimeEq`), against a
+    /// fixed dummy before returning false. GUARANTEE LEVEL: only this
+    /// cheap first step is equalised — the Argon2 cache-miss path is
+    /// intentionally NOT equalised: the cheap step is where "instant vs
+    /// ~work" was trivially observable, while equalising Argon2 itself
+    /// would burn ~50 ms of server CPU per enumeration probe.
+    ///
     /// cancel-safe: NO — an admitted init-claim may still complete its
     /// persistence after cancellation. P1-01: the persistence phase has
     /// its OWN admission limit (`claim_slots`): the permit is awaited
@@ -28,9 +43,9 @@ impl AuthState {
     /// is still in flight.
     pub async fn verify_async(self: &Arc<Self>, name: &str, password: &str) -> bool {
         if !self.entries.get(name).is_some_and(|u| u.enabled) {
-            return false;
+            return self.reject_equalised(name, password);
         }
-        let candidate = compute_cache_hmac(&self.server_secret, name, password);
+        let candidate = self.cache_hmac(name, password);
         if self.cache_matches(name, &candidate) {
             return true;
         }
@@ -135,6 +150,28 @@ impl AuthState {
         gates.entry(name.to_owned()).or_default().clone()
     }
 
+    /// SEC-03: equalised rejection for unknown/disabled names — the
+    /// same cheap HMAC step as the known-name path, then a
+    /// constant-time compare against a fixed dummy whose outcome is
+    /// discarded, then `false`. Never touches the cache, the hashing
+    /// slots, or the claim machinery.
+    fn reject_equalised(&self, name: &str, password: &str) -> bool {
+        let candidate = self.cache_hmac(name, password);
+        let _ = bool::from(DUMMY_HMAC.ct_eq(&candidate));
+        false
+    }
+
+    /// `compute_cache_hmac` with a test-only call counter (SEC-03
+    /// seam): compiles to a plain call outside test builds.
+    fn cache_hmac(&self, name: &str, password: &str) -> [u8; 32] {
+        #[cfg(test)]
+        {
+            self.hmac_probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        compute_cache_hmac(&self.server_secret, name, password)
+    }
+
     pub(super) fn cache_matches(&self, name: &str, candidate: &[u8; 32]) -> bool {
         self.cache
             .get(name)
@@ -154,7 +191,7 @@ impl AuthState {
     /// no semaphore involvement.
     #[allow(dead_code)]
     pub fn verify(&self, name: &str, password: &str) -> bool {
-        let candidate_hmac = compute_cache_hmac(&self.server_secret, name, password);
+        let candidate_hmac = self.cache_hmac(name, password);
         match self.verify_prepare(name, password, candidate_hmac) {
             Prepared::Done(ok) => ok,
             Prepared::Claim(work) => match self.claim_commit(work) {
@@ -192,6 +229,12 @@ pub(super) fn argon2_verify(stored_phc: &str, password: &str) -> bool {
     let Ok(parsed) = PasswordHash::new(stored_phc) else {
         return false;
     };
+    // Fail closed: the verifier takes the algorithm and version from the
+    // stored string, so anything but Argon2id v19 (or an absent version) must
+    // be refused here. m/t/p floors are enforced by the parameter parser.
+    if parsed.algorithm != argon2::ARGON2ID_IDENT || parsed.version.is_some_and(|v| v != 0x13) {
+        return false;
+    }
     argon2_instance()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok()

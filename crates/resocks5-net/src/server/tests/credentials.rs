@@ -679,6 +679,21 @@ async fn http_error_replies_are_complete_well_formed_heads() {
     .expect("bounded HTTP head shape pins");
 }
 
+/// An unknown status must degrade to a well-formed 500 head, never panic.
+/// Mutation: restoring the old `_ => unreachable!(...)` arm makes the
+/// unknown-status calls panic and fails this test.
+#[test]
+fn http_error_unknown_status_falls_back_to_a_500_head() {
+    const FALLBACK_500: &[u8] =
+        b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    assert_eq!(http_error(418), FALLBACK_500);
+    assert_eq!(http_error(0), FALLBACK_500);
+    assert_eq!(http_error(599), FALLBACK_500);
+    // Known statuses keep their independently pinned heads.
+    assert_eq!(http_error(407), EXPECT_HTTP_407);
+    assert_eq!(http_error(503), EXPECT_HTTP_503);
+}
+
 #[tokio::test]
 async fn timed_out_reply_is_a_504_head_distinct_from_502() {
     timeout(Duration::from_secs(10), async {

@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-probe reservation hook (`Fn(&ProxyConfig) -> Option<guard>`): `None` defers
   the probe (no connection, no health change, no event), `Some(guard)` holds the
   guard for the probe. `probe_due` / `probe_all` are unchanged.
+- `resocks5-net`: `chain::GateLevels::try_new` (duplicate ranks are an error in
+  release builds too, `GateLevelsError`), `types::MAX_CHAIN_NODES` (64) with
+  `ProxyConfigError::ChainTooLong`, `error::TimeoutKind::Socks5Greeting`, and
+  `ProxyRotator::{take_probe_claims, record_success_for, record_hard_failure_for,
+  quarantine_now_unless_tripped}` with `UpstreamProbeClaim`.
+- `resocks5-net`: feature `test-instrumentation` adds `progress::ProgressScopeProbe`,
+  an instance-scoped observer of confirmed write progress.
+- CI: a `feature-unification` job builds the `tests/feature_unification` fixture,
+  `release-behavior` runs a few release-mode suites on full runs, every job has a
+  `timeout-minutes`, and `changed-areas.sh --self-test` pins the classifier.
 
 ### Changed
 
@@ -73,6 +83,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory runs with health persistence disabled and one warning instead of
   deleting the running writer's temp; shutdown reports go through the log
   channel.
+- `resocks5-net`: a SOCKS5 greeting that gets no reply within the handshake budget
+  is `TimeoutKind::Socks5Greeting` and counts as upstream-down
+  (`is_upstream_down`); a stalled CONNECT reply is still `Socks5Handshake`.
+  `ProxyConfig` `Debug` renders the gate chain as a flat list (no recursion),
+  and `ProxyConfig::validate` rejects chains over 64 nodes.
+- `resocks5-net`: a chain probe outcome is bound to the claim that took the probe
+  (generation token): a result for a slot that was reset, re-tripped or leased
+  again meanwhile is dropped; only destination-unreachable replies (SOCKS5 REP
+  3-6, HTTP 502-504) of the final CONNECT quarantine the tested gate.
+- `resocks5`: new Argon2id hashes use m=19456 KiB, t=2, p=1 (OWASP minimum); stored
+  hashes keep verifying with their own parameters. A stored hash that is not
+  Argon2id v19 is rejected (it used to verify with the algorithm named in the
+  string). `verify_async` runs the cheap HMAC step for unknown and disabled names
+  too, so the first step takes the same time for every name.
+- `resocks5`: cached chains honour the direct fallback reserve of
+  `max_upstream_attempts` (a budget of 1 still serves the sticky cache first),
+  and `network.*` time budgets above one day and limits above 2^30 are rejected
+  at start-up.
+- `resocks5`: strict HTTP `Host` follows RFC 9110 (empty port and any digits are
+  valid, bracketed IPvFuture is accepted, no 1..65535 range); the app enables the
+  `zeroize` feature of `resocks5-net`.
 
 ### Fixed
 
@@ -113,6 +144,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: a quarantine whose deadline is not representable as an `Instant`
   (huge configured maximum) stays quarantined instead of dropping to probation at
   once.
+- `resocks5-net`: `connect_hedged` no longer launches a pending candidate on a hedge
+  tick after a win was published, catches a callback panic inside the detached
+  drain, and `HedgeError::source()` returns the last connection error.
+  `http_error` falls back to a 500 head for an unknown status instead of panicking.
+- `resocks5-net`: SOCKS5 server credentials are not cloned in raw mode and a rejected
+  buffer is wiped before it is freed (feature `zeroize`).
+- `resocks5-net`: a probe lease too large for the `Instant` range still excludes a
+  second probe, and `probe_all_with` trips an upstream atomically.
+- `resocks5`: the health file lock now outlives a blocking write that the bounded
+  shutdown stopped waiting for; a failed save clears the baseline so the next
+  round rewrites; the quarantine deadline is part of the compared state;
+  duplicated or ambiguous records (same label, different secret) are not
+  restored and warn; the lock sentinel refuses symlinks and keeps one pid line.
+- `resocks5`: the tunnel's fragmentation prelude renews its idle window from every
+  accepted relay write, and a client that only half-closes after the early reply
+  keeps its session (the IP fallback is dialed, the FIN is propagated and the
+  greeting relayed).
+- `resocks5`: the log drain reports a failed log file through a bounded, awaited
+  stderr write instead of a blocking `eprintln!` on the worker.
+- CI: `release.yml` grants `contents: write` only to the release job, and the crate
+  is packaged and verified before the token-bearing step, which publishes with
+  `--no-verify`.
 
 ## [0.4.1] - 2026-11-02
 

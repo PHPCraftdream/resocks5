@@ -19,6 +19,8 @@ use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::server::{IncomingRequest, Reply};
 mod recovery;
 #[cfg(test)]
+mod recovery_halfclose_tests;
+#[cfg(test)]
 mod tests;
 use recovery::{ipv4_literal_port, recover_and_tunnel_http};
 

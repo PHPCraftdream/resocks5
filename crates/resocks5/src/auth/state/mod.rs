@@ -75,7 +75,9 @@ pub struct AuthState {
     /// `min(available_parallelism, 4)` (fallback 1). Permits are held
     /// only around the hashing phases (R7-03): claim persistence waits
     /// run WITHOUT a permit so a claim parked on the users-file lock
-    /// cannot starve other users' hashing.
+    /// cannot starve other users' hashing. With m=19456 KiB per Argon2
+    /// verify, four concurrent verifies peak at ~76 MiB of transient
+    /// hash memory — bounded, acceptable for a server process.
     verify_slots: Arc<Semaphore>,
     /// P1-01: independent admission cap for init-claim persistence.
     /// `verify_slots` bounds only the CPU hashing phases; without a
@@ -129,6 +131,10 @@ pub struct AuthState {
     /// outside test builds.
     #[cfg(test)]
     claim_probe: Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
+    /// Test-only SEC-03 seam: counts `cache_hmac` calls (see
+    /// state/verify.rs). Compiles to nothing outside test builds.
+    #[cfg(test)]
+    hmac_probes: std::sync::atomic::AtomicU64,
 }
 
 impl AuthState {
@@ -178,6 +184,8 @@ impl AuthState {
             users_path,
             #[cfg(test)]
             claim_probe: Mutex::new(None),
+            #[cfg(test)]
+            hmac_probes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

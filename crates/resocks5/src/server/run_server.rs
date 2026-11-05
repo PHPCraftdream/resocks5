@@ -37,6 +37,17 @@ fn is_peer_disconnect(e: &anyhow::Error) -> bool {
     })
 }
 
+/// `Instant::now() + secs` that cannot panic the accept loop: a config
+/// value near `u64::MAX` seconds has no representable `Instant` offset,
+/// so the deadline clamps to a far-future instant instead. Validation
+/// rejects such values at startup; this is the second line of defence.
+fn deadline_after_now(secs: u64) -> tokio::time::Instant {
+    const FAR_FUTURE_SEC: u64 = 100 * 365 * 24 * 3600;
+    let now = tokio::time::Instant::now();
+    now.checked_add(Duration::from_secs(secs))
+        .unwrap_or_else(|| now + Duration::from_secs(FAR_FUTURE_SEC))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     auth: Arc<AuthState>,
@@ -52,6 +63,12 @@ pub async fn run_server(
     tls_connector: Option<Arc<TlsConnector>>,
     allowed_clients: Option<Arc<AllowedClients>>,
 ) -> anyhow::Result<()> {
+    network.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid `{}` (network section): {e}",
+            crate::config::MAIN_PATH
+        )
+    })?;
     let listener = TcpListener::bind(local_addr).await?;
     let local_addr_for_log = local_addr.to_string();
     logger.lifecycle(move || {
@@ -168,8 +185,7 @@ pub async fn run_server(
                     }
                 }
 
-                let client_deadline = tokio::time::Instant::now()
-                    + Duration::from_secs(network.client_protocol_timeout_sec);
+                let client_deadline = deadline_after_now(network.client_protocol_timeout_sec);
 
                 // TCP_NODELAY on the accepted client — SOCKS5/HTTP
                 // handshake is ~5 tiny writes; Nagle would add ~40 ms
@@ -358,6 +374,28 @@ mod tests {
         ] {
             assert!(!is_peer_disconnect(&anyhow::Error::new(Error::from(kind))));
         }
+    }
+
+    /// The accept-loop deadline must saturate instead of panicking on
+    /// unrepresentable offsets (`u64::MAX` seconds = `Duration::MAX`),
+    /// and ordinary values must land on their deadline (review F-APP/G).
+    /// Mutation caught: restoring the unchecked `now + Duration` panics
+    /// the first arm; a zero-length fallback fails the 1-year floor.
+    #[test]
+    fn deadline_after_now_saturates_for_duration_max() {
+        let now = tokio::time::Instant::now();
+        let far = deadline_after_now(u64::MAX);
+        let ahead = far.saturating_duration_since(now);
+        assert!(
+            ahead >= Duration::from_secs(365 * 24 * 3600),
+            "Duration::MAX must clamp to the far future, got {ahead:?}"
+        );
+        let soon = deadline_after_now(60);
+        let ahead = soon.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            ahead >= Duration::from_secs(59),
+            "an ordinary 60 s deadline must stay a deadline, got {ahead:?}"
+        );
     }
 
     fn panic_reporting_logger() -> (Arc<Logger>, mpsc::Receiver<ELog>) {

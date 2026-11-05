@@ -5,11 +5,17 @@ impl ConnectError {
     ///
     /// A stalled or refused SOCKS5/HTTP CONNECT may instead be the
     /// destination's fault, so those errors are deliberately excluded.
+    /// The SOCKS5 greeting phase is the exception: until the upstream has
+    /// answered the method selection, the CONNECT request has not been
+    /// relayed, so a [`TimeoutKind::Socks5Greeting`] stall implicates the
+    /// upstream alone.
     pub fn is_upstream_down(&self) -> bool {
         match self {
             ConnectError::Timeout { kind, .. } => matches!(
                 kind,
-                TimeoutKind::TcpConnect | TimeoutKind::HttpsTlsHandshake
+                TimeoutKind::TcpConnect
+                    | TimeoutKind::HttpsTlsHandshake
+                    | TimeoutKind::Socks5Greeting
             ),
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
             ConnectError::AuthFailed { .. } | ConnectError::MethodUnsupported { .. } => true,
@@ -60,7 +66,14 @@ mod tests {
 
     #[test]
     fn hard_failure_classification_is_exhaustive() {
-        for kind in [TimeoutKind::TcpConnect, TimeoutKind::HttpsTlsHandshake] {
+        // Mutation caught: removing `Socks5Greeting` from
+        // `is_upstream_down` (or reverting the greeting-phase split) makes
+        // this loop fail.
+        for kind in [
+            TimeoutKind::TcpConnect,
+            TimeoutKind::HttpsTlsHandshake,
+            TimeoutKind::Socks5Greeting,
+        ] {
             assert!(timeout(kind, Stage::Handshake).is_upstream_down());
         }
         for kind in [
@@ -139,6 +152,11 @@ mod tests {
             (
                 timeout(TimeoutKind::Socks5Handshake, Stage::Handshake),
                 false,
+                true,
+            ),
+            (
+                timeout(TimeoutKind::Socks5Greeting, Stage::Handshake),
+                true,
                 true,
             ),
             (

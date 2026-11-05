@@ -382,3 +382,71 @@ fn write_atomic_syncs_parent_directory_after_commit() {
     assert_eq!(loaded.users[0].name, "dave");
     cleanup(&path);
 }
+
+// The sentinel must never be followed through a symlink: the open would
+// otherwise lock whatever the link points at. Mutation: dropping the
+// symlink check makes the acquisition succeed through the link.
+#[test]
+fn a_symlinked_sentinel_is_refused() {
+    let path = unique_path("sentinel_link");
+    let sentinel = sibling_path(&path, ".lock");
+    let victim = sibling_path(&path, ".victim");
+    fs::write(&victim, "victim content").unwrap();
+
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&victim, &sentinel);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(&victim, &sentinel);
+    #[cfg(not(any(unix, windows)))]
+    let made: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no symlinks",
+    ));
+
+    // Environments without symlink privilege (e.g. Windows without
+    // developer mode) skip the check instead of failing.
+    if made.is_err() {
+        cleanup(&path);
+        let _ = fs::remove_file(&victim);
+        return;
+    }
+    let err = UsersFileLock::acquire_with_timeout(&path, Duration::from_secs(1)).unwrap_err();
+    assert!(err.to_string().contains("symlink"), "{err}");
+    assert_eq!(
+        fs::read_to_string(&victim).unwrap(),
+        "victim content",
+        "the sentinel link must not be followed"
+    );
+    // The refusal did not replace the link with a plain file.
+    let still_link = fs::symlink_metadata(&sentinel).unwrap();
+    assert!(
+        still_link.file_type().is_symlink(),
+        "{:?}",
+        still_link.file_type()
+    );
+    cleanup(&path);
+    let _ = fs::remove_file(&victim);
+}
+
+// The winner truncates the sentinel and writes its pid once, so N
+// acquisitions cannot grow the file. Mutation: keeping the old
+// append-only write makes the sentinel grow by one pid line per
+// acquisition (round 3 busts the bound and the content assert fires at
+// round 2).
+#[test]
+fn the_sentinel_holds_exactly_one_pid_line_across_acquisitions() {
+    let path = unique_path("sentinel_rewrite");
+    let sentinel = sibling_path(&path, ".lock");
+    for round in 0..5 {
+        let lock = UsersFileLock::acquire_with_timeout(&path, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&sentinel).unwrap(),
+            format!("{}\n", std::process::id()),
+            "round {round}: exactly one pid line"
+        );
+        let len = fs::metadata(&sentinel).unwrap().len();
+        assert!(len <= 16, "round {round}: sentinel grew to {len} bytes");
+        drop(lock);
+    }
+    cleanup(&path);
+}

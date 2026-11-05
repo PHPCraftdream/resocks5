@@ -3,12 +3,12 @@
 
 use std::time::Duration;
 
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 
 use crate::connect::connect_http_proxy::http_connect_on_tcp;
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::socks5_handshake;
+use crate::connect::handshake_over_stream::{socks5_connect_request, socks5_greeting};
 use crate::connect::host_port::HostPort;
 use crate::connect::tcp_dial::tcp_dial;
 use crate::connect::{AnyUpstream, UpstreamStream};
@@ -210,8 +210,20 @@ async fn dial_inner(
 
     match proxy.protocol {
         ProxyProtocol::Socks5 => {
+            if host.is_empty() || port == 0 {
+                return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
+            }
+            // One deadline for both phases: a silent greeting implicates
+            // the upstream alone, a stalled CONNECT reply may still be the
+            // destination's fault.
+            let deadline = tokio::time::Instant::now() + hs;
             let auth = socks5_auth(proxy);
-            match timeout(hs, socks5_handshake(stream, host, port, auth)).await {
+            let stream = match timeout_at(deadline, socks5_greeting(stream, auth)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(hs_timeout(TimeoutKind::Socks5Greeting)),
+            };
+            match timeout_at(deadline, socks5_connect_request(stream, host, port)).await {
                 Ok(r) => Ok(AnyUpstream::Plain(r?)),
                 Err(_) => Err(hs_timeout(TimeoutKind::Socks5Handshake)),
             }

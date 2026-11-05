@@ -18,6 +18,10 @@ use crate::types::ProxyConfig;
 #[path = "hedged_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "hedged_extra_tests.rs"]
+mod extra_tests;
+
 /// Options controlling candidate launch and handshake duration.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -109,7 +113,7 @@ impl fmt::Debug for Hedged {
 pub struct HedgeError {
     /// Number of candidates launched.
     pub attempts: usize,
-    /// Last completed connection error, if any.
+    /// Last completed connection error, if any; also exposed via `source()`.
     pub last: Option<ConnectError>,
 }
 
@@ -118,7 +122,11 @@ impl fmt::Display for HedgeError {
         f.write_str("all upstream connection attempts failed")
     }
 }
-impl std::error::Error for HedgeError {}
+impl std::error::Error for HedgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.last.as_ref().map(|e| e as _)
+    }
+}
 
 #[derive(Default)]
 struct RaceState {
@@ -209,7 +217,11 @@ async fn drain(
     let proxies = Arc::new(proxies);
     while let Some(joined) = running.join_next().await {
         if let Ok(finished) = joined {
-            report(callback.as_ref(), &proxies, finished, true);
+            // A callback panic here is caught and discarded so the remaining
+            // reports are still delivered.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                report(callback.as_ref(), &proxies, finished, true);
+            }));
         }
     }
 }
@@ -239,8 +251,10 @@ fn hedge_deadline(opts: &HedgeOptions, pending_len: usize) -> Option<tokio::time
 /// Every normally completed launched attempt is reported exactly once. The
 /// winner and failures observed before it have `after_win == false`; a
 /// `Lost` observed after a win was published reports `after_win == true`,
-/// as do the remaining results the detached drain reports. A callback
-/// panic unwinds the caller and may prevent later callbacks.
+/// as do the remaining results the detached drain reports. A callback panic
+/// on the caller's path unwinds the caller; a panic inside the detached
+/// drain is caught and discarded, and the remaining reports are still
+/// delivered.
 /// Unlaunched candidates produce no reports. Dropping this future before a
 /// winner cancels its coordinator and aborts its `JoinSet`; after a winner the
 /// drain is detached and continues independently.
@@ -335,9 +349,10 @@ where
                 }
             }, if !opts.hedge_delay.is_zero() && pending.len() > 0 => {
                 hedge_at = hedge_deadline(opts, pending.len());
-                // A tick does not launch beside a handshaking attempt.
+                // A tick does not launch beside a handshaking attempt or
+                // once a win was published.
                 let slot_busy = race.handshake_slot.try_lock().is_err();
-                if !slot_busy {
+                if !slot_busy && !race.won.load(Ordering::Acquire) {
                     if let Some((index, proxy)) = pending.next() {
                         launch(&mut running, &mut launched, index, proxy, race.clone(), target.clone(), pool.clone(), opts.handshake_timeout, tls.clone());
                     }

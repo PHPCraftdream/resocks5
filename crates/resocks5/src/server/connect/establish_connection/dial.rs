@@ -117,12 +117,13 @@ pub async fn establish_connection(
             if tried_routes.contains(&route) {
                 continue;
             }
-            if attempts >= max_attempts {
-                return Err(anyhow!(
-                    "max upstream attempts ({}) reached for {}",
-                    max_attempts,
-                    target_addr
-                ));
+            // A cached chain honours the same direct fallback reserve as
+            // the fresh plan, so several sticky chains cannot spend the
+            // reserved attempt; a budget of 1 stays cache-first.
+            let cache_budget_free =
+                attempts + direct_reserve < max_attempts || (max_attempts == 1 && attempts == 0);
+            if !cache_budget_free {
+                continue;
             }
             tried_routes.insert(route.clone());
             attempts += 1;

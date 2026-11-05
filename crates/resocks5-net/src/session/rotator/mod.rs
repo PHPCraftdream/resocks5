@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::rating::{Health, QuarantinePolicy, RatingError, RatingPolicy, Ratings};
+use crate::rating::{Health, ProbeClaim, QuarantinePolicy, RatingError, RatingPolicy, Ratings};
 use crate::types::ProxyConfig;
 
 mod probe;
@@ -39,6 +39,20 @@ impl UpstreamHealth {
     pub fn new(proxy: Arc<ProxyConfig>, health: Health) -> Self {
         Self { proxy, health }
     }
+}
+
+/// A claimed due-probe: the upstream plus the ownership token its outcome
+/// is bound to. [`ProxyRotator::take_probe_claims`] issues one per granted
+/// probe lease; [`ProxyRotator::record_success_for`] and
+/// [`ProxyRotator::record_hard_failure_for`] apply the outcome only while
+/// the token still matches the slot's state generation — a reset,
+/// re-trip, restore or newer lease in between makes it stale and it is
+/// dropped without a rating change.
+#[derive(Debug, Clone)]
+pub struct UpstreamProbeClaim {
+    /// The claimed upstream.
+    pub proxy: Arc<ProxyConfig>,
+    pub(crate) claim: ProbeClaim,
 }
 
 /// Error returned when a [`ProxyRotator`] cannot be constructed.
@@ -522,6 +536,38 @@ impl ProxyRotator {
             .collect()
     }
 
+    /// [`ProxyRotator::take_probes`] with ownership: each claim pairs the
+    /// upstream with the generation token its outcome must still match.
+    /// Report through [`ProxyRotator::record_success_for`] /
+    /// [`ProxyRotator::record_hard_failure_for`]. Empty without a
+    /// quarantine.
+    pub fn take_probe_claims(&self) -> Vec<UpstreamProbeClaim> {
+        self.ratings
+            .take_probe_claims()
+            .into_iter()
+            .map(|claim| {
+                let proxy = self.proxies[claim.index()].clone();
+                UpstreamProbeClaim { proxy, claim }
+            })
+            .collect()
+    }
+
+    /// Apply a claimed probe's success only while the claim still owns
+    /// the upstream's probation slot; stale claims change nothing.
+    /// Returns `true` when the success was applied.
+    pub fn record_success_for(&self, claim: &UpstreamProbeClaim) -> bool {
+        self.ratings.record_success_for(&claim.claim)
+    }
+
+    /// Apply a claimed probe's hard failure only while the claim still
+    /// owns the slot; stale claims change nothing. Returns the new
+    /// quarantine length when the applied failure (re-)tripped the
+    /// quarantine; `None` when the claim was stale or the applied failure
+    /// did not trip.
+    pub fn record_hard_failure_for(&self, claim: &UpstreamProbeClaim) -> Option<Duration> {
+        self.ratings.record_hard_failure_for(&claim.claim)
+    }
+
     /// Quarantine the proxy right away, without waiting for the failure
     /// threshold — for an explicit health check that found it down (e.g.
     /// at startup). Returns the quarantine length; `None` without a
@@ -529,6 +575,18 @@ impl ProxyRotator {
     pub fn quarantine_now(&self, proxy: &ProxyConfig) -> Option<Duration> {
         let i = self.index_of(proxy)?;
         self.ratings.quarantine_now(i)
+    }
+
+    /// [`ProxyRotator::quarantine_now`] unless the upstream is already
+    /// tripped (quarantined or on probation): a single ratings lock
+    /// acquisition, so a concurrent hard failure cannot slip between the
+    /// check and the trip and double the backoff on one piece of
+    /// evidence. Returns the quarantine length when THIS call did the
+    /// quarantining; `None` when the upstream was already tripped or
+    /// unknown.
+    pub fn quarantine_now_unless_tripped(&self, proxy: &ProxyConfig) -> Option<Duration> {
+        let i = self.index_of(proxy)?;
+        self.ratings.quarantine_now_unless_tripped(i)
     }
 
     /// `true` while the proxy is quarantined or on probation. Unknown

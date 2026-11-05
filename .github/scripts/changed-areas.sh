@@ -2,6 +2,7 @@
 # Pick the CI segments and the tests a change needs, from its diff.
 #
 #   changed-areas.sh EVENT BASE HEAD [MARKER]
+#   changed-areas.sh --self-test
 #
 # Writes `key=value` lines to stdout (append them to $GITHUB_OUTPUT); the
 # human-readable summary goes to stderr.
@@ -22,12 +23,10 @@
 # message carries `[full-ci]`, and when this script or ci.yml changes.
 # `structure` always runs. Cross-crate and Windows/macOS-only breakage that a
 # targeted run cannot see is caught by the full run.
+#
+# CHANGED_FILES (newline-separated paths) replaces the `git diff` file list;
+# the self-test uses it to feed cases without a git history.
 set -eu
-
-event=${1:?event}
-base=${2:-}
-head=${3:?head}
-marker=${4:-}
 
 ALL_ROWS="lean pool tls pool-tls serde rating rotator zeroize test-instrumentation default all"
 
@@ -61,6 +60,181 @@ uniq_words() {
   printf '%s\n' "$*" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 
+# ---- self-test ----
+# `changed-areas.sh --self-test` feeds the case table below through the
+# classifier itself (CHANGED_FILES injects the file list, no git history
+# needed) and pins the outputs. The `structure` job runs it: deleting or
+# breaking a mapping case here fails CI — e.g. dropping the session/chain
+# case would classify those files as generic net changes (`--no-run`, no
+# app tests) and the chain assertions below would fail.
+self_test() {
+  failures=0
+  cases=0
+  name=
+  files=
+  marker=
+  out=
+
+  # expect KEY=VALUE: the value may be empty or contain spaces.
+  expect() {
+    key=${1%%=*}
+    want=${1#*=}
+    actual=$(printf '%s\n' "$out" | sed -n "s/^$key=//p")
+    if [ "$want" != "$actual" ]; then
+      printf 'changed-areas self-test: FAIL %s: expected %s=[%s], got [%s]\n' \
+        "$name" "$key" "$want" "$actual"
+      failures=$((failures + 1))
+    fi
+  }
+
+  while IFS= read -r line; do
+    case "$line" in
+      '' | '#'*) continue ;;
+      files*)
+        files=${line#files }
+        marker=
+        ;;
+      marker*)
+        marker=${line#marker }
+        ;;
+      case*)
+        name=${line#case }
+        cases=$((cases + 1))
+        if ! out=$(CHANGED_FILES="$files" sh "$0" push base head "$marker" 2>/dev/null); then
+          printf 'changed-areas self-test: FAIL %s: classifier exited non-zero\n' "$name"
+          failures=$((failures + 1))
+          out=
+        fi
+        ;;
+      expect*)
+        expect "${line#expect }"
+        ;;
+      *)
+        printf 'changed-areas self-test: bad table line: %s\n' "$line"
+        failures=$((failures + 1))
+        ;;
+    esac
+  done <<'EOF'
+# session/chain -> SDK chain:: tests in every matrix row + app server:: tests
+files crates/resocks5-net/src/session/chain/mod.rs
+case chain
+expect full=false
+expect run_net=true
+expect net_test_args=-- chain::
+expect run_clippy_net=true
+expect run_test=true
+expect test_filter=-- server::
+expect run_lint=true
+expect run_deny=false
+expect run_portable=true
+expect run_unification=false
+
+# session/rating -> rating:: + rotator:: SDK tests (rotator implies rating)
+files crates/resocks5-net/src/session/rating/sand.rs
+case rating
+expect net_test_args=-- rating:: rotator::
+expect test_filter=-- server::
+
+# session/rotator -> rotator:: SDK tests + app server:: tests
+files crates/resocks5-net/src/session/rotator/mod.rs
+case rotator
+expect net_test_args=-- rotator::
+expect test_filter=-- server::
+
+# SDK server -> server:: SDK tests + app server::/http_proxy:: tests
+files crates/resocks5-net/src/server/conn.rs
+case net-server
+expect run_net=true
+expect net_test_args=-- server::
+expect run_test=true
+expect test_filter=-- http_proxy:: server::
+
+# generic net path (examples, ...): builds every row, runs no tests
+files crates/resocks5-net/examples/demo.rs
+case net-generic
+expect run_net=true
+expect net_test_args=--no-run
+expect run_test=false
+expect run_unification=false
+
+# the fixture workspace itself: only the feature-unification job
+files tests/feature_unification/lean-consumer/src/main.rs
+case fixture
+expect run_unification=true
+expect run_net=false
+expect run_test=false
+expect run_lint=false
+
+# SDK core -> all matrix rows, all app tests, and the fixture job
+files crates/resocks5-net/src/connect/proxy_connect/connect_proxy.rs
+case sdk-core
+expect run_unification=true
+expect net_test_args=
+expect run_test=true
+expect test_filter=
+expect run_deny=false
+
+# app server -> app server:: tests only (no SDK matrix, no fixture job)
+files crates/resocks5/src/server/accept.rs
+case app-server
+expect run_test=true
+expect test_filter=-- server::
+expect run_net=false
+expect run_unification=false
+
+# dependency manifests: both crates, license jobs, fixture job
+files Cargo.lock
+case manifests
+expect run_deny=true
+expect run_licenses=true
+expect run_net=true
+expect net_test_args=
+expect run_test=true
+expect run_unification=true
+
+# [ci: full] in the message -> the full run incl. fixture job + release lane
+files docs/RELEASE_CHECKLIST.md
+marker [ci: full]
+case full-marker
+expect full=true
+expect run_test=true
+expect test_scope=--workspace
+expect run_installers=true
+expect run_unification=true
+expect run_release_lane=true
+
+# docs-only -> nothing but the always-on structure job
+files CHANGELOG.md
+case docs-only
+expect full=false
+expect run_test=false
+expect run_net=false
+expect run_lint=false
+expect run_msrv=false
+expect run_doc=false
+expect run_portable=false
+expect run_deny=false
+expect run_unification=false
+expect run_release_lane=false
+EOF
+
+  if [ "$failures" -ne 0 ]; then
+    printf 'changed-areas self-test: %d case(s), %d failed assertion(s)\n' "$cases" "$failures"
+    exit 1
+  fi
+  printf 'changed-areas self-test: %d case(s) ok\n' "$cases"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  self_test
+  exit
+fi
+
+event=${1:?event}
+base=${2:-}
+head=${3:?head}
+marker=${4:-}
+
 full=false
 case "$event" in
   push | pull_request) ;;
@@ -75,7 +249,10 @@ if [ "$full" = false ]; then
   case "$base" in
     "" | 0000000000000000000000000000000000000000) full=true ;;
     *)
-      if git cat-file -e "$base^{commit}" 2>/dev/null; then
+      if [ -n "${CHANGED_FILES:-}" ]; then
+        # Test seam: the self-test injects the file list, no git needed.
+        files=$CHANGED_FILES
+      elif git cat-file -e "$base^{commit}" 2>/dev/null; then
         files=$(git diff --name-only "$base" "$head")
         # Messages of the range may ask for a full run too.
         if git log --format=%B "$base..$head" | grep -qE '\[(full-ci|ci: full)\]'; then
@@ -94,6 +271,7 @@ installers=false
 release_wf=false
 net_all=false
 net_touched=false
+uni_touched=false
 net_f=""
 app_all=false
 app_touched=false
@@ -155,7 +333,12 @@ if [ "$full" = false ]; then
         ;;
       crates/*/README.md)
         ;;
-      crates/resocks5-net/* | tests/feature_unification/*)
+      # The fixture workspace is not a member of the root workspace: its
+      # gate is the feature-unification job alone.
+      tests/feature_unification/*)
+        uni_touched=true
+        ;;
+      crates/resocks5-net/*)
         rust=true
         net_touched=true
         ;;
@@ -207,11 +390,16 @@ fi
 if [ "$net_all" = true ]; then
   app_all=true
 fi
-
 run_test=false
 run_net=false
 run_clippy_net=false
 run_doc_net=false
+# The fixture workspace is the unification gate: SDK core changes and the
+# fixture itself run it.
+run_unification=false
+if [ "$net_all" = true ] || [ "$uni_touched" = true ]; then
+  run_unification=true
+fi
 run_lint=$rust
 run_msrv=$rust
 run_doc=$rust
@@ -219,6 +407,7 @@ run_portable=false
 run_deny=$deps
 run_licenses=$deps
 run_installers=$installers
+run_release_lane=false
 net_rows=""
 net_test_args=""
 test_scope="-p resocks5"
@@ -264,6 +453,7 @@ if [ "$full" = true ]; then
   run_net=true
   run_clippy_net=true
   run_doc_net=true
+  run_unification=true
   run_lint=true
   run_msrv=true
   run_doc=true
@@ -271,6 +461,7 @@ if [ "$full" = true ]; then
   run_deny=true
   run_licenses=true
   run_installers=true
+  run_release_lane=true
   net_rows="$ALL_ROWS"
   net_test_args=""
   test_scope="--workspace"
@@ -292,10 +483,12 @@ net_matrix=$(rows_json "$net_rows")
   echo "net_test_args=$net_test_args"
   echo "run_clippy_net=$run_clippy_net"
   echo "run_doc_net=$run_doc_net"
+  echo "run_unification=$run_unification"
   echo "run_portable=$run_portable"
   echo "run_deny=$run_deny"
   echo "run_licenses=$run_licenses"
   echo "run_installers=$run_installers"
+  echo "run_release_lane=$run_release_lane"
   echo "test_os=$test_os"
   echo "msrv_os=$msrv_os"
   echo "test_scope=$test_scope"
@@ -306,7 +499,7 @@ net_matrix=$(rows_json "$net_rows")
   echo "event=$event full=$full"
   echo "app tests: run=$run_test scope='$test_scope' filter='${test_filter:-<all>}'"
   echo "sdk tests: run=$run_net args='${net_test_args:-<all>}'"
-  echo "lint=$run_lint msrv=$run_msrv doc=$run_doc portable=$run_portable deny=$run_deny licenses=$run_licenses installers=$run_installers"
+  echo "lint=$run_lint msrv=$run_msrv doc=$run_doc portable=$run_portable deny=$run_deny licenses=$run_licenses installers=$run_installers unification=$run_unification lane=$run_release_lane"
   if [ -n "$files" ]; then
     echo "changed files:"
     echo "$files" | sed 's/^/  /'

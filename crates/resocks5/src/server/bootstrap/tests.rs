@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::spawn;
 use tokio::sync::mpsc;
 
 use crate::logger::ELog;
@@ -629,31 +628,8 @@ fn panic_in_body_still_tears_down_bounded_and_reraises() {
         .expect("stuck blocking op must exit once released");
 }
 
-/// A drain task that never completes (sink wedged mid-write) must be
-/// given up on after the budget, not awaited forever; the timeout
-/// diagnostic must not hang either (it is itself a bounded write).
-/// Paused time lets the 5 s budget and the 1 s diagnostic budget
-/// elapse via auto-advance, proving the give-up structure returns
-/// without real wall-clock cost.
-#[tokio::test(start_paused = true)]
-async fn shutdown_drain_gives_up_on_never_completing_drain() {
-    let start = std::time::Instant::now();
-    let (tx, _rx) = mpsc::channel::<ELog>(4);
-    let logger = Arc::new(crate::logger::Logger::new(
-        tx,
-        crate::logger::LogConfig {
-            lifecycle: true,
-            ..Default::default()
-        },
-    ));
-    let drain = spawn(std::future::pending::<()>());
-    shutdown_log_drain(logger, drain).await;
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "give-up path must not wait in real time, took {:?}",
-        start.elapsed()
-    );
-}
+// The never-completing-drain give-up (5 s budget, virtual clock) is pinned in
+// `log_drain.rs`: `shutdown_drain_gives_up_exactly_at_the_budget`.
 
 #[test]
 fn all_rotators_lists_every_gate_level_then_exits() {

@@ -11,6 +11,10 @@ impl AuthState {
         *self.claim_probe.lock().expect("claim probe mutex poisoned") = Some(tx);
     }
 
+    pub(super) fn hmac_probe_count(&self) -> u64 {
+        self.hmac_probes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) fn claim_probe_emit(&self, event: &'static str) {
         let probe = self.claim_probe.lock().expect("claim probe mutex poisoned");
         if let Some(tx) = probe.as_ref() {

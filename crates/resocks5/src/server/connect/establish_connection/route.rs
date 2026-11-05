@@ -56,6 +56,9 @@ pub(crate) fn spawn_due_probes(
     let rotator = rotator.clone();
     let pool = pool.clone();
     let logger = logger.clone();
+    // Detached by design: the probe loop outlives this spawner and
+    // reports only through the rotator and the logger, so no handle is
+    // kept.
     tokio::spawn(async move {
         // At capacity the probe is deferred (review P2 №5): the endpoint
         // is saturated by real traffic, so connecting anyway would distort
@@ -65,7 +68,9 @@ pub(crate) fn spawn_due_probes(
         for event in rotator.probe_due_with(connect_timeout, reserve).await {
             match event {
                 resocks5_net::rotator::ProbeEvent::Recovered { proxy } => {
-                    logger.proxy_failure(|| {
+                    // A recovery is a lifecycle event, not a failure
+                    // (CC-10/GA-05).
+                    logger.lifecycle(|| {
                         format!(
                             "Upstream {} is reachable again - back in rotation",
                             print_cfg(&proxy)

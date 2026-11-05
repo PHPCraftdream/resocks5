@@ -311,7 +311,13 @@ async fn stall_at_connect_is_connect_stage() {
 }
 
 #[tokio::test]
-async fn socks5_stall_in_handshake() {
+async fn socks5_stall_in_greeting_is_upstream_down() {
+    // Regression for the silent-upstream decision: `dial` through a
+    // TCP-alive upstream that never answers the greeting reports
+    // Socks5Greeting and counts the upstream as down.
+    // Mutations caught: reverting the producer wiring (kind stays
+    // Socks5Handshake), or excluding Socks5Greeting from
+    // `is_upstream_down`, fails this test.
     let (l, port) = bind().await;
     let _stub = silent_stub(l);
     let o = opts().with_handshake_timeout(Duration::from_millis(150));
@@ -319,7 +325,7 @@ async fn socks5_stall_in_handshake() {
     match &err {
         ConnectError::Timeout {
             stage: Stage::Handshake,
-            kind: TimeoutKind::Socks5Handshake,
+            kind: TimeoutKind::Socks5Greeting,
             endpoint,
             after,
         } => {
@@ -328,6 +334,7 @@ async fn socks5_stall_in_handshake() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+    assert!(err.is_upstream_down());
     assert!(err
         .to_string()
         .starts_with("[SOCKS5] handshake timeout (0s) to "));

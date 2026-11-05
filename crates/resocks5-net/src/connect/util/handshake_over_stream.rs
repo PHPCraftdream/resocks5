@@ -50,7 +50,7 @@ where
 ///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
 pub async fn socks5_handshake<S>(
-    mut stream: S,
+    stream: S,
     host: &str,
     port: u16,
     auth: Option<(&str, &str)>,
@@ -61,6 +61,27 @@ where
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
+    let stream = socks5_greeting(stream, auth).await?;
+    socks5_connect_request(stream, host, port).await
+}
+
+/// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3) and,
+/// when `auth` is set, complete the RFC 1929 username/password
+/// sub-negotiation.
+///
+/// On success the stream sits right after the method-selection (or
+/// auth-status) reply, ready for [`socks5_connect_request`]. A stall in
+/// this phase means the upstream never answered its own protocol: the
+/// CONNECT request has not been sent, so the destination cannot be the
+/// cause. Producers bound this phase with
+/// [`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind).
+pub(crate) async fn socks5_greeting<S>(
+    mut stream: S,
+    auth: Option<(&str, &str)>,
+) -> Result<S, ConnectError>
+where
+    S: AsyncRead + AsyncWriteExt + Unpin,
+{
     if let Some((username, password)) = auth {
         stream.write_all(&[0x05, 0x01, 0x02]).await?;
         stream.flush().await?;
@@ -127,7 +148,28 @@ where
             });
         }
     }
+    Ok(stream)
+}
 
+/// Send the SOCKS5 CONNECT request for `host:port` (RFC 1928 §5) and read
+/// the reply through the end of the bound address.
+///
+/// On success the stream sits right after the CONNECT reply, ready for
+/// payload. A stall waiting for the reply may still be the destination's
+/// fault — the upstream has already relayed the CONNECT — so producers
+/// classify it as plain
+/// [`TimeoutKind::Socks5Handshake`](crate::error::TimeoutKind).
+pub(crate) async fn socks5_connect_request<S>(
+    mut stream: S,
+    host: &str,
+    port: u16,
+) -> Result<S, ConnectError>
+where
+    S: AsyncRead + AsyncWriteExt + Unpin,
+{
+    if host.is_empty() || port == 0 {
+        return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
+    }
     let (atyp, addr_bytes) = if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
         (0x01, ipv4.octets().to_vec())
     } else if let Ok(ipv6) = host.parse::<Ipv6Addr>() {

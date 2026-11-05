@@ -1,10 +1,11 @@
+use super::writer_tests::{acquired, spawn_saver};
 use super::*;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use resocks5_net::rating::{QuarantinePolicy, RatingPolicy};
 use resocks5_net::types::ProxyConfig;
 
-const NOW: u64 = 1_000_000;
+pub(super) const NOW: u64 = 1_000_000;
 
 pub(super) fn rotator(proxies: Vec<ProxyConfig>) -> Arc<ProxyRotator> {
     Arc::new(
@@ -188,7 +189,7 @@ fn restore_puts_quarantine_probation_and_the_countdown_back() {
         entry("socks5://d:1080", 0, STATE_ALIVE, 0, 0),
     ]);
     // 30 s of downtime: a keeps 70 s, b ran out and goes to probation.
-    let restored = restore(&[group("v4", r.clone())], &saved, NOW + 30);
+    let restored = restore(&[group("v4", r.clone())], &saved, NOW + 30).0;
     assert_eq!(
         restored,
         Restored {
@@ -236,7 +237,7 @@ fn unknown_upstreams_and_states_are_skipped() {
         entry("socks5://b:1080", 0, STATE_ALIVE, 0, 0),
     ]);
     assert_eq!(
-        restore(&[group("v4", r.clone())], &saved, NOW),
+        restore(&[group("v4", r.clone())], &saved, NOW).0,
         Restored::default()
     );
     assert!(r
@@ -254,7 +255,8 @@ fn same_address_at_another_gate_level_is_a_different_upstream() {
         &[group("v4", plain.clone()), group("gate2", gate.clone())],
         &saved,
         NOW,
-    );
+    )
+    .0;
     assert_eq!(restored.total(), 1);
     assert!(!plain.is_quarantined(&p("x")));
     assert!(gate.is_quarantined(&p("x").with_gate_level(2)));
@@ -278,7 +280,7 @@ fn the_same_upstream_in_two_groups_keeps_two_health_cells() {
     )]);
     let both = [group("v6", v6.clone()), group("v4", v4.clone())];
     assert_eq!(
-        restore(&both, &seeded, NOW).quarantined,
+        restore(&both, &seeded, NOW).0.quarantined,
         1,
         "only the v6 cell takes the record"
     );
@@ -302,7 +304,8 @@ fn the_same_upstream_in_two_groups_keeps_two_health_cells() {
                     &[group("v4", fresh_v4.clone()), group("v6", fresh_v6.clone())],
                     &loaded,
                     NOW,
-                ),
+                )
+                .0,
                 "v4 first",
             )
         } else {
@@ -311,7 +314,8 @@ fn the_same_upstream_in_two_groups_keeps_two_health_cells() {
                     &[group("v6", fresh_v6.clone()), group("v4", fresh_v4.clone())],
                     &loaded,
                     NOW,
-                ),
+                )
+                .0,
                 "v6 first",
             )
         };
@@ -353,7 +357,8 @@ fn an_old_record_without_a_group_applies_to_every_matching_group() {
         &[group("v6", a.clone()), group("v4", b.clone())],
         &loaded,
         NOW,
-    );
+    )
+    .0;
     assert_eq!(
         restored.quarantined, 2,
         "both groups take the legacy record"
@@ -374,7 +379,10 @@ fn a_different_user_at_the_same_address_is_a_different_upstream() {
         500,
         1,
     )]);
-    assert_eq!(restore(&[group("v4", r)], &saved, NOW), Restored::default());
+    assert_eq!(
+        restore(&[group("v4", r)], &saved, NOW).0,
+        Restored::default()
+    );
 }
 
 #[test]
@@ -509,7 +517,7 @@ fn signature_changes_when_only_the_group_differs() {
     );
 }
 
-async fn settle() {
+pub(super) async fn settle() {
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -542,17 +550,14 @@ async fn the_saver_writes_on_change_and_stays_quiet_otherwise() {
     let path = dir.join("health.ktav");
     let r = rotator(vec![p("a"), p("b")]);
     let (log, _rx) = logger();
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let handle = tokio::spawn(run_saver(
+    let (handle, stop, _lock) = spawn_saver(
         vec![group("v4", r.clone())],
-        path.clone(),
+        &path,
         Duration::from_secs(10),
         None,
         log,
-        Arc::clone(&stop),
-    ));
-    // The task creates its interval at the current (paused) time: let it start first.
-    settle().await;
+    )
+    .await;
 
     tokio::time::advance(Duration::from_secs(11)).await;
     until(|| path.exists()).await;
@@ -586,17 +591,14 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
     r.record_hard_failure(&p("a"));
     let initial = snapshot(&[group("v4", r.clone())], NOW);
     let (log, _rx) = logger();
-    let stop = Arc::new(tokio::sync::Notify::new());
-    let handle = tokio::spawn(run_saver(
+    let (handle, stop, _lock) = spawn_saver(
         vec![group("v4", r)],
-        path.clone(),
+        &path,
         Duration::from_secs(10),
         Some(initial),
         log,
-        Arc::clone(&stop),
-    ));
-    // The task creates its interval at the current (paused) time: let it start first.
-    settle().await;
+    )
+    .await;
     tokio::time::advance(Duration::from_secs(25)).await;
     settle().await;
     assert!(!path.exists());
@@ -613,6 +615,10 @@ async fn a_failing_save_is_logged_once_and_retried() {
     let r = rotator(vec![p("a")]);
     let (log, mut rx) = logger();
     let stop = Arc::new(tokio::sync::Notify::new());
+    // The lock sits on the existing directory: the saver's path has no
+    // parent yet — that is the injected failure.
+    let lock = acquired(&dir);
+    let started = Arc::new(tokio::sync::Notify::new());
     let handle = tokio::spawn(run_saver(
         vec![group("v4", r)],
         path.clone(),
@@ -620,9 +626,11 @@ async fn a_failing_save_is_logged_once_and_retried() {
         None,
         log,
         Arc::clone(&stop),
+        Arc::clone(&lock),
+        Some(Arc::clone(&started)),
     ));
-    // The task creates its interval at the current (paused) time: let it start first.
-    settle().await;
+    // Explicit first-tick acknowledgement instead of settle() yields.
+    started.notified().await;
 
     for _ in 0..3 {
         tokio::time::advance(Duration::from_secs(10)).await;
@@ -666,7 +674,7 @@ async fn the_final_snapshot_writes_a_loadable_file() {
     let r = rotator(vec![p("a")]);
     r.record_hard_failure(&p("a"));
     let (log, _rx) = logger();
-    save_final(&[group("v4", r)], &path, &log).await;
+    save_final(&[group("v4", r)], &path, &log, acquired(&path)).await;
     let loaded = load(&path).unwrap().unwrap();
     assert_eq!(loaded.upstreams[0].state, STATE_QUARANTINED);
     assert!(loaded.saved_at > 0);
@@ -677,13 +685,16 @@ async fn the_final_snapshot_writes_a_loadable_file() {
 async fn a_final_snapshot_into_a_missing_directory_only_warns() {
     let dir = unique_dir("save_final_bad");
     let r = rotator(vec![p("a")]);
-    let (log, _rx) = logger();
-    save_final(
-        &[group("v4", r)],
-        &dir.join("no_such_dir").join("health.ktav"),
-        &log,
-    )
-    .await;
+    let (log, mut rx) = logger();
+    let path = dir.join("no_such_dir").join("health.ktav");
+    save_final(&[group("v4", r)], &path, &log, acquired(&dir)).await;
+    // The failure is reported, not raised, and nothing is created.
+    let lines = drain(&mut rx).join(
+        "
+",
+    );
+    assert!(lines.contains("could not save"), "warned: {lines:?}");
+    assert!(!path.exists() && !dir.join("no_such_dir").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

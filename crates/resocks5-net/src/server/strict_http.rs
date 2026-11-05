@@ -46,30 +46,54 @@ fn valid_authority_host(host: &str) -> bool {
     true
 }
 
-/// 1-5 ASCII digits: the strict `Host` port shape.
-fn valid_port_digits(port: &str) -> bool {
-    !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+/// RFC 3986 IPvFuture literal inside the brackets:
+/// `v 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`.
+fn valid_ipv_future(inside: &str) -> bool {
+    let bytes = inside.as_bytes();
+    if bytes.first() != Some(&b'v') {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+        i += 1;
+    }
+    // 1*HEXDIG, then the mandatory version separator.
+    if i == 1 || bytes.get(i) != Some(&b'.') {
+        return false;
+    }
+    // 1*( unreserved / sub-delims / ":" ): `is_authority_host_byte` is exactly
+    // unreserved + sub-delims.
+    i += 1;
+    i < bytes.len()
+        && bytes[i..]
+            .iter()
+            .all(|&byte| is_authority_host_byte(byte) || byte == b':')
 }
 
-/// Strict `Host` grammar: `uri-host [ ":" port ]`, mirroring the CONNECT
-/// authority rules with a 1-5 digit port; a bare IPv6 without brackets
-/// has no valid port separator and fails.
+/// Strict `Host` grammar (RFC 9110 section 7.2, RFC 3986):
+/// `Host = uri-host [ ":" port ]` with `port = *DIGIT` — an empty port and
+/// any number of digits are valid, and the port is NOT range-checked (the
+/// 1..=65535 rule is the CONNECT authority policy, not Host syntax).
+/// `uri-host` is a bracketed IPv6 address, an RFC 3986 IPvFuture literal, or
+/// an IPv4/reg-name via `valid_authority_host`.
 fn valid_host_value(value: &str) -> bool {
     if let Some(rest) = value.strip_prefix('[') {
         let Some((inside, after)) = rest.split_once(']') else {
             return false;
         };
-        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+        if !(inside.parse::<std::net::Ipv6Addr>().is_ok() || valid_ipv_future(inside)) {
             return false;
         }
         return match after.strip_prefix(':') {
-            Some(port) => valid_port_digits(port),
+            Some(port) => port.bytes().all(|b| b.is_ascii_digit()),
             None => after.is_empty(),
         };
     }
     match value.split_once(':') {
         Some((host, port)) => {
-            !host.is_empty() && valid_authority_host(host) && valid_port_digits(port)
+            !host.is_empty()
+                && valid_authority_host(host)
+                && port.bytes().all(|b| b.is_ascii_digit())
         }
         None => !value.is_empty() && valid_authority_host(value),
     }

@@ -5,6 +5,12 @@ use std::fmt;
 use super::proxy_config::ProxyConfig;
 use super::ProxyProtocol;
 
+/// Maximum number of nodes a proxy chain may have (outermost gate first,
+/// exit last). [`ProxyConfig::validate`] rejects longer chains: they only
+/// arise from `with_gate`/`chain` loops by accident, and every nested
+/// `gate` link deepens the recursive drop.
+pub const MAX_CHAIN_NODES: usize = 64;
+
 /// Which credential field a validation error refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -55,6 +61,11 @@ pub enum ProxyConfigError {
     },
     /// `is_gate` does not match `gate_level > 0`.
     InconsistentGateFlag,
+    /// The chain has more than [`MAX_CHAIN_NODES`] nodes.
+    ChainTooLong {
+        /// The enforced maximum.
+        max: usize,
+    },
 }
 
 impl fmt::Display for ProxyConfigError {
@@ -104,6 +115,9 @@ impl fmt::Display for ProxyConfigError {
             }
             ProxyConfigError::InconsistentGateFlag => {
                 write!(f, "is_gate does not match gate_level")
+            }
+            ProxyConfigError::ChainTooLong { max } => {
+                write!(f, "proxy chain exceeds the maximum of {max} nodes")
             }
         }
     }
@@ -193,7 +207,11 @@ impl ProxyConfig {
     /// Validate this entry only (not its gate links).
     ///
     /// Checks run in a fixed order and the first failing check wins:
-    /// host, port, gate flag, then credentials.
+    /// host, port, gate flag, then credentials. This is the strict gate
+    /// for host/port forms that
+    /// [`parse_proxy_str`](crate::connect::parse_proxy_str) still accepts
+    /// (whitespace-padded hosts, a zero port); dial functions never call
+    /// it.
     pub fn validate_node(&self) -> Result<(), ProxyConfigError> {
         if self.host.is_empty() {
             return Err(ProxyConfigError::EmptyHost);
@@ -216,8 +234,20 @@ impl ProxyConfig {
 
     /// Validate every node of the chain, outermost first; the error
     /// carries the index of the first bad node.
+    ///
+    /// Chains longer than [`MAX_CHAIN_NODES`] are rejected up front; the
+    /// error then reports node 0, since no single node is at fault.
     pub fn validate(&self) -> Result<(), ChainConfigError> {
-        for (index, node) in self.nodes().iter().enumerate() {
+        let nodes = self.nodes();
+        if nodes.len() > MAX_CHAIN_NODES {
+            return Err(ChainConfigError {
+                node: 0,
+                kind: ProxyConfigError::ChainTooLong {
+                    max: MAX_CHAIN_NODES,
+                },
+            });
+        }
+        for (index, node) in nodes.iter().enumerate() {
             if let Err(kind) = node.validate_node() {
                 return Err(ChainConfigError { node: index, kind });
             }

@@ -401,7 +401,7 @@ mod tests {
         let u = UsersConfig {
             users: vec![User {
                 name: "bob".into(),
-                hash: "$argon2id$v=19$m=5120,t=2,p=1$abc$def".into(),
+                hash: "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into(),
                 is_enabled: true,
                 direct: false,
                 allowed_clients: None,
@@ -457,7 +457,7 @@ mod tests {
         let u = UsersConfig {
             users: vec![User {
                 name: "alice".into(),
-                hash: "$argon2id$v=19$m=5120,t=2,p=1$abc$def".into(),
+                hash: "$argon2id$v=19$m=19456,t=2,p=1$abc$def".into(),
                 is_enabled: true,
                 direct: false,
                 allowed_clients: None,
