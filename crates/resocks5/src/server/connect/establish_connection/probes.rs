@@ -498,9 +498,17 @@ mod tests {
     #[test]
     fn outcome_applies_only_through_the_live_claim() {
         let proxy = proxy("a", 9);
-        let rotator = rotator(proxy.clone());
+        // Short quarantine so the slot reaches probation within the test.
+        let rotator = rotator_with_policy(
+            proxy.clone(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_millis(50))
+                .with_max(Duration::from_millis(50)),
+        );
         let logger = logger();
         rotator.quarantine_now(&proxy);
+        std::thread::sleep(Duration::from_millis(80));
         let claims = rotator.take_probe_claims();
         assert_eq!(claims.len(), 1);
         assert!(outcome(&rotator, &claims[0], true, &logger));
@@ -509,6 +517,7 @@ mod tests {
         assert!(!rotator.is_quarantined(&proxy));
         // A fresh claim after a re-trip applies again.
         rotator.quarantine_now(&proxy);
+        std::thread::sleep(Duration::from_millis(80));
         let claims = rotator.take_probe_claims();
         assert_eq!(claims.len(), 1);
         assert!(outcome(&rotator, &claims[0], false, &logger));

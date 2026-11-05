@@ -209,7 +209,7 @@ impl ProxyConfig {
     /// Checks run in a fixed order and the first failing check wins:
     /// host, port, gate flag, then credentials. This is the strict gate
     /// for host/port forms that
-    /// [`parse_proxy_str`](crate::connect::parse_proxy_str) still accepts
+    /// [`parse_proxy_str`](fn@crate::connect::parse_proxy_str) still accepts
     /// (whitespace-padded hosts, a zero port); dial functions never call
     /// it.
     pub fn validate_node(&self) -> Result<(), ProxyConfigError> {

@@ -463,9 +463,9 @@ async fn a_parked_final_write_keeps_the_lock_after_finish_returned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// Regression pin for (A): the shared lock is held exactly while a blocking
-// write is in flight — a contender is refused then, and admitted the
-// moment the write commits; no clone is kept forever.
+// Regression pin for (A): a contender is refused while a blocking write is
+// in flight (and while the saver lives), and admitted once the saver has
+// finished and the write has committed; no clone is kept forever.
 #[tokio::test]
 async fn the_lock_is_ours_again_right_after_a_round_write_completes() {
     let dir = unique_dir("park_hold_release");
@@ -492,9 +492,9 @@ async fn the_lock_is_ours_again_right_after_a_round_write_completes() {
     park.release();
     disarm_write_park(&path);
     until(|| path.exists()).await;
-    UsersFileLock::acquire_with_timeout(&path, Duration::from_millis(200))
-        .expect("the completed write released the lock");
     saver.finish(&[group("v4", r)], &path).await;
+    UsersFileLock::acquire_with_timeout(&path, Duration::from_millis(200))
+        .expect("the finished saver and its writes released the lock");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -533,7 +533,7 @@ async fn a_failed_commit_forces_a_rewrite_when_the_picture_returns() {
     r.record_hard_failure(&p("a"));
     tokio::time::advance(Duration::from_secs(10)).await;
     until(|| {
-        matches!(load(&path), Ok(Some(ref file)) if file.upstreams[0].state == STATE_QUARANTINED)
+        matches!(load(&path), Ok(Some(ref file)) if file.upstreams.first().is_some_and(|u| u.state == STATE_QUARANTINED))
     })
     .await;
     let mut saw_failure = false;
@@ -553,7 +553,7 @@ async fn a_failed_commit_forces_a_rewrite_when_the_picture_returns() {
     // anyway, over the published-but-uncommitted content.
     r.record_success(&p("a"));
     tokio::time::advance(Duration::from_secs(10)).await;
-    until(|| matches!(load(&path), Ok(Some(ref file)) if file.upstreams[0].state == STATE_ALIVE))
+    until(|| matches!(load(&path), Ok(Some(ref file)) if file.upstreams.first().is_some_and(|u| u.state == STATE_ALIVE)))
         .await;
     stop.notify_one();
     handle.await.unwrap();
@@ -592,7 +592,7 @@ async fn a_failed_commit_that_removed_the_target_still_rewrites() {
     // Back to the baseline picture: the write must recreate the file.
     r.record_success(&p("a"));
     tokio::time::advance(Duration::from_secs(10)).await;
-    until(|| matches!(load(&path), Ok(Some(ref file)) if file.upstreams[0].state == STATE_ALIVE))
+    until(|| matches!(load(&path), Ok(Some(ref file)) if file.upstreams.first().is_some_and(|u| u.state == STATE_ALIVE)))
         .await;
     stop.notify_one();
     handle.await.unwrap();

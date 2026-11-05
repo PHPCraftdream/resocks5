@@ -197,6 +197,10 @@ impl Ratings {
     /// applied failure (re-)tripped the quarantine; `None` when the claim
     /// was stale (nothing changed) or the applied failure did not trip.
     pub fn record_hard_failure_for(&self, claim: &ProbeClaim) -> Option<Duration> {
+        self.record_hard_failure_for_at(claim, Instant::now())
+    }
+
+    fn record_hard_failure_for_at(&self, claim: &ProbeClaim, now: Instant) -> Option<Duration> {
         let mut inner = self.inner.lock().unwrap();
         if claim.index >= inner.cells.len() {
             return None;
@@ -204,7 +208,6 @@ impl Ratings {
         if inner.quarantine[claim.index].generation() != claim.token {
             return None;
         }
-        let now = Instant::now();
         if self.policy.enabled() {
             inner.cells[claim.index].observe_failure(now, &self.policy);
         }
@@ -748,7 +751,9 @@ mod quarantine_tests {
 
         // P1's late success: stale — dropped, the new quarantine stands.
         assert!(!r.record_success_for(&old));
-        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Quarantined);
+        // Re-quarantined at t1 for 30 s, so at t2 the slot is on probation
+        // (leased to the fresh claim) and still counts as tripped.
+        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Probation);
         assert_eq!(r.health_at(t2)[0].trips, 1);
         // P1's late hard failure: stale too — dropped.
         assert_eq!(r.record_hard_failure_for(&old), None);
@@ -772,8 +777,9 @@ mod quarantine_tests {
         let claim = r.take_probe_claims_at(t1).pop().unwrap();
         r.on_failure(0);
         r.on_failure(0);
+        // Evaluated at the probe's own instant, like the rest of this table.
         assert_eq!(
-            r.record_hard_failure_for(&claim),
+            r.record_hard_failure_for_at(&claim, t1),
             Some(Duration::from_secs(60))
         );
     }

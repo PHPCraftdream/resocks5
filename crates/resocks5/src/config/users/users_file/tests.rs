@@ -439,6 +439,9 @@ fn the_sentinel_holds_exactly_one_pid_line_across_acquisitions() {
     let sentinel = sibling_path(&path, ".lock");
     for round in 0..5 {
         let lock = UsersFileLock::acquire_with_timeout(&path, Duration::from_secs(1)).unwrap();
+        // Windows refuses reads through another handle while the byte-range
+        // lock is held: look at the sentinel after releasing it.
+        drop(lock);
         assert_eq!(
             fs::read_to_string(&sentinel).unwrap(),
             format!("{}\n", std::process::id()),
@@ -446,7 +449,6 @@ fn the_sentinel_holds_exactly_one_pid_line_across_acquisitions() {
         );
         let len = fs::metadata(&sentinel).unwrap().len();
         assert!(len <= 16, "round {round}: sentinel grew to {len} bytes");
-        drop(lock);
     }
     cleanup(&path);
 }

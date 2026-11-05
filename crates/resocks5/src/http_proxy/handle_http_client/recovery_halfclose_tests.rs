@@ -238,6 +238,9 @@ async fn client_reset_still_ends_the_session_promptly() {
 
     // Close with the 200 still unread: the kernel sends a RST instead
     // of a FIN.
+    // The reply must really sit unread in the client socket, or the close
+    // is a plain FIN (the server task may not have written it yet).
+    client.readable().await.unwrap();
     drop(client);
 
     let started = std::time::Instant::now();

@@ -356,8 +356,9 @@ mod tests {
     }
 
     /// Mutation caught: reverting `Debug` to the recursive
-    /// `gate: Some(...)` rendering makes `gate: ` appear once per nested
-    /// node instead of exactly once.
+    /// `gate: Some(...)` rendering makes `, gate: ` (the field, not the
+    /// `is_gate: ` of each node) appear once per nested node instead of
+    /// exactly once.
     #[test]
     fn debug_renders_the_gate_chain_flat_not_nested() {
         let inner = config("203.0.113.3", 1082, None, None);
@@ -368,7 +369,7 @@ mod tests {
             .as_gate()
             .with_gate(mid);
         let rendered = format!("{root:?}");
-        assert_eq!(rendered.matches("gate: ").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches(", gate: ").count(), 1, "{rendered}");
         assert!(rendered.contains("gate: [ProxyConfig"), "{rendered}");
         // Every node exactly once: the exit is the printed struct itself,
         // the list holds the gates only (outermost first).
@@ -396,7 +397,7 @@ mod tests {
             .stack_size(256 * 1024)
             .spawn(move || {
                 let rendered = format!("{cfg:?}");
-                assert_eq!(rendered.matches("gate: ").count(), 1, "{rendered}");
+                assert_eq!(rendered.matches(", gate: ").count(), 1, "{rendered}");
                 assert!(rendered.contains("gate: [ProxyConfig"), "{rendered}");
                 assert_eq!(cfg.chain_len(), 64);
             })
