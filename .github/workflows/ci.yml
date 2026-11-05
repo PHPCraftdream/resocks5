@@ -122,9 +122,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-lane
-      - run: cargo test --release -p resocks5 handle_client::
-      - run: cargo test --release -p resocks5 allowed_clients::
-      - run: cargo test --release -p resocks5 print_config_docs::
+      - run: "cargo test --release -p resocks5 handle_client::"
+      - run: "cargo test --release -p resocks5 allowed_clients::"
+      - run: "cargo test --release -p resocks5 print_config_docs::"
 
   lint:
     name: fmt + clippy
