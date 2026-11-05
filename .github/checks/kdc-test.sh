@@ -95,6 +95,18 @@ until grep -q '^READY' "$root/interop.out" 2>/dev/null; do
     [ "$tries" -lt 30 ] || { echo "kdc-test: interop server did not start" >&2; cat "$root/interop.err" >&2; exit 1; }
     sleep 1
 done
+python3 -c 'import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 1082))
+s.listen(1)
+c, _ = s.accept()
+print("greeting:", c.recv(64).hex(), flush=True)
+c.sendall(bytes([5, 1]))
+print("after reply:", c.recv(64).hex(), flush=True)' > "$root/greeting.out" 2>&1 &
+sleep 1
+curl -sS --max-time 5 --socks5-hostname "$host:1082" --socks5-gssapi-service socks "http://target.test:80/" > /dev/null 2>&1 || true
+cat "$root/greeting.out"
 body=$(curl -sS -v --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks     "http://target.test:80/" 2> "$root/curl.err") || {
     echo "kdc-test: curl failed" >&2
     cat "$root/curl.err" "$root/interop.out" "$root/interop.err" >&2
