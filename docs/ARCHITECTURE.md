@@ -259,6 +259,11 @@ Tor), connected to `ProxyConfig::outermost()`. All three attribute errors by
 `ChainStage`. Every SOCKS5 reply is validated strictly: a non-zero reserved byte
 or an empty bound domain is a `ProtocolViolation` counted against the upstream.
 
+Inbound framing lives in the SDK too (`server::accept`, used by both listeners).
+Its opt-in `ServerOptions` (`strict_http`, `raw_credentials`, `retain_credentials`)
+default to the permissive behaviour the application relies on and the application
+does not enable them; hosts such as pluggable-transport front ends do.
+
 `server/connect/establish_connection` obtains picks from the plan and passes
 complete-chain configs to `connect_chain`. `ChainPlan::record_failure` and
 `ChainPlan::record_success` account for outcomes. `ChainStage::Connect` attributes

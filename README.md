@@ -562,7 +562,8 @@ The networking core is published as a separate crate,
 connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credential
 storage, logging and routing policy stay in the host application.
 Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
-existing stream, `dial_chain_over`, needs 0.4.1), or as a
+existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate` and the
+opt-in inbound options need 0.4.2), or as a
 git dependency to follow unreleased changes:
 
 ```toml

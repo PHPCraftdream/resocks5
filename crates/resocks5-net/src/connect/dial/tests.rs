@@ -214,6 +214,23 @@ async fn socks5_auth_rejected() {
     stub.await.unwrap();
 }
 
+/// Dial skips validation entirely: a config with only a username set is
+/// invalid per `validate_node`, yet dials anonymously (no auth in greeting).
+#[tokio::test]
+async fn socks5_half_credentials_dial_anonymously() {
+    let (l, port) = bind().await;
+    let stub = socks5_stub(l, None, 0x05, 0);
+    let mut proxy = ProxyConfig::socks5("127.0.0.1", port);
+    proxy.user = Some("only-user".to_string());
+    assert_eq!(
+        proxy.validate_node(),
+        Err(crate::types::ProxyConfigError::IncompleteCredentials)
+    );
+    let up = dial_guarded(&proxy, "1.2.3.4", 80, &opts()).await.unwrap();
+    expect_ok_payload(up).await;
+    stub.await.unwrap();
+}
+
 #[tokio::test]
 async fn socks5_rep_nonzero_is_proxy_rejected() {
     let (l, port) = bind().await;

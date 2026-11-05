@@ -37,6 +37,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["std", "tl
 webpki-roots = "0.26"
 dashmap = "6"
 crossbeam-queue = "0.3"
+zeroize = "1"
 # Application-only.
 chrono = "0.4"
 regex = "1.11.1"

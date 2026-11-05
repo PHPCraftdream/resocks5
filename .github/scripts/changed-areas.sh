@@ -29,7 +29,7 @@ base=${2:-}
 head=${3:?head}
 marker=${4:-}
 
-ALL_ROWS="lean pool tls pool-tls serde rating rotator test-instrumentation default all"
+ALL_ROWS="lean pool tls pool-tls serde rating rotator zeroize test-instrumentation default all"
 
 row_args() {
   case "$1" in
@@ -40,6 +40,7 @@ row_args() {
     serde) echo "--no-default-features --features serde" ;;
     rating) echo "--no-default-features --features rating" ;;
     rotator) echo "--no-default-features --features rotator" ;;
+    zeroize) echo "--no-default-features --features zeroize" ;;
     test-instrumentation) echo "--no-default-features --features test-instrumentation" ;;
     default) echo "" ;;
     all) echo "--all-features" ;;

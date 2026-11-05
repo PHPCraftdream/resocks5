@@ -79,6 +79,10 @@ storage, or egress policy. Inbound authentication is supplied by the host closur
   upstream selection. Connector/pool-only consumers can opt out for a
   smaller public API and less to compile. Unlike `tls` and `serde` this
   removes no dependency — both modules are `std` only.
+- `zeroize` (off by default): wipes inbound credentials from memory when
+  `server::Credentials` and `server::IncomingRequest` are dropped (the
+  `zeroize` crate, already part of the TLS dependency tree). Outbound
+  `ProxyConfig` credentials are plain public `String` fields and are not wiped.
 
 ## Inbound server API
 
@@ -136,15 +140,19 @@ Contracts:
   access is allowed; supplied credentials fail when no password capability exists.
 - HTTP request line and headers are limited to 16KiB **including** `\r\n\r\n`.
   Unused headers remain bytes and accept obs-text. Basic credentials require UTF-8;
-  only the first auth header is used. Existing permissive `HTTP/` version parsing and
-  ignored SOCKS RSV are retained, not advertised as strict RFC validation.
+  only the first auth header is used. By default the parser stays permissive (any
+  `HTTP/…` version, no `Host` requirement, bare IPv6 authority, ignored SOCKS RSV in
+  requests); `ServerOptions::strict_http(true)` opts in to RFC 9112 validation.
 - `take_pipeline()` transfers exact owned HTTP over-read bytes once; remaining bytes
   stay on the stream. SOCKS consumes exactly its frame. Forward the prefix before
   reading/relaying further data. Failure or cancellation during a partial write is
   terminal, never a reason to replay the prefix.
-- `reply` maps Established/Forbidden/UpstreamUnavailable/GeneralFailure/Overloaded
-  to protocol-specific outcomes. GeneralFailure uses SOCKS REP 1 / HTTP 502,
-  distinct from admission overload (HTTP 503). Parsing never sends tunnel success.
+- `reply` maps Established/Forbidden/UpstreamUnavailable/ConnectionRefused/
+  NetworkUnreachable/TimedOut/GeneralFailure/Overloaded to protocol-specific
+  outcomes: SOCKS REP 0/2/4/5/3/6/1/1 and HTTP 200/403/502/502/502/504/502/503.
+  The host picks the variant (it knows whether the dial was refused or timed out).
+  GeneralFailure uses SOCKS REP 1 / HTTP 502, distinct from admission overload
+  (HTTP 503). Parsing never sends tunnel success.
   Hosts doing early-success recovery must not send another protocol reply afterward.
   Every completed protocol response uses `write_all` followed by `flush`, including
   method selection, password success/failure, refusals and public final replies.
@@ -162,7 +170,55 @@ Contracts:
   flush did not. Successful flushing is not a peer acknowledgement.
   Authentication side effects (such as admitted blocking password persistence) may
   finish after cancellation; the host retains its own admission permits accordingly.
-  Credentials' Debug is redacted; transport encryption is not supplied here.
+  `Debug` of `Credentials` and of `IncomingRequest` is redacted (no username,
+  password or pipeline bytes), and `ServerError::Authentication` texts never
+  contain submitted credentials; transport encryption is not supplied here.
+
+### Inbound options
+
+All options are opt-in builders on `ServerOptions`; the defaults keep the
+behaviour described above.
+
+- `retain_credentials(true)`: `accept` keeps a copy of the verified credentials;
+  `IncomingRequest::take_credentials()` hands them over once. Without it no
+  password outlives the authentication closure. `take_username()` moves the
+  verified username out of the request.
+- `raw_credentials(true)`: SOCKS5 UNAME/PASSWD that are not valid UTF-8 are
+  accepted and exposed as exact bytes (`Credentials::username_bytes()`,
+  `password_bytes()`, `is_utf8()`; `IncomingRequest::username_bytes()`). This
+  serves clients that split one UTF-8 string across the two RFC 1929 fields at the
+  255-byte limit (pluggable-transport arguments). `username()`/`password()`
+  stay `&str`: lossy for non-UTF-8 fields, do not use them for identity then.
+  HTTP Basic is unchanged (still UTF-8 only); zero-length fields stay refused.
+- `strict_http(true)`: RFC 9112 validation of the CONNECT request before any
+  authentication: exactly `method SP target SP HTTP/d.d`, versions other than
+  1.0/1.1 answer 505, authority-form with bracketed IPv6 and a 1..=65535 numeric
+  port, exactly one non-empty `Host` for HTTP/1.1, header names that are tokens
+  with no whitespace before the colon, no obs-fold, and at most one
+  `Proxy-Authorization`. Violations answer 400/505 and return
+  `ServerError::Protocol` with a fixed reason; the authentication closure is not
+  called. Many real clients omit `Host` or send HTTP/1.0, so it is off by default.
+- `IncomingRequest::into_prefixed(stream)` wraps the stream in
+  `server::Prefixed<S>`, which serves the over-read pipeline bytes before the
+  stream itself (writes pass through), instead of forwarding `take_pipeline()` by
+  hand.
+
+```text
+use resocks5_net::server::{accept, ServerOptions};
+use resocks5_net::types::ProxyConfig;
+
+// Check an entry before storing or dialing it.
+let proxy = ProxyConfig::socks5("198.51.100.7", 1080).try_with_auth("user", "pass")?;
+proxy.validate()?;
+
+let options = ServerOptions::new(deadline, false, true)
+    .retain_credentials(true)
+    .raw_credentials(true)
+    .strict_http(true);
+let mut req = accept(&mut client, &options, |c| async move { /* verify */ true }).await?;
+let credentials = req.take_credentials();   // exact bytes via username_bytes()/password_bytes()
+let mut stream = req.into_prefixed(client); // pipelined bytes first, then the socket
+```
 
 
 ## Usage
@@ -313,6 +369,16 @@ these dial/connect functions derives a route from `gate_level`; use
 to build explicit links. `ChainError` provides the underlying `ConnectError` and `ChainStage`:
 `Connect` is outer TCP, `Hop(i)` is node i tunnelling to node i+1, and
 `Target` is the exit.
+
+`ProxyConfig::validate()` checks a whole chain (outermost first) and
+`validate_node()` one entry, without any I/O: non-empty host, port 1..=65535,
+`is_gate` consistent with `gate_level`, credentials set as a pair, SOCKS5
+username/password 1..=255 bytes each (RFC 1929), and for HTTP/HTTPS no `:` in
+the username and no control characters (RFC 7617). `try_with_auth` is the
+fallible `with_auth`. Errors (`ProxyConfigError`, `ChainConfigError` with the
+failing node index) name the rule only, never a host or a credential value. The
+dial and connect functions do not call it: a half-set pair is still sent
+anonymously, so validate when you build or load a config.
 
 `dial_chain_over` runs that chain on a caller-supplied owning stream (for
 example, a Tor stream) already connected to `proxy.outermost()`; it performs

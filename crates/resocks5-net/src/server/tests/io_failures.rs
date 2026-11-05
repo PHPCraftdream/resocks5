@@ -242,8 +242,10 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
                 drop(stream); // No replay after transport failure.
             }
             for protocol in [Protocol::Socks5, Protocol::Http] {
-                for reply in [Reply::Established, Reply::Forbidden, Reply::UpstreamUnavailable, Reply::GeneralFailure, Reply::Overloaded] {
+                for reply in [Reply::Established, Reply::Forbidden, Reply::UpstreamUnavailable, Reply::ConnectionRefused, Reply::NetworkUnreachable, Reply::TimedOut, Reply::GeneralFailure, Reply::Overloaded] {
                     let req = IncomingRequest {
+                    username_raw: None,
+                    credentials: None,
                         protocol, target: "h:1".into(), username: None, pipeline: Vec::new(),
                     };
                     let (_peer, inner) = duplex(64);
@@ -327,6 +329,8 @@ async fn host_budget_cancels_final_flush_without_replay() {
     timeout(Duration::from_secs(10), async {
         for protocol in [Protocol::Socks5, Protocol::Http] {
             let req = IncomingRequest {
+                username_raw: None,
+                credentials: None,
                 protocol,
                 target: "h:1".into(),
                 username: None,

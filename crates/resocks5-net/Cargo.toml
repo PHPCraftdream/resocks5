@@ -52,6 +52,9 @@ default = ["pool", "tls", "serde", "rating", "rotator"]
 # a default feature, so ordinary release builds compile the counter
 # to nothing.
 test-instrumentation = ["rotator"]
+# Wipe inbound credentials (`server::Credentials`, the retained username of
+# `server::IncomingRequest`) from memory when they are dropped. Off by default.
+zeroize = ["dep:zeroize"]
 
 # The README-mirrored example rotates through `ProxyRotator` and dials via
 # the pool, so it is only built when the rotator and pool are compiled in;
@@ -77,6 +80,7 @@ rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

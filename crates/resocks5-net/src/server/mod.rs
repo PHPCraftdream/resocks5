@@ -19,7 +19,22 @@ use crate::connect::HostPort;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const AUTH_FAILURE: &[u8] = &[1, 1];
-const RESP_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+mod credentials;
+
+pub use credentials::Credentials;
+
+mod reply;
+
+pub use reply::Reply;
+
+use reply::{http_error, reply_bytes};
+
+mod prefixed;
+
+pub use prefixed::Prefixed;
+
+mod strict_http;
 
 /// Independent authentication capabilities and the host-supplied absolute deadline.
 ///
@@ -30,6 +45,9 @@ pub struct ServerOptions {
     deadline: Instant,
     anonymous: bool,
     password: bool,
+    retain_credentials: bool,
+    raw_credentials: bool,
+    strict_http: bool,
 }
 
 impl ServerOptions {
@@ -40,31 +58,34 @@ impl ServerOptions {
             deadline,
             anonymous: allow_anonymous,
             password: allow_password,
+            retain_credentials: false,
+            raw_credentials: false,
+            strict_http: false,
         }
     }
-}
 
-/// Owned UTF-8 credentials supplied at most once per handshake.
-/// Debug deliberately reveals neither username nor password.
-pub struct Credentials {
-    username: String,
-    password: String,
-}
-
-impl Credentials {
-    /// Submitted username, without normalization.
-    pub fn username(&self) -> &str {
-        &self.username
+    /// Default off. When on, `accept` keeps a copy of the verified credentials in the returned request.
+    pub fn retain_credentials(mut self, retain: bool) -> Self {
+        self.retain_credentials = retain;
+        self
     }
-    /// Submitted password, without normalization.
-    pub fn password(&self) -> &str {
-        &self.password
-    }
-}
 
-impl fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Credentials { username: [REDACTED], password: [REDACTED] }")
+    /// Default off. When on, SOCKS5 UNAME/PASSWD that are not valid UTF-8 are
+    /// accepted and exposed as raw bytes (`Credentials::username_bytes`). The
+    /// RFC 1929 1..255 length limits still apply. HTTP Basic is unchanged: a
+    /// non-UTF-8 `Proxy-Authorization` payload is still a 407 regardless of
+    /// this flag.
+    pub fn raw_credentials(mut self, raw: bool) -> Self {
+        self.raw_credentials = raw;
+        self
+    }
+
+    /// Default off. When on, the HTTP CONNECT request is validated against
+    /// RFC 9112; violations are answered with the HTTP status below and
+    /// `ServerError::Protocol`.
+    pub fn strict_http(mut self, strict: bool) -> Self {
+        self.strict_http = strict;
+        self
     }
 }
 
@@ -78,29 +99,26 @@ pub enum Protocol {
     Http,
 }
 
-/// Host-selected final tunnel response; parsing itself never sends success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Reply {
-    /// Egress is ready, or the host deliberately begins early-success recovery.
-    Established,
-    /// Target policy rejected the request (SOCKS REP 2 / HTTP 403).
-    Forbidden,
-    /// Egress failed (SOCKS REP 4 / HTTP 502).
-    UpstreamUnavailable,
-    /// Egress failed without a more specific cause (SOCKS REP 1 / HTTP 502).
-    GeneralFailure,
-    /// Host admission cap reached (SOCKS REP 1 / HTTP 503).
-    Overloaded,
-}
-
 /// An authenticated, unresolved request and the exact payload already consumed.
-#[derive(Debug)]
 pub struct IncomingRequest {
     protocol: Protocol,
     target: String,
     username: Option<String>,
+    username_raw: Option<Vec<u8>>,
+    credentials: Option<Credentials>,
     pipeline: Vec<u8>,
+}
+
+impl fmt::Debug for IncomingRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IncomingRequest")
+            .field("protocol", &self.protocol)
+            .field("target", &self.target)
+            .field("has_username", &self.username.is_some())
+            .field("has_credentials", &self.credentials.is_some())
+            .field("pipeline_len", &self.pipeline.len())
+            .finish()
+    }
 }
 
 impl IncomingRequest {
@@ -126,6 +144,30 @@ impl IncomingRequest {
     pub fn take_pipeline(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pipeline)
     }
+
+    /// Retained credentials, if `retain_credentials(true)` was set and password auth
+    /// ran; hands ownership to the caller. Second call: `None`.
+    pub fn take_credentials(&mut self) -> Option<Credentials> {
+        self.credentials.take()
+    }
+
+    /// Moves the verified username out; afterwards `username()` is `None`. Independent
+    /// of retained credentials (they keep their own copy until taken or dropped).
+    /// Anonymous: `None`.
+    pub fn take_username(&mut self) -> Option<String> {
+        let taken = self.username.take();
+        self.username_raw = None;
+        taken
+    }
+
+    /// Exact verified identity bytes; `None` for anonymous or after
+    /// [`Self::take_username`]. For a non-UTF-8 UNAME these are the raw
+    /// submitted bytes (the `username()` text is then lossy).
+    pub fn username_bytes(&self) -> Option<&[u8]> {
+        self.username
+            .as_ref()
+            .map(|username| self.username_raw.as_deref().unwrap_or(username.as_bytes()))
+    }
     /// Write and flush the host's tunnel outcome. Call once, before forwarding payload.
     /// Never send another protocol reply after early success.
     ///
@@ -137,18 +179,7 @@ impl IncomingRequest {
         stream: &mut S,
         reply: Reply,
     ) -> Result<(), ServerError> {
-        let bytes: &[u8] = match (self.protocol, reply) {
-            (Protocol::Socks5, Reply::Established) => &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-            (Protocol::Socks5, Reply::Forbidden) => &[5, 2, 0, 1, 0, 0, 0, 0, 0, 0],
-            (Protocol::Socks5, Reply::UpstreamUnavailable) => &[5, 4, 0, 1, 0, 0, 0, 0, 0, 0],
-            (Protocol::Socks5, Reply::GeneralFailure) => &[5, 1, 0, 1, 0, 0, 0, 0, 0, 0],
-            (Protocol::Socks5, Reply::Overloaded) => &[5, 1, 0, 1, 0, 0, 0, 0, 0, 0],
-            (Protocol::Http, Reply::Established) => b"HTTP/1.1 200 Connection Established\r\n\r\n",
-            (Protocol::Http, Reply::Forbidden) => http_error(403),
-            (Protocol::Http, Reply::UpstreamUnavailable) => http_error(502),
-            (Protocol::Http, Reply::GeneralFailure) => http_error(502),
-            (Protocol::Http, Reply::Overloaded) => http_error(503),
-        };
+        let bytes = reply_bytes(self.protocol, reply);
         stream.write_all(bytes).await?;
         stream.flush().await.map_err(ServerError::Io)
     }
@@ -286,7 +317,8 @@ where
     };
     stream.write_all(&[5, chosen]).await?;
     stream.flush().await?;
-    let username = if chosen == 2 {
+    let mut retained = None;
+    let (username, username_raw) = if chosen == 2 {
         let mut header = [0; 2];
         stream.read_exact(&mut header).await?;
         if header[0] != 1 {
@@ -314,32 +346,51 @@ where
         }
         let mut password = vec![0; usize::from(plen)];
         stream.read_exact(&mut password).await?;
-        let user = match String::from_utf8(user) {
-            Ok(s) => s,
-            Err(_) => return auth_fail(stream, "Invalid UTF-8 in username").await,
+        let (username, username_raw) = if options.raw_credentials {
+            match String::from_utf8(user.clone()) {
+                Ok(text) => (text, None),
+                Err(_) => (String::from_utf8_lossy(&user).into_owned(), Some(user)),
+            }
+        } else {
+            match String::from_utf8(user) {
+                Ok(text) => (text, None),
+                Err(_) => return auth_fail(stream, "Invalid UTF-8 in username").await,
+            }
         };
-        let password = match String::from_utf8(password) {
-            Ok(s) => s,
-            Err(_) => return auth_fail(stream, "Invalid UTF-8 in password").await,
+        let (password, password_raw) = if options.raw_credentials {
+            match String::from_utf8(password.clone()) {
+                Ok(text) => (text, None),
+                Err(_) => (
+                    String::from_utf8_lossy(&password).into_owned(),
+                    Some(password),
+                ),
+            }
+        } else {
+            match String::from_utf8(password) {
+                Ok(text) => (text, None),
+                Err(_) => return auth_fail(stream, "Invalid UTF-8 in password").await,
+            }
         };
-        let identity = user.clone();
-        if !authenticate(Credentials {
-            username: user,
+        let identity = username.clone();
+        let credentials = Credentials::with_raw(
+            username.clone(),
             password,
-        })
-        .await
-        {
+            username_raw.clone(),
+            password_raw,
+        );
+        retained = options.retain_credentials.then(|| credentials.duplicate());
+        if !authenticate(credentials).await {
             stream.write_all(AUTH_FAILURE).await?;
             stream.flush().await?;
-            return Err(ServerError::Authentication(format!(
-                "Auth failed for user '{identity}'"
-            )));
+            return Err(ServerError::Authentication(
+                "SOCKS5 username/password authentication failed".into(),
+            ));
         }
         stream.write_all(&[1, 0]).await?;
         stream.flush().await?;
-        Some(identity)
+        (Some(identity), username_raw)
     } else {
-        None
+        (None, None)
     };
     let mut header = [0; 4];
     stream.read_exact(&mut header).await?;
@@ -403,6 +454,8 @@ where
         protocol: Protocol::Socks5,
         target,
         username,
+        username_raw,
+        credentials: retained,
         pipeline: Vec::new(),
     })
 }
@@ -414,19 +467,6 @@ async fn auth_fail<T, S: AsyncWrite + Unpin>(
     stream.write_all(AUTH_FAILURE).await?;
     stream.flush().await?;
     Err(ServerError::Authentication(message.into()))
-}
-
-fn http_error(status: u16) -> &'static [u8] {
-    match status {
-        400 => b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        403 => b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        407 => RESP_407,
-        431 => b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        501 => b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        502 => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        503 => b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        _ => unreachable!("private HTTP response status"),
-    }
 }
 
 async fn http_fail<T, S: AsyncWrite + Unpin>(
@@ -515,6 +555,18 @@ where
             }
         },
     };
+    let header_lines: Vec<&[u8]> = lines.collect();
+    if options.strict_http {
+        if let Err(violation) = strict_http::validate(request_line, &header_lines) {
+            let (status, reason) = match violation {
+                strict_http::StrictViolation::Bad(reason) => (400u16, reason),
+                strict_http::StrictViolation::Unsupported => {
+                    (505u16, "strict HTTP: unsupported HTTP-version")
+                }
+            };
+            return http_fail(stream, status, ServerError::Protocol(reason.into())).await;
+        }
+    }
     let mut parts = request_line.splitn(3, ' ');
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -558,8 +610,9 @@ where
         )
         .await;
     }
+    let mut retained = None;
     let mut auth_value = None;
-    for line in lines {
+    for line in header_lines {
         if line.is_empty() {
             continue;
         }
@@ -640,16 +693,13 @@ where
                 .await;
             }
             let identity = user.to_owned();
-            if !authenticate(Credentials {
-                username: identity.clone(),
-                password: password.to_owned(),
-            })
-            .await
-            {
+            let credentials = Credentials::new(identity.clone(), password.to_owned());
+            retained = options.retain_credentials.then(|| credentials.duplicate());
+            if !authenticate(credentials).await {
                 return http_fail(
                     stream,
                     407,
-                    ServerError::Authentication(format!("HTTP auth failed for user {identity:?}")),
+                    ServerError::Authentication("HTTP proxy authentication failed".into()),
                 )
                 .await;
             }
@@ -673,8 +723,33 @@ where
         protocol: Protocol::Http,
         target: target.to_owned(),
         username,
+        username_raw: None,
+        credentials: retained,
         pipeline,
     })
+}
+
+#[cfg(feature = "zeroize")]
+impl IncomingRequest {
+    /// Overwrite retained secret material in place; the pipeline is payload and stays.
+    pub(crate) fn wipe(&mut self) {
+        if let Some(username) = &mut self.username {
+            zeroize::Zeroize::zeroize(username);
+        }
+        if let Some(raw) = &mut self.username_raw {
+            zeroize::Zeroize::zeroize(raw);
+        }
+        if let Some(credentials) = &mut self.credentials {
+            credentials.wipe();
+        }
+    }
+}
+
+#[cfg(feature = "zeroize")]
+impl Drop for IncomingRequest {
+    fn drop(&mut self) {
+        self.wipe();
+    }
 }
 
 #[cfg(test)]

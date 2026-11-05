@@ -99,6 +99,52 @@ async fn dial_chain_over_example() {
     read_ok(stream).await;
 }
 
+/// README "Inbound options" example: validate a config, accept with the opt-in
+/// options, take the retained credentials, read the pipeline through `Prefixed`.
+#[tokio::test]
+async fn inbound_options_example() {
+    use resocks5_net::server::{accept, ServerOptions};
+
+    let proxy = ProxyConfig::socks5("198.51.100.7", 1080)
+        .try_with_auth("user", "pass")
+        .unwrap();
+    proxy.validate().unwrap();
+
+    // CONNECT with Basic auth and an over-read payload in the same write.
+    let basic = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode("user:pass")
+    };
+    let request = format!(
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic {basic}\r\n\r\nEARLY"
+    );
+    let (mut peer, mut client) = tokio::io::duplex(4096);
+    peer.write_all(request.as_bytes()).await.unwrap();
+    peer.write_all(b"LATER").await.unwrap();
+    drop(peer);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let options = ServerOptions::new(deadline, false, true)
+        .retain_credentials(true)
+        .raw_credentials(true)
+        .strict_http(true);
+    let mut req = accept(&mut client, &options, |c| async move {
+        c.username() == "user" && c.password() == "pass"
+    })
+    .await
+    .unwrap();
+    assert_eq!(req.target(), "example.com:443");
+    let credentials = req.take_credentials().expect("credentials retained");
+    assert_eq!(credentials.username_bytes(), b"user");
+    assert_eq!(credentials.password_bytes(), b"pass");
+    assert!(credentials.is_utf8());
+
+    let mut stream = req.into_prefixed(client);
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(rest, b"EARLYLATER");
+}
+
 /// `connect::connect_proxy_once` example.
 #[tokio::test]
 async fn connect_proxy_once_example() {

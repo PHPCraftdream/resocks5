@@ -15,7 +15,8 @@ use resocks5_net::connect::{
     connect_proxy_once, dial, dial_chain, dial_plain, handshake_over_stream, socks5_handshake,
     AnyUpstream, ChainError, DialOptions, UpstreamStream,
 };
-use resocks5_net::types::ProxyConfig;
+use resocks5_net::server::{accept, Credentials, IncomingRequest, Prefixed, ServerOptions};
+use resocks5_net::types::{ChainConfigError, ProxyConfig, ProxyConfigError};
 use resocks5_net::ConnectError;
 use tokio::io::DuplexStream;
 
@@ -48,6 +49,14 @@ fn errors_cross_threads_and_tasks() {
 fn config_types_are_shareable() {
     assert_send_sync::<ProxyConfig>();
     assert_send_sync::<DialOptions>();
+}
+
+#[test]
+fn validation_errors_are_shareable() {
+    assert_send_sync::<ProxyConfigError>();
+    assert_send_sync::<ChainConfigError>();
+    assert_send_static::<ProxyConfigError>();
+    assert_send_static::<ChainConfigError>();
 }
 
 #[allow(dead_code)]
@@ -157,5 +166,101 @@ fn pool_api_is_send() {
         None,
         &resocks5_net::connect::HedgeOptions::default(),
         |_| {},
+    ));
+}
+
+#[test]
+fn prefixed_wrappers_are_send_and_unpin() {
+    assert_send::<Prefixed<tokio::net::TcpStream>>();
+    assert_unpin::<Prefixed<tokio::net::TcpStream>>();
+    assert_send::<Prefixed<DuplexStream>>();
+    assert_unpin::<Prefixed<DuplexStream>>();
+}
+
+/// `into_prefixed` is usable from a spawned `Send + 'static` task.
+#[allow(dead_code)]
+fn into_prefixed_inside_spawned_task_is_spawnable() {
+    fn spawnable<F: Future + Send + 'static>(_: F)
+    where
+        F::Output: Send + 'static,
+    {
+    }
+
+    spawnable(async move {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let opts = ServerOptions::new(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            true,
+            false,
+        );
+        let request = accept(&mut server, &opts, |_| async { true }).await;
+        if let Ok(req) = request {
+            let mut prefixed = req.into_prefixed(server);
+            use tokio::io::AsyncWriteExt;
+            prefixed.write_all(b"ok").await.ok();
+        }
+        drop(client);
+    });
+}
+
+#[test]
+fn credentials_and_requests_stay_send() {
+    assert_send::<Credentials>();
+    assert_send::<IncomingRequest>();
+}
+
+/// The `accept` future with `retain_credentials(true)` stays `Send` when the closure is.
+#[allow(dead_code)]
+fn retained_credentials_accept_future_is_send() {
+    let (mut duplex, _) = tokio::io::duplex(1024);
+    let opts = ServerOptions::new(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        false,
+        true,
+    )
+    .retain_credentials(true);
+    future_is_send(resocks5_net::server::accept(
+        &mut duplex,
+        &opts,
+        |credentials| async move {
+            credentials.username() == "user" && credentials.password() == "password"
+        },
+    ));
+}
+
+/// The `accept` future with `raw_credentials(true)` stays `Send` when the closure is.
+#[allow(dead_code)]
+fn raw_credentials_accept_future_is_send() {
+    let (mut duplex, _) = tokio::io::duplex(1024);
+    let opts = ServerOptions::new(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        false,
+        true,
+    )
+    .raw_credentials(true);
+    future_is_send(resocks5_net::server::accept(
+        &mut duplex,
+        &opts,
+        |credentials| async move {
+            credentials.username_bytes() == b"user".as_slice()
+                && credentials.password_bytes() == b"password".as_slice()
+        },
+    ));
+}
+
+/// The `accept` future with `strict_http(true)` stays `Send` when the closure is.
+#[allow(dead_code)]
+fn strict_http_accept_future_is_send() {
+    let (mut duplex, _) = tokio::io::duplex(1024);
+    let opts = ServerOptions::new(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        false,
+        true,
+    )
+    .strict_http(true);
+    future_is_send(resocks5_net::server::accept(
+        &mut duplex,
+        &opts,
+        |credentials| async move { credentials.username() == "user" },
     ));
 }

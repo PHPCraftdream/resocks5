@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net`: `ProxyConfig::validate()`, `validate_node()` and
+  `try_with_auth()` with the typed `ProxyConfigError`, `ChainConfigError` and
+  `CredentialField`: host, port, gate flag, credential pairing, SOCKS5 1..=255 byte
+  fields (RFC 1929) and HTTP Basic rules (no `:` in the username, no control
+  characters, RFC 7617). No I/O, no values in error texts; the dial functions are
+  unchanged.
+- `resocks5-net`: `server::Reply::{ConnectionRefused, NetworkUnreachable, TimedOut}`
+  (SOCKS5 REP 5 / 3 / 6, HTTP 502 / 502 / 504).
+- `resocks5-net`: `server::Prefixed<S>` and `IncomingRequest::into_prefixed(stream)`
+  serve the over-read request bytes before the stream.
+- `resocks5-net`: `ServerOptions::retain_credentials`,
+  `IncomingRequest::take_credentials` / `take_username` and
+  `Credentials::into_parts`.
+- `resocks5-net`: `ServerOptions::raw_credentials` with
+  `Credentials::{username_bytes, password_bytes, is_utf8}` and
+  `IncomingRequest::username_bytes`: SOCKS5 UNAME/PASSWD that are not valid UTF-8
+  (a character split across the two fields at 255 bytes) are accepted as bytes.
+- `resocks5-net`: `ServerOptions::strict_http`: opt-in RFC 9112 validation of the
+  CONNECT request (bracketed IPv6, numeric port, HTTP/1.0 and 1.1 only with 505
+  otherwise, a single `Host`, token header names, no obs-fold, one
+  `Proxy-Authorization`); the default stays permissive.
+- `resocks5-net`: optional feature `zeroize` wipes inbound credentials on drop.
+
+### Changed
+
+- `resocks5-net`: `ServerError::Authentication` texts no longer contain the
+  submitted username, and `Debug` of `IncomingRequest` no longer prints the
+  username or the pipeline bytes (`has_username`, `has_credentials` and
+  `pipeline_len` instead).
+
 ## [0.4.1] - 2026-11-02
 
 ### Added
