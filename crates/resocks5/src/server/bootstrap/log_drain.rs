@@ -294,6 +294,23 @@ mod tests {
         );
     }
 
+    /// The production sink really writes to the process stderr and returns
+    /// within its bound (no hang, no panic). Mutation: replacing the bounded
+    /// async write with a never-completing future fails the outer timeout.
+    #[tokio::test]
+    async fn the_production_stderr_sink_completes_within_its_bound() {
+        tokio::time::timeout(
+            Duration::from_secs(DIAGNOSTIC_TIMEOUT_SEC + 3),
+            StderrDiagnostics.emit(
+                "log drain diagnostic (test)
+"
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("the stderr diagnostic must return");
+    }
+
     /// Records the paused-clock instant of the first diagnostic.
     struct StampEmit {
         at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,

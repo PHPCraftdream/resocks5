@@ -672,12 +672,13 @@ async fn a_quarantine_countdown_alone_writes_nothing() {
         log,
     )
     .await;
-    for _ in 0..3 {
+    // One tick per advance; every tick is decided as "unchanged": a write
+    // leaves the count short and `until` panics (no sleeping on a blocking
+    // write).
+    for round in 1..=3u64 {
         tokio::time::advance(Duration::from_secs(10)).await;
+        until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= round).await;
     }
-    // Every tick was decided as "unchanged": a write would leave the count
-    // short and `until` panics (no sleeping on a blocking write).
-    until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= 3).await;
     assert!(!path.exists(), "passage of time alone must not write");
     stop.notify_one();
     handle.await.unwrap();

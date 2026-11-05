@@ -601,10 +601,14 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
         log,
     )
     .await;
-    tokio::time::advance(Duration::from_secs(25)).await;
-    // Both ticks must have been skipped as unchanged (not merely "no file
-    // yet"): a write would leave the count short.
-    until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= 2).await;
+    // One tick per advance (the interval delays missed ticks, so a single
+    // long jump would be one tick). Each tick must be skipped as unchanged,
+    // not merely "no file yet": a write leaves the count short and `until`
+    // panics.
+    for round in 1..=2u64 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= round).await;
+    }
     assert!(!path.exists());
     stop.notify_one();
     handle.await.unwrap();

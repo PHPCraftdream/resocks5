@@ -162,6 +162,10 @@ jobs:
       - run: sh .github/scripts/check-no-doctests.sh
       # The classifier's mapping table, executable-checked on every CI run.
       - run: sh .github/scripts/changed-areas.sh --self-test
+      # Timeouts, aggregation and release permissions, with a self-test that
+      # breaks copies of the workflows and expects each break to be caught.
+      - run: sh .github/checks/workflow-hygiene.sh
+      - run: sh .github/checks/workflow-hygiene.sh --self-test
 
   # Machine-verifies the `rust-version` declared in the workspace manifest.
   # Runs on ubuntu AND windows because some deps gate code behind cfg(windows)
@@ -295,6 +299,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc -p resocks5-net --no-default-features --no-deps --locked
       - run: cargo doc -p resocks5-net --no-default-features --features pool --no-deps --locked
+
+  # The no-provider leg of the crypto-provider contract: with rustls'
+  # `custom-provider` nothing is auto-selected, so `make_tls_connector` must
+  # panic with the documented message (the normal leg runs in net-features).
+  crypto-provider-contract:
+    name: crypto provider contract (no-provider graph)
+    needs: changes
+    if: needs.changes.outputs.run_net == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: provider-contract
+      - name: expect the documented panic
+        env:
+          RESOCKS5NET_PROVIDER_CONTRACT_EXPECT_PANIC: "1"
+        run: cargo test -p resocks5-net --features "tls,rustls/custom-provider" --test crypto_provider_contract --locked
 
   # tests/feature_unification is its own workspace (excluded from the root
   # one), so no job above ever compiles it. There cargo unifies `tls` and
@@ -449,6 +473,7 @@ jobs:
       - net-features
       - clippy-net-lean
       - doc-net-lean
+      - crypto-provider-contract
       - feature-unification
       - portable-builds
       - deny

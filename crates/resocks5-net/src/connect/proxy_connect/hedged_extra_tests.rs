@@ -265,3 +265,14 @@ fn hedge_error_source_exposes_last_error_only() {
     };
     assert!(empty.source().is_none());
 }
+
+/// Deterministic pin of the tick decision (the end-to-end test above catches
+/// the missing `won` check only probabilistically). Mutations: ignoring `won`
+/// fails the third row, ignoring `slot_busy` the second.
+#[test]
+fn a_hedge_tick_launches_only_when_idle_and_not_won() {
+    assert!(tick_may_launch(false, false), "idle, no win: launch");
+    assert!(!tick_may_launch(true, false), "a handshake is running");
+    assert!(!tick_may_launch(false, true), "a win was published");
+    assert!(!tick_may_launch(true, true));
+}

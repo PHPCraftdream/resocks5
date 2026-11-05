@@ -617,6 +617,29 @@ fn decode_raw_field_returns_exact_pairs() {
     assert_eq!(raw.as_deref(), Some(b"ab\xff".as_slice()));
 }
 
+/// The helper consumes the buffer: a valid field becomes the text in place and
+/// an invalid one comes back as the very same allocation, neither is copied.
+/// Mutation: going back to `String::from_utf8(raw.clone())` / cloning the
+/// bytes changes the data pointer and fails both assertions.
+#[test]
+fn decode_raw_field_does_not_copy_the_buffer() {
+    let raw = b"plain-field".to_vec();
+    let ptr = raw.as_ptr();
+    let (text, kept) = decode_raw_field(raw);
+    assert_eq!(text.as_ptr(), ptr, "valid UTF-8 must convert in place");
+    assert!(kept.is_none());
+
+    let raw = b"ab\xffcd".to_vec();
+    let ptr = raw.as_ptr();
+    let (_, kept) = decode_raw_field(raw);
+    let kept = kept.expect("invalid UTF-8 keeps the bytes");
+    assert_eq!(
+        kept.as_ptr(),
+        ptr,
+        "the exact bytes must come back without a clone"
+    );
+}
+
 /// `drop_secret` must wipe rejected credential bytes before they are freed:
 /// the witness records what its `Drop` sees, so the assertion reads live
 /// memory only. Mutation: dropping without the in-place wipe lets the buffer

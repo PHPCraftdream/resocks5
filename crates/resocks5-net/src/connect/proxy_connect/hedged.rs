@@ -226,6 +226,13 @@ async fn drain(
     }
 }
 
+/// A hedge tick launches the next candidate only beside no handshaking attempt
+/// and only while no win was published (a published win means the coordinator
+/// is about to return; a launch would be an extra connection nobody uses).
+fn tick_may_launch(slot_busy: bool, won: bool) -> bool {
+    !slot_busy && !won
+}
+
 /// Next hedge-tick deadline. `None` arms no timer: a delay too large for the
 /// monotonic clock behaves as "never hedge" instead of panicking on overflow.
 fn hedge_deadline(opts: &HedgeOptions, pending_len: usize) -> Option<tokio::time::Instant> {
@@ -352,7 +359,7 @@ where
                 // A tick does not launch beside a handshaking attempt or
                 // once a win was published.
                 let slot_busy = race.handshake_slot.try_lock().is_err();
-                if !slot_busy && !race.won.load(Ordering::Acquire) {
+                if tick_may_launch(slot_busy, race.won.load(Ordering::Acquire)) {
                     if let Some((index, proxy)) = pending.next() {
                         launch(&mut running, &mut launched, index, proxy, race.clone(), target.clone(), pool.clone(), opts.handshake_timeout, tls.clone());
                     }
