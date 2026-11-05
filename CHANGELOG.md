@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by
+  default), SOCKS5 private method 0x80: the password never crosses the wire. The
+  server stores a per-user Argon2id salt, parameters and the derived key `K`
+  (`UserSecret`, behind the `SecretStore` trait); a login is a mutual HMAC-SHA256
+  challenge-response over `K` with fresh nonces on both sides, so a recorded
+  exchange cannot be replayed and a server without `K` cannot pass. Unknown users
+  get a decoy (`DecoyKey`) indistinguishable from a wrong password; the client
+  refuses server parameters below its floor (`KdfParams::DEFAULT`, 19 MiB / t=2 /
+  p=1) and above hard limits.
+- `resocks5-net`: init enrollment for `secure_auth`: a user stored as "waiting"
+  (`StoredUser::Init`) is enrolled by its first client, which sends `K` sealed
+  with X25519 + HKDF-SHA256 + ChaCha20-Poly1305 bound to both nonces;
+  `SecretStore::claim` stores it atomically (one winner). A client enrolls only
+  with `SecureCredentials::allow_enrollment(true)`.
+- `resocks5-net`: `ProxyConfig::with_secure_auth(SecureCredentials)` — dial and
+  chain hops authenticate to a SOCKS5 upstream with secure auth;
+  `server::accept_secure(stream, options, store, decoy)` — inbound SOCKS5 with
+  method 0x80 (or 0x00), never username/password; any HTTP `Proxy-Authorization`
+  is answered 407.
+- `resocks5-net`: `ProxyConfig::from_uri` / `from_uri_with(ProxyUriOptions)` parse
+  `socks5://`, `http://`, `https://` URIs with percent-decoded credentials; the
+  typed `ProxyUriError` never carries the input.
+- `resocks5-net`: `ConnectError::suggested_reply()` maps a dial failure to the
+  `server::Reply` to send the client (SOCKS5 REP 2/3/4/5/6, HTTP 403/502/503/504).
+- `resocks5-net`: `connect::socks5_handshake_until` and
+  `http_connect_handshake_until` run a handshake under an absolute deadline and
+  fail with a typed `ConnectError::Timeout`.
+- `resocks5-net`: `server::Credentials::basic_payload()` — the whole decoded HTTP
+  Basic token, without splitting at `:`.
+
+### Changed
+
+- `resocks5-net` (**breaking**): clear-text credentials are off by default. A
+  client never sends a password in clear text (SOCKS5 username/password, HTTP
+  Basic) unless feature `cleartext-client` is on — otherwise the dial fails with
+  `ConnectError::CleartextCredentialsRefused` before any byte is sent; the server
+  (`server::accept`) never offers or accepts them unless feature
+  `cleartext-server` is on (SOCKS5 0x02 not chosen, HTTP Basic answered 407).
+- `resocks5` (**breaking**): inbound users authenticate with secure auth only.
+  SOCKS5 username/password and HTTP Basic are refused; standard clients
+  (browsers, curl) can connect only anonymously, a password needs a
+  `resocks5-net` client (`ProxyConfig::with_secure_auth`). HTTP CONNECT has no
+  password authentication. Upstream proxy credentials work as before.
+- `resocks5`: `users[].hash` keeps the Argon2id v19 PHC form; it is now read as
+  the secure-auth key. Hashes written by earlier versions are exactly that, so
+  existing accounts keep working with the same password. A stored value in
+  another format, or derived below m=19456,t=2,p=1 (default clients refuse it),
+  is reported at startup; reset it with `users set-password`.
+- `resocks5`: `hash: init` accounts are claimed by the first enrolling client
+  (only the sealed key travels); concurrent first logins have exactly one winner,
+  the others are denied. A user filtered by `allowed_clients` is answered like a
+  wrong password and cannot claim an init account.
+
+### Removed
+
+- `resocks5`: the server-side password verify path and its in-memory password
+  cache: the server neither receives nor holds passwords and never runs Argon2
+  for a login.
+
 ## [0.5.0] - 2026-11-05
 
 ### Added

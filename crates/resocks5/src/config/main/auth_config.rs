@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthConfig {
     /// When `true`, the server advertises SOCKS5 method `0x00`
-    /// (no-authentication) alongside any user/password method, so a
+    /// (no-authentication) alongside secure auth (method `0x80`), so a
     /// client without credentials can connect anonymously. The HTTP
     /// CONNECT path mirrors the same policy — no Proxy-Authorization
     /// required. When `false`, only authenticated clients are accepted.

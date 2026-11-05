@@ -722,18 +722,14 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
- "dashmap",
- "getrandom",
  "ktav",
  "regex",
  "resocks5-net",
  "rpassword",
  "serde",
  "socket2",
- "subtle",
  "tokio",
  "tokio-rustls",
- "zeroize",
 ]
 
 [[package]]

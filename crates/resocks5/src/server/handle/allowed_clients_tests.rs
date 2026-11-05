@@ -5,7 +5,9 @@
 //! Observable boundary без внешнего upstream: rotators = None, target
 //! `blocked.invalid:443` запрещён banned-regex'ом → допущенный клиент
 //! получает 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); недопущенный —
-//! обычный auth failure (407 / [1,1]) или закрытие без единого байта.
+//! обычный auth failure (secure auth `Denied` / 407) или закрытие без
+//! единого байта. Пароли — только secure auth (SOCKS5 0x80); HTTP Basic и
+//! SOCKS5 UNAME/PASSWD отклоняются всегда.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +18,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::handle_client::handle_client;
+use crate::auth::test_support::{creds, enrolling};
 use crate::auth::AuthState;
 use crate::config::{AllowedClients, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
+use resocks5_net::secure_auth::{client_authenticate, METHOD};
 use resocks5_net::server::ServerError;
+use resocks5_net::SecureAuthError;
 use tokio::time::{timeout, Instant};
 
 const BANNED: &str = "^blocked[.]invalid:443$";
@@ -41,7 +46,7 @@ enum Protocol {
 enum Expect {
     /// Глобальный фильтр: закрытие без единого байта ответа.
     GlobalDeny,
-    /// Обычный отказ аутентификации: [1,1] / 407.
+    /// Обычный отказ аутентификации: secure auth `Denied` / 407.
     AuthFail,
     /// Фильтры пройдены, дошли до routing: 403 / reply Forbidden.
     RouteBanned,
@@ -84,8 +89,8 @@ fn test_logger() -> Arc<crate::logger::Logger> {
     ))
 }
 
-/// Собрать AuthState и прогнать один обмен; вернуть auth для проверок
-/// кеша. Сетевая часть выполняется в [`run_case_with_auth`].
+/// Собрать AuthState и прогнать один обмен. Сетевая часть выполняется в
+/// [`run_case_with_auth`].
 async fn run_case(c: Case) -> Arc<AuthState> {
     let Case {
         protocol,
@@ -115,8 +120,7 @@ async fn run_case(c: Case) -> Arc<AuthState> {
     auth
 }
 
-/// То же с уже собранным AuthState (прогрев кеша, персистентный
-/// users-файл).
+/// То же с уже собранным AuthState (персистентный users-файл).
 async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
@@ -211,15 +215,16 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
             }
         }
         (Protocol::Socks5, Expect::AuthFail) => {
-            client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-            let mut method = [0u8; 2];
-            client.read_exact(&mut method).await.unwrap();
-            assert_eq!(method, [0x05, 0x02]);
             let (u, p) = c.creds.expect("AuthFail-кейс требует credentials");
-            client.write_all(&subnegotiation(u, p)).await.unwrap();
-            let mut verdict = [0u8; 2];
-            client.read_exact(&mut verdict).await.unwrap();
-            assert_eq!(verdict, [0x01, 0x01], "аутентификация обязана отказать");
+            secure_greeting(client).await;
+            let error = client_authenticate(client, &enrolling(u, p))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SecureAuthError::Denied,
+                "аутентификация обязана отказать"
+            );
             // Сервер закрывает соединение после отказа: принимаем только
             // EOF-класс исходы, любую другую Err не глотаем.
             let mut rest = [0u8; 1];
@@ -236,14 +241,10 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
         }
         (Protocol::Socks5, Expect::RouteBanned) => {
             if let Some((u, p)) = c.creds {
-                client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-                let mut method = [0u8; 2];
-                client.read_exact(&mut method).await.unwrap();
-                assert_eq!(method, [0x05, 0x02]);
-                client.write_all(&subnegotiation(u, p)).await.unwrap();
-                let mut verdict = [0u8; 2];
-                client.read_exact(&mut verdict).await.unwrap();
-                assert_eq!(verdict, [0x01, 0x00], "валидные credentials обязаны пройти");
+                secure_greeting(client).await;
+                client_authenticate(client, &creds(u, p))
+                    .await
+                    .expect("валидные credentials обязаны пройти");
             } else {
                 client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
                 let mut method = [0u8; 2];
@@ -273,11 +274,8 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
             );
         }
         (Protocol::Http, Expect::RouteBanned) => {
-            let token = c.creds.map(|(u, p)| B64.encode(format!("{u}:{p}")));
-            client
-                .write_all(&http_connect(token.as_deref()))
-                .await
-                .unwrap();
+            assert!(c.creds.is_none(), "HTTP никогда не аутентифицирует пароль");
+            client.write_all(&http_connect(None)).await.unwrap();
             let mut response = Vec::new();
             client.read_to_end(&mut response).await.unwrap();
             assert_eq!(
@@ -289,12 +287,12 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
     }
 }
 
-fn subnegotiation(user: &str, pass: &str) -> Vec<u8> {
-    let mut out = vec![0x01, user.len() as u8];
-    out.extend_from_slice(user.as_bytes());
-    out.push(pass.len() as u8);
-    out.extend_from_slice(pass.as_bytes());
-    out
+/// SOCKS5 greeting предлагает только secure auth (0x80).
+async fn secure_greeting(client: &mut TcpStream) {
+    client.write_all(&[0x05, 0x01, METHOD]).await.unwrap();
+    let mut method = [0u8; 2];
+    client.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [0x05, METHOD]);
 }
 
 fn socks_connect() -> Vec<u8> {
@@ -315,6 +313,10 @@ fn http_connect(b64_creds: Option<&str>) -> Vec<u8> {
 
 const BOTH: [Protocol; 2] = [Protocol::Socks5, Protocol::Http];
 
+/// Кейсы с паролем: HTTP отвечает 407 на любые credentials, фильтр там
+/// ничего не различает — проверяем SOCKS5 (secure auth).
+const WITH_PASSWORD: [Protocol; 1] = [Protocol::Socks5];
+
 /// Кейс 1a: глобальный deny сильнее разрешающего пользователя.
 /// Клиент ничего не шлёт; при удалении global-фильтра 403/407 не будет —
 /// handler повиснет до protocol timeout, тест упадёт на общем таймауте
@@ -322,7 +324,7 @@ const BOTH: [Protocol; 2] = [Protocol::Socks5, Protocol::Http];
 #[tokio::test]
 async fn global_deny_beats_permissive_user() {
     for protocol in BOTH {
-        let auth = run_case(Case {
+        run_case(Case {
             protocol,
             expect: Expect::GlobalDeny,
             global_rule: Some("203.0.113.7"),
@@ -331,20 +333,15 @@ async fn global_deny_beats_permissive_user() {
             creds: Some(("alice", "pw")),
         })
         .await;
-        assert!(
-            !auth.cache_contains("alice"),
-            "запрещённый peer не должен доходить до verify (кеш пуст)"
-        );
     }
 }
 
 /// Кейс 1b: user-deny при глобальном `*` — обычный auth failure.
-/// Без user-фильтра SOCKS5 вернёт успешный verdict [1,0] вместо [1,1],
-/// а HTTP дойдёт до 403 вместо отказа 407.
+/// Без user-фильтра secure auth пройдёт вместо `Denied`.
 #[tokio::test]
 async fn user_deny_beats_global_star() {
-    for protocol in BOTH {
-        let auth = run_case(Case {
+    for protocol in WITH_PASSWORD {
+        run_case(Case {
             protocol,
             expect: Expect::AuthFail,
             global_rule: Some("*"),
@@ -353,21 +350,17 @@ async fn user_deny_beats_global_star() {
             creds: Some(("alice", "pw")),
         })
         .await;
-        assert!(
-            !auth.cache_contains("alice"),
-            "фильтр обязан сработать ДО verify: кеш паролей не заполняется"
-        );
     }
 }
 
 /// Кейсы 1c и 3: global allow + user None → доходим до routing
 /// boundary (banned target → 403/Forbidden); None не ограничивает.
-/// Counterfactual: фильтр ложно запрещает loopback — будет [1,1]/407
+/// Counterfactual: фильтр ложно запрещает loopback — будет `Denied`
 /// или закрытие.
 #[tokio::test]
 async fn global_allow_and_user_none_reach_routing_boundary() {
-    for protocol in BOTH {
-        let auth = run_case(Case {
+    for protocol in WITH_PASSWORD {
+        run_case(Case {
             protocol,
             expect: Expect::RouteBanned,
             global_rule: Some("loopback"),
@@ -376,10 +369,6 @@ async fn global_allow_and_user_none_reach_routing_boundary() {
             creds: Some(("alice", "pw")),
         })
         .await;
-        assert!(
-            auth.cache_contains("alice"),
-            "успешный verify обязан прогреть кеш паролей"
-        );
     }
 }
 
@@ -415,46 +404,88 @@ async fn anonymous_obeys_only_global_rule() {
     }
 }
 
-/// Кейс 5: прогретый кеш паролей не обходится user-фильтром. Прогрев —
-/// прямой `verify_async` без привязки к IP; проверяется, что фильтр
-/// срабатывает ДО cache-hit при обмене с запрещённого peer.
+/// Кейс 5: открытый пароль не принимается даже верный и с разрешённого
+/// peer: SOCKS5 UNAME/PASSWD не выбирается ([5,0xFF]), HTTP Basic — 407.
+/// Counterfactual: приложение на clear-text `accept` пропустило бы оба.
 #[tokio::test]
-async fn warm_cache_does_not_bypass_user_filter() {
-    let auth = Arc::new(
-        AuthState::build(
-            &crate::config::AuthConfig {
-                allow_anonymous: false,
-            },
-            &UsersConfig {
-                users: vec![user("alice", "pw", Some("203.0.113.9"), false)],
-            },
-            "unused",
-        )
-        .unwrap(),
-    );
-    // Прогрев: hash известен, пароль в кеше.
-    assert!(auth.verify_async("alice", "pw").await);
-    assert!(auth.cache_contains("alice"));
-
+async fn a_cleartext_password_is_never_accepted() {
     for protocol in BOTH {
-        run_case_with_auth(
-            &Case {
-                protocol,
-                expect: Expect::AuthFail,
-                global_rule: Some("*"),
-                users: Vec::new(), // auth собран отдельно
-                allow_anonymous: false,
-                creds: Some(("alice", "pw")),
-            },
-            auth.clone(),
-        )
-        .await;
+        let auth = Arc::new(
+            AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: false,
+                },
+                &UsersConfig {
+                    users: vec![user("alice", "pw", None, false)],
+                },
+                "unused",
+            )
+            .unwrap(),
+        );
+        let request = match protocol {
+            Protocol::Socks5 => vec![0x05, 0x01, 0x02],
+            Protocol::Http => http_connect(Some(&B64.encode("alice:pw"))),
+        };
+        let response = exchange_raw(auth, &request).await;
+        match protocol {
+            Protocol::Socks5 => assert_eq!(response, [0x05, 0xFF], "0x02 не выбирается"),
+            Protocol::Http => assert!(
+                response.starts_with(b"HTTP/1.1 407 "),
+                "ожидался 407, получено: {:?}",
+                String::from_utf8_lossy(&response)
+            ),
+        }
     }
-    // Отказ дан фильтром, а не провалом verify: кеш остался на месте.
-    assert!(
-        auth.cache_contains("alice"),
-        "прогретый кеш не должен быть испорчен"
-    );
+}
+
+/// Один обмен: клиент пишет `request` и читает всё до закрытия.
+async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
+    let logger = test_logger();
+    let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
+    let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(1),
+        1,
+    ));
+    let frag = Arc::new(TlsFragmentConfig::default());
+    let network = Arc::new(NetworkConfig::default());
+    let direct_limiter = Arc::new(tokio::sync::Semaphore::new(8));
+    let no_gates = Arc::new(GateLevels::default());
+    let no_rotator: Option<Arc<ProxyRotator>> = None;
+    timeout(Duration::from_secs(8), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let handler = handle_client(
+            stream,
+            &auth,
+            &no_gates,
+            &no_rotator,
+            &no_rotator,
+            &logger,
+            &banned,
+            &pool,
+            &frag,
+            &network,
+            None,
+            &direct_limiter,
+            &None,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let leg = async {
+            client.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            let _ = client.read_to_end(&mut response).await;
+            response
+        };
+        let (handler_res, response) = tokio::join!(handler, leg);
+        assert!(handler_res.is_err(), "открытый пароль обязан дать ошибку");
+        response
+    })
+    .await
+    .expect("общий таймаут 8с на обмен")
 }
 
 /// Кейс 6: direct-пользователь подчиняется фильтру; запрещённый IP
@@ -462,7 +493,7 @@ async fn warm_cache_does_not_bypass_user_filter() {
 /// Counterfactual: убрать user-фильтр — запрос ушёл бы в direct-ветку.
 #[tokio::test]
 async fn direct_user_denied_before_direct_paths() {
-    for protocol in BOTH {
+    for protocol in WITH_PASSWORD {
         run_case(Case {
             protocol,
             expect: Expect::AuthFail,
@@ -475,9 +506,9 @@ async fn direct_user_denied_before_direct_paths() {
     }
 }
 
-/// Кейс 7: user с hash='init' и фильтром, исключающим peer: валидные-looking
-/// credentials дают обычный auth failure; init-claim НЕ происходит —
-/// users-файл на диске байт-в-байт не меняется, кеш не заполняется.
+/// Кейс 7: user с hash='init' и фильтром, исключающим peer: регистрация
+/// даёт обычный auth failure; init-claim НЕ происходит — users-файл на
+/// диске байт-в-байт не меняется.
 /// Counterfactual: убрать user-фильтр — claim прошёл бы, файл изменился бы,
 /// тест упал бы на сравнении байтов и на исходе.
 #[tokio::test]
@@ -535,7 +566,6 @@ async fn user_filter_blocks_init_claim() {
             before, after,
             "запрещённый peer не должен инициировать init-claim (файл неизменен)"
         );
-        assert!(!auth.cache_contains("bob"));
     }
     let _ = std::fs::remove_file(&path);
 }
