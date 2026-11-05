@@ -1,8 +1,11 @@
 //! The `;gssapi=` option of an upstream list entry.
 
+#[cfg(not(feature = "gssapi-system"))]
 use resocks5_net::types::ProxyProtocol;
 
-use super::startup::{parse_proxy_list_checked, split_gssapi_option};
+#[cfg(not(feature = "gssapi-system"))]
+use super::startup::parse_proxy_list_checked;
+use super::startup::split_gssapi_option;
 
 /// The option is split off the end only; credentials with a semicolon, and an
 /// empty option, stay part of the entry. Mutation: splitting at the first

@@ -149,7 +149,7 @@ impl GssBackend for SystemBackend {
 }
 
 /// Real Kerberos: needs a KDC, a keytab and a ticket. Run by the
-/// `gssapi-system` CI job (`.github/scripts/kdc-test.sh`), which sets
+/// `gssapi-system` CI job (`.github/checks/kdc-test.sh`), which sets
 /// `KRB5_CONFIG`, `KRB5CCNAME` (a TGT for `GSS_TEST_PRINCIPAL`) and
 /// `KRB5_KTNAME` (the key of `socks/localhost`).
 #[cfg(test)]

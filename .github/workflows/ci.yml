@@ -323,7 +323,7 @@ jobs:
   # The Kerberos backend links the platform GSS-API (libkrb5) and needs its
   # headers and libclang, so it is outside the `--all-features`-style rows above;
   # this job builds it, lints it, and runs the real-Kerberos tests against a
-  # throwaway MIT KDC (.github/scripts/kdc-test.sh).
+  # throwaway MIT KDC (.github/checks/kdc-test.sh).
   gssapi-system:
     name: gssapi (real Kerberos)
     needs: changes
@@ -346,7 +346,7 @@ jobs:
       - run: cargo clippy -p resocks5 --features gssapi-system --all-targets --locked -- -D warnings
       # The app's GSSAPI account mapping, on the mock mechanism.
       - run: cargo test -p resocks5 --features gssapi --locked gssapi
-      - run: sh .github/scripts/kdc-test.sh
+      - run: sh .github/checks/kdc-test.sh
 
   # tests/feature_unification is its own workspace (excluded from the root
   # one), so no job above ever compiles it. There cargo unifies `tls` and

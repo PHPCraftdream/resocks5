@@ -129,7 +129,11 @@ pub(super) fn parse_proxy_list_checked(
 /// credentials and the upstream prefers it. Splits the option off the entry.
 pub(super) fn split_gssapi_option(line: &str) -> (&str, Option<&str>) {
     match line.rsplit_once(";gssapi=") {
-        Some((entry, service)) if !service.is_empty() => (entry, Some(service)),
+        // A service name is `service@host`: never empty, no `:` (a credential
+        // or a port after the marker means it was not the option).
+        Some((entry, service)) if !service.is_empty() && !service.contains(':') => {
+            (entry, Some(service))
+        }
         _ => (line, None),
     }
 }
