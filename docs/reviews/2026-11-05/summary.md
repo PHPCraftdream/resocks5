@@ -265,16 +265,16 @@ API-C01 raw owned extraction lossy — documented tradeoff, можно уточ�
 
 | Отчёт | Существенная поверхность |
 |---|---|
-| [Async](2026-11-05-async.md) | Blocking writer/shutdown, deadlines/cancel, detached tasks, stages. Намеренный loser drain отдельно от потерянного ownership. |
-| [Concurrency](2026-11-05-concurrency.md) | Admission/lease/state/lifecycle, DashMap/locks/atomics. Unsafe data race/Relaxed payload publication не установлены. |
-| [Data/types](2026-11-05-data-types.md) | Exponential traversal, duplicate/quarantine, numeric/time boundaries, allocation/O estimates. |
-| [Conformance](2026-11-05-conformance.md) | Wire/security/persistence guarantees, route budget/topology/strict validation; full RFC conformance не заявляется. |
-| [Drop/RAII](2026-11-05-drop-raii.md) | Writers/temp lifecycle, raw wipe, refill owners, recursive depth, test destructor panic. |
-| [API/lifetimes](2026-11-05-api-lifetimes.md) | Blanket Box impl/public commitments, borrowing/nameability/Send, no established dangling reference/new patch break. |
-| [Security](2026-11-05-security.md) | Argon2id v19 m5120KiB/t2/p1 + random128bit salt; HMAC-SHA256 random256bit process key/constant-time digest; rustls/ring TLS1.2/1.3 roots/names; credential remnants/Debug. Remote auth bypass/Critical/production secret log leak не установлены. |
-| [Deps/features](2026-11-05-deps-features.md) | Features/MSRV/provenance/publish environment/CI policy. Checksums/pins не аттестуют vulnerability-чистоту. |
-| [Testing](2026-11-05-testing.md) | CI selection/oracle gaps, mutation-sensitive test proposals, no executed tests or diagnosed TLS cause. |
-| [Unsafe/FFI](2026-11-05-unsafe-ffi.md) | Inventory17 unsafe blocks (10production/7test-support), Unix flock/Win32 descriptor/handle ownership и mirrors. Конкретная UB не подтверждена; ABI/Miri gaps не равны UB. |
+| [Async](runtime/async.md) | Blocking writer/shutdown, deadlines/cancel, detached tasks, stages. Намеренный loser drain отдельно от потерянного ownership. |
+| [Concurrency](runtime/concurrency.md) | Admission/lease/state/lifecycle, DashMap/locks/atomics. Unsafe data race/Relaxed payload publication не установлены. |
+| [Data/types](api/data-types.md) | Exponential traversal, duplicate/quarantine, numeric/time boundaries, allocation/O estimates. |
+| [Conformance](api/conformance.md) | Wire/security/persistence guarantees, route budget/topology/strict validation; full RFC conformance не заявляется. |
+| [Drop/RAII](runtime/drop-raii.md) | Writers/temp lifecycle, raw wipe, refill owners, recursive depth, test destructor panic. |
+| [API/lifetimes](api/api-lifetimes.md) | Blanket Box impl/public commitments, borrowing/nameability/Send, no established dangling reference/new patch break. |
+| [Security](process/security.md) | Argon2id v19 m5120KiB/t2/p1 + random128bit salt; HMAC-SHA256 random256bit process key/constant-time digest; rustls/ring TLS1.2/1.3 roots/names; credential remnants/Debug. Remote auth bypass/Critical/production secret log leak не установлены. |
+| [Deps/features](process/deps-features.md) | Features/MSRV/provenance/publish environment/CI policy. Checksums/pins не аттестуют vulnerability-чистоту. |
+| [Testing](process/testing.md) | CI selection/oracle gaps, mutation-sensitive test proposals, no executed tests or diagnosed TLS cause. |
+| [Unsafe/FFI](runtime/unsafe-ffi.md) | Inventory17 unsafe blocks (10production/7test-support), Unix flock/Win32 descriptor/handle ownership и mirrors. Конкретная UB не подтверждена; ABI/Miri gaps не равны UB. |
 
 Ключевые resolved pins: Tokio1.54.1, rustls0.23.46, tokio-rustls0.26.4, ring0.17.14, rustls-webpki0.103.16, DashMap6.1.0, crossbeam-queue0.3.12, zeroize1.8.2, serde1.0.228, ktav0.8.0. Workspace edition2021/MSRV1.88. Fixture dependency graph отличается и не является проверкой точного production graph.
 
