@@ -52,7 +52,7 @@ async fn a_held_health_lock_disables_persistence_and_touches_nothing() {
         1,
         "exactly one warning, through the logger: {lines:?}"
     );
-    assert!(lines[0].contains("locked"), "{lines:?}");
+    assert!(lines[0].contains("locked by another process"), "{lines:?}");
     tokio::time::timeout(
         Duration::from_secs(1),
         saver.finish(&[group("v4", r.clone())], &path),
@@ -82,7 +82,9 @@ async fn a_held_health_lock_disables_persistence_and_touches_nothing() {
     );
     let lines = drain(&mut rx2);
     assert!(
-        !lines.iter().any(|line| line.contains("locked")),
+        !lines
+            .iter()
+            .any(|line| line.contains("locked by another process")),
         "the free lock must not warn: {lines:?}"
     );
     saver.finish(&[group("v4", r)], &path).await;

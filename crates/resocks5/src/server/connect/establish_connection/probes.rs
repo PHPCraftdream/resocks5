@@ -469,10 +469,13 @@ mod tests {
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
-            handshake_timeout: Duration::from_secs(2),
+            // Windows answers a refused loopback connect only after ~2 s: the
+            // handshake budget must outlast it, or the refusal reaches the
+            // probe as a timeout (inconclusive) instead of a REP 5.
+            handshake_timeout: Duration::from_secs(10),
             tls: None,
-            deadline: claimed + Duration::from_secs(5),
-            lease_until: claimed + Duration::from_secs(30),
+            deadline: claimed + Duration::from_secs(20),
+            lease_until: claimed + Duration::from_secs(60),
         })
         .await;
         assert!(middle_rotator.is_quarantined(&middle));
