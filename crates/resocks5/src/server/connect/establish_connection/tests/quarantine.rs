@@ -605,7 +605,7 @@ async fn a_cached_chain_with_a_quarantined_gate_is_not_dialed() {
     );
     exit.link_proxy(target.to_string(), cached);
     // Quarantine the gate out of band: the state get_linked cannot see.
-    assert!(gate_rotator.record_hard_failure(&bad).is_some());
+    assert!(gate_rotator.quarantine_now(&bad).is_some());
     let logger = test_logger();
     let banned = Arc::new(RegexSet::empty());
     let pool = Arc::new(ProxyPool::new(

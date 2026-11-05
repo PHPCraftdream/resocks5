@@ -576,7 +576,7 @@ async fn strict_end_to_end_authority_grammar_and_field_values() {
         // (7) Accept: HTAB inside a field value stays legal end to end.
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
-            &["Host: h:443", "X-T: a\u{9}b"],
+            &["Host: h:443", auth.as_str(), "X-T: a\u{9}b"],
             b"",
         );
         let (mut peer, mut server) = duplex(4096);

@@ -570,8 +570,10 @@ fn take_username_zeroizes_raw_bytes_before_free() {
         observed: std::rc::Rc<std::cell::RefCell<(usize, Vec<u8>)>>,
     }
     impl zeroize::Zeroize for Witness {
+        // Overwrite in place and keep the length: `Vec::zeroize` would also
+        // clear it, leaving the witness nothing to observe.
         fn zeroize(&mut self) {
-            self.bytes.zeroize();
+            self.bytes.iter_mut().for_each(|b| *b = 0);
         }
     }
     impl Drop for Witness {
