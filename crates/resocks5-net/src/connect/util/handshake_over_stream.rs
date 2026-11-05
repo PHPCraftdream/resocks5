@@ -243,6 +243,17 @@ where
     Ok(stream)
 }
 
+/// `Instant::now() + budget` for a caller-supplied budget: a sum outside the
+/// clock's range (e.g. `Duration::MAX`) means "no practical deadline" instead
+/// of an overflow panic on the dial path.
+pub(crate) fn deadline_after(budget: std::time::Duration) -> tokio::time::Instant {
+    const FAR: std::time::Duration = std::time::Duration::from_secs(100 * 365 * 24 * 3600);
+    let now = tokio::time::Instant::now();
+    now.checked_add(budget)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv6Addr;
@@ -250,7 +261,19 @@ mod tests {
 
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-    use super::handshake_over_stream;
+    use super::{deadline_after, handshake_over_stream};
+
+    /// Mutation: the plain `Instant::now() + budget` panics on `Duration::MAX`;
+    /// a clamp to `now` would fail the far-future floor.
+    #[test]
+    fn deadline_after_survives_unrepresentable_budgets() {
+        let now = tokio::time::Instant::now();
+        let far = deadline_after(Duration::MAX);
+        assert!(far.saturating_duration_since(now) >= Duration::from_secs(365 * 24 * 3600));
+        let soon = deadline_after(Duration::from_secs(5));
+        let ahead = soon.saturating_duration_since(tokio::time::Instant::now());
+        assert!(ahead >= Duration::from_secs(4) && ahead <= Duration::from_secs(5));
+    }
 
     /// Minimal SOCKS5 server stub over a duplex half: completes the greeting
     /// (plus username/password sub-negotiation when `auth` is set, asserting

@@ -8,7 +8,9 @@ use tokio::time::{timeout, timeout_at};
 use crate::connect::connect_http_proxy::http_connect_on_tcp;
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::{socks5_connect_request, socks5_greeting};
+use crate::connect::handshake_over_stream::{
+    deadline_after, socks5_connect_request, socks5_greeting,
+};
 use crate::connect::host_port::HostPort;
 use crate::connect::tcp_dial::tcp_dial;
 use crate::connect::{AnyUpstream, UpstreamStream};
@@ -216,7 +218,7 @@ async fn dial_inner(
             // One deadline for both phases: a silent greeting implicates
             // the upstream alone, a stalled CONNECT reply may still be the
             // destination's fault.
-            let deadline = tokio::time::Instant::now() + hs;
+            let deadline = deadline_after(hs);
             let auth = socks5_auth(proxy);
             let stream = match timeout_at(deadline, socks5_greeting(stream, auth)).await {
                 Ok(Ok(s)) => s,

@@ -14,7 +14,9 @@ use tokio::time::{timeout, timeout_at};
 use super::{dial_inner, DialOptions};
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::{socks5_connect_request, socks5_greeting};
+use crate::connect::handshake_over_stream::{
+    deadline_after, socks5_connect_request, socks5_greeting,
+};
 use crate::connect::host_port::HostPort;
 use crate::connect::http_connect_handshake;
 use crate::connect::tcp_dial::tcp_dial;
@@ -429,7 +431,7 @@ async fn hop(
                     parsed.port,
                 )));
             }
-            let deadline = tokio::time::Instant::now() + hs;
+            let deadline = deadline_after(hs);
             let stream =
                 match timeout_at(deadline, socks5_greeting(stream, socks5_auth(node))).await {
                     Ok(Ok(s)) => s,
@@ -490,7 +492,7 @@ async fn https_hop(
             source: None,
         })?;
 
-    let deadline = tokio::time::Instant::now() + hs;
+    let deadline = deadline_after(hs);
     let mut tls =
         match tokio::time::timeout_at(deadline, connector.connect(server_name, stream)).await {
             Ok(Ok(s)) => s,

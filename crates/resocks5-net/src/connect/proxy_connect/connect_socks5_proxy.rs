@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::time::timeout_at;
 
 #[cfg(feature = "pool")]
-use crate::connect::handshake_over_stream::{socks5_connect_request, socks5_greeting};
+use crate::connect::handshake_over_stream::{
+    deadline_after, socks5_connect_request, socks5_greeting,
+};
 #[cfg(feature = "pool")]
 use crate::connect::host_port::HostPort;
 #[cfg(feature = "pool")]
@@ -74,7 +76,7 @@ pub(crate) async fn socks5_on_acquired(
             parsed.port,
         )));
     }
-    let deadline = tokio::time::Instant::now() + handshake_timeout;
+    let deadline = deadline_after(handshake_timeout);
     let stream = match timeout_at(deadline, socks5_greeting(stream, socks5_auth(proxy))).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(e),

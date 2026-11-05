@@ -780,3 +780,34 @@ fn aliasing_upstreams_are_saved_without_secrets_and_never_restored() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// (C) boundary of the deadline tolerance: a shift of up to one save interval
+// is "unchanged" (time passing, whole-second truncation), a larger shift is a
+// re-trip and must be written. Mutations: tolerance 0 makes the first two
+// asserts fail; an unbounded tolerance makes the last one fail.
+#[test]
+fn unchanged_tolerates_a_deadline_shift_of_at_most_one_interval() {
+    let build = |saved_at: u64, remaining: u64| {
+        let mut f = file(vec![grouped(
+            &upstream_label(&p("a")),
+            0,
+            "v4",
+            STATE_QUARANTINED,
+            remaining,
+            1,
+        )]);
+        f.saved_at = saved_at;
+        f
+    };
+    let every = Duration::from_secs(10);
+    let last = build(1000, 30); // deadline 1030
+    assert!(unchanged(&last, &build(1010, 20), every), "same deadline");
+    assert!(
+        unchanged(&last, &build(1010, 30), every),
+        "shift == one interval"
+    );
+    assert!(
+        !unchanged(&last, &build(1011, 30), every),
+        "shift > one interval"
+    );
+}

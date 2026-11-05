@@ -162,7 +162,9 @@ fn signature(file: &HealthFile) -> Vec<(&str, &str, u8, &str, u32, u32)> {
 /// interval. The deadline is absolute (`saved_at + remaining_sec`), so it
 /// is stable across ticks while only its whole-second truncation drifts;
 /// a real re-trip with identical counters (reset + new failure) moves it
-/// far enough to count as a change and gets written.
+/// by more than an interval and gets written. A re-trip that moves it by at
+/// most one interval is deliberately not written: a restart would restore a
+/// quarantine that ends less than one save interval earlier or later.
 fn unchanged(last: &HealthFile, current: &HealthFile, every: Duration) -> bool {
     last.upstreams.len() == current.upstreams.len()
         && signature(last) == signature(current)

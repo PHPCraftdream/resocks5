@@ -88,8 +88,9 @@ impl From<RatingError> for RotatorError {
 }
 
 /// True when `a` and `b` refer to the same real-world upstream rating
-/// slot: endpoint, protocol, and account all match. `gate` is
-/// deliberately excluded — it records how the upstream is reached on
+/// slot: endpoint, protocol, account and `gate_level` (the node's own rank:
+/// the same endpoint at two levels is two slots) all match. The `gate`
+/// LINK field is deliberately excluded — it records how the upstream is reached on
 /// this attempt (it is set on the gate-composite configs written to
 /// the sticky cache), not what the upstream is — so rating a
 /// gate-composite still lands on the plain upstream's slot. Compares

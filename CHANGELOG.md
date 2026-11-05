@@ -150,6 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tick after a win was published, catches a callback panic inside the detached
   drain, and `HedgeError::source()` returns the last connection error.
   `http_error` falls back to a 500 head for an unknown status instead of panicking.
+- `resocks5-net`: a `Duration::MAX` handshake budget no longer panics the dial
+  paths (SOCKS5 and TLS hops use a checked deadline); `same_upstream` documents
+  that `gate_level` is part of an upstream's identity and the `gate` link is not.
 - `resocks5-net`: SOCKS5 server credentials are not cloned in raw mode and a rejected
   buffer is wiped before it is freed (feature `zeroize`).
 - `resocks5-net`: a probe lease too large for the `Instant` range still excludes a

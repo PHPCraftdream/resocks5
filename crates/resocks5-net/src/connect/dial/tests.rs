@@ -340,6 +340,28 @@ async fn socks5_stall_in_greeting_is_upstream_down() {
         .starts_with("[SOCKS5] handshake timeout (0s) to "));
 }
 
+/// A `Duration::MAX` handshake budget must not panic the dial (unchecked
+/// `Instant + Duration`): against a silent upstream it simply keeps waiting,
+/// cut here by the outer timeout. Mutation: the unchecked add panics.
+#[tokio::test]
+async fn unrepresentable_handshake_budget_does_not_panic() {
+    let (l, port) = bind().await;
+    let _stub = silent_stub(l);
+    let o = opts().with_handshake_timeout(Duration::MAX);
+    let outcome = timeout(
+        Duration::from_millis(300),
+        dial(
+            &ProxyConfig::socks5("127.0.0.1", port),
+            "x.test",
+            80,
+            &o,
+            None,
+        ),
+    )
+    .await;
+    assert!(outcome.is_err(), "no deadline in practice: still waiting");
+}
+
 #[tokio::test]
 async fn dial_plain_socks5_matches_dial_with_none() {
     let (l, port) = bind().await;
