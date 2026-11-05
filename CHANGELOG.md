@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail with a typed `ConnectError::Timeout`.
 - `resocks5-net`: `server::Credentials::basic_payload()` — the whole decoded HTTP
   Basic token, without splitting at `:`.
+- `resocks5-net`: `DialOptions::with_nodelay` / `with_keepalive` (fields `nodelay`,
+  `keepalive`) set `TCP_NODELAY` and TCP keepalive on the socket to the proxy
+  (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
+  returns the bare `TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (HTTPS is refused
+  before any connect).
 
 ### Changed
 

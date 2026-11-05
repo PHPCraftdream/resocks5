@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+use crate::connect::DialOptions;
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::ProxyConfig;
 
@@ -44,6 +45,28 @@ pub(crate) async fn tcp_dial(
             after: connect_timeout,
         }),
     }
+}
+
+/// Apply the [`DialOptions`] socket options to the socket to `proxy`.
+pub(crate) fn apply_socket_options(
+    stream: &TcpStream,
+    proxy: &ProxyConfig,
+    opts: &DialOptions,
+) -> Result<(), ConnectError> {
+    let io = |source| ConnectError::Io {
+        stage: Stage::Connect,
+        endpoint: Some(format!("{}:{}", proxy.host, proxy.port)),
+        source,
+    };
+    if opts.nodelay {
+        stream.set_nodelay(true).map_err(io)?;
+    }
+    if let Some(idle) = opts.keepalive {
+        socket2::SockRef::from(stream)
+            .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(idle))
+            .map_err(io)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
