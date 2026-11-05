@@ -1,5 +1,4 @@
 use super::claim::{Prepared, INIT_HASH};
-use super::verify::compute_cache_hmac;
 use super::*;
 use crate::auth::compute_hash;
 use crate::config::User;
@@ -89,8 +88,8 @@ fn build_state_with_disk_file(users: Vec<User>, allow_anonymous: bool) -> (AuthS
 /// a clear message if the specific event never arrives within
 /// `guard`. Guards are sized several SECONDS — well above the worst
 /// Argon2id-under-load stretches observed on this machine (hashing
-/// degrades from ~15 ms to multiple seconds under concurrent CPU
-/// load).
+/// degrades from a few milliseconds to multiple seconds under
+/// concurrent CPU load).
 ///
 /// A slow hash can make an event unreachable rather than merely
 /// late, and no guard size fixes that: `prepare_claim` resolves a
@@ -546,9 +545,8 @@ fn empty_password_cannot_claim_init() {
     assert!(!Path::new(&path).exists());
     // Same rejection directly through the claim fn, independent of
     // verify()'s framing.
-    let hmac = compute_cache_hmac(&state.server_secret, "bob", "");
     assert!(matches!(
-        state.prepare_claim("bob", "", hmac),
+        state.prepare_claim("bob", ""),
         Prepared::Done(false)
     ));
     {
@@ -663,3 +661,4 @@ async fn password_length_256_cannot_claim_init_async() {
 mod claim_tests;
 mod concurrency_tests;
 mod gate_tests;
+mod verify_tests;

@@ -111,7 +111,7 @@ fn users_lock_held_externally_does_not_block_cache_miss_verify_for_other_user() 
     // T2: a fresh cache-miss verify for alice (Argon2 only, no
     // claim machinery) must complete in milliseconds, not wait
     // behind T1's parked persist. The 5 s bound is a generous
-    // companion guard (Argon2id can degrade from ~15 ms to seconds
+    // companion guard (Argon2id can degrade from a few ms to seconds
     // under concurrent CPU load on this machine — see the
     // recovery-plan note), not the discriminator: in the old
     // (write-guard-held-across-persist) implementation this read
@@ -268,7 +268,7 @@ async fn async_verify_completes_while_claim_parked_without_hashing_slot() {
     // T2: a fresh cache-miss verify_async for alice — the REAL
     // server path — must complete while T1 is still parked. The
     // 5 s timeout bound is a generous companion guard (Argon2id can
-    // degrade from ~15 ms to seconds under concurrent CPU load on
+    // degrade from a few ms to seconds under concurrent CPU load on
     // this machine — see the machine-load note in this file), not
     // the discriminator: pre-fix, T1 holds the only free permit
     // until the file lock is released, so T2 cannot even start
@@ -497,10 +497,7 @@ fn claim_pileup_cannot_starve_ordinary_login_on_small_blocking_pool() {
             for (name, pw) in [("bob", "bob-pw"), ("carl", "carl-pw"), ("dave", "dave-pw")] {
                 let u = users.iter().find(|u| u.name == name).unwrap();
                 assert!(u.hash.starts_with("$argon2id$"), "{name} hash in memory");
-                assert!(
-                    state.cache_matches(name, &compute_cache_hmac(&state.server_secret, name, pw)),
-                    "{name} cache entry"
-                );
+                assert!(state.cache_matches(name, pw), "{name} cache entry");
             }
         }
         let loaded: UsersConfig = ktav::from_file(&path).unwrap();

@@ -9,8 +9,8 @@ use resocks5_net::chain::GateLevels;
 use resocks5_net::connect::{connect_chain, ChainStage, HostPort};
 use resocks5_net::error::ConnectError;
 use resocks5_net::pool::ProxyPool;
-use resocks5_net::rotator::ProxyRotator;
-use resocks5_net::types::ProxyConfig;
+use resocks5_net::rotator::{ProxyRotator, UpstreamProbeClaim};
+use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
 pub(super) fn healthy_prefix(gates: &GateLevels, rank: u8) -> Option<ProxyConfig> {
     let mut nodes = Vec::new();
@@ -33,7 +33,7 @@ pub(super) fn healthy_prefix(gates: &GateLevels, rank: u8) -> Option<ProxyConfig
 /// What one chain-probe attempt says about the tested node. Success is
 /// detected before classification — this enum only grades failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProbeVerdict {
+pub(super) enum ProbeVerdict {
     /// The tested node itself failed: quarantine it again.
     HardFailure,
     /// Prefix failure, local capacity or the probe deadline: no rating
@@ -42,21 +42,39 @@ enum ProbeVerdict {
 }
 
 /// Pure classification of one chain-probe failure (audit V07, review P2
-/// №3): the target stage covers the WHOLE handshake of the last prefix
-/// node — its greeting, auth, TLS and its CONNECT to the tested node —
-/// so only `ProxyRejected` there (the tested node answered the CONNECT
-/// with a refusal) is a hard failure of the tested node. Every other
-/// target-stage error names the prefix, and prefix stages (`Connect`,
-/// `Hop`) and local capacity say nothing about the tested node: all
-/// inconclusive.
+/// №3, finding D): the target stage covers the WHOLE handshake of the
+/// last prefix node — its greeting, auth, TLS and its CONNECT to the
+/// tested node — so a refusal there can name the prefix's own policy
+/// instead of the tested node. Only destination-unreachable replies are
+/// evidence about the tested node itself: SOCKS5 REP 3-6 (network/host
+/// unreachable, refused, TTL expired) and HTTP 502/503/504. Everything
+/// else — 407/403 auth or policy refusals, malformed status lines
+/// (`code: None`), SOCKS REP 2 (ruleset), any other code — is the prefix
+/// proxy's business: inconclusive.
 ///
 /// Takes the decomposed error because `ChainError` has no constructor
 /// outside `resocks5-net`.
-fn classify_probe_error(stage: ChainStage, error: &ConnectError) -> ProbeVerdict {
+pub(super) fn classify_probe_error(stage: ChainStage, error: &ConnectError) -> ProbeVerdict {
+    let ConnectError::ProxyRejected { protocol, code, .. } = error else {
+        return ProbeVerdict::Inconclusive;
+    };
     match stage {
-        ChainStage::Target if matches!(error, ConnectError::ProxyRejected { .. }) => {
-            ProbeVerdict::HardFailure
-        }
+        ChainStage::Target => match protocol {
+            ProxyProtocol::Socks5 => {
+                if matches!(code, Some(3..=6)) {
+                    ProbeVerdict::HardFailure
+                } else {
+                    ProbeVerdict::Inconclusive
+                }
+            }
+            ProxyProtocol::Http | ProxyProtocol::Https => {
+                if matches!(code, Some(502..=504)) {
+                    ProbeVerdict::HardFailure
+                } else {
+                    ProbeVerdict::Inconclusive
+                }
+            }
+        },
         _ => ProbeVerdict::Inconclusive,
     }
 }
@@ -77,17 +95,32 @@ pub(crate) fn probe_deadline(
     connect_timeout.saturating_add(handshake_timeout.saturating_mul(handshakes))
 }
 
+/// `instant + duration` with a far-future stand-in when the sum leaves
+/// the `Instant` range (finding F-APP): config timeouts are u64 seconds,
+/// and a huge `handshake_timeout`/`connect_timeout` must not panic the
+/// probe scheduler.
+pub(super) fn claim_instant_plus(
+    instant: tokio::time::Instant,
+    duration: Duration,
+) -> tokio::time::Instant {
+    const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    instant
+        .checked_add(duration)
+        .or_else(|| instant.checked_add(FAR))
+        .unwrap_or(instant)
+}
+
 /// Margin between a probe's own budget and its lease (review P2 №4): an
 /// attempt must finish this long before its lease expires, so one
 /// attempt can never outlive the lease it claims. Shared with startup,
-/// which derives the quarantine policy's lease from the same helper.
+/// which derives the quarantine policy's lease from the same helper; the margin keeps one attempt from outliving its lease.
 pub(crate) const PROBE_LEASE_MARGIN: Duration = Duration::from_secs(5);
 
 /// Lease one claimed probe owns: the worst-case budget over `depth`
 /// prefix nodes plus [`PROBE_LEASE_MARGIN`]. Startup derives the
 /// quarantine policy's lease from the gate-level count with this
-/// helper; probe settlement fences on the same formula, so the two
-/// cannot diverge (review P2 №4).
+/// helper; the probe budget stays below it by construction, so a
+/// settled attempt can never have outrun its lease (review P2 №4).
 pub(crate) fn probe_lease(
     connect_timeout: Duration,
     handshake_timeout: Duration,
@@ -112,15 +145,12 @@ pub(super) fn spawn_chain_probes(
     for rotator in &exits {
         super::route::spawn_due_probes(rotator, &pool, &logger, connect_timeout);
     }
-    // The lease a claimed probe owns, on the same formula startup puts
-    // into the quarantine policy (gate-level count = worst-case depth).
-    let lease = probe_lease(connect_timeout, handshake_timeout, gates.iter().count());
     for (rank, rotator) in gates.iter().skip(1) {
-        // The lease starts at the claim (take_probes), not when the spawned
-        // task first runs; read the clock BEFORE the claim so `claimed` is
-        // never later than the SDK's own lease start (review P2 №4).
+        // The attempt budget runs from the claim: read the clock BEFORE
+        // take_probe_claims so a delayed task start cannot stretch the
+        // attempt (review P2 №4).
         let claimed = tokio::time::Instant::now();
-        for proxy in rotator.take_probes() {
+        for claim in rotator.take_probe_claims() {
             let (gates, pool, logger, rotator, tls) = (
                 gates.clone(),
                 pool.clone(),
@@ -128,26 +158,26 @@ pub(super) fn spawn_chain_probes(
                 rotator.clone(),
                 tls.clone(),
             );
+            // Detached by design: the probe outlives this spawner and
+            // reports only through the rotator's generation-checked
+            // claims (finding E), so no handle is kept.
             tokio::spawn(async move {
                 let Some(prefix) = healthy_prefix(&gates, rank) else {
                     return;
                 };
-                // Absolute deadline from the claim: a delayed task start
-                // cannot stretch the attempt past the lease.
                 let budget =
                     probe_deadline(connect_timeout, handshake_timeout, prefix.nodes().len())
                         .saturating_sub(Duration::from_secs(1));
-                let deadline = claimed + budget;
+                let deadline = claim_instant_plus(claimed, budget);
                 probe_chain(ProbeAttempt {
                     prefix: &prefix,
-                    proxy: &proxy,
+                    claim: &claim,
                     rotator: &rotator,
                     pool: &pool,
                     logger: &logger,
                     handshake_timeout,
                     tls: tls.as_ref(),
                     deadline,
-                    lease_until: claimed + lease,
                 })
                 .await;
             });
@@ -155,16 +185,29 @@ pub(super) fn spawn_chain_probes(
     }
 }
 
-fn outcome(rotator: &ProxyRotator, proxy: &ProxyConfig, success: bool, logger: &Logger) {
+/// Apply a settled probe outcome through its claim: the outcome counts
+/// only while the claim still owns the slot (finding E). Returns `true`
+/// when it was applied. A recovery is a lifecycle event, not a failure
+/// (CC-10/GA-05) — only the re-quarantine goes to the failure channel.
+fn outcome(
+    rotator: &ProxyRotator,
+    claim: &UpstreamProbeClaim,
+    success: bool,
+    logger: &Logger,
+) -> bool {
+    let proxy = &claim.proxy;
     if success {
-        rotator.record_success(proxy);
-        logger.proxy_failure(|| {
+        if !rotator.record_success_for(claim) {
+            return false;
+        }
+        logger.lifecycle(|| {
             format!(
                 "Upstream {} is reachable again - back in rotation",
                 print_cfg(proxy)
             )
         });
-    } else if let Some(duration) = rotator.record_hard_failure(proxy) {
+        true
+    } else if let Some(duration) = rotator.record_hard_failure_for(claim) {
         logger.proxy_failure(|| {
             format!(
                 "Upstream {} is still unreachable - quarantined for {}s",
@@ -172,38 +215,40 @@ fn outcome(rotator: &ProxyRotator, proxy: &ProxyConfig, success: bool, logger: &
                 duration.as_secs()
             )
         });
+        true
+    } else {
+        false
     }
 }
 
-/// One chain-probe attempt with its budgets (review P2 №4): `deadline`
-/// and `lease_until` are absolute instants derived from the
-/// `take_probes()` claim, so a delayed task start cannot stretch the
-/// attempt past the lease and a settlement at or after `lease_until` is
-/// discarded instead of rated.
-struct ProbeAttempt<'a> {
-    prefix: &'a ProxyConfig,
-    proxy: &'a ProxyConfig,
-    rotator: &'a ProxyRotator,
-    pool: &'a ProxyPool,
-    logger: &'a Logger,
-    handshake_timeout: Duration,
-    tls: Option<&'a TlsConnector>,
-    deadline: tokio::time::Instant,
-    lease_until: tokio::time::Instant,
+/// One chain-probe attempt with its budget (review P2 №4 + finding E):
+/// `deadline` is an absolute instant derived from the claim, bounding the
+/// work; the outcome is applied through `claim`, whose generation check
+/// replaces the old time fence — a slot that changed hands while the
+/// attempt ran discards the result instead of rating it.
+pub(super) struct ProbeAttempt<'a> {
+    pub(super) prefix: &'a ProxyConfig,
+    pub(super) claim: &'a UpstreamProbeClaim,
+    pub(super) rotator: &'a ProxyRotator,
+    pub(super) pool: &'a ProxyPool,
+    pub(super) logger: &'a Logger,
+    pub(super) handshake_timeout: Duration,
+    pub(super) tls: Option<&'a TlsConnector>,
+    pub(super) deadline: tokio::time::Instant,
 }
 
-async fn probe_chain(params: ProbeAttempt<'_>) {
+pub(super) async fn probe_chain(params: ProbeAttempt<'_>) {
     let ProbeAttempt {
         prefix,
-        proxy,
+        claim,
         rotator,
         pool,
         logger,
         handshake_timeout,
         tls,
         deadline,
-        lease_until,
     } = params;
+    let proxy = &claim.proxy;
     // The tested node is this probe's CONNECT target: hold one cap
     // permit for it, like a real connection, until the probe settles
     // (review P2 №5). At capacity is our own load, not the node's
@@ -227,28 +272,21 @@ async fn probe_chain(params: ProbeAttempt<'_>) {
         connect_chain(prefix, &target, pool, handshake_timeout, tls),
     )
     .await;
-    // Settlement fence (review P2 №4): at or after `lease_until` the
-    // slot may already be leased to a fresh probe whose state a late
-    // result must not clear or re-trip.
-    if tokio::time::Instant::now() >= lease_until {
-        logger.attempt(|| {
-            format!(
-                "Chain probe of {} settled after its lease - result \
-                 discarded, health unchanged",
-                print_cfg(proxy)
-            )
-        });
-        return;
-    }
     match attempt {
         // Reachable through the healthy prefix: back in rotation.
-        Ok(Ok(_)) => outcome(rotator, proxy, true, logger),
-        // The tested node refused the prefix's CONNECT: quarantine it
+        Ok(Ok(_)) => {
+            if !outcome(rotator, claim, true, logger) {
+                stale_result_discarded(logger, proxy);
+            }
+        }
+        // The tested node could not reach its destination: quarantine it
         // again.
         Ok(Err(error))
             if classify_probe_error(error.stage(), error.error()) == ProbeVerdict::HardFailure =>
         {
-            outcome(rotator, proxy, false, logger)
+            if !outcome(rotator, claim, false, logger) {
+                stale_result_discarded(logger, proxy);
+            }
         }
         // The whole attempt ran past its deadline: inconclusive, like
         // every other failure that says nothing about the tested node.
@@ -271,14 +309,24 @@ async fn probe_chain(params: ProbeAttempt<'_>) {
     }
 }
 
+/// A settled result whose slot changed hands meanwhile: dropped.
+fn stale_result_discarded(logger: &Logger, proxy: &ProxyConfig) {
+    logger.attempt(|| {
+        format!(
+            "Chain probe of {} settled stale - result discarded, \
+             health unchanged",
+            print_cfg(proxy)
+        )
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::probes_tests::spawn_slow_success_stub;
     use super::*;
     use crate::logger::LogConfig;
     use resocks5_net::rating::QuarantinePolicy;
-    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn proxy(host: &str, rank: u8) -> ProxyConfig {
@@ -311,49 +359,6 @@ mod tests {
     fn logger() -> Logger {
         let (tx, _) = tokio::sync::mpsc::channel(1);
         Logger::new(tx, LogConfig::default())
-    }
-
-    /// SOCKS5 stub that completes its handshake only after `delay` and
-    /// then reports CONNECT success WITHOUT dialing the requested
-    /// destination. `accepts` counts accepted TCP connections; `done`
-    /// fires after the success reply is written.
-    async fn spawn_slow_success_stub(
-        delay: Duration,
-        accepts: Arc<AtomicUsize>,
-        done: tokio::sync::mpsc::Sender<()>,
-    ) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                accepts.fetch_add(1, Ordering::Relaxed);
-                let done = done.clone();
-                tokio::spawn(async move {
-                    let mut greeting = [0u8; 3];
-                    if socket.read_exact(&mut greeting).await.is_err() {
-                        return;
-                    }
-                    tokio::time::sleep(delay).await;
-                    if socket.write_all(&[5, 0]).await.is_err() {
-                        return;
-                    }
-                    let mut head = [0u8; 4];
-                    if socket.read_exact(&mut head).await.is_err() || head[3] != 1 {
-                        return;
-                    }
-                    let mut bound = [0u8; 6];
-                    if socket.read_exact(&mut bound).await.is_err() {
-                        return;
-                    }
-                    let _ = socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await;
-                    let _ = done.send(()).await;
-                });
-            }
-        });
-        addr
     }
 
     #[test]
@@ -402,21 +407,21 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let gates = GateLevels::new(vec![(3, outer_rotator), (2, middle_rotator.clone())]);
         let prefix = healthy_prefix(&gates, 2).unwrap();
         let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(2),
             tls: None,
             deadline: claimed + Duration::from_secs(5),
-            lease_until: claimed + Duration::from_secs(30),
         })
         .await;
         assert_eq!(
@@ -458,14 +463,15 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let gates = GateLevels::new(vec![(3, outer_rotator), (2, middle_rotator.clone())]);
         let prefix = healthy_prefix(&gates, 2).unwrap();
         let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
@@ -475,7 +481,6 @@ mod tests {
             handshake_timeout: Duration::from_secs(10),
             tls: None,
             deadline: claimed + Duration::from_secs(20),
-            lease_until: claimed + Duration::from_secs(60),
         })
         .await;
         assert!(middle_rotator.is_quarantined(&middle));
@@ -486,99 +491,37 @@ mod tests {
         );
     }
 
+    // Finding E: outcomes apply only through the live claim; a consumed
+    // claim is stale and must change nothing the second time. Mutation:
+    // remove the generation check (the second outcome call would
+    // re-quarantine and the assertion on is_quarantined fails).
     #[test]
-    fn outcome_success_clears_quarantine_and_failure_requarantines() {
+    fn outcome_applies_only_through_the_live_claim() {
         let proxy = proxy("a", 9);
-        let rotator = rotator(proxy.clone());
+        // Short quarantine so the slot reaches probation within the test.
+        let rotator = rotator_with_policy(
+            proxy.clone(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_millis(50))
+                .with_max(Duration::from_millis(50)),
+        );
         let logger = logger();
         rotator.quarantine_now(&proxy);
-        outcome(&rotator, &proxy, true, &logger);
+        std::thread::sleep(Duration::from_millis(80));
+        let claims = rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
+        assert!(outcome(&rotator, &claims[0], true, &logger));
         assert!(!rotator.is_quarantined(&proxy));
-        outcome(&rotator, &proxy, false, &logger);
+        assert!(!outcome(&rotator, &claims[0], false, &logger));
+        assert!(!rotator.is_quarantined(&proxy));
+        // A fresh claim after a re-trip applies again.
+        rotator.quarantine_now(&proxy);
+        std::thread::sleep(Duration::from_millis(80));
+        let claims = rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
+        assert!(outcome(&rotator, &claims[0], false, &logger));
         assert!(rotator.is_quarantined(&proxy));
-    }
-
-    // Review P2 №3 classification table: at the target stage ONLY a
-    // `ProxyRejected` reply — the tested node answered the prefix's
-    // CONNECT with a refusal — is a hard failure. The target stage also
-    // covers the last prefix node's own greeting/auth/TLS, whose
-    // failures blame the prefix, not the tested node. Mutations: (a)
-    // classify every counting target-stage error as HardFailure (the
-    // behaviour this replaces), (b) classify nothing as HardFailure.
-    #[test]
-    fn classification_target_proxy_rejected_is_the_only_hard_failure() {
-        use resocks5_net::error::{Stage, TimeoutKind};
-        use resocks5_net::pool::AtCapacity;
-        use resocks5_net::types::ProxyProtocol;
-        use std::io;
-
-        let rejected = || ConnectError::ProxyRejected {
-            protocol: ProxyProtocol::Socks5,
-            code: Some(5),
-            response: String::new(),
-        };
-        let cap = || {
-            ConnectError::AtCapacity(AtCapacity {
-                host: "prefix".to_owned(),
-                port: 1080,
-            })
-        };
-        let auth = || ConnectError::AuthFailed { status: 0xff };
-        let method = || ConnectError::MethodUnsupported {
-            got: 0xff,
-            with_auth: false,
-        };
-        let handshake_timeout = || ConnectError::Timeout {
-            stage: Stage::Handshake,
-            kind: TimeoutKind::Socks5Handshake,
-            endpoint: "prefix:1080".to_owned(),
-            after: Duration::from_secs(1),
-        };
-        let io_err = || ConnectError::Io {
-            stage: Stage::Connect,
-            endpoint: None,
-            source: io::Error::from(io::ErrorKind::ConnectionRefused),
-        };
-        // Target-stage refusal of the CONNECT: the tested node failed.
-        assert_eq!(
-            classify_probe_error(ChainStage::Target, &rejected()),
-            ProbeVerdict::HardFailure
-        );
-        // Any other target-stage error belongs to the prefix's own
-        // handshake.
-        for error in [auth(), method(), handshake_timeout(), io_err()] {
-            assert_eq!(
-                classify_probe_error(ChainStage::Target, &error),
-                ProbeVerdict::Inconclusive,
-                "{error:?}"
-            );
-        }
-        // A TLS failure on the prefix's HTTPS hop: inconclusive too.
-        assert_eq!(
-            classify_probe_error(
-                ChainStage::Target,
-                &ConnectError::Tls {
-                    message: "[HTTPS] TLS handshake to prefix:1080 failed".to_owned(),
-                    source: None,
-                }
-            ),
-            ProbeVerdict::Inconclusive
-        );
-        // Prefix stages say nothing about the tested node, refusals
-        // included.
-        for stage in [ChainStage::Connect, ChainStage::Hop(0)] {
-            assert_eq!(
-                classify_probe_error(stage, &rejected()),
-                ProbeVerdict::Inconclusive
-            );
-        }
-        // Local capacity is never the tested node's fault.
-        for stage in [ChainStage::Connect, ChainStage::Hop(0), ChainStage::Target] {
-            assert_eq!(
-                classify_probe_error(stage, &cap()),
-                ProbeVerdict::Inconclusive
-            );
-        }
     }
 
     // V07 integration: a failing prefix must leave the tested node on
@@ -604,7 +547,8 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let before = middle_rotator.health();
 
         let outer_rotator = rotator(super::super::tests_chains::config(dead_addr, 3));
@@ -614,14 +558,13 @@ mod tests {
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(2),
             tls: None,
             deadline: claimed + Duration::from_millis(500),
-            lease_until: claimed + Duration::from_secs(30),
         })
         .await;
 
@@ -729,7 +672,8 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let before = middle_rotator.health();
 
         let outer_rotator = rotator(super::super::tests_chains::config(silent_addr, 3));
@@ -740,14 +684,13 @@ mod tests {
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(5),
             tls: None,
             deadline: claimed + Duration::from_millis(200),
-            lease_until: claimed + Duration::from_secs(30),
         })
         .await;
         assert!(start.elapsed() < Duration::from_secs(3));
@@ -755,70 +698,6 @@ mod tests {
         assert_eq!(after[0].health.state, before[0].health.state);
         assert_eq!(after[0].health.trips, before[0].health.trips);
         assert_eq!(after[0].health.consecutive, before[0].health.consecutive);
-    }
-
-    // Review P2 №4 settlement fence: an attempt that completes at or
-    // after `claim + lease` is discarded — no rating call, health
-    // unchanged — because the slot may already be leased to a fresh
-    // probe. Mutation: settle without the lease check (the late success
-    // would clear the newer probe's quarantine state).
-    #[tokio::test]
-    async fn settlement_after_lease_is_discarded() {
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel(1);
-        let prefix_addr =
-            spawn_slow_success_stub(Duration::from_millis(300), accepts.clone(), done_tx).await;
-        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr = unavailable.local_addr().unwrap();
-        drop(unavailable);
-        let middle = super::super::tests_chains::config(dead_addr, 2);
-        let middle_rotator = rotator_with_policy(
-            middle.clone(),
-            QuarantinePolicy::default()
-                .with_threshold(1)
-                .with_initial(Duration::from_millis(50))
-                .with_max(Duration::from_millis(200)),
-        );
-        assert_eq!(
-            middle_rotator.quarantine_now(&middle),
-            Some(Duration::from_millis(50))
-        );
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
-        let before = middle_rotator.health();
-        let outer_rotator = rotator(super::super::tests_chains::config(prefix_addr, 3));
-        let gates = GateLevels::new(vec![(3, outer_rotator), (2, middle_rotator.clone())]);
-        let prefix = healthy_prefix(&gates, 2).unwrap();
-        let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
-        let claimed = tokio::time::Instant::now();
-        probe_chain(ProbeAttempt {
-            prefix: &prefix,
-            proxy: &middle,
-            rotator: &middle_rotator,
-            pool: &pool,
-            logger: &logger(),
-            handshake_timeout: Duration::from_secs(2),
-            tls: None,
-            // Generous budget: the attempt itself succeeds.
-            deadline: claimed + Duration::from_secs(5),
-            // But the lease is already over when the stub answers
-            // (it sleeps 300 ms first).
-            lease_until: claimed + Duration::from_millis(150),
-        })
-        .await;
-        // The attempt really completed: the stub wrote its success
-        // reply after the lease had already expired.
-        tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(claimed.elapsed() >= Duration::from_millis(150));
-        assert_eq!(accepts.load(Ordering::Relaxed), 1);
-        let after = middle_rotator.health();
-        assert_eq!(after[0].health.state, before[0].health.state);
-        assert_eq!(after[0].health.trips, before[0].health.trips);
-        assert_eq!(after[0].health.consecutive, before[0].health.consecutive);
-        assert!(middle_rotator.is_quarantined(&middle));
     }
 
     // Review P2 №5: the tested node is the probe's CONNECT target — its
@@ -849,7 +728,8 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let before = middle_rotator.health();
         // Per-upstream cap 1, filled by a held permit for the tested
         // node — no connection involved.
@@ -865,14 +745,13 @@ mod tests {
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(2),
             tls: None,
             deadline: claimed + Duration::from_secs(5),
-            lease_until: claimed + Duration::from_secs(30),
         })
         .await;
         // At capacity: nothing connected and health is untouched.
@@ -892,14 +771,13 @@ mod tests {
         let claimed = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(2),
             tls: None,
             deadline: claimed + Duration::from_secs(5),
-            lease_until: claimed + Duration::from_secs(30),
         })
         .await;
         tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
@@ -936,7 +814,8 @@ mod tests {
             Some(Duration::from_millis(50))
         );
         tokio::time::sleep(Duration::from_millis(60)).await;
-        assert_eq!(middle_rotator.take_probes().len(), 1);
+        let claims = middle_rotator.take_probe_claims();
+        assert_eq!(claims.len(), 1);
         let before = middle_rotator.health();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let silent_addr = listener.local_addr().unwrap();
@@ -957,14 +836,13 @@ mod tests {
         let start = tokio::time::Instant::now();
         probe_chain(ProbeAttempt {
             prefix: &prefix,
-            proxy: &middle,
+            claim: &claims[0],
             rotator: &middle_rotator,
             pool: &pool,
             logger: &logger(),
             handshake_timeout: Duration::from_secs(5),
             tls: None,
             deadline: claimed + Duration::from_millis(300),
-            lease_until: tokio::time::Instant::now() + Duration::from_secs(30),
         })
         .await;
         assert!(start.elapsed() < Duration::from_millis(150));

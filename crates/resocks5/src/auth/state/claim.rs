@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::anyhow;
 
+use super::verify::CachedPassword;
 use super::AuthState;
 use crate::auth::compute_hash::compute_hash;
 use crate::config::users_file::{write_atomic, UsersFileLock};
@@ -17,7 +18,8 @@ pub(super) const INIT_HASH: &str = "init";
 /// persistence phase 2 (`claim_commit`).
 pub(super) struct ClaimWork {
     pub(super) name: String,
-    candidate_hmac: [u8; 32],
+    /// The presented password, remembered once the claim is published.
+    candidate: CachedPassword,
     pub(super) index: usize,
     new_hash: String,
 }
@@ -41,16 +43,11 @@ impl AuthState {
     /// CPU-bound prefix of an init-claim. Returns `Prepared::Done` when
     /// no persistence is needed, or `Prepared::Claim` carrying the work
     /// `claim_commit` must finish.
-    pub(super) fn verify_prepare(
-        &self,
-        name: &str,
-        password: &str,
-        candidate_hmac: [u8; 32],
-    ) -> Prepared {
+    pub(super) fn verify_prepare(&self, name: &str, password: &str) -> Prepared {
         let Some(entry) = self.entries.get(name).filter(|u| u.enabled) else {
             return Prepared::Done(false);
         };
-        if self.cache_matches(name, &candidate_hmac) {
+        if self.cache_matches(name, password) {
             return Prepared::Done(true);
         }
         let hash = self.users.read().expect("users RwLock poisoned")[entry.index]
@@ -58,14 +55,9 @@ impl AuthState {
             .clone();
 
         if hash != INIT_HASH {
-            return Prepared::Done(self.verify_against_committed(
-                name,
-                &hash,
-                password,
-                candidate_hmac,
-            ));
+            return Prepared::Done(self.verify_against_committed(name, &hash, password));
         }
-        self.prepare_claim(name, password, candidate_hmac)
+        self.prepare_claim(name, password)
     }
 
     /// CPU-bound prefix of the init-claim flow: empty-password
@@ -74,12 +66,7 @@ impl AuthState {
     /// committed while we hashed is resolved inline (we hold a hashing
     /// permit in the async path). Returns `Prepared::Claim` when the
     /// claim must still be persisted and published by `claim_commit`.
-    pub(super) fn prepare_claim(
-        &self,
-        name: &str,
-        password: &str,
-        candidate_hmac: [u8; 32],
-    ) -> Prepared {
+    pub(super) fn prepare_claim(&self, name: &str, password: &str) -> Prepared {
         // An empty password must never be claimable. The CLI rejects
         // empty passwords (run_user_command::read_new_password); this
         // claim path is reachable from any input protocol, so it
@@ -99,7 +86,7 @@ impl AuthState {
         }
 
         // Compute the new hash outside the write lock — Argon2id takes
-        // ~15 ms and we don't want it blocking concurrent read-side
+        // ~50 ms and we don't want it blocking concurrent read-side
         // verify calls during that window.
         let Ok(new_hash) = compute_hash(password) else {
             return Prepared::Done(false);
@@ -114,17 +101,12 @@ impl AuthState {
         // account while we were hashing. SHORT read guard; the Argon2
         // verify runs outside it.
         if let Some(claimed_hash) = self.claimed_hash_if_any(idx) {
-            return Prepared::Done(self.verify_against_committed(
-                name,
-                &claimed_hash,
-                password,
-                candidate_hmac,
-            ));
+            return Prepared::Done(self.verify_against_committed(name, &claimed_hash, password));
         }
 
         Prepared::Claim(ClaimWork {
             name: name.to_string(),
-            candidate_hmac,
+            candidate: CachedPassword::new(password),
             index: idx,
             new_hash,
         })
@@ -156,7 +138,7 @@ impl AuthState {
 
         let ClaimWork {
             name,
-            candidate_hmac,
+            candidate,
             index: idx,
             new_hash,
         } = work;
@@ -211,7 +193,7 @@ impl AuthState {
                 // on claim_lock (which we hold across persist+publish),
                 // so a brief write guard is sufficient to publish.
                 self.users.write().expect("users RwLock poisoned")[idx].hash = new_hash.clone();
-                self.cache.insert(name.clone(), candidate_hmac);
+                self.cache.insert(name.clone(), candidate);
                 ClaimOutcome::Done(true)
             }
             ClaimPersist::DiskHashChanged(disk_hash) => {

@@ -106,7 +106,7 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
         // prepare_claim's pre-mutex fast path. A fixed 3 s sleep
         // silently made the test require the loser's ABSOLUTE
         // Argon2id time to fit inside that sleep. Under concurrent
-        // CPU load hashing degrades from ~15 ms to seconds, the loser
+        // CPU load hashing degrades from a few ms to seconds, the loser
         // then found a published hash, resolved inline, never entered
         // claim_commit at all, and the wait below timed out on an
         // event that could no longer ever arrive — a hard failure, in
@@ -216,10 +216,7 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
         "winner hash must still verify"
     );
     assert!(
-        state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
-        ),
+        state.cache_matches("bob", "same-pw"),
         "cache must hold the entry for the winning password"
     );
 
@@ -283,7 +280,7 @@ fn init_claim_persist_failure_after_winner_cannot_reset_winner_hash() {
     // actually REACHED claim_commit — its first statement emits
     // claim_commit_entered — instead of sleeping a fixed 2 s and
     // hoping its Argon2id hashing finished: under real CPU load that
-    // stretch is seconds, not the ~15 ms nominal, so no fixed sleep
+    // stretch is seconds, not a nominal few ms, so no fixed sleep
     // can prove arrival. The parent still holds claim_lock here, so
     // after the event the racer is necessarily parked on the mutex
     // and cannot pass the post-mutex re-check until the winner's
@@ -372,10 +369,7 @@ fn init_claim_persist_failure_after_winner_cannot_reset_winner_hash() {
     let loaded: UsersConfig = ktav::from_file(&path).unwrap();
     assert_eq!(loaded.users[0].hash, winner_hash, "disk must be untouched");
     assert!(
-        state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "winner-pw")
-        ),
+        state.cache_matches("bob", "winner-pw"),
         "cache must hold the winning password's entry"
     );
 

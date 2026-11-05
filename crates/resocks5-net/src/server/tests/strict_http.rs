@@ -25,7 +25,7 @@ const EXPECT_HTTP_505: &[u8] =
 #[test]
 fn strict_validate_table_rejects_and_accepts_per_rule() {
     #[rustfmt::skip]
-    let rejected: [(&str, &[&str], &str); 58] = [
+    let rejected: [(&str, &[&str], &str); 63] = [
         // Bracketed but not an IPv6 address (only hex digits and colons).
         (
             "CONNECT [:::]:443 HTTP/1.1",
@@ -136,15 +136,21 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             &["Host: h:443", "Proxy-Authorization: Basic a\u{0}b"],
             "strict HTTP: invalid header field value",
         ),
-        // Strict Host grammar: uri-host [ ":" 1-5 digit port ].
+        // Strict Host grammar (RFC 9110 section 7.2): uri-host [ ":" port ], port = *DIGIT.
         ("CONNECT h:1 HTTP/1.1", &["Host: bad/path"], "strict HTTP: invalid Host header"),
         ("CONNECT h:1 HTTP/1.1", &["Host: user@example.com"], "strict HTTP: invalid Host header"),
         ("CONNECT h:1 HTTP/1.1", &["Host: bad%zz.example"], "strict HTTP: invalid Host header"),
-        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:"], "strict HTTP: invalid Host header"),
-        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:abc"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: h:abc"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: h:1a"], "strict HTTP: invalid Host header"),
         ("CONNECT h:1 HTTP/1.1", &["Host: [::1"], "strict HTTP: invalid Host header"),
         ("CONNECT h:1 HTTP/1.1", &["Host: a b"], "strict HTTP: invalid Host header"),
         ("CONNECT h:1 HTTP/1.1", &["Host: ::1"], "strict HTTP: invalid Host header"),
+        // IPvFuture needs 1*HEXDIG, then '.', then a non-empty tail.
+        ("CONNECT h:1 HTTP/1.1", &["Host: [v.x]"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [v1.]"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [V.x]"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [V1.]"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [w1.x]"], "strict HTTP: invalid Host header"),
     ];
     for (request_line, headers, want) in rejected {
         let hdrs: Vec<&[u8]> = headers.iter().map(|h| h.as_bytes()).collect();
@@ -156,7 +162,7 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
     }
 
     #[rustfmt::skip]
-    let accepted: [(&str, &[&str]); 25] = [
+    let accepted: [(&str, &[&str]); 34] = [
         // IPv4-embedded IPv6 is a valid bracketed literal.
         (
             "CONNECT [::ffff:192.0.2.1]:443 HTTP/1.1",
@@ -207,12 +213,22 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:443", "X-T: v\u{80}\u{ff}"],
         ),
-        // Strict Host grammar accepts reg-names, IPv4:port, bracketed IPv6, OWS.
+        // Strict Host grammar (RFC 9110 section 7.2): reg-names, empty port,
+        // any-digit port without range check, IPvFuture, bracketed IPv6, OWS.
         ("CONNECT h:1 HTTP/1.1", &["Host: example.com"]),
         ("CONNECT h:1 HTTP/1.1", &["Host: example.com:443"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:"]), // empty port
+        ("CONNECT h:1 HTTP/1.1", &["Host: h:000443"]), // leading zeros, 6 digits
+        ("CONNECT h:1 HTTP/1.1", &["Host: h:0"]), // not range-checked
+        ("CONNECT h:1 HTTP/1.1", &["Host: h:99999"]), // not range-checked
         ("CONNECT h:1 HTTP/1.1", &["Host: 192.0.2.1:80"]),
         ("CONNECT h:1 HTTP/1.1", &["Host: [::1]:443"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [::1]:0"]),
         ("CONNECT h:1 HTTP/1.1", &["Host: [2001:db8::1]"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [v1.example]"]), // IPvFuture
+        ("CONNECT h:1 HTTP/1.1", &["Host: [V1.example]"]), // IPvFuture, uppercase V (ABNF "v")
+        ("CONNECT h:1 HTTP/1.1", &["Host: [VaF.x:80]:443"]), // hex digits of either case
+        ("CONNECT h:1 HTTP/1.1", &["Host: [v1.a:b]"]), // IPvFuture tail with ':'
         ("CONNECT h:1 HTTP/1.1", &["Host: ex%41mple.com"]),
         ("CONNECT h:1 HTTP/1.1", &["Host: example.com  "]), // trailing OWS trimmed
     ];

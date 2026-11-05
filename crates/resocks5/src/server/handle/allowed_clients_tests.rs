@@ -355,7 +355,7 @@ async fn user_deny_beats_global_star() {
         .await;
         assert!(
             !auth.cache_contains("alice"),
-            "фильтр обязан сработать ДО verify: HMAC-кеш не заполняется"
+            "фильтр обязан сработать ДО verify: кеш паролей не заполняется"
         );
     }
 }
@@ -378,7 +378,7 @@ async fn global_allow_and_user_none_reach_routing_boundary() {
         .await;
         assert!(
             auth.cache_contains("alice"),
-            "успешный verify обязан прогреть HMAC-кеш"
+            "успешный verify обязан прогреть кеш паролей"
         );
     }
 }
@@ -415,7 +415,7 @@ async fn anonymous_obeys_only_global_rule() {
     }
 }
 
-/// Кейс 5: прогретый HMAC-кеш не обходится user-фильтром. Прогрев —
+/// Кейс 5: прогретый кеш паролей не обходится user-фильтром. Прогрев —
 /// прямой `verify_async` без привязки к IP; проверяется, что фильтр
 /// срабатывает ДО cache-hit при обмене с запрещённого peer.
 #[tokio::test]
@@ -432,7 +432,7 @@ async fn warm_cache_does_not_bypass_user_filter() {
         )
         .unwrap(),
     );
-    // Прогрев: hash известен, HMAC в кеше.
+    // Прогрев: hash известен, пароль в кеше.
     assert!(auth.verify_async("alice", "pw").await);
     assert!(auth.cache_contains("alice"));
 

@@ -14,4 +14,4 @@ mod validate_tests;
 pub use chain::ChainKey;
 pub use proxy_config::ProxyConfig;
 pub use proxy_protocol::ProxyProtocol;
-pub use validate::{ChainConfigError, CredentialField, ProxyConfigError};
+pub use validate::{ChainConfigError, CredentialField, ProxyConfigError, MAX_CHAIN_NODES};

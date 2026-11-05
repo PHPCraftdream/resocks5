@@ -44,6 +44,14 @@ pub enum TimeoutKind {
     TcpConnect,
     /// SOCKS5 handshake timeout.
     Socks5Handshake,
+    /// SOCKS5 timeout while waiting for the upstream's first reply to the
+    /// greeting (method selection, or the RFC 1929 username/password
+    /// sub-negotiation): the upstream accepted TCP but never spoke its own
+    /// protocol, so the destination has not been contacted yet and the
+    /// failure implicates the upstream alone. Shares the legacy
+    /// handshake-timeout message text; the phase distinction is carried in
+    /// this kind.
+    Socks5Greeting,
     /// HTTP CONNECT handshake timeout.
     HttpHandshake,
     /// HTTPS: the TLS handshake to the proxy timed out.
@@ -242,6 +250,14 @@ impl fmt::Display for ConnectError {
                     write!(f, "connect timeout ({}s) to {}", after.as_secs(), endpoint)
                 }
                 TimeoutKind::Socks5Handshake => {
+                    write!(
+                        f,
+                        "[SOCKS5] handshake timeout ({}s) to {}",
+                        after.as_secs(),
+                        endpoint
+                    )
+                }
+                TimeoutKind::Socks5Greeting => {
                     write!(
                         f,
                         "[SOCKS5] handshake timeout ({}s) to {}",

@@ -2,14 +2,18 @@
 //!
 //! Generic `AsyncWrite` instrumentation with zero TLS-specific logic,
 //! kept in a dependency-free top-level module so `connect` and `pool`
-//! can both depend on it without forming a module cycle. Three pieces:
+//! can both depend on it without forming a module cycle. Four pieces:
 //!
 //! - [`FlushProgress`] — the monotonic counter sink progress is
 //!   reported into;
 //! - `CONFIRMED_WRITE_PROGRESS` — the task-local carrying the sink for
 //!   the current task, installed with `confirmed_scope`;
 //! - [`ProgressReportingWriter`] — an `AsyncWrite` wrapper that reports
-//!   every accepted byte into the enclosing scope.
+//!   every accepted byte into the enclosing scope;
+//! - `ProgressScopeProbe` (feature `test-instrumentation`; plain code
+//!   span, not a link: it does not exist without the feature) — a
+//!   test-only pass-through wrapper giving an instance-scoped progress
+//!   oracle next to the process-global counter.
 //!
 //! # Custom writer stacks
 //!
@@ -152,6 +156,13 @@ impl FlushProgress {
         CONFIRMED_WRITE_PROGRESS_TOTAL.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Identity of the backing counter, so the test-only
+    /// [`ProgressScopeProbe`] can tell one scope instance from another.
+    #[cfg(feature = "test-instrumentation")]
+    fn is_same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.counter, &other.counter)
+    }
+
     /// The ambient confirmed-progress sink of the current task, if the
     /// code being polled runs underneath one of the crate's bounded
     /// helpers (`send_possibly_fragmented`, the bounded flush in the
@@ -184,8 +195,129 @@ impl FlushProgress {
 /// compare deltas, never absolutes, and treat a delta as a LOWER bound
 /// on a single chain's confirmed traffic — concurrently running tests
 /// can only inflate it.
+///
+/// For a per-send oracle immune to that pollution, wrap the writer in
+/// [`ProgressScopeProbe`].
 #[cfg(feature = "test-instrumentation")]
 pub static CONFIRMED_WRITE_PROGRESS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only instance-scoped observer of confirmed write progress
+/// (feature `test-instrumentation`). The process-global
+/// [`CONFIRMED_WRITE_PROGRESS_TOTAL`] accumulates across the whole
+/// process, so concurrent tests pollute it: a delta over it is only a
+/// lower bound for a single writer stack. Wrapping the writer handed
+/// to a bounded helper in this probe gives the oracle for exactly that
+/// send: on every poll it observes the ambient scope instance and
+/// folds its growth into one accumulator
+/// ([`confirmed_total`](Self::confirmed_total)), rebasing when the
+/// helper's per-chunk scopes change the instance. Nothing outside the
+/// polls of this probe can move the accumulator, so it counts only the
+/// bytes THAT send confirmed below the buffering layer — no other test
+/// can inflate it. Pure pass-through otherwise.
+#[cfg(feature = "test-instrumentation")]
+pub struct ProgressScopeProbe<W> {
+    inner: W,
+    /// Instance seen at the most recent observation, for delta folding.
+    seen: Option<FlushProgress>,
+    /// `seen`'s total at that observation (baseline of the next delta).
+    seen_total: u64,
+    /// Confirmed bytes accumulated across every observed instance.
+    confirmed_total: u64,
+}
+
+#[cfg(feature = "test-instrumentation")]
+impl<W> ProgressScopeProbe<W> {
+    /// Wraps `inner` so its polls observe the enclosing
+    /// confirmed-progress scope.
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            seen: None,
+            seen_total: 0,
+            confirmed_total: 0,
+        }
+    }
+
+    /// Unwraps back to the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    /// Total confirmed bytes observed so far, across every ambient
+    /// scope instance this probe was polled under.
+    pub fn confirmed_total(&self) -> u64 {
+        self.confirmed_total
+    }
+
+    /// Folds the ambient instance's growth since the previous
+    /// observation into the accumulator. Called before AND after each
+    /// forwarding poll: the trailing call captures what the inner
+    /// stack reported during it. A newly seen instance is rebased at
+    /// its current total — growth is never credited without having
+    /// been observed.
+    fn observe(&mut self) {
+        let Some(current) = FlushProgress::current() else {
+            return;
+        };
+        let now = current.total();
+        if self
+            .seen
+            .as_ref()
+            .is_some_and(|prev| prev.is_same_instance(&current))
+        {
+            self.confirmed_total += now.saturating_sub(self.seen_total);
+        }
+        self.seen = Some(current);
+        self.seen_total = now;
+    }
+}
+
+#[cfg(feature = "test-instrumentation")]
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressScopeProbe<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.observe();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.observe();
+        result
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.observe();
+        let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.observe();
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.observe();
+        let result = Pin::new(&mut this.inner).poll_flush(cx);
+        this.observe();
+        result
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.observe();
+        let result = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.observe();
+        result
+    }
+}
 
 tokio::task_local! {
     pub(crate) static CONFIRMED_WRITE_PROGRESS: FlushProgress;

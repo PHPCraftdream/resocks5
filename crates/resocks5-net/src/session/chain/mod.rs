@@ -23,12 +23,55 @@ pub struct GateLevels {
     levels: Vec<(u8, Arc<ProxyRotator>)>,
 }
 
+/// Why [`GateLevels::try_new`] rejected the configured levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateLevelsError {
+    duplicated_rank: u8,
+}
+
+impl GateLevelsError {
+    /// The rank that appeared at more than one level.
+    #[must_use]
+    pub fn duplicated_rank(&self) -> u8 {
+        self.duplicated_rank
+    }
+}
+
+impl std::fmt::Display for GateLevelsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "duplicate gate rank {}", self.duplicated_rank)
+    }
+}
+
+impl std::error::Error for GateLevelsError {}
+
 impl GateLevels {
-    /// Sort gates by descending rank. Duplicate ranks trigger a debug assertion.
+    /// Sort gates by descending rank.
+    ///
+    /// Duplicate ranks are only rejected in debug builds: release builds
+    /// keep them, with the order among equal ranks left to the sort. Use
+    /// [`GateLevels::try_new`] to reject duplicates in release builds too.
     pub fn new(mut levels: Vec<(u8, Arc<ProxyRotator>)>) -> Self {
         levels.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
         debug_assert!(levels.windows(2).all(|pair| pair[0].0 != pair[1].0));
         Self { levels }
+    }
+    /// Fallible [`GateLevels::new`]: sorts gates by descending rank and
+    /// rejects duplicate ranks in release builds too. The sort happens
+    /// first, so equal ranks are adjacent when checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GateLevelsError`] naming the duplicated rank; the error
+    /// carries no proxy or credential data.
+    pub fn try_new(mut levels: Vec<(u8, Arc<ProxyRotator>)>) -> Result<Self, GateLevelsError> {
+        levels.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+        if let Some(pair) = levels.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(GateLevelsError {
+                duplicated_rank: pair[0].0,
+            });
+        }
+        Ok(Self { levels })
     }
     /// Return whether no gate levels were configured.
     pub fn is_empty(&self) -> bool {
@@ -432,5 +475,58 @@ impl std::fmt::Debug for ChainPlan {
             .field("layers", &self.layers.len())
             .field("done", &self.done)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod gate_levels_tests {
+    use std::sync::Arc;
+
+    use crate::rotator::ProxyRotator;
+    use crate::types::ProxyConfig;
+
+    use super::GateLevels;
+
+    fn rotator(host: &str) -> Arc<ProxyRotator> {
+        Arc::new(ProxyRotator::new(vec![ProxyConfig::socks5(host, 1)]))
+    }
+
+    /// Mutation caught: removing the duplicate check from `try_new` (or
+    /// leaving it debug-only) fails this in release test builds.
+    #[test]
+    fn try_new_rejects_duplicate_ranks() {
+        let err = GateLevels::try_new(vec![
+            (2, rotator("dup-a")),
+            (5, rotator("high")),
+            (2, rotator("dup-b")),
+        ])
+        .unwrap_err();
+        assert_eq!(err.duplicated_rank(), 2);
+        assert_eq!(err.to_string(), "duplicate gate rank 2");
+        assert!(GateLevels::try_new(vec![(2, rotator("a")), (5, rotator("b"))]).is_ok());
+        assert!(GateLevels::try_new(vec![(7, rotator("solo"))]).is_ok());
+    }
+
+    /// Mutation caught: removing the descending sort from `try_new`
+    /// leaves the input order and the `[3, 2, 1]` assertion fails.
+    #[test]
+    fn try_new_sorts_descending() {
+        let levels = GateLevels::try_new(vec![
+            (1, rotator("low")),
+            (3, rotator("high")),
+            (2, rotator("mid")),
+        ])
+        .expect("distinct ranks are accepted");
+        let ranks: Vec<u8> = levels.iter().map(|(rank, _)| rank).collect();
+        assert_eq!(ranks, [3, 2, 1]);
+    }
+
+    /// Mutation caught: rejecting or panicking on empty levels in
+    /// `try_new` fails this.
+    #[test]
+    fn try_new_accepts_empty_levels() {
+        let levels = GateLevels::try_new(Vec::new()).expect("empty is fine");
+        assert!(levels.is_empty());
+        assert_eq!(levels.len(), 0);
     }
 }

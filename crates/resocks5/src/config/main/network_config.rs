@@ -278,6 +278,67 @@ impl Default for NetworkConfig {
     }
 }
 
+impl NetworkConfig {
+    /// Upper bound for every time budget in seconds: beyond one day a
+    /// value is always a misconfiguration, and the accept loop's deadline
+    /// arithmetic cannot represent values near `u64::MAX` seconds.
+    const MAX_TIMEOUT_SEC: u64 = 24 * 60 * 60;
+    /// Same ceiling for the millisecond budget.
+    const MAX_TIMEOUT_MS: u64 = Self::MAX_TIMEOUT_SEC * 1000;
+    /// Upper bound for the concurrency/attempt limits: beyond this
+    /// nothing sane operates and `Semaphore::new` rejects permit counts
+    /// close to `usize::MAX`.
+    const MAX_LIMIT: usize = 1 << 30;
+
+    /// Bounds every numeric `network.*` timeout and limit. Called once at
+    /// startup so a bad value fails the boot with the key named instead
+    /// of panicking the accept loop on deadline arithmetic.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        for (key, value) in [
+            ("connect_timeout_sec", self.connect_timeout_sec),
+            ("handshake_timeout_sec", self.handshake_timeout_sec),
+            ("tunnel_max_lifetime_sec", self.tunnel_max_lifetime_sec),
+            ("tcp_keepalive_sec", self.tcp_keepalive_sec),
+            (
+                "client_protocol_timeout_sec",
+                self.client_protocol_timeout_sec,
+            ),
+            ("tunnel_idle_timeout_sec", self.tunnel_idle_timeout_sec),
+            ("quarantine_initial_sec", self.quarantine_initial_sec),
+            ("quarantine_max_sec", self.quarantine_max_sec),
+            ("health_save_sec", self.health_save_sec),
+        ] {
+            if value > Self::MAX_TIMEOUT_SEC {
+                anyhow::bail!(
+                    "network.{key} = {value} exceeds the maximum of {} s",
+                    Self::MAX_TIMEOUT_SEC
+                );
+            }
+        }
+        if self.hedge_delay_ms > Self::MAX_TIMEOUT_MS {
+            anyhow::bail!(
+                "network.hedge_delay_ms = {} exceeds the maximum of {} ms",
+                self.hedge_delay_ms,
+                Self::MAX_TIMEOUT_MS
+            );
+        }
+        for (key, value) in [
+            ("max_concurrent_clients", self.max_concurrent_clients),
+            ("max_upstream_attempts", self.max_upstream_attempts),
+            ("max_per_upstream", self.max_per_upstream),
+            ("max_concurrent_direct", self.max_concurrent_direct),
+        ] {
+            if value > Self::MAX_LIMIT {
+                anyhow::bail!(
+                    "network.{key} = {value} exceeds the maximum of {}",
+                    Self::MAX_LIMIT
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +420,113 @@ mod tests {
             "serialized NetworkConfig::default() still contains cb_ fields:\n{}",
             serialized
         );
+    }
+
+    type Mutation = fn(&mut NetworkConfig);
+
+    /// A `u64::MAX` timeout must be rejected naming the key: unchecked
+    /// deadline arithmetic (`Instant::now() + secs`) would panic the
+    /// accept loop (review F-APP/G). Every `*_sec` timeout key is
+    /// covered; dropping one from `validate` fails this loop.
+    #[test]
+    fn validation_rejects_u64_max_seconds_and_names_the_key() {
+        let mutations: [(&str, Mutation); 9] = [
+            ("network.connect_timeout_sec", |c: &mut NetworkConfig| {
+                c.connect_timeout_sec = u64::MAX
+            }),
+            ("network.handshake_timeout_sec", |c: &mut NetworkConfig| {
+                c.handshake_timeout_sec = u64::MAX
+            }),
+            (
+                "network.tunnel_max_lifetime_sec",
+                |c: &mut NetworkConfig| c.tunnel_max_lifetime_sec = u64::MAX,
+            ),
+            ("network.tcp_keepalive_sec", |c: &mut NetworkConfig| {
+                c.tcp_keepalive_sec = u64::MAX
+            }),
+            (
+                "network.client_protocol_timeout_sec",
+                |c: &mut NetworkConfig| c.client_protocol_timeout_sec = u64::MAX,
+            ),
+            (
+                "network.tunnel_idle_timeout_sec",
+                |c: &mut NetworkConfig| c.tunnel_idle_timeout_sec = u64::MAX,
+            ),
+            ("network.quarantine_initial_sec", |c: &mut NetworkConfig| {
+                c.quarantine_initial_sec = u64::MAX
+            }),
+            ("network.quarantine_max_sec", |c: &mut NetworkConfig| {
+                c.quarantine_max_sec = u64::MAX
+            }),
+            ("network.health_save_sec", |c: &mut NetworkConfig| {
+                c.health_save_sec = u64::MAX
+            }),
+        ];
+        for (key, set) in mutations {
+            let mut cfg = NetworkConfig::default();
+            set(&mut cfg);
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(key),
+                "expected {key} in the error, got: {error}"
+            );
+        }
+    }
+
+    /// Huge limits are equally rejected: `Semaphore::new` panics on
+    /// permit counts close to `usize::MAX` (review F-APP/G).
+    #[test]
+    fn validation_rejects_huge_limits_and_names_the_key() {
+        let mutations: [(&str, Mutation); 4] = [
+            ("network.max_concurrent_clients", |c: &mut NetworkConfig| {
+                c.max_concurrent_clients = usize::MAX
+            }),
+            ("network.max_upstream_attempts", |c: &mut NetworkConfig| {
+                c.max_upstream_attempts = usize::MAX
+            }),
+            ("network.max_per_upstream", |c: &mut NetworkConfig| {
+                c.max_per_upstream = usize::MAX
+            }),
+            ("network.max_concurrent_direct", |c: &mut NetworkConfig| {
+                c.max_concurrent_direct = usize::MAX
+            }),
+        ];
+        for (key, set) in mutations {
+            let mut cfg = NetworkConfig::default();
+            set(&mut cfg);
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(key),
+                "expected {key} in the error, got: {error}"
+            );
+        }
+    }
+
+    /// Values exactly at the limits are accepted and the shipped
+    /// defaults stay within bounds. Catches `>=` drift in the checks.
+    #[test]
+    fn validation_accepts_boundary_values_and_defaults() {
+        NetworkConfig::default()
+            .validate()
+            .expect("the shipped defaults must validate");
+        let cfg = NetworkConfig {
+            connect_timeout_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            handshake_timeout_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            tunnel_max_lifetime_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            tcp_keepalive_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            client_protocol_timeout_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            tunnel_idle_timeout_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            quarantine_initial_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            quarantine_max_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            health_save_sec: NetworkConfig::MAX_TIMEOUT_SEC,
+            hedge_delay_ms: NetworkConfig::MAX_TIMEOUT_MS,
+            max_concurrent_clients: NetworkConfig::MAX_LIMIT,
+            max_upstream_attempts: NetworkConfig::MAX_LIMIT,
+            max_per_upstream: NetworkConfig::MAX_LIMIT,
+            max_concurrent_direct: NetworkConfig::MAX_LIMIT,
+            ..Default::default()
+        };
+        cfg.validate()
+            .expect("values exactly at the limit must validate");
     }
 }

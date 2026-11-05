@@ -11,21 +11,21 @@ use super::*;
 use crate::pool::{PoolConfig, ProxyPool};
 use crate::types::ProxyConfig;
 
-fn proxy(host: impl Into<String>, port: u16) -> Arc<ProxyConfig> {
+pub(super) fn proxy(host: impl Into<String>, port: u16) -> Arc<ProxyConfig> {
     Arc::new(ProxyConfig::socks5(host, port))
 }
 
-fn pool(connect_timeout: Duration) -> Arc<ProxyPool> {
+pub(super) fn pool(connect_timeout: Duration) -> Arc<ProxyPool> {
     Arc::new(ProxyPool::new(PoolConfig::default(), connect_timeout, 8))
 }
 
-fn opts(delay: Duration) -> HedgeOptions {
+pub(super) fn opts(delay: Duration) -> HedgeOptions {
     HedgeOptions::default()
         .with_hedge_delay(delay)
         .with_handshake_timeout(Duration::from_secs(2))
 }
 
-async fn loopback() -> (TcpListener, Arc<ProxyConfig>) {
+pub(super) async fn loopback() -> (TcpListener, Arc<ProxyConfig>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     (listener, proxy(addr.ip().to_string(), addr.port()))
@@ -48,7 +48,7 @@ async fn read_request(stream: &mut TcpStream) {
     stream.read_exact(&mut tail).await.unwrap();
 }
 
-async fn accept_socks(listener: TcpListener, payload: &'static [u8]) -> JoinHandle<()> {
+pub(super) async fn accept_socks(listener: TcpListener, payload: &'static [u8]) -> JoinHandle<()> {
     tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         read_request(&mut stream).await;
@@ -62,10 +62,10 @@ async fn accept_socks(listener: TcpListener, payload: &'static [u8]) -> JoinHand
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Observed {
-    index: usize,
-    after_win: bool,
-    outcome: &'static str,
+pub(super) struct Observed {
+    pub(super) index: usize,
+    pub(super) after_win: bool,
+    pub(super) outcome: &'static str,
 }
 
 fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
@@ -77,7 +77,7 @@ fn outcome_name(outcome: &AttemptOutcome) -> &'static str {
     }
 }
 
-async fn receive_reports(
+pub(super) async fn receive_reports(
     receiver: &mut mpsc::Receiver<Observed>,
     count: usize,
     deadline: Duration,
@@ -102,7 +102,7 @@ async fn receive_reports(
     reports
 }
 
-fn send_report(tx: &mpsc::Sender<Observed>, report: &AttemptReport) {
+pub(super) fn send_report(tx: &mpsc::Sender<Observed>, report: &AttemptReport) {
     tx.try_send(Observed {
         index: report.index,
         after_win: report.after_win,

@@ -37,6 +37,28 @@ fn distinct_gate_levels_have_distinct_rating_slots() {
     assert!((after_level_two[0] - 1.0).abs() < 1e-9);
 }
 
+/// The `gate` link (how the upstream is reached) is not part of the identity:
+/// a gate-composite config from the sticky cache lands on the plain
+/// upstream's slot. Mutation: comparing or hashing `gate` makes `index_of`
+/// miss the composite and the failure rates nothing.
+#[test]
+fn gate_composite_lands_on_the_plain_upstream_slot() {
+    let plain = make_proxy("host", 1000);
+    let composite = plain.clone().with_gate(make_proxy("outer", 2000));
+    let rotator = ProxyRotator::new(vec![plain.clone(), make_proxy("other", 1001)]);
+    assert_eq!(rotator.index_of(&composite), Some(0));
+    assert_eq!(rotator.index_of(&composite), rotator.index_of(&plain));
+    for _ in 0..8 {
+        rotator.record_failure(&composite);
+    }
+    let weights = rotator.ratings.weights();
+    assert!(
+        weights[0] < 1.0,
+        "the composite's failure rates the plain slot"
+    );
+    assert!((weights[1] - 1.0).abs() < 1e-9);
+}
+
 #[test]
 fn rating_index_checks_identity_on_hash_collision() {
     let first = make_proxy("one", 1000);

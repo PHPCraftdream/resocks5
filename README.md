@@ -111,7 +111,7 @@ upstream is probed for free because its weight never hits zero.
 | Front end | SOCKS5 + HTTP CONNECT (auto) | many | many | many |
 | Rotation model | sand-rating soft-weight, self-recovering | round-robin / parent | chaining-first | failover |
 | Per-target stickiness | yes | — | — | — |
-| Auth | Argon2id + HMAC verify-cache | basic | basic | basic |
+| Auth | Argon2id + verify-cache (пароль в памяти) | basic | basic | basic |
 | TLS ClientHello fragmentation | yes | no | no | no |
 | Single-port dual-protocol | yes | — | — | — |
 
@@ -483,7 +483,9 @@ retains the original gate meaning; gates without an ordinary exit cannot
 form a route. The complete chain is sticky per target. Ordinary-route
 fallback bypasses gates and selects only ordinary exits; it does not connect
 directly to the target. All attempts share `network.max_upstream_attempts`,
-with at least one attempt reserved for fallback. `network.max_per_upstream`
+with at least one attempt reserved for fallback; cached chains are admitted
+under the same reserve, except that a budget of 1 still serves the sticky
+cache first. `network.max_per_upstream`
 limits each node's permits for the whole tunnel lifetime. Startup probes
 and the pre-connect pool cover only the outermost gate level and exits;
 probes for inner quarantined gates traverse the healthy outer prefix.
@@ -516,7 +518,7 @@ The route is server -> h1 -> h3 -> h4 -> target.
 если задано); элементы внутри одного списка — альтернативы **ИЛИ**.
 Фильтр пользователя выполняется **до проверки пароля**, поэтому
 отклонённый IP получает обычный отказ аутентификации (SOCKS5 `[1,1]` /
-HTTP 407) без работы Argon2, без попадания в HMAC-кеш и без записи
+HTTP 407) без работы Argon2, без попадания в кеш паролей и без записи
 init-claim на диск. К anonymous-клиентам он не применяется вообще
 (они подчиняются только глобальному правилу); direct-пользователи
 подчиняются ему как все.
@@ -563,12 +565,12 @@ connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credentia
 storage, logging and routing policy stay in the host application.
 Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
 existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate` and the
-opt-in inbound options need 0.4.2), or as a
+opt-in inbound options need 0.5.0), or as a
 git dependency to follow unreleased changes:
 
 ```toml
 [dependencies]
-resocks5-net = "0.4"
+resocks5-net = "0.5"
 # resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

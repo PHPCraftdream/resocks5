@@ -59,6 +59,15 @@ fn validation_errors_are_shareable() {
     assert_send_static::<ChainConfigError>();
 }
 
+/// `GateLevels::try_new`'s error crosses threads and spawned tasks.
+#[cfg(feature = "rotator")]
+#[test]
+fn gate_levels_error_is_shareable() {
+    use resocks5_net::chain::GateLevelsError;
+    assert_send_sync::<GateLevelsError>();
+    assert_send_static::<GateLevelsError>();
+}
+
 #[allow(dead_code)]
 fn dial_futures_are_send() {
     let proxy = ProxyConfig::socks5("127.0.0.1", 1080);

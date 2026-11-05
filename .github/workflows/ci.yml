@@ -29,6 +29,7 @@ jobs:
   changes:
     name: changes (which segments to run)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -42,10 +43,12 @@ jobs:
       net_test_args: ${{ steps.areas.outputs.net_test_args }}
       run_clippy_net: ${{ steps.areas.outputs.run_clippy_net }}
       run_doc_net: ${{ steps.areas.outputs.run_doc_net }}
+      run_unification: ${{ steps.areas.outputs.run_unification }}
       run_portable: ${{ steps.areas.outputs.run_portable }}
       run_deny: ${{ steps.areas.outputs.run_deny }}
       run_licenses: ${{ steps.areas.outputs.run_licenses }}
       run_installers: ${{ steps.areas.outputs.run_installers }}
+      run_release_lane: ${{ steps.areas.outputs.run_release_lane }}
       test_os: ${{ steps.areas.outputs.test_os }}
       msrv_os: ${{ steps.areas.outputs.msrv_os }}
       test_scope: ${{ steps.areas.outputs.test_scope }}
@@ -94,6 +97,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.test_os) }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,11 +105,38 @@ jobs:
       - run: cargo build ${{ needs.changes.outputs.test_scope }} --all-targets
       - run: cargo test ${{ needs.changes.outputs.test_scope }} ${{ needs.changes.outputs.test_filter }}
 
+  # Release-mode behavioral lane: the workspace `test` job runs only in the
+  # dev profile, and the release binaries are built (release.yml) but never
+  # tested. This full-run-only lane re-runs a few fast, hermetic
+  # budget/stage/parser suites under the optimized release profile (fat LTO,
+  # codegen-units=1), where optimizer-dependent behaviour would show first.
+  # The filters are module-level substrings of existing test paths.
+  release-behavior:
+    name: release-mode tests (budgets, stages, parsers)
+    needs: changes
+    if: needs.changes.outputs.run_release_lane == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-lane
+      - run: "cargo test --release -p resocks5 handle_client::"
+      - run: "cargo test --release -p resocks5 allowed_clients::"
+      - run: "cargo test --release -p resocks5 print_config_docs::"
+      - run: "cargo test --release -p resocks5 budget_tests::"
+      - run: "cargo test --release -p resocks5 probes_tests::"
+      - run: "cargo test --release -p resocks5-net strict_http"
+      - run: "cargo test --release -p resocks5-net dial::"
+
   lint:
     name: fmt + clippy
     needs: changes
     if: needs.changes.outputs.run_lint == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -118,14 +149,23 @@ jobs:
   # Code-structure rule: at most 1000 lines per Rust file and at most 7 entries
   # per directory. Files and directories that were already over are recorded
   # with their size in the scripts' BASELINE (a ratchet that can only shrink).
+  # The last step runs the classifier's self-test: the changed-areas.sh
+  # mapping table is checked against pinned cases on every CI run.
   structure:
-    name: structure (1000 lines, 7 entries, no doctests)
+    name: structure (1000 lines, 7 entries, no doctests, classifier)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: sh .github/scripts/check-line-limit.sh
       - run: sh .github/scripts/check-dir-entries.sh
       - run: sh .github/scripts/check-no-doctests.sh
+      # The classifier's mapping table, executable-checked on every CI run.
+      - run: sh .github/scripts/changed-areas.sh --self-test
+      # Timeouts, aggregation and release permissions, with a self-test that
+      # breaks copies of the workflows and expects each break to be caught.
+      - run: sh .github/checks/workflow-hygiene.sh
+      - run: sh .github/checks/workflow-hygiene.sh --self-test
 
   # Machine-verifies the `rust-version` declared in the workspace manifest.
   # Runs on ubuntu AND windows because some deps gate code behind cfg(windows)
@@ -141,6 +181,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.msrv_os) }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -157,6 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D warnings
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -204,6 +246,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.net_matrix) }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -220,6 +263,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_clippy_net == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -246,6 +290,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_doc_net == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -254,6 +299,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc -p resocks5-net --no-default-features --no-deps --locked
       - run: cargo doc -p resocks5-net --no-default-features --features pool --no-deps --locked
+
+  # The no-provider leg of the crypto-provider contract: with rustls'
+  # `custom-provider` nothing is auto-selected, so `make_tls_connector` must
+  # panic with the documented message (the normal leg runs in net-features).
+  crypto-provider-contract:
+    name: crypto provider contract (no-provider graph)
+    needs: changes
+    if: needs.changes.outputs.run_net == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: provider-contract
+      - name: expect the documented panic
+        env:
+          RESOCKS5NET_PROVIDER_CONTRACT_EXPECT_PANIC: "1"
+        run: cargo test -p resocks5-net --features "tls,rustls/custom-provider" --test crypto_provider_contract --locked
+
+  # tests/feature_unification is its own workspace (excluded from the root
+  # one), so no job above ever compiles it. There cargo unifies `tls` and
+  # `pool` ON for the whole fixture graph while lean-consumer's source must
+  # still compile unchanged — the documented P2-01 / R2-P2-01 mutation
+  # classes (a cfg'd-away connector parameter changing the arity, a
+  # privately-imported TlsConnector) are invisible to the workspace jobs and
+  # only bite under unification. `--locked`: the fixture's Cargo.lock is
+  # tracked, so a dependency change must update it.
+  feature-unification:
+    name: feature unification (fixture workspace)
+    needs: changes
+    if: needs.changes.outputs.run_unification == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/feature_unification
+      - name: lean consumer alone (no tls, no pool in its graph)
+        working-directory: tests/feature_unification
+        run: cargo check -p lean-consumer --locked
+      - name: combined graph (tls+pool unified on; lean source must compile)
+        working-directory: tests/feature_unification
+        run: cargo build --workspace --locked
 
   # The release binaries must run on a bare machine: fully static on Linux
   # (musl, x86_64 + arm64) and a static CRT on Windows (no VC++ Redistributable).
@@ -277,6 +369,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             rustflags: -D warnings -C target-feature=+crt-static
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -316,6 +409,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_deny == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -327,6 +421,7 @@ jobs:
     if: needs.changes.outputs.run_deny == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -342,6 +437,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run_licenses == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -364,10 +460,12 @@ jobs:
   ci-result:
     name: ci result
     if: always()
+    timeout-minutes: 5
     needs:
       - changes
       - installers
       - test
+      - release-behavior
       - lint
       - structure
       - msrv
@@ -375,6 +473,8 @@ jobs:
       - net-features
       - clippy-net-lean
       - doc-net-lean
+      - crypto-provider-contract
+      - feature-unification
       - portable-builds
       - deny
       - deny-advisories

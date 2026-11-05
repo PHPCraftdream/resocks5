@@ -382,12 +382,19 @@ pub(super) async fn run_server_inner() -> Result<()> {
         None
     };
 
-    let gate_levels = Arc::new(GateLevels::new(
-        gate_groups
-            .into_iter()
-            .map(|(rank, proxies)| Ok((rank, Arc::new(new_rotator(proxies).map_err(map_cfg_err)?))))
-            .collect::<Result<Vec<_>>>()?,
-    ));
+    // Ranks come from a map (unique by construction); `try_new` enforces the
+    // invariant in release builds too.
+    let gate_levels = Arc::new(
+        GateLevels::try_new(
+            gate_groups
+                .into_iter()
+                .map(|(rank, proxies)| {
+                    Ok((rank, Arc::new(new_rotator(proxies).map_err(map_cfg_err)?)))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid gate levels: {e}"))?,
+    );
 
     let v4_rotator = if !v4_proxies.is_empty() {
         Some(Arc::new(new_rotator(v4_proxies).map_err(map_cfg_err)?))

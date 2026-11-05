@@ -291,6 +291,32 @@ async fn phase<T>(
         .map_err(|_| ServerError::Deadline)?
 }
 
+/// Raw-mode decode of one submitted credential field: the lossy text plus the
+/// exact bytes when they were not valid UTF-8. Consumes the buffer — the
+/// valid-UTF-8 path converts the allocation in place, the invalid path
+/// recovers the bytes from the decode error instead of cloning.
+fn decode_raw_field(raw: Vec<u8>) -> (String, Option<Vec<u8>>) {
+    match String::from_utf8(raw) {
+        Ok(text) => (text, None),
+        Err(error) => {
+            let bytes = error.into_bytes();
+            let lossy = String::from_utf8_lossy(&bytes).into_owned();
+            (lossy, Some(bytes))
+        }
+    }
+}
+
+/// Consume a rejected credential buffer; wiped before it is freed under
+/// feature `zeroize`, a plain drop otherwise.
+#[cfg(feature = "zeroize")]
+fn drop_secret<T: zeroize::Zeroize>(secret: T) {
+    let mut secret = secret;
+    zeroize::Zeroize::zeroize(&mut secret);
+}
+
+#[cfg(not(feature = "zeroize"))]
+fn drop_secret<T>(_: T) {}
+
 /// cancel-safe: NO — exact reads and replies may be partial; authentication
 /// side effects may survive cancellation. The host discards the stream.
 async fn socks<S, A, F>(
@@ -347,31 +373,27 @@ where
         let mut password = vec![0; usize::from(plen)];
         stream.read_exact(&mut password).await?;
         let (username, username_raw) = if options.raw_credentials {
-            match String::from_utf8(user.clone()) {
-                Ok(text) => (text, None),
-                Err(_) => (String::from_utf8_lossy(&user).into_owned(), Some(user)),
-            }
+            decode_raw_field(user)
         } else {
             match String::from_utf8(user) {
                 Ok(text) => (text, None),
-                Err(_) => return auth_fail(stream, "Invalid UTF-8 in username").await,
+                Err(error) => {
+                    drop_secret(error.into_bytes());
+                    return auth_fail(stream, "Invalid UTF-8 in username").await;
+                }
             }
         };
         let (password, password_raw) = if options.raw_credentials {
-            match String::from_utf8(password.clone()) {
-                Ok(text) => (text, None),
-                Err(_) => (
-                    String::from_utf8_lossy(&password).into_owned(),
-                    Some(password),
-                ),
-            }
+            decode_raw_field(password)
         } else {
             match String::from_utf8(password) {
                 Ok(text) => (text, None),
-                Err(_) => return auth_fail(stream, "Invalid UTF-8 in password").await,
+                Err(error) => {
+                    drop_secret(error.into_bytes());
+                    return auth_fail(stream, "Invalid UTF-8 in password").await;
+                }
             }
         };
-        let identity = username.clone();
         let credentials = Credentials::with_raw(
             username.clone(),
             password,
@@ -388,7 +410,7 @@ where
         }
         stream.write_all(&[1, 0]).await?;
         stream.flush().await?;
-        (Some(identity), username_raw)
+        (Some(username), username_raw)
     } else {
         (None, None)
     };
@@ -429,6 +451,9 @@ where
             let domain =
                 String::from_utf8(domain).map_err(|e| ServerError::Protocol(e.to_string()))?;
             let target = format!("{domain}:{port}");
+            // Deliberately permissive: `@`, `/`, `%` pass; only control or
+            // whitespace bytes and the host:port shape are rejected (strict
+            // HTTP mode is the stricter grammar).
             if domain.is_empty()
                 || domain
                     .bytes()
@@ -600,6 +625,8 @@ where
         )
         .await;
     }
+    // Permissive target grammar: `HostPort::parse` accepts `@`, `/`, `%` in
+    // the host; strict_http applies the stricter RFC grammar.
     if HostPort::parse(target).is_none() {
         return http_fail(
             stream,
@@ -639,6 +666,9 @@ where
     }
     let username = match auth_value {
         Some(value) => {
+            // Only a single SP separates scheme and token (RFC 9110 section
+            // 11): a TAB stays inside the scheme token, which then never
+            // matches Basic — 407, intentionally.
             let mut parts = value.splitn(2, ' ');
             let scheme = parts.next().unwrap_or("");
             let token = parts.next().map(str::trim);
@@ -650,6 +680,8 @@ where
                 )
                 .await;
             };
+            // Canonical STANDARD base64 requires padding: an unpadded token
+            // fails the decode and answers 407, intentionally.
             let decoded = match general_purpose::STANDARD.decode(token) {
                 Ok(b) => b,
                 Err(_) => {

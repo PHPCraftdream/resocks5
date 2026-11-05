@@ -46,6 +46,15 @@ impl std::error::Error for ParseProxyError {}
 /// password. Blank lines, `#` comments and anything that fails to parse
 /// yield a [`ParseProxyError`]. `protocol` is supplied by the caller
 /// because the line itself carries no protocol info.
+///
+/// # Leniency
+///
+/// This parser is deliberately lenient: it keeps leading/trailing
+/// whitespace in the host (` host:80` parses to the host `" host"`) and
+/// accepts a zero port (`host:0`). [`ProxyConfig::validate`] is the
+/// strict gate that rejects those forms; neither `dial`/`dial_chain` nor
+/// `connect_proxy*` calls `validate`, so a lenient parse reaches the
+/// dial path unchanged unless the caller validates first.
 pub fn parse_proxy_str(
     conn_str: &str,
     protocol: ProxyProtocol,
@@ -280,5 +289,41 @@ mod tests {
         assert_eq!(err("*"), ParseProxyError::BadGate);
         assert_eq!(err("**"), ParseProxyError::BadGate);
         assert_eq!(err("user@host:80"), ParseProxyError::BadHostPort);
+    }
+
+    /// Pins the current parse/validate divergence (API-01): these forms
+    /// parse leniently but `validate_node` rejects them. Mutations
+    /// caught: rejecting them in the parser, or accepting them in
+    /// `validate_node`, fails the matching assertion.
+    #[test]
+    fn parse_is_lenient_where_validate_is_strict() {
+        for (line, host, port) in [
+            (" host:80", " host", 80),
+            ("host :80", "host ", 80),
+            ("host:0", "host", 0),
+        ] {
+            let cfg = parse_proxy_str(line, ProxyProtocol::Socks5)
+                .unwrap_or_else(|e| panic!("{line:?} must parse leniently: {e}"));
+            assert_eq!((cfg.host.as_str(), cfg.port), (host, port), "{line:?}");
+            assert!(
+                cfg.validate_node().is_err(),
+                "{line:?} must fail validation"
+            );
+        }
+    }
+
+    /// The bracketed and bare IPv6 forms both parse AND validate: the
+    /// divergence is limited to whitespace-padded hosts and the zero
+    /// port. Mutation caught: breaking the IPv6 handling in
+    /// `HostPort::parse` (or over-tightening `validate_node`'s host rule)
+    /// fails this.
+    #[test]
+    fn ipv6_forms_parse_and_validate_alike() {
+        for (line, host, port) in [("[::1]:80", "::1", 80), ("::1:80", "::1", 80)] {
+            let cfg = parse_proxy_str(line, ProxyProtocol::Socks5)
+                .unwrap_or_else(|e| panic!("{line:?} must parse: {e}"));
+            assert_eq!((cfg.host.as_str(), cfg.port), (host, port), "{line:?}");
+            assert_eq!(cfg.validate_node(), Ok(()), "{line:?}");
+        }
     }
 }

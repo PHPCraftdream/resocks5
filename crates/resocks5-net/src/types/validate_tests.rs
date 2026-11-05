@@ -1,7 +1,10 @@
 use std::error::Error as _;
 use std::sync::Arc;
 
-use super::{ChainConfigError, CredentialField, ProxyConfig, ProxyConfigError, ProxyProtocol};
+use super::{
+    ChainConfigError, CredentialField, ProxyConfig, ProxyConfigError, ProxyProtocol,
+    MAX_CHAIN_NODES,
+};
 
 fn cfg(protocol: ProxyProtocol, host: &str, port: u16) -> ProxyConfig {
     ProxyConfig::new(protocol, host, port)
@@ -699,4 +702,62 @@ fn constructors_still_accept_zero_port_and_empty_host() {
         assert_eq!(c.host, "");
         assert_eq!(c.validate_node(), Err(ProxyConfigError::EmptyHost));
     }
+}
+
+// chain depth limit
+fn deep_chain(nodes: usize) -> ProxyConfig {
+    let mut cfg = ProxyConfig::socks5("depth-host", 1);
+    for _ in 1..nodes {
+        cfg = ProxyConfig::socks5("depth-host", 1).with_gate(cfg);
+    }
+    cfg
+}
+
+/// Mutation caught: removing the depth check from `ProxyConfig::validate`
+/// lets the 65-node chain validate cleanly and this fails.
+#[test]
+fn validate_rejects_chains_longer_than_max_nodes() {
+    let chain = deep_chain(MAX_CHAIN_NODES + 1);
+    assert_eq!(chain.chain_len(), MAX_CHAIN_NODES + 1);
+    let err = chain.validate().unwrap_err();
+    assert_eq!(err.node(), 0);
+    assert_eq!(
+        err.kind(),
+        ProxyConfigError::ChainTooLong {
+            max: MAX_CHAIN_NODES
+        }
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("64"), "{rendered}");
+    assert!(!rendered.contains("depth-host"), "{rendered}");
+    assert!(!format!("{err:?}").contains("depth-host"));
+}
+
+/// Boundary pin: exactly [`MAX_CHAIN_NODES`] nodes stay valid. Mutation
+/// caught: an off-by-one (`>=` instead of `>`) in the depth check makes
+/// this fail.
+#[test]
+fn validate_accepts_chain_of_exactly_max_nodes() {
+    let chain = deep_chain(MAX_CHAIN_NODES);
+    assert_eq!(chain.chain_len(), MAX_CHAIN_NODES);
+    assert_eq!(chain.validate(), Ok(()));
+}
+
+/// Mutation caught: moving the depth check behind the per-node loop lets
+/// the invalid inner node (empty host, zero port at the exit) error win
+/// and this fails.
+#[test]
+fn chain_depth_error_wins_over_node_errors() {
+    let mut cfg = ProxyConfig::socks5("", 0);
+    for _ in 0..MAX_CHAIN_NODES {
+        cfg = ProxyConfig::socks5("depth-host", 1).with_gate(cfg);
+    }
+    assert_eq!(cfg.chain_len(), MAX_CHAIN_NODES + 1);
+    let err = cfg.validate().unwrap_err();
+    assert_eq!(
+        err.kind(),
+        ProxyConfigError::ChainTooLong {
+            max: MAX_CHAIN_NODES
+        }
+    );
 }

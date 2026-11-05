@@ -7,7 +7,7 @@ members = ["crates/resocks5-net", "crates/resocks5"]
 exclude = ["tests/feature_unification"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 # Verified against the `msrv` job in .github/workflows/ci.yml (runs on
 # ubuntu + windows with `--locked`). Two constraints bind the floor:
@@ -45,7 +45,6 @@ getrandom = "0.2"
 sha2 = "0.10"
 subtle = "2.6"
 argon2 = "0.5"
-hmac = "0.12"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 ktav = "0.8.0"

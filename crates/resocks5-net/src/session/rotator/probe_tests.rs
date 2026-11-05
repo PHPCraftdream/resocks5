@@ -278,3 +278,141 @@ async fn probe_all_with_at_capacity_neither_probes_nor_quarantines() {
     assert_eq!(health[0].health.trips, 0);
     assert_eq!(health[0].health.consecutive, 0);
 }
+
+// Finding E: claims carry ownership. An ordinary request success resets
+// the slot, a renewed failure re-quarantines it, a fresh probe claims it
+// — and the first probe's late outcome must then change nothing, while
+// the fresh claim still applies. Mutation: remove the generation
+// comparison (the stale calls apply: P1's success clears P2's quarantine
+// and P1's failure re-trips the slot).
+#[tokio::test]
+async fn probe_claims_go_stale_when_the_slot_changes_hands() {
+    let proxy = proxy("192.0.2.1", 9);
+    let rotator = rotator(vec![proxy.clone()], 1);
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut claims = rotator.take_probe_claims();
+    assert_eq!(claims.len(), 1);
+    let old = claims.pop().unwrap();
+
+    // A normal request succeeds (reset), then the upstream fails hard
+    // again (re-quarantine: success reset the trip count, so trips = 1).
+    rotator.record_success(&proxy);
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    assert_eq!(rotator.health()[0].health.trips, 1);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut claims = rotator.take_probe_claims();
+    assert_eq!(claims.len(), 1);
+    let fresh = claims.pop().unwrap();
+    // The slot is leased to the fresh claim only.
+    assert!(rotator.take_probe_claims().is_empty());
+
+    // P1's late success: stale — dropped, P2's quarantine stands.
+    assert!(!rotator.record_success_for(&old));
+    assert!(rotator.is_quarantined(&proxy));
+    assert_eq!(rotator.health()[0].health.trips, 1);
+    // P1's late hard failure: stale too — dropped.
+    assert_eq!(rotator.record_hard_failure_for(&old), None);
+    assert_eq!(rotator.health()[0].health.trips, 1);
+    // P2's ownership is intact: its success applies.
+    assert!(rotator.record_success_for(&fresh));
+    assert!(!rotator.is_quarantined(&proxy));
+    assert_eq!(rotator.health()[0].health.trips, 0);
+}
+
+// Finding E, direct path: the claim is taken BEFORE reserve runs, so a
+// health change inside reserve (a reset here) makes the outcome stale —
+// dropped silently, no event. Mutations: taking claims after reserve
+// (the outcome applies: Recovered reported) or dropping the generation
+// check when reporting.
+#[tokio::test]
+async fn probe_due_with_drops_a_success_that_lost_its_claim() {
+    let (listener, address) = listener().await;
+    let proxy = proxy("127.0.0.1", address.port());
+    let rotator = Arc::new(rotator(vec![proxy.clone()], 1));
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let bump = Arc::clone(&rotator);
+    let events = rotator
+        .probe_due_with(Duration::from_secs(1), move |proxy| {
+            // Runs after the claim: resets the slot while the probe is
+            // already owned by the older generation.
+            bump.record_success(proxy);
+            Some(())
+        })
+        .await;
+    assert!(events.is_empty(), "a stale success must not be reported");
+    assert!(!rotator.is_quarantined(&proxy));
+    assert_eq!(rotator.health()[0].health.trips, 0);
+    assert_eq!(rotator.health()[0].health.consecutive, 0);
+    drop(listener);
+}
+
+// Finding E, direct path, failure half: the reserve-side reset makes the
+// probe's hard failure stale too — no event, no consecutive bump, the
+// slot stays healthy. Mutation: dropping the generation check when
+// reporting (the failure re-quarantines: StillDown is reported and
+// consecutive becomes 1).
+#[tokio::test]
+async fn probe_due_with_drops_a_failure_that_lost_its_claim() {
+    let proxy = proxy("192.0.2.1", 9);
+    let rotator = Arc::new(rotator(vec![proxy.clone()], 1));
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let bump = Arc::clone(&rotator);
+    let events = rotator
+        .probe_due_with(Duration::from_millis(50), move |proxy| {
+            bump.record_success(proxy);
+            Some(())
+        })
+        .await;
+    assert!(events.is_empty(), "a stale failure must not be reported");
+    assert!(!rotator.is_quarantined(&proxy));
+    assert_eq!(rotator.health()[0].health.trips, 0);
+    assert_eq!(rotator.health()[0].health.consecutive, 0);
+}
+
+// Finding H3, rotator half: quarantining an already-tripped upstream is
+// a no-op. Mutation: unconditional trip_now (check dropped): the second
+// call returns Some and trips becomes 2.
+#[tokio::test]
+async fn quarantine_now_unless_tripped_skips_a_tripped_upstream() {
+    let dead = proxy("192.0.2.1", 9);
+    let rotator = rotator(vec![dead.clone()], 3);
+    assert_eq!(
+        rotator.quarantine_now_unless_tripped(&dead),
+        Some(Duration::from_millis(20))
+    );
+    assert_eq!(rotator.quarantine_now_unless_tripped(&dead), None);
+    assert_eq!(rotator.health()[0].health.trips, 1);
+}
+
+// Finding H3, race half: one lock acquisition — among many concurrent
+// callers exactly one quarantines, trips == 1. Mutation: the two-step
+// is_quarantined + quarantine_now pair lets several callers trip under
+// contention.
+#[test]
+fn concurrent_quarantine_of_one_upstream_trips_once() {
+    let dead = proxy("192.0.2.1", 9);
+    let rotator = Arc::new(rotator(vec![dead.clone()], 3));
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let rotator = Arc::clone(&rotator);
+        let barrier = Arc::clone(&barrier);
+        let dead = dead.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            rotator.quarantine_now_unless_tripped(&dead)
+        }));
+    }
+    let applied = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(Option::is_some)
+        .count();
+    assert_eq!(applied, 1);
+    assert_eq!(rotator.health()[0].health.trips, 1);
+}

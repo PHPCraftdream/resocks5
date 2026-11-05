@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::{timeout_at, Instant};
+use tokio::time::timeout_at;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
@@ -66,7 +66,7 @@ pub(crate) async fn https_on_stream(
             }
         })?;
 
-    let deadline = Instant::now() + handshake_timeout;
+    let deadline = crate::connect::handshake_over_stream::deadline_after(handshake_timeout);
     let mut tls_stream = match timeout_at(
         deadline,
         tls_connector.connect(server_name, ProgressReportingWriter::new(stream)),

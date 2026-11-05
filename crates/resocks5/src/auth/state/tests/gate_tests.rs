@@ -299,10 +299,7 @@ fn same_account_claim_follower_waits_on_gate_not_on_a_blocking_thread() {
         let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
         assert_eq!(bob.hash, winner_hash, "disk and memory must agree");
         assert!(state.verify("bob", "same-pw"));
-        assert!(state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
-        ));
+        assert!(state.cache_matches("bob", "same-pw"));
 
         holder.join().expect("join holder");
         let _ = std::fs::remove_file(&path);
@@ -537,10 +534,7 @@ fn cancelled_leader_holds_claim_gate_against_same_account_follower() {
         let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
         assert_eq!(bob.hash, winner_hash, "disk and memory must agree");
         assert!(state.verify("bob", "same-pw"));
-        assert!(state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
-        ));
+        assert!(state.cache_matches("bob", "same-pw"));
 
         holder.join().expect("join holder");
         let _ = std::fs::remove_file(&path);

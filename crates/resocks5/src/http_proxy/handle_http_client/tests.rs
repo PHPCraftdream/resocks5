@@ -16,7 +16,7 @@ use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 use tokio::net::TcpListener;
 
-fn test_logger() -> Arc<crate::logger::Logger> {
+pub(super) fn test_logger() -> Arc<crate::logger::Logger> {
     let (tx, _rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
     Arc::new(crate::logger::Logger::new(
         tx,
@@ -27,7 +27,9 @@ fn test_logger() -> Arc<crate::logger::Logger> {
 /// Minimal no-auth SOCKS5 stub. After CONNECT succeeds it writes
 /// `banner` to the tunnel (if non-empty), then records everything the
 /// client sends. The log starts with the requested target ("host:port").
-async fn spawn_socks5_stub(banner: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+pub(super) async fn spawn_socks5_stub(
+    banner: &'static [u8],
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -94,7 +96,7 @@ async fn serve_stub_client(
     Some(())
 }
 
-fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
+pub(super) fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
     resocks5_net::types::ProxyConfig::socks5("127.0.0.1", addr.port())
 }
 
@@ -809,7 +811,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
 }
 
 /// Parse a real request to obtain the recovery reply capability.
-async fn recovery_request() -> IncomingRequest {
+pub(super) async fn recovery_request() -> IncomingRequest {
     let (mut peer, mut stream) = tokio::io::duplex(128);
     peer.write_all(b"CONNECT 203.0.113.9:443 HTTP/1.1\r\n\r\n")
         .await
