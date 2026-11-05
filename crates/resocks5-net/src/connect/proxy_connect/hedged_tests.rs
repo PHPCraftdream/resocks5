@@ -609,3 +609,275 @@ async fn already_handshaking_attempt_reports_late_success_and_closes_socket() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn holder_success_reports_tcp_ready_sibling_lost_without_connect() {
+    // Mutation catches: non-exclusive handshake admission (the sibling would
+    // send a greeting while the holder holds the slot), a win not published
+    // by the holder itself, and a missing post-admission `won` re-check —
+    // each would let the sibling send its own CONNECT here.
+    let (holder_listener, holder) = loopback().await;
+    let (sibling_listener, sibling) = loopback().await;
+    let (request_read_tx, request_read_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let holder_server = tokio::spawn(async move {
+        let (mut stream, _) = holder_listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        let _ = request_read_tx.send(());
+        let _ = release_rx.await;
+        stream
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let _ = stream.read_u8().await;
+    });
+    let race = Arc::new(RaceState::default());
+    let mut running = JoinSet::new();
+    let mut launched = Vec::new();
+    launch(
+        &mut running,
+        &mut launched,
+        0,
+        holder,
+        race.clone(),
+        "example.com:80".to_owned(),
+        pool(Duration::from_secs(1)),
+        Duration::from_secs(1),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(1), request_read_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // The holder sent its greeting plus CONNECT, so it holds the slot; the
+    // sibling must wait instead of handshaking beside it.
+    launch(
+        &mut running,
+        &mut launched,
+        1,
+        sibling,
+        race,
+        "example.com:80".to_owned(),
+        pool(Duration::from_secs(1)),
+        Duration::from_secs(1),
+        None,
+    );
+    let (mut sibling_stream, _) =
+        tokio::time::timeout(Duration::from_secs(1), sibling_listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+    match tokio::time::timeout(Duration::from_millis(150), sibling_stream.read_u8()).await {
+        Err(_) => {}
+        Ok(Ok(byte)) => panic!("sibling sent byte {byte} while the holder held the handshake slot"),
+        Ok(Err(error)) => panic!("sibling socket closed while waiting for the slot: {error}"),
+    }
+    let _ = release_tx.send(());
+    match tokio::time::timeout(Duration::from_secs(1), sibling_stream.read_u8())
+        .await
+        .unwrap()
+    {
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "sibling must close its silent socket once the holder wins"
+        ),
+        Ok(byte) => panic!("sibling sent byte {byte} after the holder won"),
+    }
+    let (tx, mut rx) = mpsc::channel(2);
+    let drain = tokio::spawn(drain(
+        running,
+        launched,
+        Arc::new(move |report: &AttemptReport| send_report(&tx, report)),
+    ));
+    assert_eq!(
+        receive_reports(&mut rx, 2, Duration::from_secs(2)).await,
+        [
+            Observed {
+                index: 0,
+                after_win: true,
+                outcome: "late-success"
+            },
+            Observed {
+                index: 1,
+                after_win: true,
+                outcome: "lost"
+            },
+        ]
+    );
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), holder_server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn holder_failure_lets_waiting_sibling_perform_its_own_connect() {
+    // Mutation catches: a TCP-ready sibling giving up (Lost) instead of
+    // waiting for a failed slot-holder, a slot not freed on the failure
+    // path, and a failure wrongly published as a win — the sibling must go
+    // on to complete its own CONNECT and succeed.
+    let (holder_listener, holder) = loopback().await;
+    let (sibling_listener, sibling) = loopback().await;
+    let (request_read_tx, request_read_rx) = tokio::sync::oneshot::channel();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    let (sibling_accepted_tx, sibling_accepted_rx) = tokio::sync::oneshot::channel();
+    let holder_server = tokio::spawn(async move {
+        let (mut stream, _) = holder_listener.accept().await.unwrap();
+        read_request(&mut stream).await;
+        let _ = request_read_tx.send(());
+        let _ = close_rx.await;
+        drop(stream);
+    });
+    let sibling_server = tokio::spawn(async move {
+        let (mut stream, _) = sibling_listener.accept().await.unwrap();
+        let _ = sibling_accepted_tx.send(());
+        read_request(&mut stream).await;
+        stream
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let _ = stream.read_u8().await;
+    });
+    let race = Arc::new(RaceState::default());
+    let mut running = JoinSet::new();
+    let mut launched = Vec::new();
+    launch(
+        &mut running,
+        &mut launched,
+        0,
+        holder,
+        race.clone(),
+        "example.com:80".to_owned(),
+        pool(Duration::from_secs(1)),
+        Duration::from_secs(1),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(1), request_read_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    launch(
+        &mut running,
+        &mut launched,
+        1,
+        sibling,
+        race,
+        "example.com:80".to_owned(),
+        pool(Duration::from_secs(1)),
+        Duration::from_secs(1),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(1), sibling_accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = close_tx.send(());
+    let first = tokio::time::timeout(Duration::from_secs(2), running.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.index, 0);
+    assert!(matches!(first.result, Err(AttemptFailure::Failed(_))));
+    let second = tokio::time::timeout(Duration::from_secs(2), running.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.index, 1);
+    assert!(
+        second.result.is_ok(),
+        "sibling must proceed and succeed after the holder fails"
+    );
+    drop(second.result);
+    tokio::time::timeout(Duration::from_secs(1), holder_server)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), sibling_server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn max_hedge_delay_never_panics_and_never_hedges() {
+    // Mutation catches: arming the hedge deadline with plain `now() + delay`
+    // (panics on `Duration::MAX`) and launching a second candidate despite
+    // an unarmable timer.
+    let (listener, candidate) = loopback().await;
+    let (unused_listener, unused) = loopback().await;
+    let server = accept_socks(listener, b"ok").await;
+    let (tx, mut rx) = mpsc::channel(2);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        connect_hedged(
+            &[candidate, unused],
+            "example.com:80",
+            &pool(Duration::from_secs(1)),
+            None,
+            &opts(Duration::MAX),
+            move |report| send_report(&tx, report),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.winner, 0);
+    drop(result.stream);
+    server.await.unwrap();
+    assert_eq!(
+        receive_reports(&mut rx, 1, Duration::from_secs(1)).await,
+        [Observed {
+            index: 0,
+            after_win: false,
+            outcome: "won"
+        }]
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), unused_listener.accept())
+            .await
+            .is_err(),
+        "an unhedgeable delay must not launch the second candidate"
+    );
+}
+
+#[tokio::test]
+async fn max_hedge_delay_with_single_candidate_wins_without_timer() {
+    // Mutation catches: computing the hedge deadline after the (only)
+    // launch even when no candidate remains — the old `now() + delay`
+    // panicked here although no timer was ever needed.
+    let (listener, candidate) = loopback().await;
+    let server = accept_socks(listener, b"ok").await;
+    let (tx, mut rx) = mpsc::channel(1);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        connect_hedged(
+            &[candidate],
+            "example.com:80",
+            &pool(Duration::from_secs(1)),
+            None,
+            &opts(Duration::MAX),
+            move |report| send_report(&tx, report),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.winner, 0);
+    drop(result.stream);
+    server.await.unwrap();
+    assert_eq!(
+        receive_reports(&mut rx, 1, Duration::from_secs(1)).await,
+        [Observed {
+            index: 0,
+            after_win: false,
+            outcome: "won"
+        }]
+    );
+}

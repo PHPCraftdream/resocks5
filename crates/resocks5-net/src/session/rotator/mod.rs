@@ -211,6 +211,10 @@ impl StickyCache {
 /// [`pick_order`](ProxyRotator::pick_order) returns a weighted-random
 /// permutation; [`get_next`](ProxyRotator::get_next) is plain round-robin,
 /// used for the fallback and the sticky-cache-miss path.
+///
+/// Identical upstreams (same endpoint, protocol and account) are
+/// deduplicated at construction, keeping the first occurrence's
+/// position; the rotator then describes unique upstreams only.
 pub struct ProxyRotator {
     /// Pre-built `Arc<ProxyConfig>` per upstream. `get_next` returns a
     /// cheap refcount clone, so no full struct copy on rotation.
@@ -358,6 +362,11 @@ impl ProxyRotator {
     /// [`take_probes`](ProxyRotator::take_probes) hands it out for one
     /// out-of-band check at a time.
     ///
+    /// Identical upstreams (same endpoint, protocol and account) are
+    /// deduplicated at construction, keeping the first occurrence's
+    /// position; [`RotatorError::Empty`] still applies to an empty
+    /// input list.
+    ///
     /// # Errors
     /// Returns [`RotatorError::Empty`] when `proxies` is empty, or
     /// [`RotatorError::InvalidPolicy`] when `policy` or `quarantine` fails
@@ -372,25 +381,29 @@ impl ProxyRotator {
         if proxies.is_empty() {
             return Err(RotatorError::Empty);
         }
-        let n = proxies.len();
         let identity_hasher = RandomState::new();
-        let mut by_identity = HashMap::<_, Vec<usize>>::with_capacity(n);
-        for (index, proxy) in proxies.iter().enumerate() {
+        // One rating slot per unique identity: identical upstreams
+        // collapse onto the first occurrence's position, so `len()`,
+        // `all_proxies()`, the ratings and `health()` describe unique
+        // upstreams only.
+        let mut unique: Vec<ProxyConfig> = Vec::with_capacity(proxies.len());
+        let mut by_identity = HashMap::<_, Vec<usize>>::with_capacity(proxies.len());
+        for proxy in proxies {
             let bucket = by_identity
-                .entry(upstream_hash(&identity_hasher, proxy))
+                .entry(upstream_hash(&identity_hasher, &proxy))
                 .or_default();
-            if let Some(slot) = bucket
-                .iter_mut()
-                .find(|slot| same_upstream(proxy, &proxies[**slot]))
+            if bucket
+                .iter()
+                .any(|slot| same_upstream(&proxy, &unique[*slot]))
             {
-                *slot = index;
-            } else {
-                bucket.push(index);
+                continue;
             }
+            bucket.push(unique.len());
+            unique.push(proxy);
         }
-        let ratings = Ratings::try_with_quarantine(n, policy, quarantine)?;
+        let ratings = Ratings::try_with_quarantine(unique.len(), policy, quarantine)?;
         Ok(Self {
-            proxies: proxies.into_iter().map(Arc::new).collect(),
+            proxies: unique.into_iter().map(Arc::new).collect(),
             identity_hasher,
             by_identity,
             index: AtomicUsize::new(0),
@@ -446,7 +459,8 @@ impl ProxyRotator {
         self.proxies[i].clone()
     }
 
-    /// Number of upstreams in the rotator.
+    /// Number of upstreams in the rotator (duplicates collapsed at
+    /// construction).
     pub fn len(&self) -> usize {
         self.proxies.len()
     }
@@ -464,8 +478,9 @@ impl ProxyRotator {
 
     /// Look up the internal index for the given proxy config.
     ///
-    /// Expected O(1), with no lock or allocation. Duplicate identities
-    /// resolve to the last configured slot.
+    /// Expected O(1), with no lock or allocation. Identities are unique
+    /// in the rotator (duplicates collapsed at construction); the
+    /// per-slot comparison still guards against hash collisions.
     fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
         self.by_identity
             .get(&upstream_hash(&self.identity_hasher, p))?

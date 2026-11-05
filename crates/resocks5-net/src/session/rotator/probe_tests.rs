@@ -1,5 +1,6 @@
 use super::*;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 
@@ -173,4 +174,107 @@ async fn a_refused_connect_reports_the_io_error_not_a_timeout() {
         }
         other => panic!("unexpected events: {other:?}"),
     }
+}
+
+fn rotator_with_margins(proxies: Vec<ProxyConfig>) -> ProxyRotator {
+    ProxyRotator::try_with_quarantine(
+        proxies,
+        RatingPolicy::default(),
+        QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::from_millis(300))
+            .with_max(Duration::from_millis(300))
+            .with_probe_lease(Duration::from_millis(300)),
+        DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+        DEFAULT_STICKY_CACHE_TTL,
+    )
+    .unwrap()
+}
+
+/// Guard stand-in whose Drop counts: the probe must drop it exactly once,
+/// after the attempt settles.
+struct DropCounter(Arc<AtomicUsize>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// P2 №5 (a): at capacity the due probe is deferred — no connection, no
+// health change — and the lease expires so take_probes hands the
+// upstream out again.
+#[tokio::test]
+async fn probe_due_with_at_capacity_defers_without_connecting_or_rating() {
+    let (listener, address) = listener().await;
+    let proxy = proxy("127.0.0.1", address.port());
+    let rotator = rotator_with_margins(vec![proxy.clone()]);
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let before = rotator.health();
+    let events = rotator
+        .probe_due_with(Duration::from_secs(1), |_| None::<()>)
+        .await;
+    assert!(events.is_empty(), "a deferred probe reports nothing");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "a deferred probe must not connect"
+    );
+    let after = rotator.health();
+    assert_eq!(after[0].health.state, before[0].health.state);
+    assert_eq!(after[0].health.trips, before[0].health.trips);
+    assert_eq!(after[0].health.consecutive, before[0].health.consecutive);
+    assert!(rotator.is_quarantined(&proxy));
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(rotator.take_probes().len(), 1);
+    drop(listener);
+}
+
+// P2 №5 (b): with a reservation the probe connects, recovers the
+// upstream and drops the guard when the attempt settles.
+#[tokio::test]
+async fn probe_due_with_holds_the_guard_for_the_probe_and_recovers() {
+    let (listener, address) = listener().await;
+    let proxy = proxy("127.0.0.1", address.port());
+    let rotator = rotator_with_margins(vec![proxy.clone()]);
+    assert!(rotator.record_hard_failure(&proxy).is_some());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&drops);
+    let events = rotator
+        .probe_due_with(Duration::from_secs(1), move |_| {
+            Some(DropCounter(Arc::clone(&counter)))
+        })
+        .await;
+    assert!(
+        matches!(events.as_slice(), [ProbeEvent::Recovered { proxy: p }] if p.host == proxy.host)
+    );
+    assert!(!rotator.is_quarantined(&proxy));
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "the guard drops once, after the probe settles"
+    );
+    drop(listener);
+}
+
+// P2 №5, start-up half: an at-capacity upstream is neither probed nor
+// quarantined at start-up.
+#[tokio::test]
+async fn probe_all_with_at_capacity_neither_probes_nor_quarantines() {
+    let proxy = proxy("192.0.2.1", 9);
+    let rotator = rotator_with_margins(vec![proxy.clone()]);
+    let events = rotator
+        .probe_all_with(Duration::from_millis(200), |_| None::<()>)
+        .await;
+    assert!(events.is_empty());
+    assert!(!rotator.is_quarantined(&proxy));
+    let health = rotator.health();
+    assert_eq!(health[0].health.trips, 0);
+    assert_eq!(health[0].health.consecutive, 0);
 }

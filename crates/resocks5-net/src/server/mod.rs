@@ -156,7 +156,7 @@ impl IncomingRequest {
     /// Anonymous: `None`.
     pub fn take_username(&mut self) -> Option<String> {
         let taken = self.username.take();
-        self.username_raw = None;
+        discard_wiped(&mut self.username_raw);
         taken
     }
 
@@ -727,6 +727,23 @@ where
         credentials: retained,
         pipeline,
     })
+}
+
+/// Drop the value held by `slot`, wiping it in place first: the struct's
+/// `Drop`-based wipe never sees a value already taken out, so under
+/// `zeroize` the buffer is overwritten BEFORE it is freed.
+#[cfg(feature = "zeroize")]
+fn discard_wiped<T: zeroize::Zeroize>(slot: &mut Option<T>) {
+    if let Some(value) = slot.as_mut() {
+        zeroize::Zeroize::zeroize(value);
+    }
+    slot.take();
+}
+
+/// Without `zeroize` this is a plain take-and-drop; behaviour is unchanged.
+#[cfg(not(feature = "zeroize"))]
+fn discard_wiped<T>(slot: &mut Option<T>) {
+    slot.take();
 }
 
 #[cfg(feature = "zeroize")]

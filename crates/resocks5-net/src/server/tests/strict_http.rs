@@ -24,7 +24,8 @@ const EXPECT_HTTP_505: &[u8] =
 /// Case A: the pure validator rejects and accepts exactly per rule class.
 #[test]
 fn strict_validate_table_rejects_and_accepts_per_rule() {
-    let rejected: [(&str, &[&str], &str); 36] = [
+    #[rustfmt::skip]
+    let rejected: [(&str, &[&str], &str); 58] = [
         // Bracketed but not an IPv6 address (only hex digits and colons).
         (
             "CONNECT [:::]:443 HTTP/1.1",
@@ -32,130 +33,34 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             "strict HTTP: bracketed authority is not an IPv6 address",
         ),
         // A control character inside a field name is an invalid token.
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["X\u{1}Y: v"],
-            "strict HTTP: invalid header field name",
-        ),
+        ("CONNECT h:443 HTTP/1.1", &["X\u{1}Y: v"], "strict HTTP: invalid header field name"),
         // Duplicate Host is rejected for HTTP/1.0 as well.
-        (
-            "CONNECT h:443 HTTP/1.0",
-            &["Host: a", "Host: b"],
-            "strict HTTP: duplicate Host header",
-        ),
-        (
-            "CONNECT h:1 HTTP/garbage",
-            &[],
-            "strict HTTP: malformed HTTP-version",
-        ),
-        (
-            "CONNECT h:1 HTTP/1.1 extra",
-            &[],
-            "strict HTTP: malformed request line",
-        ),
-        (
-            "CONNECT h:1 http/1.1",
-            &[],
-            "strict HTTP: malformed HTTP-version",
-        ),
-        (
-            "CONNECT h:1 HTTP/11",
-            &[],
-            "strict HTTP: malformed HTTP-version",
-        ),
-        (
-            "CONNECT h:1 HTTP/1.",
-            &[],
-            "strict HTTP: malformed HTTP-version",
-        ),
-        (
-            "CONNECT h:1 HTTP/1.10",
-            &[],
-            "strict HTTP: malformed HTTP-version",
-        ),
-        (
-            "CONNECT  h:1 HTTP/1.1",
-            &[],
-            "strict HTTP: malformed request line",
-        ), // two spaces
-        (
-            "CONNECT h:1 HTTP/1.1 ",
-            &[],
-            "strict HTTP: malformed request line",
-        ), // trailing space
+        ("CONNECT h:443 HTTP/1.0", &["Host: a", "Host: b"], "strict HTTP: duplicate Host header"),
+        ("CONNECT h:1 HTTP/garbage", &[], "strict HTTP: malformed HTTP-version"),
+        ("CONNECT h:1 HTTP/1.1 extra", &[], "strict HTTP: malformed request line"),
+        ("CONNECT h:1 http/1.1", &[], "strict HTTP: malformed HTTP-version"),
+        ("CONNECT h:1 HTTP/11", &[], "strict HTTP: malformed HTTP-version"),
+        ("CONNECT h:1 HTTP/1.", &[], "strict HTTP: malformed HTTP-version"),
+        ("CONNECT h:1 HTTP/1.10", &[], "strict HTTP: malformed HTTP-version"),
+        ("CONNECT  h:1 HTTP/1.1", &[], "strict HTTP: malformed request line"), // two spaces
+        ("CONNECT h:1 HTTP/1.1 ", &[], "strict HTTP: malformed request line"), // trailing space
         ("CONNECT h:1 HTTP/2.0", &[], "505"),
         ("CONNECT h:1 HTTP/0.9", &[], "505"),
         ("CONNECT h:1 HTTP/1.2", &[], "505"),
-        (
-            "CONNECT ::1:443 HTTP/1.1",
-            &[],
-            "strict HTTP: bare IPv6 authority",
-        ),
-        (
-            "CONNECT 2001:db8::1:443 HTTP/1.1",
-            &[],
-            "strict HTTP: bare IPv6 authority",
-        ),
-        (
-            "CONNECT h:+80 HTTP/1.1",
-            &[],
-            "strict HTTP: invalid authority port",
-        ),
-        (
-            "CONNECT h:0 HTTP/1.1",
-            &[],
-            "strict HTTP: invalid authority port",
-        ),
-        (
-            "CONNECT h:65536 HTTP/1.1",
-            &[],
-            "strict HTTP: invalid authority port",
-        ),
-        (
-            "CONNECT h: HTTP/1.1",
-            &[],
-            "strict HTTP: invalid authority port",
-        ),
-        (
-            "CONNECT h HTTP/1.1",
-            &[],
-            "strict HTTP: authority is missing a port",
-        ),
-        (
-            "CONNECT :443 HTTP/1.1",
-            &[],
-            "strict HTTP: authority host is empty",
-        ),
-        (
-            "CONNECT h:80a HTTP/1.1",
-            &[],
-            "strict HTTP: invalid authority port",
-        ),
-        (
-            "CONNECT [::1] HTTP/1.1",
-            &[],
-            "strict HTTP: authority is missing a port",
-        ),
-        (
-            "CONNECT [h]:80 HTTP/1.1",
-            &[],
-            "strict HTTP: bracketed authority is not an IPv6 address",
-        ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["X-Other: v"],
-            "strict HTTP: missing Host header",
-        ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["Host:"],
-            "strict HTTP: empty Host header",
-        ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["Host:   "],
-            "strict HTTP: empty Host header",
-        ),
+        ("CONNECT ::1:443 HTTP/1.1", &[], "strict HTTP: bare IPv6 authority"),
+        ("CONNECT 2001:db8::1:443 HTTP/1.1", &[], "strict HTTP: bare IPv6 authority"),
+        ("CONNECT h:+80 HTTP/1.1", &[], "strict HTTP: invalid authority port"),
+        ("CONNECT h:0 HTTP/1.1", &[], "strict HTTP: invalid authority port"),
+        ("CONNECT h:65536 HTTP/1.1", &[], "strict HTTP: invalid authority port"),
+        ("CONNECT h: HTTP/1.1", &[], "strict HTTP: invalid authority port"),
+        ("CONNECT h HTTP/1.1", &[], "strict HTTP: authority is missing a port"),
+        ("CONNECT :443 HTTP/1.1", &[], "strict HTTP: authority host is empty"),
+        ("CONNECT h:80a HTTP/1.1", &[], "strict HTTP: invalid authority port"),
+        ("CONNECT [::1] HTTP/1.1", &[], "strict HTTP: authority is missing a port"),
+        ("CONNECT [h]:80 HTTP/1.1", &[], "strict HTTP: bracketed authority is not an IPv6 address"),
+        ("CONNECT h:443 HTTP/1.1", &["X-Other: v"], "strict HTTP: missing Host header"),
+        ("CONNECT h:443 HTTP/1.1", &["Host:"], "strict HTTP: empty Host header"),
+        ("CONNECT h:443 HTTP/1.1", &["Host:   "], "strict HTTP: empty Host header"),
         (
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:1", "host: h:1"],
@@ -166,31 +71,15 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             &["Host: h:1", "HOST: h:1"],
             "strict HTTP: duplicate Host header",
         ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["Host : h:1"],
-            "strict HTTP: whitespace before header colon",
-        ),
+        ("CONNECT h:443 HTTP/1.1", &["Host : h:1"], "strict HTTP: whitespace before header colon"),
         (
             "CONNECT h:443 HTTP/1.1",
             &["X-No-Colon-Value"],
             "strict HTTP: header line is missing a colon",
         ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &[" X-Opaque: v"],
-            "strict HTTP: obsolete line folding",
-        ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &[": v"],
-            "strict HTTP: empty header field name",
-        ),
-        (
-            "CONNECT h:443 HTTP/1.1",
-            &["X Bad(Name): v"],
-            "strict HTTP: invalid header field name",
-        ),
+        ("CONNECT h:443 HTTP/1.1", &[" X-Opaque: v"], "strict HTTP: obsolete line folding"),
+        ("CONNECT h:443 HTTP/1.1", &[": v"], "strict HTTP: empty header field name"),
+        ("CONNECT h:443 HTTP/1.1", &["X Bad(Name): v"], "strict HTTP: invalid header field name"),
         (
             "CONNECT h:443 HTTP/1.1",
             &[
@@ -200,6 +89,62 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             ],
             "strict HTTP: duplicate Proxy-Authorization header",
         ),
+        // Authority host grammar: CONNECT authorities carry no path/userinfo.
+        (
+            "CONNECT example.com/path:443 HTTP/1.1",
+            &["Host: h"],
+            "strict HTTP: invalid authority host",
+        ),
+        (
+            "CONNECT user@example.com:443 HTTP/1.1",
+            &["Host: h"],
+            "strict HTTP: invalid authority host",
+        ),
+        ("CONNECT example.com?x:443 HTTP/1.1", &["Host: h"], "strict HTTP: invalid authority host"),
+        ("CONNECT example.com#f:443 HTTP/1.1", &["Host: h"], "strict HTTP: invalid authority host"),
+        // A backslash is neither unreserved nor a sub-delim.
+        ("CONNECT bad\\host:443 HTTP/1.1", &["Host: h"], "strict HTTP: invalid authority host"),
+        // Percent-escapes need exactly two hex digits.
+        (
+            "CONNECT bad%zz.example:443 HTTP/1.1",
+            &["Host: h"],
+            "strict HTTP: invalid authority host",
+        ),
+        ("CONNECT %2:443 HTTP/1.1", &["Host: h"], "strict HTTP: invalid authority host"),
+        ("CONNECT bad%:443 HTTP/1.1", &["Host: h"], "strict HTTP: invalid authority host"),
+        // A space splits the request line before any host grammar runs.
+        ("CONNECT exa mple.com:443 HTTP/1.1", &[], "strict HTTP: malformed request line"),
+        // CTL bytes in field values: NUL, 0x1F, and 0x7F, in any header.
+        (
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", "X: a\u{0}b"],
+            "strict HTTP: invalid header field value",
+        ),
+        (
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", "X: v\u{1f}"],
+            "strict HTTP: invalid header field value",
+        ),
+        (
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", "X: v\u{7f}"],
+            "strict HTTP: invalid header field value",
+        ),
+        ("CONNECT h:443 HTTP/1.1", &["Host: a\u{0}b"], "strict HTTP: invalid header field value"),
+        (
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", "Proxy-Authorization: Basic a\u{0}b"],
+            "strict HTTP: invalid header field value",
+        ),
+        // Strict Host grammar: uri-host [ ":" 1-5 digit port ].
+        ("CONNECT h:1 HTTP/1.1", &["Host: bad/path"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: user@example.com"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: bad%zz.example"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:abc"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [::1"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: a b"], "strict HTTP: invalid Host header"),
+        ("CONNECT h:1 HTTP/1.1", &["Host: ::1"], "strict HTTP: invalid Host header"),
     ];
     for (request_line, headers, want) in rejected {
         let hdrs: Vec<&[u8]> = headers.iter().map(|h| h.as_bytes()).collect();
@@ -210,7 +155,8 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
         }
     }
 
-    let accepted: [(&str, &[&str]); 11] = [
+    #[rustfmt::skip]
+    let accepted: [(&str, &[&str]); 25] = [
         // IPv4-embedded IPv6 is a valid bracketed literal.
         (
             "CONNECT [::ffff:192.0.2.1]:443 HTTP/1.1",
@@ -236,6 +182,39 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
             "CONNECT h:443 HTTP/1.1",
             &["Proxy-Authorization: Basic dXNlcjpwYXNz", "Host: h:443"],
         ),
+        // Authority host grammar accepts reg-names, IPv4, bracketed IPv6,
+        // and well-formed percent-escapes.
+        (
+            "CONNECT example.com:443 HTTP/1.1",
+            &["Host: example.com:443"],
+        ),
+        (
+            "CONNECT a-b_c.example:443 HTTP/1.1",
+            &["Host: a-b_c.example"],
+        ),
+        ("CONNECT 192.0.2.1:443 HTTP/1.1", &["Host: 192.0.2.1"]),
+        (
+            "CONNECT [2001:db8::1]:443 HTTP/1.1",
+            &["Host: [2001:db8::1]:443"],
+        ),
+        (
+            "CONNECT ex%41mple.com:443 HTTP/1.1",
+            &["Host: ex%41mple.com"],
+        ),
+        // HTAB and obs-text bytes stay legal in field values.
+        ("CONNECT h:443 HTTP/1.1", &["Host: h:443", "X-T: a\u{9}b"]),
+        (
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", "X-T: v\u{80}\u{ff}"],
+        ),
+        // Strict Host grammar accepts reg-names, IPv4:port, bracketed IPv6, OWS.
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com:443"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: 192.0.2.1:80"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [::1]:443"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: [2001:db8::1]"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: ex%41mple.com"]),
+        ("CONNECT h:1 HTTP/1.1", &["Host: example.com  "]), // trailing OWS trimmed
     ];
     for (request_line, headers) in accepted {
         let hdrs: Vec<&[u8]> = headers.iter().map(|h| h.as_bytes()).collect();
@@ -371,6 +350,123 @@ async fn strict_end_to_end_rejects_per_rule_class() {
     })
     .await
     .expect("bounded strict_end_to_end_rejects_per_rule_class");
+}
+
+/// Case B: authority-grammar and field-value violations answer 400 before any
+/// authentication, and the grammar's accept set authenticates end to end.
+#[tokio::test]
+async fn strict_end_to_end_authority_grammar_and_field_values() {
+    timeout(Duration::from_secs(10), async {
+        let opts = || options(false, true).strict_http(true);
+        let token = general_purpose::STANDARD.encode("user:pass");
+        let auth = format!("Proxy-Authorization: Basic {token}");
+
+        // (1) Path inside the authority: 400, never authenticated.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let frame = http_req(
+            "CONNECT example.com/path:443 HTTP/1.1",
+            &[auth.as_str()],
+            b"",
+        );
+        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "strict HTTP: invalid authority host");
+        assert_eq!(response, EXPECT_HTTP_400);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (2) userinfo-style '@' inside the authority.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let frame = http_req(
+            "CONNECT user@example.com:443 HTTP/1.1",
+            &[auth.as_str()],
+            b"",
+        );
+        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "strict HTTP: invalid authority host");
+        assert_eq!(response, EXPECT_HTTP_400);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (3) NUL in a field value despite a VALID auth header.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let frame = http_req(
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", auth.as_str(), "X-Evil: a\u{0}b"],
+            b"",
+        );
+        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
+        assert_eq!(response, EXPECT_HTTP_400);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (4) 0x1F inside the Host value despite a VALID auth header.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let frame = http_req(
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: a\u{1f}b", auth.as_str()],
+            b"",
+        );
+        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
+        assert_eq!(response, EXPECT_HTTP_400);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (5) 0x7F inside the Proxy-Authorization value itself.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let evil_auth = format!("Proxy-Authorization: Basic {token}\u{7f}");
+        let frame = http_req(
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", evil_auth.as_str()],
+            b"",
+        );
+        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
+        assert_eq!(response, EXPECT_HTTP_400);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // (6) Accept: IPv4 and reg-name authorities authenticate, target intact.
+        for target in ["192.0.2.1:443", "a-b_c.example:443"] {
+            let frame = http_req(
+                &format!("CONNECT {target} HTTP/1.1"),
+                &[&format!("Host: {target}"), auth.as_str()],
+                b"",
+            );
+            let (mut peer, mut server) = duplex(4096);
+            peer.write_all(&frame).await.unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let result = accept(&mut server, &opts(), move |c| async move {
+                assert_eq!(c.username(), "user");
+                assert_eq!(c.password(), "pass");
+                counted.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .await;
+            drop(server);
+            peer.read_to_end(&mut Vec::new()).await.unwrap();
+            let req = result.expect("strict authority accepted");
+            assert_eq!(req.target(), target);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        // (7) Accept: HTAB inside a field value stays legal end to end.
+        let frame = http_req(
+            "CONNECT h:443 HTTP/1.1",
+            &["Host: h:443", auth.as_str(), "X-T: a\u{9}b"],
+            b"",
+        );
+        let (mut peer, mut server) = duplex(4096);
+        peer.write_all(&frame).await.unwrap();
+        let result = accept(&mut server, &opts(), |_| async move { true }).await;
+        drop(server);
+        peer.read_to_end(&mut Vec::new()).await.unwrap();
+        assert_eq!(result.expect("HTAB value accepted").target(), "h:443");
+    })
+    .await
+    .expect("bounded strict_end_to_end_authority_grammar_and_field_values");
 }
 
 /// Case C: browser-like and curl-like strict requests authenticate and connect.
@@ -572,6 +668,16 @@ async fn strict_off_default_keeps_lenient_behaviour() {
             (http_req("CONNECT h:0 HTTP/1.1", &[], b""), "h:0"),
             // version check is only the HTTP/ prefix — pinned current behaviour.
             (http_req("CONNECT h:1 HTTP/garbage", &[], b""), "h:1"),
+            // HostPort::parse accepts a path in the authority — pinned current behaviour.
+            (
+                http_req("CONNECT example.com/path:443 HTTP/1.1", &[], b""),
+                "example.com/path:443",
+            ),
+            // Header field values are never byte-checked without strict — pinned current behaviour.
+            (
+                http_req("CONNECT h:443 HTTP/1.1", &["X: a\u{0}b"], b""),
+                "h:443",
+            ),
         ];
         for (frame, want_target) in lenient {
             let (mut peer, mut server) = duplex(4096);

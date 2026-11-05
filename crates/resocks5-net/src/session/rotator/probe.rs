@@ -50,20 +50,28 @@ async fn reachable(proxy: &ProxyConfig, connect_timeout: Duration) -> Result<(),
 
 type CheckResult = Result<(), String>;
 
+/// Spawn one reachability check per probe. The check decides per probe
+/// whether the attempt may start: `None` (at capacity) starts nothing —
+/// no task, no connection, nothing to report — while `Some(future)` runs
+/// as its own task; every task is started before the first one is
+/// awaited.
 fn spawn_checks<F, Fut>(
     proxies: Vec<Arc<ProxyConfig>>,
     check: F,
 ) -> JoinSet<(Arc<ProxyConfig>, CheckResult)>
 where
-    F: Fn(Arc<ProxyConfig>) -> Fut + Send + Sync + 'static,
+    F: Fn(Arc<ProxyConfig>) -> Option<Fut> + Send + Sync + 'static,
     Fut: Future<Output = CheckResult> + Send + 'static,
 {
     let check = Arc::new(check);
     let mut tasks = JoinSet::new();
     for proxy in proxies {
         let check = Arc::clone(&check);
+        let Some(future) = check(Arc::clone(&proxy)) else {
+            continue;
+        };
         tasks.spawn(async move {
-            let result = check(Arc::clone(&proxy)).await;
+            let result = future.await;
             (proxy, result)
         });
     }
@@ -84,8 +92,36 @@ where
 impl ProxyRotator {
     /// Probe expired quarantine leases and report outcomes.
     pub async fn probe_due(&self, connect_timeout: Duration) -> Vec<ProbeEvent> {
-        let tasks = spawn_checks(self.take_probes(), move |proxy| async move {
-            reachable(&proxy, connect_timeout).await
+        self.probe_due_with(connect_timeout, |_| Some(())).await
+    }
+
+    /// [`ProxyRotator::probe_due`] with a per-probe capacity reservation.
+    ///
+    /// `reserve` runs once per due upstream, before any connection is
+    /// made. Returning `None` defers the probe: no connection, no health
+    /// change, no [`ProbeEvent`] — capacity is this process's own load,
+    /// not the upstream's fault — and the probe lease simply expires, so
+    /// [`ProxyRotator::take_probes`] hands the upstream out again later.
+    /// Returning `Some(guard)` pins `guard` (e.g. a pool permit) for the
+    /// probe's whole duration; it drops once the connect attempt
+    /// settles.
+    pub async fn probe_due_with<G, R>(
+        &self,
+        connect_timeout: Duration,
+        reserve: R,
+    ) -> Vec<ProbeEvent>
+    where
+        G: Send + 'static,
+        R: Fn(&ProxyConfig) -> Option<G> + Send + Sync + 'static,
+    {
+        let tasks = spawn_checks(self.take_probes(), move |proxy| {
+            let guard = reserve(&proxy)?;
+            Some(async move {
+                let result = reachable(&proxy, connect_timeout).await;
+                // `_guard` holds the cap slot until the attempt settles.
+                let _guard = guard;
+                result
+            })
         });
 
         let mut events = Vec::new();
@@ -110,8 +146,28 @@ impl ProxyRotator {
 
     /// Check every configured upstream, quarantining unavailable ones when enabled.
     pub async fn probe_all(&self, connect_timeout: Duration) -> Vec<ProbeEvent> {
-        let tasks = spawn_checks(self.proxies.clone(), move |proxy| async move {
-            reachable(&proxy, connect_timeout).await
+        self.probe_all_with(connect_timeout, |_| Some(())).await
+    }
+
+    /// [`ProxyRotator::probe_all`] with the same per-probe reservation as
+    /// [`ProxyRotator::probe_due_with`]: an at-capacity upstream is not
+    /// probed and not quarantined at start-up.
+    pub async fn probe_all_with<G, R>(
+        &self,
+        connect_timeout: Duration,
+        reserve: R,
+    ) -> Vec<ProbeEvent>
+    where
+        G: Send + 'static,
+        R: Fn(&ProxyConfig) -> Option<G> + Send + Sync + 'static,
+    {
+        let tasks = spawn_checks(self.proxies.clone(), move |proxy| {
+            let guard = reserve(&proxy)?;
+            Some(async move {
+                let result = reachable(&proxy, connect_timeout).await;
+                let _guard = guard;
+                result
+            })
         });
 
         let mut events = Vec::new();
@@ -148,11 +204,13 @@ mod tests {
             Arc::new(ProxyConfig::socks5("192.0.2.1", 30_002)),
             Arc::new(ProxyConfig::socks5("192.0.2.1", 30_003)),
         ];
-        let tasks = spawn_checks(proxies, |proxy| async move {
-            if proxy.port == 30_001 {
-                panic!("synthetic task failure");
-            }
-            Err("down".to_owned())
+        let tasks = spawn_checks(proxies, |proxy| {
+            Some(async move {
+                if proxy.port == 30_001 {
+                    panic!("synthetic task failure");
+                }
+                Err("down".to_owned())
+            })
         });
         let mut completed = 0;
         drain_checks(tasks, |_, result| {
@@ -174,10 +232,10 @@ mod tests {
 
         let tasks = spawn_checks(proxies, move |_| {
             let barrier = Arc::clone(&barrier_for_check);
-            async move {
+            Some(async move {
                 barrier.wait().await;
                 Err("down".to_owned())
-            }
+            })
         });
         let mut completed = 0;
         timeout(

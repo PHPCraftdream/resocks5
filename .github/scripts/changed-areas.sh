@@ -143,6 +143,11 @@ if [ "$full" = false ]; then
         net_f="$net_f rotator::"
         app_f="$app_f server::"
         ;;
+      crates/resocks5-net/src/session/chain/*)
+        rust=true
+        net_f="$net_f chain::"
+        app_f="$app_f server::"
+        ;;
       crates/resocks5-net/src/server/*)
         rust=true
         net_f="$net_f server::"

@@ -16,6 +16,65 @@ fn is_tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+/// Authority-host bytes: RFC 3986 unreserved + sub-delims; `%XX` escapes are
+/// checked separately. Dotted quads need no extra range check here.
+fn is_authority_host_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte)
+}
+
+/// True when every byte is an authority-host byte and every `%` opens a
+/// two-hex-digit escape.
+fn valid_authority_host(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let Some(hex) = bytes.get(i + 1..i + 3) else {
+                return false;
+            };
+            if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+                return false;
+            }
+            i += 3;
+        } else {
+            if !is_authority_host_byte(bytes[i]) {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
+/// 1-5 ASCII digits: the strict `Host` port shape.
+fn valid_port_digits(port: &str) -> bool {
+    !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Strict `Host` grammar: `uri-host [ ":" port ]`, mirroring the CONNECT
+/// authority rules with a 1-5 digit port; a bare IPv6 without brackets
+/// has no valid port separator and fails.
+fn valid_host_value(value: &str) -> bool {
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if inside.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return match after.strip_prefix(':') {
+            Some(port) => valid_port_digits(port),
+            None => after.is_empty(),
+        };
+    }
+    match value.split_once(':') {
+        Some((host, port)) => {
+            !host.is_empty() && valid_authority_host(host) && valid_port_digits(port)
+        }
+        None => !value.is_empty() && valid_authority_host(value),
+    }
+}
+
 /// Validate the already-split HTTP CONNECT request against RFC 9112.
 ///
 /// `request_line` is the request line text; `headers` are the raw header
@@ -71,6 +130,10 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
         if h.contains(':') {
             return Err(bad("strict HTTP: bare IPv6 authority"));
         }
+        // CONNECT authorities carry no path, userinfo, query, or fragment.
+        if !valid_authority_host(h) {
+            return Err(bad("strict HTTP: invalid authority host"));
+        }
         port_text = port;
     }
     if port_text.is_empty() || port_text.len() > 5 || !port_text.bytes().all(|b| b.is_ascii_digit())
@@ -86,6 +149,7 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
 
     let mut host_count = 0usize;
     let mut host_value_empty = false;
+    let mut host_value: Option<&[u8]> = None;
     let mut proxy_auth_count = 0usize;
     for line in headers {
         if line.first() == Some(&b' ') || line.first() == Some(&b'\t') {
@@ -107,11 +171,17 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
         if !name.iter().all(|&b| is_tchar(b)) {
             return Err(bad("strict HTTP: invalid header field name"));
         }
+        // RFC 9112 field values: CTL bytes are invalid; HTAB and SP are the
+        // only bytes below 0x20 because CRLF never reaches this validator.
+        if value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7F) {
+            return Err(bad("strict HTTP: invalid header field value"));
+        }
         let lower = name.to_ascii_lowercase();
         match lower.as_slice() {
             b"host" => {
                 host_count += 1;
                 host_value_empty = value.trim_ascii().is_empty();
+                host_value = Some(value.trim_ascii());
             }
             b"proxy-authorization" => proxy_auth_count += 1,
             _ => {}
@@ -126,6 +196,12 @@ pub(crate) fn validate(request_line: &str, headers: &[&[u8]]) -> Result<(), Stri
     }
     if host_value_empty {
         return Err(bad("strict HTTP: empty Host header"));
+    }
+    // Exactly one non-empty Host value must be `uri-host [ ":" port ]`.
+    if let Some(host) = host_value {
+        if !std::str::from_utf8(host).is_ok_and(valid_host_value) {
+            return Err(bad("strict HTTP: invalid Host header"));
+        }
     }
     if proxy_auth_count > 1 {
         return Err(bad("strict HTTP: duplicate Proxy-Authorization header"));

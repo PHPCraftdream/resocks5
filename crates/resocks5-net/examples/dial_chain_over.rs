@@ -34,7 +34,11 @@ async fn main() -> anyhow::Result<()> {
         .write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
         .await?;
     let mut body = Vec::new();
-    stream.read_to_end(&mut body).await?;
-    println!("received {} bytes", body.len());
+    let n = tokio::time::timeout(Duration::from_secs(5), async {
+        stream.take(64 * 1024).read_to_end(&mut body).await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("peer kept sending for over 5 s"))??;
+    println!("received {n} bytes");
     Ok(())
 }

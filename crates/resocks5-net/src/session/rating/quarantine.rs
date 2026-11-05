@@ -121,10 +121,20 @@ impl QuarantinePolicy {
     }
 
     /// Length of the `trips`-th quarantine (`trips >= 1`): `initial`
-    /// doubled `trips - 1` times, capped at `max`.
+    /// doubled `trips - 1` times, capped at `max`. Doubling stops once
+    /// the cap is reached (or the length saturates), so huge trip counts
+    /// cost at most ~64 doublings.
     fn duration_for(&self, trips: u32) -> Duration {
-        let shift = trips.saturating_sub(1).min(20);
-        self.initial.saturating_mul(1u32 << shift).min(self.max)
+        let mut length = self.initial;
+        for _ in 0..trips.saturating_sub(1) {
+            let doubled = length.saturating_mul(2);
+            let stuck = doubled == length;
+            length = doubled;
+            if stuck || length >= self.max {
+                break;
+            }
+        }
+        length.min(self.max)
     }
 }
 
@@ -137,6 +147,15 @@ pub(super) enum State {
     Quarantined,
     /// Backoff over, not yet confirmed alive: handed out only as a probe.
     Probation,
+}
+
+/// End of a period that starts at `now`: `now + length`, or a far-future
+/// stand-in when `Instant` cannot represent the sum (e.g. `Duration::MAX`).
+fn deadline(now: Instant, length: Duration) -> Instant {
+    const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    now.checked_add(length)
+        .or_else(|| now.checked_add(FAR))
+        .unwrap_or(now)
 }
 
 /// Per-upstream quarantine bookkeeping.
@@ -181,7 +200,7 @@ impl Cell {
         }
         self.trips = self.trips.saturating_add(1);
         let length = policy.duration_for(self.trips);
-        self.until = Some(now.checked_add(length).unwrap_or(now));
+        self.until = Some(deadline(now, length));
         Some(length)
     }
 
@@ -193,7 +212,7 @@ impl Cell {
         self.consecutive = self.consecutive.max(policy.threshold);
         self.trips = self.trips.saturating_add(1);
         let length = policy.duration_for(self.trips);
-        self.until = Some(now.checked_add(length).unwrap_or(now));
+        self.until = Some(deadline(now, length));
         length
     }
 
@@ -226,7 +245,7 @@ impl Cell {
         self.lease_until = None;
         self.trips = trips.max(1);
         self.consecutive = consecutive.max(policy.threshold);
-        self.until = Some(now.checked_add(left).unwrap_or(now));
+        self.until = Some(deadline(now, left));
     }
 
     /// A success proves the upstream alive: forget everything.
@@ -267,6 +286,48 @@ mod tests {
         assert_eq!(p.duration_for(2), Duration::from_secs(60));
         assert_eq!(p.duration_for(3), Duration::from_secs(100));
         assert_eq!(p.duration_for(u32::MAX), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn duration_reaches_the_cap_beyond_the_shift_limit() {
+        let p = QuarantinePolicy::default()
+            .with_initial(Duration::from_millis(1))
+            .with_max(Duration::from_secs(3600));
+        assert_eq!(p.duration_for(1), Duration::from_millis(1));
+        assert_eq!(p.duration_for(20), Duration::from_millis(524_288));
+        assert_eq!(p.duration_for(21), Duration::from_millis(1_048_576));
+        assert_eq!(p.duration_for(22), Duration::from_millis(2_097_152));
+        assert_eq!(p.duration_for(23), Duration::from_secs(3600));
+        assert_eq!(p.duration_for(u32::MAX), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn duration_reaches_max_from_sub_millisecond_initials() {
+        let p = QuarantinePolicy::default()
+            .with_initial(Duration::from_nanos(1))
+            .with_max(Duration::from_secs(3600));
+        assert_eq!(p.duration_for(50), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn default_policy_durations_double_then_cap() {
+        let p = QuarantinePolicy::default();
+        assert_eq!(p.duration_for(1), Duration::from_secs(30));
+        assert_eq!(p.duration_for(2), Duration::from_secs(60));
+        assert_eq!(p.duration_for(3), Duration::from_secs(120));
+        assert_eq!(p.duration_for(5), Duration::from_secs(480));
+        assert_eq!(p.duration_for(6), Duration::from_secs(600));
+        assert_eq!(p.duration_for(u32::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn duration_with_max_equal_to_initial_is_always_the_cap() {
+        let p = QuarantinePolicy::default()
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::from_secs(30));
+        assert_eq!(p.duration_for(1), Duration::from_secs(30));
+        assert_eq!(p.duration_for(2), Duration::from_secs(30));
+        assert_eq!(p.duration_for(u32::MAX), Duration::from_secs(30));
     }
 
     #[test]
@@ -385,5 +446,75 @@ mod tests {
             .with_initial(Duration::ZERO)
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn hard_failure_with_unrepresentable_deadline_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::MAX)
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        assert_eq!(c.hard_failure(t0, &p), Some(Duration::MAX));
+        assert_eq!(c.state(t0), State::Quarantined);
+    }
+
+    #[test]
+    fn retrip_with_unrepresentable_deadline_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        // Seed a high trip count without waiting out the doublings.
+        c.restore(true, Duration::from_secs(30), 100, 1, t0, &p);
+        let length = c.trip_now(t0, &p);
+        assert_eq!(length, Duration::MAX);
+        assert_eq!(c.state(t0), State::Quarantined);
+        assert_eq!(c.state(t0 + Duration::from_secs(1)), State::Quarantined);
+    }
+
+    #[test]
+    fn restore_with_unrepresentable_left_stays_quarantined() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(3)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        c.restore(true, Duration::MAX, 1, 3, t0, &p);
+        assert_eq!(c.state(t0), State::Quarantined);
+        // At least a year left; the exact cap is the platform's Instant range.
+        assert!(c.snapshot(t0).1 >= Duration::from_secs(365 * 24 * 3600));
+    }
+
+    #[test]
+    fn normal_deadlines_are_exact() {
+        let p = QuarantinePolicy::default();
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        for _ in 0..3 {
+            c.hard_failure(t0, &p);
+        }
+        assert_eq!(
+            c.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(30), 1, 3)
+        );
+
+        let mut r = Cell::default();
+        r.restore(true, Duration::from_secs(100), 2, 3, t0, &p);
+        assert_eq!(
+            r.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(100), 2, 3)
+        );
+
+        let mut q = Cell::default();
+        assert_eq!(q.trip_now(t0, &p), Duration::from_secs(30));
+        assert_eq!(
+            q.snapshot(t0),
+            (State::Quarantined, Duration::from_secs(30), 1, 3)
+        );
     }
 }

@@ -51,7 +51,7 @@ async fn reservation_reclaims_an_idle_socket_without_releasing_its_slot() {
     assert!(pool.reserve_permit(&proxy).is_ok());
 }
 
-fn make_proxy(host: &str, port: u16) -> ProxyConfig {
+pub(super) fn make_proxy(host: &str, port: u16) -> ProxyConfig {
     ProxyConfig::socks5(host, port)
 }
 
@@ -231,16 +231,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Shared accept/open counters for the counting listener.
 #[derive(Default)]
-struct Counters {
+pub(super) struct Counters {
     accepted: AtomicUsize,
     open: AtomicUsize,
 }
 
 impl Counters {
-    fn accepted(&self) -> usize {
+    pub(super) fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
-    fn open(&self) -> usize {
+    pub(super) fn open(&self) -> usize {
         self.open.load(Ordering::SeqCst)
     }
 }
@@ -250,7 +250,7 @@ impl Counters {
 /// handler task that reads until EOF; a guard decrements `open`
 /// when the socket drops (peer closed or task ends), so `open`
 /// drains to 0 once the pool-side sockets are gone.
-async fn counting_listener(l: tokio::net::TcpListener, counters: Arc<Counters>) {
+pub(super) async fn counting_listener(l: tokio::net::TcpListener, counters: Arc<Counters>) {
     loop {
         let Ok((sock, _)) = l.accept().await else {
             break;
@@ -296,7 +296,7 @@ async fn counting_listener(l: tokio::net::TcpListener, counters: Arc<Counters>) 
 /// build profile. A tiny REAL (blocking) sleep forces genuine
 /// wall-clock progress every iteration without touching tokio's
 /// own paused clock, so real I/O actually gets a chance to land.
-async fn quiesce(cond: impl Fn() -> bool) {
+pub(super) async fn quiesce(cond: impl Fn() -> bool) {
     for _ in 0..500 {
         if cond() {
             return;
@@ -308,7 +308,7 @@ async fn quiesce(cond: impl Fn() -> bool) {
     panic!("condition did not become true within the advance budget");
 }
 
-fn pool_cfg(spare_per_proxy: usize) -> PoolConfig {
+pub(super) fn pool_cfg(spare_per_proxy: usize) -> PoolConfig {
     PoolConfig {
         enabled: true,
         spare_per_proxy,

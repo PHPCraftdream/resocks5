@@ -87,9 +87,11 @@ client TCP                                          target host
 
 ## Sand-rating: how an upstream is chosen
 
-`resocks5` does **not** use a binary circuit breaker. Failed upstreams are
-not quarantined — they are *demoted* via a soft-weight model called
-sand-rating that converges back on its own as upstreams recover.
+`resocks5` does **not** use a binary circuit breaker. The soft sand-rating
+layer never excludes an upstream: failed upstreams are *demoted* and their
+weight converges back on its own as they recover. A separate hard layer,
+quarantine, does exclude upstreams after repeated hard failures and probes
+them back in (see below).
 
 ### State (per upstream)
 
@@ -347,9 +349,11 @@ on every request:
   process — no persistence.
 - Subsequent verifies for the same name compare the stored HMAC in constant
   time. Hit → success without touching Argon2.
-- On a password change, the new HMAC mismatches the cache → fallthrough to
-  Argon2 → success → cache updated. Old passwords stop authenticating the
-  moment the new one is recorded, including for in-flight sessions.
+- Password and policy changes are not hot-applied: users are a startup
+  snapshot, so a CLI or users-file change requires a server restart. The
+  only runtime update is the init-claim below; it swaps the hash in the
+  running process, after which old passwords fail, the cache miss falls
+  through to Argon2, and the stored HMAC is refreshed.
 
 The `hash == "init"` sentinel implements claim-on-first-login: the first
 authenticated connect for that username records the password and writes
