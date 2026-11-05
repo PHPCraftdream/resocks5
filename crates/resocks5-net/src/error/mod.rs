@@ -152,6 +152,49 @@ impl fmt::Display for ProtocolViolation {
     }
 }
 
+/// Why a secure-auth exchange (SOCKS5 method 0x80, see `secure_auth`) failed.
+/// Never carries a user name, a password or key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecureAuthError {
+    /// A message had an unexpected version or status byte.
+    BadVersion,
+    /// A field length was out of range (empty or oversized user name, salt).
+    BadLength,
+    /// The offered KDF parameters are outside the hard limits.
+    KdfOutOfRange,
+    /// The offered KDF parameters are weaker than the client's floor.
+    KdfTooWeak,
+    /// The key derivation (or the OS random source) failed.
+    Kdf,
+    /// The server's proof did not verify: it does not hold the user's key.
+    ServerProofMismatch,
+    /// The server rejected the proof (wrong password, or an unknown user).
+    Denied,
+    /// The server refused the exchange outright.
+    Refused,
+    /// The stream failed or ended during the exchange.
+    Io(io::ErrorKind),
+}
+
+impl fmt::Display for SecureAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BadVersion => "[SECURE-AUTH] unexpected version or status",
+            Self::BadLength => "[SECURE-AUTH] field length out of range",
+            Self::KdfOutOfRange => "[SECURE-AUTH] key-derivation parameters out of range",
+            Self::KdfTooWeak => "[SECURE-AUTH] key-derivation parameters below the client's floor",
+            Self::Kdf => "[SECURE-AUTH] key derivation failed",
+            Self::ServerProofMismatch => "[SECURE-AUTH] the server did not prove it holds the key",
+            Self::Denied => "[SECURE-AUTH] authentication denied",
+            Self::Refused => "[SECURE-AUTH] exchange refused by the server",
+            Self::Io(_) => "[SECURE-AUTH] I/O error during the exchange",
+        })
+    }
+}
+
+impl std::error::Error for SecureAuthError {}
+
 /// The typed error returned by every public connect/pool entry point.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -220,6 +263,8 @@ pub enum ConnectError {
     /// Basic to a plain-HTTP proxy), and the feature `cleartext-client` is off.
     /// Raised before the first byte of the handshake; nothing was sent.
     CleartextCredentialsRefused,
+    /// The secure-auth exchange (SOCKS5 method 0x80) with the upstream failed.
+    SecureAuth(SecureAuthError),
     /// An HTTPS upstream was requested but the crate was built without
     /// the `tls` feature.
     TlsFeatureMissing {
@@ -358,6 +403,7 @@ impl fmt::Display for ConnectError {
             ConnectError::Tls { message, .. } => write!(f, "{}", message),
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
+            ConnectError::SecureAuth(error) => write!(f, "{}", error),
             ConnectError::CleartextCredentialsRefused => f.write_str(
                 "refusing to send credentials in clear text (feature `cleartext-client` is off)",
             ),

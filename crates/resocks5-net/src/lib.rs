@@ -45,7 +45,9 @@
 // isn't noisy — only `cargo doc` surfaces it.
 #![warn(missing_docs)]
 
-pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
+pub use error::{
+    socks5_rep_description, ConnectError, ProtocolViolation, SecureAuthError, Stage, TimeoutKind,
+};
 
 /// May this build send credentials in clear text (feature `cleartext-client`)?
 /// The crate's own unit tests always may; integration tests link the library
@@ -71,5 +73,8 @@ pub mod rating;
 #[cfg(feature = "rotator")]
 #[path = "session/rotator/mod.rs"]
 pub mod rotator;
+#[cfg(feature = "secure-auth")]
+#[path = "session/secure_auth/mod.rs"]
+pub mod secure_auth;
 pub mod server;
 pub mod types;

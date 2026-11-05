@@ -20,7 +20,9 @@ impl ConnectError {
                     | TimeoutKind::Socks5Greeting
             ),
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
-            ConnectError::AuthFailed { .. } | ConnectError::MethodUnsupported { .. } => true,
+            ConnectError::AuthFailed { .. }
+            | ConnectError::MethodUnsupported { .. }
+            | ConnectError::SecureAuth(_) => true,
             ConnectError::Protocol(
                 ProtocolViolation::Socks5BadVersion { .. }
                 | ProtocolViolation::Socks5BadAuthVersion { .. },
@@ -82,6 +84,7 @@ impl ConnectError {
             | ConnectError::Protocol(_)
             | ConnectError::InvalidTarget(_)
             | ConnectError::CleartextCredentialsRefused
+            | ConnectError::SecureAuth(_)
             | ConnectError::TlsFeatureMissing { .. } => Reply::GeneralFailure,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => Reply::UpstreamUnavailable,
