@@ -4,12 +4,7 @@
 use std::time::Duration;
 
 #[cfg(feature = "pool")]
-use tokio::time::timeout_at;
-
-#[cfg(feature = "pool")]
-use crate::connect::handshake_over_stream::{
-    deadline_after, socks5_connect_request, socks5_greeting,
-};
+use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 #[cfg(feature = "pool")]
 use crate::connect::host_port::HostPort;
 #[cfg(feature = "pool")]
@@ -17,7 +12,7 @@ use crate::connect::tcp_dial::upstream_endpoint;
 #[cfg(feature = "pool")]
 use crate::connect::UpstreamStream;
 #[cfg(feature = "pool")]
-use crate::error::{ConnectError, Stage, TimeoutKind};
+use crate::error::ConnectError;
 #[cfg(feature = "pool")]
 use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
@@ -69,38 +64,15 @@ pub(crate) async fn socks5_on_acquired(
 ) -> Result<UpstreamStream, ConnectError> {
     let parsed = HostPort::parse(target_addr)
         .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
-    // Same pre-write target checks `handshake_over_stream` used to make.
-    if parsed.host.is_empty() || parsed.port == 0 {
-        return Err(ConnectError::InvalidTarget(HostPort::format(
-            parsed.host,
-            parsed.port,
-        )));
-    }
-    let deadline = deadline_after(handshake_timeout);
-    let stream = match timeout_at(deadline, socks5_greeting(stream, socks5_auth(proxy))).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(ConnectError::Timeout {
-                stage: Stage::Handshake,
-                kind: TimeoutKind::Socks5Greeting,
-                endpoint: upstream_endpoint(proxy),
-                after: handshake_timeout,
-            })
-        }
-    };
-    match timeout_at(
-        deadline,
-        socks5_connect_request(stream, parsed.host, parsed.port),
+    // Target checks run before any byte is written (inside the helper).
+    socks5_handshake_bounded(
+        stream,
+        parsed.host,
+        parsed.port,
+        socks5_auth(proxy),
+        deadline_after(handshake_timeout),
+        &upstream_endpoint(proxy),
+        handshake_timeout,
     )
     .await
-    {
-        Ok(r) => r,
-        Err(_) => Err(ConnectError::Timeout {
-            stage: Stage::Handshake,
-            kind: TimeoutKind::Socks5Handshake,
-            endpoint: upstream_endpoint(proxy),
-            after: handshake_timeout,
-        }),
-    }
 }

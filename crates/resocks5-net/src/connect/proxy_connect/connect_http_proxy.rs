@@ -125,6 +125,48 @@ where
     }
 }
 
+/// [`http_connect_handshake`] bounded by an ABSOLUTE `deadline`, with a typed
+/// timeout: [`ConnectError::Timeout`] (stage [`Stage::Handshake`], kind
+/// [`TimeoutKind::HttpHandshake`], or [`TimeoutKind::HttpsConnectHandshake`]
+/// when `proxy` is an HTTPS upstream), the `host:port` of `proxy` as the
+/// endpoint and the time left at the call as `after`. HTTP has no separate
+/// greeting phase, so there is no finer kind than "the CONNECT reply did not
+/// arrive".
+///
+/// On error or timeout the stream is in an unspecified state: drop it.
+///
+/// # Errors
+///
+/// As [`http_connect_handshake`], plus the timeout above.
+///
+/// cancel-safe: NO — a cancelled handshake must close the stream.
+pub async fn http_connect_handshake_until<S>(
+    stream: &mut S,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    let after = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match tokio::time::timeout_at(deadline, http_connect_handshake(stream, target_addr, proxy))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ConnectError::Timeout {
+            stage: crate::error::Stage::Handshake,
+            kind: if proxy.protocol == ProxyProtocol::Https {
+                crate::error::TimeoutKind::HttpsConnectHandshake
+            } else {
+                crate::error::TimeoutKind::HttpHandshake
+            },
+            endpoint: format!("{}:{}", proxy.host, proxy.port),
+            after,
+        }),
+    }
+}
+
 async fn write_connect_request<S>(
     stream: &mut S,
     target_addr: &str,
@@ -364,5 +406,76 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::time::Duration;
+
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::time::Instant;
+
+    use super::http_connect_handshake_until;
+    use crate::error::{ConnectError, Stage, TimeoutKind};
+    use crate::types::ProxyConfig;
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_millis(200)
+    }
+
+    /// A silent HTTP upstream is a typed handshake timeout carrying the
+    /// upstream endpoint; an HTTPS upstream gets its own kind. Mutation:
+    /// dropping the deadline (the call hangs) or reusing one kind for both
+    /// fails the matches.
+    #[tokio::test]
+    async fn a_silent_upstream_is_a_typed_timeout() {
+        for (proxy, expected) in [
+            (ProxyConfig::http("up", 8080), TimeoutKind::HttpHandshake),
+            (
+                ProxyConfig::https("up", 8443),
+                TimeoutKind::HttpsConnectHandshake,
+            ),
+        ] {
+            let (mut client, _server) = duplex(1024);
+            let error = http_connect_handshake_until(&mut client, "h.test:443", &proxy, soon())
+                .await
+                .unwrap_err();
+            match &error {
+                ConnectError::Timeout {
+                    stage: Stage::Handshake,
+                    kind,
+                    endpoint,
+                    ..
+                } => {
+                    assert_eq!(*kind, expected);
+                    assert_eq!(endpoint, &format!("up:{}", proxy.port));
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+    }
+
+    /// A 200 inside the deadline completes the handshake.
+    #[tokio::test]
+    async fn a_reply_inside_the_deadline_succeeds() {
+        let (mut client, mut server) = duplex(1024);
+        let stub = tokio::spawn(async move {
+            let mut head = [0u8; 64];
+            let _ = server.read(&mut head).await.unwrap();
+            server
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        http_connect_handshake_until(
+            &mut client,
+            "h.test:443",
+            &ProxyConfig::http("up", 8080),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        stub.await.unwrap();
     }
 }

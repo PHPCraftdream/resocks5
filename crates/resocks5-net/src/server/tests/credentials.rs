@@ -865,3 +865,18 @@ async fn accept_then_error_replies_reach_the_scripted_client() {
     .await
     .expect("bounded handshake-level error replies");
 }
+
+/// The retained Basic payload (the whole `user:pass` text) is wiped with the
+/// rest of the credentials. Mutation: leaving it out of `wipe` keeps the text.
+#[cfg(feature = "zeroize")]
+#[test]
+fn zeroize_wipes_the_basic_payload() {
+    let mut c = Credentials::with_basic_payload(
+        "wipe-user".to_owned(),
+        "wipe-pass".to_owned(),
+        "wipe-user:wipe-pass".to_owned(),
+    );
+    assert_eq!(c.basic_payload(), Some("wipe-user:wipe-pass"));
+    c.wipe();
+    assert_eq!(c.basic_payload(), Some(""));
+}
