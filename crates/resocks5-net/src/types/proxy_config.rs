@@ -3,7 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::connect::{parse_proxy_str, ParseProxyError};
+use crate::connect::{
+    parse_proxy_str, parse_proxy_uri, ParseProxyError, ProxyUriError, ProxyUriOptions,
+};
 use crate::types::ProxyProtocol;
 
 /// Placeholder printed by [`ProxyConfig`]'s [`Debug`](std::fmt::Debug) impl in
@@ -116,6 +118,28 @@ impl ProxyConfig {
     /// compatibility).
     pub fn from_addr(protocol: ProxyProtocol, addr: &str) -> Result<Self, ParseProxyError> {
         parse_proxy_str(addr, protocol)
+    }
+
+    /// Parse `scheme://[user:password@]host:port` (schemes `socks5`, `socks5h`,
+    /// `http`, `https`) with the default [`ProxyUriOptions`]: percent-decoded
+    /// credentials, a required port, no path, query or fragment. Errors carry no
+    /// input text. See [`parse_proxy_uri`] for the grammar.
+    ///
+    /// # Errors
+    ///
+    /// A [`ProxyUriError`] naming the first problem.
+    pub fn from_uri(uri: &str) -> Result<Self, ProxyUriError> {
+        parse_proxy_uri(uri, &ProxyUriOptions::new())
+    }
+
+    /// [`ProxyConfig::from_uri`] with explicit [`ProxyUriOptions`] (for example
+    /// `ip_literal_only(true)` to refuse host names).
+    ///
+    /// # Errors
+    ///
+    /// A [`ProxyUriError`] naming the first problem.
+    pub fn from_uri_with(uri: &str, options: &ProxyUriOptions) -> Result<Self, ProxyUriError> {
+        parse_proxy_uri(uri, options)
     }
 
     /// Link this entry to the outer `gate` node dialed first.
