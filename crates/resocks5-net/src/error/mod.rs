@@ -215,6 +215,11 @@ pub enum ConnectError {
     Protocol(ProtocolViolation),
     /// The target address could not be parsed into a SOCKS5 request.
     InvalidTarget(String),
+    /// The upstream is configured with a user name and password that this
+    /// build would have to send in clear text (SOCKS5 UNAME/PASSWD, or HTTP
+    /// Basic to a plain-HTTP proxy), and the feature `cleartext-client` is off.
+    /// Raised before the first byte of the handshake; nothing was sent.
+    CleartextCredentialsRefused,
     /// An HTTPS upstream was requested but the crate was built without
     /// the `tls` feature.
     TlsFeatureMissing {
@@ -353,6 +358,9 @@ impl fmt::Display for ConnectError {
             ConnectError::Tls { message, .. } => write!(f, "{}", message),
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
+            ConnectError::CleartextCredentialsRefused => f.write_str(
+                "refusing to send credentials in clear text (feature `cleartext-client` is off)",
+            ),
         }
     }
 }

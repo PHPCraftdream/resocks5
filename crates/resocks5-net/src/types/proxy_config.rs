@@ -142,6 +142,22 @@ impl ProxyConfig {
         parse_proxy_uri(uri, options)
     }
 
+    /// Would using this entry send its credentials in clear text? SOCKS5
+    /// UNAME/PASSWD always does; HTTP Basic does unless the proxy is reached over
+    /// TLS (`https`).
+    pub(crate) fn sends_cleartext_credentials(&self) -> bool {
+        self.user.is_some() && self.password.is_some() && self.protocol != ProxyProtocol::Https
+    }
+
+    /// Refuse an entry that would have to send credentials in clear text when
+    /// the build does not allow it (feature `cleartext-client`).
+    pub(crate) fn refuse_cleartext(&self) -> Result<(), crate::ConnectError> {
+        if !crate::CLEARTEXT_CLIENT && self.sends_cleartext_credentials() {
+            return Err(crate::ConnectError::CleartextCredentialsRefused);
+        }
+        Ok(())
+    }
+
     /// Link this entry to the outer `gate` node dialed first.
     pub fn with_gate(mut self, gate: ProxyConfig) -> Self {
         self.gate = Some(Arc::new(gate));

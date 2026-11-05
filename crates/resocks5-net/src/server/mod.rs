@@ -332,14 +332,17 @@ where
     let nmethods = stream.read_u8().await?;
     let mut methods = vec![0; usize::from(nmethods)];
     stream.read_exact(&mut methods).await?;
-    let chosen = if options.password && methods.contains(&2) {
+    // Method 0x02 (RFC 1929) carries the password in clear text: offered only
+    // by a build with `cleartext-server`.
+    let password_offered = crate::CLEARTEXT_SERVER && options.password;
+    let chosen = if password_offered && methods.contains(&2) {
         2
     } else if options.anonymous && methods.contains(&0) {
         0
     } else {
         stream.write_all(&[5, 255]).await?;
         stream.flush().await?;
-        return Err(ServerError::Authentication(format!("No mutually supported SOCKS5 auth method (server: anonymous={}, user/pass={}; client offered {} method(s))", options.anonymous, options.password, methods.len())));
+        return Err(ServerError::Authentication(format!("No mutually supported SOCKS5 auth method (server: anonymous={}, user/pass={}; client offered {} method(s))", options.anonymous, password_offered, methods.len())));
     };
     stream.write_all(&[5, chosen]).await?;
     stream.flush().await?;
@@ -672,6 +675,17 @@ where
             let mut parts = value.splitn(2, ' ');
             let scheme = parts.next().unwrap_or("");
             let token = parts.next().map(str::trim);
+            if !crate::CLEARTEXT_SERVER && scheme.eq_ignore_ascii_case("Basic") {
+                // HTTP Basic is the password in (base64) clear text.
+                return http_fail(
+                    stream,
+                    407,
+                    ServerError::Authentication(
+                        "clear-text credentials (HTTP Basic) are not accepted".into(),
+                    ),
+                )
+                .await;
+            }
             let Some(token) = token.filter(|_| scheme.eq_ignore_ascii_case("Basic")) else {
                 return http_fail(
                     stream,

@@ -47,6 +47,14 @@
 
 pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
 
+/// May this build send credentials in clear text (feature `cleartext-client`)?
+/// The crate's own unit tests always may; integration tests link the library
+/// without `cfg(test)` and so exercise the default (refusing) build.
+pub(crate) const CLEARTEXT_CLIENT: bool = cfg!(any(test, feature = "cleartext-client"));
+/// May this build offer and accept clear-text credentials (feature
+/// `cleartext-server`)? Same test rule as [`CLEARTEXT_CLIENT`].
+pub(crate) const CLEARTEXT_SERVER: bool = cfg!(any(test, feature = "cleartext-server"));
+
 #[cfg(feature = "rotator")]
 #[path = "session/chain/mod.rs"]
 pub mod chain;

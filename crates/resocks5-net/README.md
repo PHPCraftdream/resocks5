@@ -83,6 +83,16 @@ storage, or egress policy. Inbound authentication is supplied by the host closur
   `server::Credentials` and `server::IncomingRequest` are dropped (the
   `zeroize` crate, already part of the TLS dependency tree). Outbound
   `ProxyConfig` credentials are plain public `String` fields and are not wiped.
+- `cleartext-client` / `cleartext-server` (**off by default**): the only way this
+  crate sends or accepts a password in clear text. Without `cleartext-client`
+  a dial that would send SOCKS5 UNAME/PASSWD (RFC 1929) or HTTP Basic to a
+  plain-HTTP proxy fails with `ConnectError::CleartextCredentialsRefused`
+  before the first byte is written (HTTP Basic inside the TLS connection to an
+  HTTPS proxy is not clear text and is always allowed). Without
+  `cleartext-server` the inbound side never offers SOCKS5 method 0x02 and
+  answers HTTP Basic with 407, so the credential callback never sees a
+  clear-text password. The integration tests in `tests/no_cleartext.rs` pin
+  both on the default build.
 
 ## Inbound server API
 

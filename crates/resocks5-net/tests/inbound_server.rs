@@ -1,3 +1,4 @@
+#![cfg(feature = "cleartext-server")]
 //! Downstream witness: public API, host authentication, and real separate TCP egress.
 use resocks5_net::server::{accept, Protocol, Reply, ServerOptions};
 use std::sync::{

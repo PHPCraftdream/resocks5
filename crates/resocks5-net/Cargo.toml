@@ -52,6 +52,16 @@ default = ["pool", "tls", "serde", "rating", "rotator"]
 # a default feature, so ordinary release builds compile the counter
 # to nothing.
 test-instrumentation = ["rotator"]
+# Clear-text credentials. OFF by default: without `cleartext-client` the crate
+# never sends a password in clear text (SOCKS5 RFC 1929 UNAME/PASSWD, HTTP Basic
+# to a plain-HTTP proxy) — a dial that would is refused with
+# `ConnectError::CleartextCredentialsRefused` before the first byte; without
+# `cleartext-server` the inbound side never offers or accepts SOCKS5 method 0x02
+# and answers HTTP Basic with 407. (HTTP Basic inside a TLS connection to an HTTPS
+# proxy is not clear text and is always allowed.) The crate's own unit tests
+# run with both on.
+cleartext-client = []
+cleartext-server = []
 # Wipe inbound credentials (`server::Credentials`, the retained username of
 # `server::IncomingRequest`) from memory when they are dropped. Off by default.
 zeroize = ["dep:zeroize"]
@@ -63,6 +73,11 @@ zeroize = ["dep:zeroize"]
 [[example]]
 name = "connect_through_proxy"
 required-features = ["rotator", "pool"]
+
+# The demo server authenticates with a fixed demo:demo pair (clear text).
+[[example]]
+name = "serve_local"
+required-features = ["cleartext-server"]
 
 # Doctests are forbidden in this repository: examples in rustdoc are
 # `text` blocks, behaviour is covered by ordinary tests (tests/doc_examples.rs).

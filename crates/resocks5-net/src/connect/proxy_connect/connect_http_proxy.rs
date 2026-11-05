@@ -175,6 +175,7 @@ async fn write_connect_request<S>(
 where
     S: AsyncWriteExt + Unpin,
 {
+    proxy.refuse_cleartext()?;
     if target_addr
         .bytes()
         .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())

@@ -82,6 +82,10 @@ pub(crate) async fn socks5_greeting<S>(
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
+    if auth.is_some() && !crate::CLEARTEXT_CLIENT {
+        // RFC 1929 sends the password as is: refused before any byte.
+        return Err(ConnectError::CleartextCredentialsRefused);
+    }
     if let Some((username, password)) = auth {
         stream.write_all(&[0x05, 0x01, 0x02]).await?;
         stream.flush().await?;

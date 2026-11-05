@@ -46,7 +46,7 @@ impl ConnectError {
     /// | other [`Io`](ConnectError::Io) at [`Stage::Connect`] (the upstream itself is unreachable) | `UpstreamUnavailable` |
     /// | other [`Io`](ConnectError::Io) | `GeneralFailure` |
     /// | TLS failure | `UpstreamUnavailable` |
-    /// | [`Protocol`](ConnectError::Protocol), [`InvalidTarget`](ConnectError::InvalidTarget), missing TLS feature | `GeneralFailure` |
+    /// | [`Protocol`](ConnectError::Protocol), [`InvalidTarget`](ConnectError::InvalidTarget), [`CleartextCredentialsRefused`](ConnectError::CleartextCredentialsRefused), missing TLS feature | `GeneralFailure` |
     /// | per-upstream cap hit (`AtCapacity`) | `Overloaded` |
     ///
     /// Only the destination's own verdict (a `ProxyRejected` code) selects a
@@ -81,6 +81,7 @@ impl ConnectError {
             | ConnectError::MethodUnsupported { .. }
             | ConnectError::Protocol(_)
             | ConnectError::InvalidTarget(_)
+            | ConnectError::CleartextCredentialsRefused
             | ConnectError::TlsFeatureMissing { .. } => Reply::GeneralFailure,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => Reply::UpstreamUnavailable,
@@ -95,6 +96,10 @@ impl ConnectError {
     pub fn counts_against_upstream(&self) -> bool {
         #[cfg(feature = "pool")]
         if matches!(self, ConnectError::AtCapacity(_)) {
+            return false;
+        }
+        // Our own configuration, not the upstream's behaviour.
+        if matches!(self, ConnectError::CleartextCredentialsRefused) {
             return false;
         }
         true

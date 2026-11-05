@@ -418,6 +418,7 @@ async fn hop(
         endpoint: format!("{}:{}", node.host, node.port),
         after: hs,
     };
+    node.refuse_cleartext()?;
     match node.protocol {
         ProxyProtocol::Socks5 => {
             let parsed = HostPort::parse(target)

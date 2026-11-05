@@ -174,6 +174,8 @@ async fn dial_inner(
     tls_connector: Option<&TlsConnector>,
     on_tcp: impl FnOnce(),
 ) -> Result<AnyUpstream, ConnectError> {
+    // Before the TCP connect: nothing reaches the upstream.
+    proxy.refuse_cleartext()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
