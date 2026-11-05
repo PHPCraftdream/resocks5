@@ -79,3 +79,28 @@ klist
 export GSS_TEST_PRINCIPAL=alice@TEST.LOCAL
 export GSS_TEST_SERVICE="socks@$host"
 cargo test -p resocks5-net --features gssapi-system --locked -- --ignored --test-threads=1 gssapi::system
+
+# Interoperability: a third-party client (curl) against our server over real
+# Kerberos. A curl built without GSS-API is a CI image problem, so it fails
+# loudly instead of skipping.
+curl --version | grep -qi "gss" || { echo "kdc-test: this curl has no GSS-API" >&2; exit 1; }
+cargo build -p resocks5-net --features gssapi-system --example gssapi_interop_server --locked
+port=1081
+"${CARGO_TARGET_DIR:-target}/debug/examples/gssapi_interop_server" "127.0.0.1:$port" "$GSS_TEST_SERVICE"     > "$root/interop.out" 2> "$root/interop.err" &
+server_pid=$!
+tries=0
+until grep -q '^READY' "$root/interop.out" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 30 ] || { echo "kdc-test: interop server did not start" >&2; cat "$root/interop.err" >&2; exit 1; }
+    sleep 1
+done
+body=$(curl -sS --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks     "http://target.test:80/" 2> "$root/curl.err") || {
+    echo "kdc-test: curl failed" >&2
+    cat "$root/curl.err" "$root/interop.out" "$root/interop.err" >&2
+    exit 1
+}
+wait "$server_pid" || { echo "kdc-test: interop server failed" >&2; cat "$root/interop.err" >&2; exit 1; }
+cat "$root/interop.out"
+[ "$body" = "ok" ] || { echo "kdc-test: unexpected body: $body" >&2; exit 1; }
+grep -q "principal=alice@TEST.LOCAL target=target.test:80 method=Gssapi" "$root/interop.out"     || { echo "kdc-test: the server did not see the expected client" >&2; exit 1; }
+echo "kdc-test: curl --socks5-gssapi interoperates"

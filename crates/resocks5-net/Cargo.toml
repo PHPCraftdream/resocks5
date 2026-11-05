@@ -105,6 +105,11 @@ required-features = ["rotator", "pool"]
 name = "serve_local"
 required-features = ["cleartext-server"]
 
+# One-connection GSSAPI server the Kerberos CI job points curl at.
+[[example]]
+name = "gssapi_interop_server"
+required-features = ["gssapi-system"]
+
 # Doctests are forbidden in this repository: examples in rustdoc are
 # `text` blocks, behaviour is covered by ordinary tests (tests/doc_examples.rs).
 # Enforced by .github/scripts/check-no-doctests.sh.

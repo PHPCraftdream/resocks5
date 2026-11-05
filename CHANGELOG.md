@@ -113,7 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated identity (a host mapping a principal to an account).
 - `resocks5-net`: feature `gssapi-system` and `gssapi::system::SystemBackend`,
   Kerberos 5 through the system GSS-API (MIT Kerberos / Heimdal on Linux, Apple
-  GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC.
+  GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC, which also
+  checks interoperability with a third-party client (`curl --socks5-gssapi`) against the
+  `gssapi_interop_server` example.
 
 ### Removed
 
