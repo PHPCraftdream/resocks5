@@ -126,6 +126,10 @@ jobs:
       - run: "cargo test --release -p resocks5 handle_client::"
       - run: "cargo test --release -p resocks5 allowed_clients::"
       - run: "cargo test --release -p resocks5 print_config_docs::"
+      - run: "cargo test --release -p resocks5 budget_tests::"
+      - run: "cargo test --release -p resocks5 probes_tests::"
+      - run: "cargo test --release -p resocks5-net strict_http"
+      - run: "cargo test --release -p resocks5-net dial::"
 
   lint:
     name: fmt + clippy

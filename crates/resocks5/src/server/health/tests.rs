@@ -589,8 +589,10 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
     let path = dir.join("health.ktav");
     let r = rotator(vec![p("a")]);
     r.record_hard_failure(&p("a"));
-    let initial = snapshot(&[group("v4", r.clone())], NOW);
+    // Same clock as the saver (the test unix clock follows the tokio clock).
+    let initial = snapshot(&[group("v4", r.clone())], unix_now());
     let (log, _rx) = logger();
+    let skips = arm_skip_counter(&path);
     let (handle, stop, _lock) = spawn_saver(
         vec![group("v4", r)],
         &path,
@@ -600,7 +602,9 @@ async fn the_saver_skips_the_write_when_the_restored_picture_is_unchanged() {
     )
     .await;
     tokio::time::advance(Duration::from_secs(25)).await;
-    settle().await;
+    // Both ticks must have been skipped as unchanged (not merely "no file
+    // yet"): a write would leave the count short.
+    until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= 2).await;
     assert!(!path.exists());
     stop.notify_one();
     handle.await.unwrap();

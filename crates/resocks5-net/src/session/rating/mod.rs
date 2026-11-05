@@ -49,6 +49,13 @@ pub struct Ratings {
 /// slot's generation, and [`Ratings::record_success_for`] /
 /// [`Ratings::record_hard_failure_for`] then drop outcomes whose claim no
 /// longer matches instead of rating a slot somebody else owns now.
+///
+/// The claim is about ownership, not about time: the lease only keeps a
+/// second probe away while it runs. An outcome that arrives after its lease
+/// ran out but before anybody claimed the slot again is still evidence about
+/// that upstream and is applied; once a newer claim (or any reset, trip or
+/// restore) exists, the old outcome is dropped. Bound a probe's own run time
+/// with its connect/handshake budget, not with the lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeClaim {
     index: usize,

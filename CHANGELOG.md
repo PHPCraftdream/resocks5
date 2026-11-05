@@ -150,6 +150,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tick after a win was published, catches a callback panic inside the detached
   drain, and `HedgeError::source()` returns the last connection error.
   `http_error` falls back to a 500 head for an unknown status instead of panicking.
+- `resocks5-net`: strict HTTP accepts an uppercase `V` in a bracketed IPvFuture
+  `Host` (`[V1.example]`), as the RFC 3986 ABNF string is case-insensitive.
+- `resocks5`: the health writer compares quarantine deadlines with a two-second
+  tolerance (the whole-second truncation jitter) instead of one save interval, so a
+  re-trip with unchanged counters is saved whenever its expiry really moved.
 - `resocks5-net`: a `Duration::MAX` handshake budget no longer panics the dial
   paths (SOCKS5 and TLS hops use a checked deadline); `same_upstream` documents
   that `gate_level` is part of an upstream's identity and the `gate` link is not.

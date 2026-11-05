@@ -22,18 +22,32 @@ const P: u32 = 1;
 #[cfg(test)]
 const TEST_M_KIB: u32 = 1024;
 
-pub(in crate::auth) fn argon2_instance() -> Argon2<'static> {
-    #[cfg(test)]
-    let m_kib = TEST_M_KIB;
-    #[cfg(not(test))]
-    let m_kib = M_KIB;
+fn argon2_with(m_kib: u32) -> Argon2<'static> {
     let params = Params::new(m_kib, T, P, None).expect("hardcoded Argon2 params are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// The production instance (also built by the policy test, which test builds
+/// of `argon2_instance` bypass for speed).
+fn production_argon2() -> Argon2<'static> {
+    argon2_with(M_KIB)
+}
+
+pub(in crate::auth) fn argon2_instance() -> Argon2<'static> {
+    #[cfg(test)]
+    {
+        argon2_with(TEST_M_KIB)
+    }
+    #[cfg(not(test))]
+    {
+        production_argon2()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 
     /// Policy pin: NEW hashes must use the OWASP minimum (m=19456 KiB,
     /// t=2, p=1). Mutation `M_KIB → 5120` (or lowering T/P) fails here.
@@ -42,5 +56,27 @@ mod tests {
         assert_eq!(M_KIB, 19456);
         assert_eq!(T, 2);
         assert_eq!(P, 1);
+    }
+
+    /// The PHC string the production path creates carries the policy, not
+    /// just the constants: m=19456,t=2,p=1, Argon2id v19, and it verifies.
+    /// One real production-cost hash (19 MiB), deliberately the only one.
+    /// Mutation: the production path building its instance from other
+    /// parameters (or the test instance leaking into it) fails the match.
+    #[test]
+    fn production_instance_creates_policy_phc() {
+        let salt = SaltString::encode_b64(&[9u8; 16]).unwrap();
+        let phc = production_argon2()
+            .hash_password(b"policy-check", &salt)
+            .unwrap()
+            .to_string();
+        assert!(
+            phc.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "unexpected PHC prefix: {phc}"
+        );
+        let parsed = PasswordHash::new(&phc).unwrap();
+        assert!(production_argon2()
+            .verify_password(b"policy-check", &parsed)
+            .is_ok());
     }
 }

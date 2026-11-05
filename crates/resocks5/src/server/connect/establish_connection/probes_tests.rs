@@ -55,15 +55,28 @@ fn logger() -> Logger {
     Logger::new(tx, LogConfig::default())
 }
 
-/// SOCKS5 stub that completes its handshake only after `delay` and
+/// How a success stub holds its method-selection reply back.
+pub(super) enum Hold {
+    /// Reply after a fixed delay.
+    Delay(Duration),
+    /// Tell `reached` that the greeting arrived, then reply only once
+    /// `release` is notified: the test controls the order of events.
+    Barrier {
+        reached: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    },
+}
+
+/// SOCKS5 stub that completes its handshake only after `hold` and
 /// then reports CONNECT success WITHOUT dialing the requested
 /// destination. `accepts` counts accepted TCP connections; `done`
 /// fires after the success reply is written.
-pub(super) async fn spawn_slow_success_stub(
-    delay: Duration,
+pub(super) async fn spawn_success_stub(
+    hold: Hold,
     accepts: Arc<AtomicUsize>,
     done: tokio::sync::mpsc::Sender<()>,
 ) -> SocketAddr {
+    let hold = Arc::new(hold);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -73,12 +86,19 @@ pub(super) async fn spawn_slow_success_stub(
             };
             accepts.fetch_add(1, Ordering::Relaxed);
             let done = done.clone();
+            let hold = Arc::clone(&hold);
             tokio::spawn(async move {
                 let mut greeting = [0u8; 3];
                 if socket.read_exact(&mut greeting).await.is_err() {
                     return;
                 }
-                tokio::time::sleep(delay).await;
+                match &*hold {
+                    Hold::Delay(delay) => tokio::time::sleep(*delay).await,
+                    Hold::Barrier { reached, release } => {
+                        let _ = reached.send(()).await;
+                        release.notified().await;
+                    }
+                }
                 if socket.write_all(&[5, 0]).await.is_err() {
                     return;
                 }
@@ -96,6 +116,15 @@ pub(super) async fn spawn_slow_success_stub(
         }
     });
     addr
+}
+
+/// [`spawn_success_stub`] with a fixed delay.
+pub(super) async fn spawn_slow_success_stub(
+    delay: Duration,
+    accepts: Arc<AtomicUsize>,
+    done: tokio::sync::mpsc::Sender<()>,
+) -> SocketAddr {
+    spawn_success_stub(Hold::Delay(delay), accepts, done).await
 }
 
 /// SOCKS5 stub that completes the greeting and answers the CONNECT
@@ -424,8 +453,17 @@ async fn destination_unreachable_replies_retrip_the_tested_node() {
 async fn stale_settlement_after_a_newer_claim_is_discarded() {
     let accepts = Arc::new(AtomicUsize::new(0));
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel(1);
-    let prefix_addr =
-        spawn_slow_success_stub(Duration::from_millis(300), accepts.clone(), done_tx).await;
+    let (reached_tx, mut reached_rx) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let prefix_addr = spawn_success_stub(
+        Hold::Barrier {
+            reached: reached_tx,
+            release: Arc::clone(&release),
+        },
+        accepts.clone(),
+        done_tx,
+    )
+    .await;
     let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = unavailable.local_addr().unwrap();
     drop(unavailable);
@@ -452,13 +490,22 @@ async fn stale_settlement_after_a_newer_claim_is_discarded() {
     let pool = ProxyPool::new(Default::default(), Duration::from_secs(2), 4);
     let claimed = tokio::time::Instant::now();
     let bump = async {
-        // While P1 is in flight: a normal request succeeds (reset), the
-        // node fails hard again (re-trip), the backoff expires.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Ordering by events, not by delays: P1 has reached the prefix's
+        // CONNECT, THEN the slot changes hands, THEN P2 holds the fresh
+        // claim, and only then is P1's reply released.
+        reached_rx.recv().await.unwrap();
         middle_rotator.record_success(&middle);
         assert!(middle_rotator.record_hard_failure(&middle).is_some());
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        middle_rotator.take_probe_claims()
+        // The re-trip's backoff (50 ms) must run out before P2 can claim.
+        let fresh = loop {
+            let claims = middle_rotator.take_probe_claims();
+            if !claims.is_empty() {
+                break claims;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        release.notify_one();
+        fresh
     };
     let log = logger();
     let ((), fresh_claims) = tokio::join!(

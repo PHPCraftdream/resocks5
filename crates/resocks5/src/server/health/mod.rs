@@ -96,9 +96,32 @@ impl Restored {
 }
 
 pub(crate) fn unix_now() -> u64 {
+    #[cfg(test)]
+    let now = test_unix_now();
+    #[cfg(not(test))]
+    let now = real_unix_now();
+    now
+}
+
+fn real_unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Test clock: the real unix time at the first call on this thread plus the
+/// time elapsed on the tokio clock since then, so a paused clock that is
+/// advanced moves `saved_at` exactly like the `Instant`-based countdown.
+#[cfg(test)]
+fn test_unix_now() -> u64 {
+    thread_local! {
+        static ORIGIN: (u64, tokio::time::Instant) = (real_unix_now(), tokio::time::Instant::now());
+    }
+    ORIGIN.with(|(base, at)| {
+        base + tokio::time::Instant::now()
+            .saturating_duration_since(*at)
+            .as_secs()
+    })
 }
 
 fn upstream_label(proxy: &ProxyConfig) -> String {
@@ -157,19 +180,22 @@ fn signature(file: &HealthFile) -> Vec<(&str, &str, u8, &str, u32, u32)> {
         .collect()
 }
 
+/// Whole-second truncation of `saved_at` and of `remaining_sec` can move the
+/// recomputed absolute deadline of one and the same quarantine by up to two
+/// seconds between two snapshots; anything beyond that is a different deadline.
+const DEADLINE_JITTER_SEC: u64 = 2;
+
 /// The compared picture is unchanged: the compared fields are identical
-/// and every live quarantine deadline moved by less than one save
-/// interval. The deadline is absolute (`saved_at + remaining_sec`), so it
-/// is stable across ticks while only its whole-second truncation drifts;
-/// a real re-trip with identical counters (reset + new failure) moves it
-/// by more than an interval and gets written. A re-trip that moves it by at
-/// most one interval is deliberately not written: a restart would restore a
-/// quarantine that ends less than one save interval earlier or later.
-fn unchanged(last: &HealthFile, current: &HealthFile, every: Duration) -> bool {
+/// and every live quarantine deadline is the same up to the truncation jitter.
+/// The deadline is absolute (`saved_at + remaining_sec`), so plain passage of
+/// time does not move it, while a re-trip with identical counters (reset + a
+/// new failure) does and gets written.
+fn unchanged(last: &HealthFile, current: &HealthFile) -> bool {
     last.upstreams.len() == current.upstreams.len()
         && signature(last) == signature(current)
         && last.upstreams.iter().zip(&current.upstreams).all(|(l, c)| {
-            deadline(l, last.saved_at).abs_diff(deadline(c, current.saved_at)) <= every.as_secs()
+            deadline(l, last.saved_at).abs_diff(deadline(c, current.saved_at))
+                <= DEADLINE_JITTER_SEC
         })
 }
 
@@ -391,6 +417,9 @@ impl HealthSaver {
             }
             Err(_) => {
                 task.abort();
+                // The aborted loop is gone once this returns, so only a
+                // blocking write that is still running can keep the lock.
+                let _ = (&mut task).await;
                 logger.proxy_failure(|| {
                     format!(
                         "the health writer did not stop in {FINISH_BUDGET:?}; continuing without a final snapshot"
@@ -636,6 +665,8 @@ struct Seams {
     /// Paths whose blocking write must not run yet; the gate opens when
     /// the test releases it (every later write for the path parks too).
     parks: HashMap<PathBuf, Arc<TestPark>>,
+    /// Paths whose saver counts the rounds it skipped as unchanged.
+    skips: HashMap<PathBuf, Arc<std::sync::atomic::AtomicU64>>,
     /// Paths whose next blocking write must simulate a failed commit:
     /// `Publish` leaves the new content on the target (the undetermined
     /// commit outcome), `Vanish` removes the target.
@@ -732,6 +763,26 @@ fn arm_write_park(path: &Path) -> Arc<TestPark> {
     park
 }
 
+/// Count the rounds the saver of `path` skipped as unchanged.
+#[cfg(test)]
+fn arm_skip_counter(path: &Path) -> Arc<std::sync::atomic::AtomicU64> {
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    seams()
+        .lock()
+        .unwrap()
+        .skips
+        .insert(path.to_path_buf(), Arc::clone(&counter));
+    counter
+}
+
+#[cfg(test)]
+fn note_skip(path: &Path) {
+    let counter = seams().lock().unwrap().skips.get(path).map(Arc::clone);
+    if let Some(counter) = counter {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 fn disarm_write_park(path: &Path) {
     seams().lock().unwrap().parks.remove(path);
@@ -787,7 +838,9 @@ pub(crate) async fn run_saver(
             _ = ticker.tick() => {},
         }
         let current = snapshot(&groups, unix_now());
-        if last.as_ref().is_some_and(|l| unchanged(l, &current, every)) {
+        if last.as_ref().is_some_and(|l| unchanged(l, &current)) {
+            #[cfg(test)]
+            note_skip(&path);
             continue;
         }
         match save_offloaded(path.clone(), current.clone(), Arc::clone(&lock)).await {

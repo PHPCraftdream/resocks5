@@ -5,8 +5,8 @@
 //! alias/duplicate restore policy. Pure-state tests live in `tests.rs`.
 
 use super::tests::{
-    counting_listener, drain, file, group, grouped, logger, p, rotator, settle, test_pool,
-    unique_dir, until, NOW,
+    counting_listener, drain, file, group, grouped, logger, p, rotator, test_pool, unique_dir,
+    until, NOW,
 };
 use super::*;
 use std::sync::atomic::Ordering;
@@ -663,6 +663,7 @@ async fn a_quarantine_countdown_alone_writes_nothing() {
     r.record_hard_failure(&p("a"));
     let initial = snapshot(&[group("v4", r.clone())], unix_now());
     let (log, _rx) = logger();
+    let skips = arm_skip_counter(&path);
     let (handle, stop, _lock) = spawn_saver(
         vec![group("v4", r.clone())],
         &path,
@@ -674,7 +675,9 @@ async fn a_quarantine_countdown_alone_writes_nothing() {
     for _ in 0..3 {
         tokio::time::advance(Duration::from_secs(10)).await;
     }
-    settle().await;
+    // Every tick was decided as "unchanged": a write would leave the count
+    // short and `until` panics (no sleeping on a blocking write).
+    until(|| skips.load(std::sync::atomic::Ordering::SeqCst) >= 3).await;
     assert!(!path.exists(), "passage of time alone must not write");
     stop.notify_one();
     handle.await.unwrap();
@@ -781,12 +784,14 @@ fn aliasing_upstreams_are_saved_without_secrets_and_never_restored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// (C) boundary of the deadline tolerance: a shift of up to one save interval
-// is "unchanged" (time passing, whole-second truncation), a larger shift is a
-// re-trip and must be written. Mutations: tolerance 0 makes the first two
-// asserts fail; an unbounded tolerance makes the last one fail.
+// (C) the compared deadline is stable: plain passage of time (or the
+// whole-second truncation jitter) is "unchanged", a different expiry with the
+// same counters is a re-trip and must be written, whatever the save interval.
+// Mutations: tolerance 0 fails the first two asserts; an interval-sized
+// tolerance (the old behaviour: expiry 40 -> 48 with a 30 s interval) fails
+// the last one.
 #[test]
-fn unchanged_tolerates_a_deadline_shift_of_at_most_one_interval() {
+fn unchanged_compares_the_deadline_stably() {
     let build = |saved_at: u64, remaining: u64| {
         let mut f = file(vec![grouped(
             &upstream_label(&p("a")),
@@ -799,15 +804,19 @@ fn unchanged_tolerates_a_deadline_shift_of_at_most_one_interval() {
         f.saved_at = saved_at;
         f
     };
-    let every = Duration::from_secs(10);
-    let last = build(1000, 30); // deadline 1030
-    assert!(unchanged(&last, &build(1010, 20), every), "same deadline");
+    let last = build(1000, 40); // deadline 1040
     assert!(
-        unchanged(&last, &build(1010, 30), every),
-        "shift == one interval"
+        unchanged(&last, &build(1010, 30)),
+        "time passed, same deadline"
     );
     assert!(
-        !unchanged(&last, &build(1011, 30), every),
-        "shift > one interval"
+        unchanged(&last, &build(1011, 30)),
+        "1 s of truncation jitter"
     );
+    assert!(
+        unchanged(&last, &build(1010, 32)),
+        "2 s of truncation jitter"
+    );
+    assert!(!unchanged(&last, &build(1000, 48)), "a re-trip 8 s later");
+    assert!(!unchanged(&last, &build(1000, 43)), "beyond the jitter");
 }

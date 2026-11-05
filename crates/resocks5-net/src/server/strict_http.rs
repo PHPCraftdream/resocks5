@@ -47,10 +47,11 @@ fn valid_authority_host(host: &str) -> bool {
 }
 
 /// RFC 3986 IPvFuture literal inside the brackets:
-/// `v 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`.
+/// `"v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`; the literal `"v"`
+/// of an ABNF string is case-insensitive (RFC 5234), so `V` is accepted too.
 fn valid_ipv_future(inside: &str) -> bool {
     let bytes = inside.as_bytes();
-    if bytes.first() != Some(&b'v') {
+    if !matches!(bytes.first(), Some(b'v' | b'V')) {
         return false;
     }
     let mut i = 1;
