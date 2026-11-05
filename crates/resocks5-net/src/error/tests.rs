@@ -66,6 +66,12 @@ async fn socks5_stub_replying(
         let _ = sock.read_exact(&mut request).await;
         let _ = sock.write_all(connect_reply).await;
         let _ = sock.shutdown().await;
+        // The username/password sub-negotiation is 11 bytes, one more than
+        // the 10 read above: closing with that byte unread would RST the
+        // connection and race the client's read of the reply. Drain until
+        // the client closes (bounded) so the close is a clean FIN.
+        let mut rest = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), sock.read_to_end(&mut rest)).await;
     });
     (addr.ip().to_string(), addr.port())
 }
