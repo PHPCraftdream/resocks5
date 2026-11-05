@@ -64,7 +64,7 @@ pub mod chain;
 pub mod connect;
 pub mod error;
 #[cfg(feature = "gssapi")]
-#[path = "session/gssapi/mod.rs"]
+#[path = "session/auth/gssapi/mod.rs"]
 pub mod gssapi;
 #[cfg(feature = "pool")]
 #[path = "session/pool/mod.rs"]
@@ -78,7 +78,7 @@ pub mod rating;
 #[path = "session/rotator/mod.rs"]
 pub mod rotator;
 #[cfg(feature = "secure-auth")]
-#[path = "session/secure_auth/mod.rs"]
+#[path = "session/auth/secure_auth/mod.rs"]
 pub mod secure_auth;
 pub mod server;
 #[cfg(feature = "test-instrumentation")]
