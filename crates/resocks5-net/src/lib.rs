@@ -64,4 +64,7 @@ pub mod rating;
 #[path = "session/rotator/mod.rs"]
 pub mod rotator;
 pub mod server;
+#[cfg(feature = "test-instrumentation")]
+#[path = "session/testing/mod.rs"]
+pub mod testing;
 pub mod types;
