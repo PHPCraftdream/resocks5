@@ -717,8 +717,12 @@ async fn start_restores_probes_the_due_ones_and_keeps_saving() {
 
     // The recovery is written out by the running saver.
     for _ in 0..100 {
-        let now = load(&path).unwrap().unwrap();
-        if now.upstreams[0].state == STATE_ALIVE {
+        // Tolerate the writer replacing the file under the read.
+        if load(&path)
+            .ok()
+            .flatten()
+            .is_some_and(|now| now.upstreams[0].state == STATE_ALIVE)
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -775,7 +779,9 @@ async fn start_with_a_broken_file_still_runs_and_overwrites_it() {
     );
     assert!(!found, "an unreadable file is not a picture");
     for _ in 0..100 {
-        if load(&path).is_ok() {
+        // The blocking writer replaces the file concurrently: only a readable
+        // file counts, not one that is momentarily absent.
+        if matches!(load(&path), Ok(Some(_))) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -593,7 +593,20 @@ async fn a_cached_chain_with_a_quarantined_gate_is_not_dialed() {
     let bad = socks5_config(bad_addr, true);
     let good = socks5_config(good_addr, true);
     let exit_cfg = socks5_config(exit_addr, false);
-    let gate_rotator = Arc::new(ProxyRotator::new(vec![bad.clone(), good.clone()]));
+    // A long quarantine: no due probe may touch the bad gate during the test.
+    let gate_rotator = Arc::new(
+        ProxyRotator::try_with_quarantine(
+            vec![bad.clone(), good.clone()],
+            Default::default(),
+            QuarantinePolicy::default()
+                .with_threshold(1)
+                .with_initial(Duration::from_secs(60))
+                .with_max(Duration::from_secs(60)),
+            16,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    );
     let gates = Arc::new(GateLevels::new(vec![(1, gate_rotator.clone())]));
     let exit = Arc::new(ProxyRotator::new(vec![exit_cfg.clone()]));
     let cached = Arc::new(
@@ -605,7 +618,7 @@ async fn a_cached_chain_with_a_quarantined_gate_is_not_dialed() {
     );
     exit.link_proxy(target.to_string(), cached);
     // Quarantine the gate out of band: the state get_linked cannot see.
-    assert!(gate_rotator.quarantine_now(&bad).is_some());
+    assert!(gate_rotator.record_hard_failure(&bad).is_some());
     let logger = test_logger();
     let banned = Arc::new(RegexSet::empty());
     let pool = Arc::new(ProxyPool::new(
