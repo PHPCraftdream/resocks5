@@ -22,14 +22,15 @@
 //! ## In-memory cache
 //!
 //! ~50 ms per auth would be lethal for browser traffic (Firefox opens
-//! tens of TCP sessions per page). On every successful Argon2 verify
-//! we cache `HMAC-SHA256(server_secret, name || 0x00 || password)` keyed
-//! by username, so subsequent connections from the same client
-//! validate in nanoseconds. A 32-byte `server_secret` is generated once
-//! at startup and never persisted — a memory dump cannot be replayed
-//! in a later run, and the plaintext password never sits in process
-//! memory for longer than the verify call itself. Failed attempts are
-//! not cached (caching them would speed up brute-force).
+//! tens of TCP sessions per page). After a successful Argon2 verify we
+//! keep the presented password in process memory, keyed by username, so
+//! every later connection from the same client is ONE constant-time
+//! comparison against it — nothing is recomputed or hashed again. The
+//! password is stored as presented (a memory or crash dump shows it; it is
+//! never written to disk), and is wiped when its entry is replaced or
+//! dropped. Failed attempts are not cached (caching them would speed up
+//! brute-force). The cache is empty after a restart, so the first login
+//! of each user after a start pays Argon2 once.
 
 pub mod compute_hash;
 mod params;

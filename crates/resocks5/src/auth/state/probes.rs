@@ -11,8 +11,14 @@ impl AuthState {
         *self.claim_probe.lock().expect("claim probe mutex poisoned") = Some(tx);
     }
 
-    pub(super) fn hmac_probe_count(&self) -> u64 {
-        self.hmac_probes.load(std::sync::atomic::Ordering::Relaxed)
+    pub(super) fn compare_probe_count(&self) -> u64 {
+        self.compare_probes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn note_compare(&self) {
+        self.compare_probes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn claim_probe_emit(&self, event: &'static str) {

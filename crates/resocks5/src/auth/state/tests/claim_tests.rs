@@ -216,10 +216,7 @@ fn init_claim_racer_rechecks_after_claim_lock_and_does_not_clobber_winner() {
         "winner hash must still verify"
     );
     assert!(
-        state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "same-pw")
-        ),
+        state.cache_matches("bob", "same-pw"),
         "cache must hold the entry for the winning password"
     );
 
@@ -372,10 +369,7 @@ fn init_claim_persist_failure_after_winner_cannot_reset_winner_hash() {
     let loaded: UsersConfig = ktav::from_file(&path).unwrap();
     assert_eq!(loaded.users[0].hash, winner_hash, "disk must be untouched");
     assert!(
-        state.cache_matches(
-            "bob",
-            &compute_cache_hmac(&state.server_secret, "bob", "winner-pw")
-        ),
+        state.cache_matches("bob", "winner-pw"),
         "cache must hold the winning password's entry"
     );
 

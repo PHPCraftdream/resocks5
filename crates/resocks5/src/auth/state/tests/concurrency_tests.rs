@@ -497,10 +497,7 @@ fn claim_pileup_cannot_starve_ordinary_login_on_small_blocking_pool() {
             for (name, pw) in [("bob", "bob-pw"), ("carl", "carl-pw"), ("dave", "dave-pw")] {
                 let u = users.iter().find(|u| u.name == name).unwrap();
                 assert!(u.hash.starts_with("$argon2id$"), "{name} hash in memory");
-                assert!(
-                    state.cache_matches(name, &compute_cache_hmac(&state.server_secret, name, pw)),
-                    "{name} cache entry"
-                );
+                assert!(state.cache_matches(name, pw), "{name} cache entry");
             }
         }
         let loaded: UsersConfig = ktav::from_file(&path).unwrap();

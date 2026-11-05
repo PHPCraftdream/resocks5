@@ -152,6 +152,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http_error` falls back to a 500 head for an unknown status instead of panicking.
 - `resocks5-net`: strict HTTP accepts an uppercase `V` in a bracketed IPvFuture
   `Host` (`[V1.example]`), as the RFC 3986 ABNF string is case-insensitive.
+- `resocks5`: the verify-cache keeps the presented password in process memory
+  (wiped on drop, never persisted) instead of an HMAC of it, so a repeated login is
+  one constant-time comparison and nothing is recomputed; unknown and disabled
+  names run the same single comparison against a dummy. Anyone who can read the
+  process memory (dump, debugger) can read the cached passwords of users who
+  logged in since the start.
 - `resocks5`: the health writer compares quarantine deadlines with a two-second
   tolerance (the whole-second truncation jitter) instead of one save interval, so a
   re-trip with unchanged counters is saved whenever its expiry really moved.

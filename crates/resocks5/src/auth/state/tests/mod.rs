@@ -1,5 +1,4 @@
 use super::claim::{Prepared, INIT_HASH};
-use super::verify::compute_cache_hmac;
 use super::*;
 use crate::auth::compute_hash;
 use crate::config::User;
@@ -546,9 +545,8 @@ fn empty_password_cannot_claim_init() {
     assert!(!Path::new(&path).exists());
     // Same rejection directly through the claim fn, independent of
     // verify()'s framing.
-    let hmac = compute_cache_hmac(&state.server_secret, "bob", "");
     assert!(matches!(
-        state.prepare_claim("bob", "", hmac),
+        state.prepare_claim("bob", ""),
         Prepared::Done(false)
     ));
     {

@@ -112,12 +112,11 @@ pub struct AuthState {
     /// (and skips Proxy-Authorization on HTTP); when `false`, only
     /// authenticated clients are accepted.
     pub allow_anonymous: bool,
-    /// Process-local HMAC key. The cache stores no plaintext passwords.
-    server_secret: [u8; 32],
-    /// `name → HMAC(server_secret, name || 0x00 || password)` for the
-    /// last successfully verified password. Hit = O(1) success;
-    /// miss/mismatch = fall back to Argon2.
-    cache: DashMap<String, [u8; 32]>,
+    /// `name → the last successfully verified password`, kept as presented
+    /// (plaintext in process memory by design, wiped on drop). Hit = one
+    /// constant-time comparison, no recomputation; miss/mismatch = fall
+    /// back to Argon2.
+    cache: DashMap<String, verify::CachedPassword>,
     /// Path to `resocks5.users.ktav` (parameter so tests can point at a
     /// temp file). Used only by the init-claim path to persist the
     /// freshly-hashed password.
@@ -131,10 +130,10 @@ pub struct AuthState {
     /// outside test builds.
     #[cfg(test)]
     claim_probe: Mutex<Option<std::sync::mpsc::Sender<&'static str>>>,
-    /// Test-only SEC-03 seam: counts `cache_hmac` calls (see
-    /// state/verify.rs). Compiles to nothing outside test builds.
+    /// Test-only SEC-03 seam: counts the first-step password comparisons
+    /// (see state/verify.rs). Compiles to nothing outside test builds.
     #[cfg(test)]
-    hmac_probes: std::sync::atomic::AtomicU64,
+    compare_probes: std::sync::atomic::AtomicU64,
 }
 
 impl AuthState {
@@ -144,9 +143,6 @@ impl AuthState {
         users_path: impl Into<String>,
     ) -> Result<Self> {
         let users_path = users_path.into();
-        let mut server_secret = [0u8; 32];
-        getrandom::getrandom(&mut server_secret)
-            .map_err(|e| anyhow!("OS random source unavailable: {}", e))?;
         let mut entries = HashMap::with_capacity(users.users.len());
         for (index, user) in users.users.iter().enumerate() {
             // Компилируем правило КАЖДОГО пользователя — включая disabled
@@ -179,17 +175,16 @@ impl AuthState {
             claim_slots: Arc::new(Semaphore::new(2)),
             claim_gates: Mutex::new(HashMap::new()),
             allow_anonymous: auth_cfg.allow_anonymous,
-            server_secret,
             cache: DashMap::new(),
             users_path,
             #[cfg(test)]
             claim_probe: Mutex::new(None),
             #[cfg(test)]
-            hmac_probes: std::sync::atomic::AtomicU64::new(0),
+            compare_probes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
-    /// Test-only: есть ли закешированный HMAC у пользователя (для
+    /// Test-only: есть ли закешированный пароль у пользователя (для
     /// проверки, что запрещённый IP не дошёл до verify_async).
     #[cfg(test)]
     pub(crate) fn cache_contains(&self, name: &str) -> bool {

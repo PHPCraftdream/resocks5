@@ -43,7 +43,7 @@ client TCP                                          target host
 └────────────────────┬──────────────────────────┘
                      ▼
 ┌───────────────────────────────────────────────┐
-│ 2. Authenticate                               │   Argon2id verify + verify-cache (HMAC of
+│ 2. Authenticate                               │   Argon2id verify + verify-cache (password
 │    (auth/state/, both handlers)               │   server_secret ⨁ name ⨁ password) for
 │                                               │   O(1) re-auth without re-Argon2
 └────────────────────┬──────────────────────────┘
@@ -344,16 +344,17 @@ Defaults are picked conservatively; `resocks5 config` documents each one.
 `resocks5` uses Argon2id with per-user PHC strings. To avoid running Argon2
 on every request:
 
-- On the first successful verify, we compute `HMAC(server_secret, name ⨁ 0x00 ⨁ password)`
-  and store that in a `DashMap`. The `server_secret` is fresh 32 bytes per
-  process — no persistence.
-- Subsequent verifies for the same name compare the stored HMAC in constant
-  time. Hit → success without touching Argon2.
+- On the first successful verify, we keep the presented password in a
+  `DashMap` keyed by name — plaintext in process memory by design, wiped
+  when the entry is replaced or dropped, never persisted.
+- Subsequent verifies for the same name compare the presented password with
+  it in constant time (content; the length is not hidden). Hit → success
+  without touching Argon2 and without recomputing anything.
 - Password and policy changes are not hot-applied: users are a startup
   snapshot, so a CLI or users-file change requires a server restart. The
   only runtime update is the init-claim below; it swaps the hash in the
   running process, after which old passwords fail, the cache miss falls
-  through to Argon2, and the stored HMAC is refreshed.
+  through to Argon2, and the remembered password is replaced.
 
 The `hash == "init"` sentinel implements claim-on-first-login: the first
 authenticated connect for that username records the password and writes

@@ -111,7 +111,7 @@ upstream is probed for free because its weight never hits zero.
 | Front end | SOCKS5 + HTTP CONNECT (auto) | many | many | many |
 | Rotation model | sand-rating soft-weight, self-recovering | round-robin / parent | chaining-first | failover |
 | Per-target stickiness | yes | — | — | — |
-| Auth | Argon2id + HMAC verify-cache | basic | basic | basic |
+| Auth | Argon2id + verify-cache (пароль в памяти) | basic | basic | basic |
 | TLS ClientHello fragmentation | yes | no | no | no |
 | Single-port dual-protocol | yes | — | — | — |
 
@@ -518,7 +518,7 @@ The route is server -> h1 -> h3 -> h4 -> target.
 если задано); элементы внутри одного списка — альтернативы **ИЛИ**.
 Фильтр пользователя выполняется **до проверки пароля**, поэтому
 отклонённый IP получает обычный отказ аутентификации (SOCKS5 `[1,1]` /
-HTTP 407) без работы Argon2, без попадания в HMAC-кеш и без записи
+HTTP 407) без работы Argon2, без попадания в кеш паролей и без записи
 init-claim на диск. К anonymous-клиентам он не применяется вообще
 (они подчиняются только глобальному правилу); direct-пользователи
 подчиняются ему как все.
