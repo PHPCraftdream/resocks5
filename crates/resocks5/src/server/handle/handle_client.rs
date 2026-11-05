@@ -126,9 +126,36 @@ pub async fn handle_client(
     // per-connection store applies the user's allowed_clients rule, so a
     // filtered peer gets the decoy and cannot enroll an init account.
     let store = auth.peer_store(peer_ip);
-    let req =
-        resocks5_net::server::accept_secure(&mut client_stream, &options, &store, auth.decoy())
-            .await?;
+    #[cfg(feature = "gssapi")]
+    let methods = {
+        let methods = resocks5_net::server::AuthMethods::secure(&store, auth.decoy());
+        match auth.gssapi_acceptor() {
+            Some(acceptor) => methods.with_gssapi(acceptor),
+            None => methods,
+        }
+    };
+    #[cfg(not(feature = "gssapi"))]
+    let methods = resocks5_net::server::AuthMethods::secure(&store, auth.decoy());
+    #[cfg_attr(not(feature = "gssapi"), allow(unused_mut))]
+    let mut req = resocks5_net::server::accept_with(&mut client_stream, &options, &methods).await?;
+    #[cfg(feature = "gssapi")]
+    if req.auth_method() == resocks5_net::server::AuthMethod::Gssapi {
+        // The principal is the identity; the account of that name (enabled,
+        // IP-admitted) is what everything downstream sees.
+        let principal = req.username().map(str::to_owned).unwrap_or_default();
+        match auth.gssapi_account(&principal, peer_ip) {
+            Some(account) => req.set_identity(account),
+            None => {
+                let _ = req
+                    .reply(&mut client_stream, resocks5_net::server::Reply::Forbidden)
+                    .await;
+                return Err(resocks5_net::server::ServerError::Authentication(
+                    "GSSAPI principal has no enabled account".to_owned(),
+                )
+                .into());
+            }
+        }
+    }
     match req.protocol() {
         resocks5_net::server::Protocol::Socks5 => {
             handle_socks5_client(
@@ -236,6 +263,7 @@ mod tests {
             crate::auth::AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig { users: Vec::new() },
                 "unused",
@@ -681,6 +709,7 @@ mod tests {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig {
                     users: vec![crate::config::User {
@@ -846,6 +875,7 @@ mod tests {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig {
                     users: vec![crate::config::User {

@@ -136,6 +136,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             AuthState::build(
                 &AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &UsersConfig {
                     users: vec![User {

@@ -111,12 +111,57 @@ pub(super) fn parse_proxy_list_checked(
         if line.starts_with('#') {
             continue;
         }
-        match parse_proxy_str(line, proto) {
-            Ok(config) => parsed.push(config),
+        let (entry, service) = split_gssapi_option(line);
+        match parse_proxy_str(entry, proto) {
+            Ok(config) => match attach_gssapi(config, service) {
+                Some(config) => parsed.push(config),
+                None => failed.push(idx + 1),
+            },
             Err(_) => failed.push(idx + 1),
         }
     }
     (parsed, failed)
+}
+
+/// An entry may end in `;gssapi=<service@host>`: the SOCKS5 upstream is then
+/// authenticated with GSSAPI (Kerberos) as that host-based service, strongest
+/// method first, falling back to secure auth when the entry also has
+/// credentials and the upstream prefers it. Splits the option off the entry.
+pub(super) fn split_gssapi_option(line: &str) -> (&str, Option<&str>) {
+    match line.rsplit_once(";gssapi=") {
+        Some((entry, service)) if !service.is_empty() => (entry, Some(service)),
+        _ => (line, None),
+    }
+}
+
+/// Apply the `;gssapi=` option to a parsed entry; `None` drops the entry (with
+/// a warning that names no credentials): GSSAPI needs a SOCKS5 upstream and a
+/// build with the `gssapi-system` backend.
+fn attach_gssapi(config: ProxyConfig, service: Option<&str>) -> Option<ProxyConfig> {
+    let Some(service) = service else {
+        return Some(config);
+    };
+    if config.protocol != ProxyProtocol::Socks5 {
+        println!(
+            "warning: upstream {}:{}: `;gssapi=` applies to SOCKS5 upstreams only — entry skipped",
+            config.host, config.port
+        );
+        return None;
+    }
+    #[cfg(feature = "gssapi-system")]
+    {
+        let backend = resocks5_net::gssapi::system::SystemBackend::new().shared();
+        Some(config.with_gssapi(resocks5_net::gssapi::GssCredentials::new(backend, service)))
+    }
+    #[cfg(not(feature = "gssapi-system"))]
+    {
+        let _ = service;
+        println!(
+            "warning: upstream {}:{}: `;gssapi=` needs a build with the `gssapi-system` feature — entry skipped",
+            config.host, config.port
+        );
+        None
+    }
 }
 
 /// Diagnostic for one dropped line. Deliberately receives only the list

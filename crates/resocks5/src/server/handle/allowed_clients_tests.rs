@@ -102,7 +102,10 @@ async fn run_case(c: Case) -> Arc<AuthState> {
     } = c;
     let auth = Arc::new(
         AuthState::build(
-            &crate::config::AuthConfig { allow_anonymous },
+            &crate::config::AuthConfig {
+                allow_anonymous,
+                ..Default::default()
+            },
             &UsersConfig { users },
             "unused",
         )
@@ -414,6 +417,7 @@ async fn a_cleartext_password_is_never_accepted() {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: false,
+                    ..Default::default()
                 },
                 &UsersConfig {
                     users: vec![user("alice", "pw", None, false)],
@@ -540,6 +544,7 @@ async fn user_filter_blocks_init_claim() {
         AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &UsersConfig { users },
             &path,

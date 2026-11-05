@@ -197,6 +197,15 @@ impl IncomingRequest {
         self.credentials.take()
     }
 
+    /// Replace the authenticated identity: for a host that maps an
+    /// authenticated GSSAPI principal (`name@REALM`) to a local account name,
+    /// so that everything downstream sees the account. `auth_method()` is
+    /// unchanged.
+    pub fn set_identity(&mut self, name: String) {
+        discard_wiped(&mut self.username_raw);
+        self.username = Some(name);
+    }
+
     /// Moves the verified username out; afterwards `username()` is `None`. Independent
     /// of retained credentials (they keep their own copy until taken or dropped).
     /// Anonymous: `None`.

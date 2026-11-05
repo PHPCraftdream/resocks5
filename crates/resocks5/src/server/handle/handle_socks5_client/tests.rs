@@ -81,6 +81,7 @@ fn auth_state_with_users(
         crate::auth::AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &crate::config::UsersConfig { users },
             path,
@@ -181,6 +182,7 @@ async fn passwords_of_any_length_enroll_and_survive_a_restart() {
             crate::auth::AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: false,
+                    ..Default::default()
                 },
                 &loaded,
                 path.clone(),

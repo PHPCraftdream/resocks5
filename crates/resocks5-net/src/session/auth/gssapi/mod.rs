@@ -34,6 +34,8 @@ use crate::error::GssapiError;
 pub mod mock;
 #[cfg(test)]
 mod negotiation_tests;
+#[cfg(feature = "gssapi-system")]
+pub mod system;
 #[cfg(test)]
 mod tests;
 

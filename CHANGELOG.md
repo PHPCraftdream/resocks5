@@ -100,6 +100,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with credentials is reported at startup and its dials are refused. The app no
   longer enables `cleartext-client`.
 
+- `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
+  the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
+  system Kerberos backend; not in the release binaries). `auth.gssapi_service`
+  (and `auth.gssapi_min_protection`) enable it; `users add-gssapi <principal>`
+  creates a password-less account named like the principal (`hash: gssapi`) to
+  which that principal maps; a SOCKS5 upstream entry may end in
+  `;gssapi=<service@host>`. Methods adapt on the fly, strongest first: the server
+  picks GSSAPI, then secure auth, then anonymous; a client with several methods
+  offers them all and nothing weaker.
+- `resocks5-net`: `server::IncomingRequest::set_identity` replaces the
+  authenticated identity (a host mapping a principal to an account).
+- `resocks5-net`: feature `gssapi-system` and `gssapi::system::SystemBackend`,
+  Kerberos 5 through the system GSS-API (MIT Kerberos / Heimdal on Linux, Apple
+  GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC.
+
 ### Removed
 
 - `resocks5`: the server-side password verify path and its in-memory password

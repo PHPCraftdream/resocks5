@@ -572,6 +572,7 @@ async fn handle_client_hands_partial_http_pipeline_to_recovery_losslessly() {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig { users: Vec::new() },
                 "unused-handoff",
@@ -709,6 +710,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
         AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &crate::config::UsersConfig {
                 users: vec![crate::config::User {

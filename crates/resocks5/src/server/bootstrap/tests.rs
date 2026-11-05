@@ -360,6 +360,7 @@ fn main_cfg_with_allowed(rule: &str) -> crate::config::MainConfig {
         banned_patterns: Vec::new(),
         auth: crate::config::AuthConfig {
             allow_anonymous: false,
+            ..Default::default()
         },
         log: crate::logger::LogConfig::default(),
         pool: Default::default(),

@@ -7,3 +7,5 @@ pub(crate) mod handle_socks5_client;
 mod allowed_clients_tests;
 #[cfg(test)]
 mod direct_tests;
+#[cfg(all(test, feature = "gssapi"))]
+mod gssapi_tests;

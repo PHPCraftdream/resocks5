@@ -11,6 +11,7 @@ use crate::auth::secret::parse_secret;
 use crate::config::{AuthConfig, User, UsersConfig};
 
 mod claim;
+pub(crate) mod gssapi;
 mod store;
 
 pub(crate) use claim::INIT_HASH;
@@ -75,6 +76,9 @@ pub struct AuthState {
     /// Path to `resocks5.users.ktav` (parameter so tests can point at a
     /// temp file). Used only by enrollment.
     users_path: String,
+    /// GSSAPI acceptor, when `auth.gssapi_service` is set.
+    #[cfg(feature = "gssapi")]
+    gssapi: Option<resocks5_net::gssapi::GssAcceptor>,
 }
 
 impl AuthState {
@@ -108,6 +112,10 @@ impl AuthState {
             });
         }
         warn_unusable_secrets(&users.users, &users_path);
+        #[cfg(feature = "gssapi")]
+        let gssapi = gssapi::configured_acceptor(auth_cfg)?;
+        #[cfg(not(feature = "gssapi"))]
+        gssapi::refuse_without_support(auth_cfg)?;
         Ok(Self {
             users: RwLock::new(users.users.clone()),
             claim_lock: Mutex::new(()),
@@ -117,6 +125,8 @@ impl AuthState {
             decoy: DecoyKey::generate().map_err(|e| anyhow!("decoy key: {e}"))?,
             enrollment_floor: enrollment_floor(),
             users_path,
+            #[cfg(feature = "gssapi")]
+            gssapi,
         })
     }
 
@@ -183,7 +193,10 @@ impl AuthState {
 /// is not a usable secret, or one derived more cheaply than a default client
 /// accepts. Names only, never the values.
 fn warn_unusable_secrets(users: &[User], users_path: &str) {
-    for user in users.iter().filter(|u| u.is_enabled && u.hash != INIT_HASH) {
+    for user in users
+        .iter()
+        .filter(|u| u.is_enabled && u.hash != INIT_HASH && u.hash != gssapi::GSSAPI_HASH)
+    {
         match parse_secret(&user.hash) {
             Err(e) => eprintln!(
                 "{users_path}: user {:?}: stored hash unusable ({e}); \

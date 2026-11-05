@@ -84,6 +84,9 @@ demoting any that fail via the sand-rating model instead of dropping them.
   crosses the wire and is never stored (an Argon2id-derived key and a mutual
   HMAC challenge-response), with an optional init-on-first-login mode.
   Clear-text passwords (SOCKS5 username/password, HTTP Basic) are refused.
+  Optionally GSSAPI/Kerberos (RFC 1961, feature `gssapi-system`): no password
+  at all. Methods adapt on the fly, strongest first (GSSAPI, secure auth,
+  anonymous), on the server and for upstreams.
 - **Safety rails:** idle/lifetime tunnel timeouts, TCP keepalive, a
   max-concurrent-clients cap, and regex-based banned-target patterns.
 - **Configurable logging** by category, with optional non-blocking file output.

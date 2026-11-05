@@ -365,6 +365,21 @@ the sentinel under `claim_lock`, merges the secret into the current users
 file under the cross-process lock, and publishes it. Concurrent claims
 serialize — exactly one winner, the others are denied.
 
+### GSSAPI and method choice
+
+With `auth.gssapi_service` set (build feature `gssapi-system`), `handle_client`
+passes `AuthMethods::secure(..).with_gssapi(..)` to `server::accept_with`. The
+client's greeting lists its strong methods, strongest first; the server picks the
+strongest it has (GSSAPI, secure auth, anonymous) and never clear text. For
+GSSAPI the SDK runs the RFC 1961 exchange over the system Kerberos backend and
+returns the principal; `AuthState::gssapi_account` maps it to the enabled,
+IP-admitted account of the same name (`hash: gssapi`, created with
+`users add-gssapi`) and `IncomingRequest::set_identity` makes everything
+downstream see that account. The SOCKS request and reply travel as protected
+messages (the reply through `IncomingRequest::reply`); tunnel data is plain.
+Upstreams use the same negotiation: `ProxyConfig::with_gssapi` and
+`with_secure_auth` both set means both are offered, GSSAPI first.
+
 ## Config files
 
 Three KTAV files in the working directory, all auto-created on first run

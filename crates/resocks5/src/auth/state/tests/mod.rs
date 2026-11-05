@@ -45,7 +45,10 @@ fn make_init_user(name: &str, enabled: bool) -> User {
 fn build_state(users: Vec<User>, allow_anonymous: bool) -> Arc<AuthState> {
     Arc::new(
         AuthState::build(
-            &AuthConfig { allow_anonymous },
+            &AuthConfig {
+                allow_anonymous,
+                ..Default::default()
+            },
             &UsersConfig { users },
             "/__resocks5_test_never_written__",
         )
@@ -70,6 +73,7 @@ fn build_state_persistent(users: Vec<User>) -> (Arc<AuthState>, String) {
     let state = AuthState::build(
         &AuthConfig {
             allow_anonymous: false,
+            ..Default::default()
         },
         &UsersConfig { users },
         path.clone(),
@@ -271,6 +275,7 @@ fn disabled_user_invalid_rule_fails_build() {
     let res = AuthState::build(
         &AuthConfig {
             allow_anonymous: false,
+            ..Default::default()
         },
         &UsersConfig {
             users: vec![user_with_rule(
@@ -294,6 +299,7 @@ fn duplicate_user_invalid_rule_fails_build() {
     let res = AuthState::build(
         &AuthConfig {
             allow_anonymous: false,
+            ..Default::default()
         },
         &UsersConfig {
             users: vec![
