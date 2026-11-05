@@ -45,9 +45,9 @@ fn socks5_pair(proxy: &ProxyConfig) -> Option<(&str, &str)> {
 ///
 /// Returns [`ConnectError`] when acquiring a socket or running the
 /// SOCKS5 handshake fails, or when the handshake budget expires
-/// ([`TimeoutKind::Socks5Greeting`] while the upstream has not answered
+/// ([`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind::Socks5Greeting) while the upstream has not answered
 /// the greeting yet — it never spoke its own protocol;
-/// [`TimeoutKind::Socks5Handshake`] once the CONNECT reply may be the
+/// [`TimeoutKind::Socks5Handshake`](crate::error::TimeoutKind::Socks5Handshake) once the CONNECT reply may be the
 /// destination's fault).
 #[cfg(feature = "pool")]
 pub async fn connect_socks5_proxy(
@@ -62,9 +62,9 @@ pub async fn connect_socks5_proxy(
 
 /// The SOCKS5 half of [`connect_socks5_proxy`] on a socket already taken
 /// from the pool, bounded by `handshake_timeout`. One deadline covers
-/// both phases: a greeting stall reports [`TimeoutKind::Socks5Greeting`]
+/// both phases: a greeting stall reports [`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind::Socks5Greeting)
 /// (the upstream never spoke its own protocol), a stalled CONNECT reply
-/// stays [`TimeoutKind::Socks5Handshake`].
+/// stays [`TimeoutKind::Socks5Handshake`](crate::error::TimeoutKind::Socks5Handshake).
 #[cfg(feature = "pool")]
 pub(crate) async fn socks5_on_acquired(
     stream: UpstreamStream,

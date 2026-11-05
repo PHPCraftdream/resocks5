@@ -157,12 +157,8 @@ async fn basic_payload_is_the_whole_decoded_token() {
             ("OnA=", ":p", "", "p"),
             ("dTpwOg==", "u:p:", "u", "p:"),
         ] {
-            let bytes = format!(
-                "CONNECT h:443 HTTP/1.1
-Proxy-Authorization: Basic {token}
-
-"
-            );
+            let bytes =
+                format!("CONNECT h:443 HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n");
             let (mut peer, mut stream) = duplex(1024);
             peer.write_all(bytes.as_bytes()).await.unwrap();
             let seen = Arc::new(std::sync::Mutex::new(None));

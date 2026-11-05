@@ -878,5 +878,5 @@ fn zeroize_wipes_the_basic_payload() {
     );
     assert_eq!(c.basic_payload(), Some("wipe-user:wipe-pass"));
     c.wipe();
-    assert_eq!(c.basic_payload(), Some(""));
+    assert_eq!(c.basic_payload(), None);
 }

@@ -126,8 +126,8 @@ where
 }
 
 /// [`http_connect_handshake`] bounded by an ABSOLUTE `deadline`, with a typed
-/// timeout: [`ConnectError::Timeout`] (stage [`Stage::Handshake`], kind
-/// [`TimeoutKind::HttpHandshake`], or [`TimeoutKind::HttpsConnectHandshake`]
+/// timeout: [`ConnectError::Timeout`] (stage [`Stage::Handshake`](crate::error::Stage::Handshake), kind
+/// [`TimeoutKind::HttpHandshake`](crate::error::TimeoutKind::HttpHandshake), or [`TimeoutKind::HttpsConnectHandshake`](crate::error::TimeoutKind::HttpsConnectHandshake)
 /// when `proxy` is an HTTPS upstream), the `host:port` of `proxy` as the
 /// endpoint and the time left at the call as `after`. HTTP has no separate
 /// greeting phase, so there is no finer kind than "the CONNECT reply did not
