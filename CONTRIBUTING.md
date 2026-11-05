@@ -97,6 +97,17 @@ and every example's behaviour is covered by an ordinary test (see
 `doctest = false` in `[lib]`; `sh .github/scripts/check-no-doctests.sh` (run by the
 `structure` job) fails on any other code block or a missing setting.
 
+### Diagnosing a flaky timing test
+
+The three real-TLS drip tests (`connect/tls/upstream_tls.rs`) record a
+failure-only report through `connect/tls/test_trace.rs`: it is printed with the
+failing test's output and says how fast the drip server really ran (read sizes,
+asked vs real sleeps), whether the runtime or the OS timer stalled (a 10 ms
+heartbeat's lateness and `std::thread::sleep` resolution at test start), the
+socket buffers the OS granted, and a 500 ms throughput timeline. A passing run
+prints nothing; set `RESOCKS5_TRACE=1` and add `-- --nocapture` to see the report
+anyway. Attach that report to any flaky-test issue.
+
 ### Code structure (the `structure` CI job)
 
 - A Rust file has at most **1000 lines**

@@ -261,6 +261,7 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use super::super::test_trace::{Diag, DripStats, Trace};
     use crate::connect::connect_proxy::connect_proxy;
     use crate::connect::tls_fragment::{send_possibly_fragmented, FragmentSpec, SendProgress};
     use crate::connect::tunnel::tunnel_with_timeouts;
@@ -312,19 +313,35 @@ mod tests {
     /// TCP close as an error (`UnexpectedEof`), not a clean end of
     /// stream, so this explicit shutdown is required even though nothing
     /// is written back. The whole body is bounded by a 30 s timeout so a
-    /// regression fails fast instead of hanging the suite.
+    /// regression fails fast instead of hanging the suite. The timeout is
+    /// reported as an error that carries the drip statistics (the test then
+    /// fails on `server.await.unwrap().unwrap()`), and every phase is noted
+    /// in the failure-only trace.
     async fn run_dripping_tls_proxy(
         listener: tokio::net::TcpListener,
         acceptor: tokio_rustls::TlsAcceptor,
         drip_chunk: usize,
         drip_delay: Duration,
+        trace: Arc<Trace>,
+        stats: Arc<DripStats>,
     ) -> anyhow::Result<Vec<u8>> {
+        let on_timeout = Arc::clone(&stats);
         tokio::time::timeout(Duration::from_secs(30), async move {
-            let (accepted, _) = listener.accept().await?;
+            let (accepted, peer) = listener.accept().await?;
+            trace.note(format!("server: accepted {peer}"));
             // Accepted sockets inherit the listener's buffers on Windows;
             // shrink again for the platforms that don't inherit.
             let _ = SockRef::from(&accepted).set_recv_buffer_size(1024);
+            trace.note(format!(
+                "server: accepted socket recv buffer granted {:?} (asked 1024)",
+                SockRef::from(&accepted).recv_buffer_size()
+            ));
+            let handshake_started = std::time::Instant::now();
             let mut tls = acceptor.accept(accepted).await?;
+            trace.note(format!(
+                "server: TLS handshake done in {:?}",
+                handshake_started.elapsed()
+            ));
 
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
@@ -336,6 +353,10 @@ mod tests {
             tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .await?;
             tls.flush().await?;
+            trace.note(format!(
+                "server: CONNECT request ({} B) read, 200 sent; drip starts ({drip_chunk} B / {drip_delay:?})",
+                request.len()
+            ));
 
             // The deliberate slow drain: target rate is `drip_chunk` bytes
             // per `drip_delay`. The sleep is scaled to the bytes actually
@@ -347,20 +368,47 @@ mod tests {
             // timeout on some platforms with a flat per-call sleep).
             let mut collected = Vec::new();
             let mut chunk = vec![0u8; drip_chunk];
+            let mut previous_sleep_end = std::time::Instant::now();
             loop {
                 let n = tls.read(&mut chunk).await?;
+                stats.record_read(n, previous_sleep_end.elapsed());
                 if n == 0 {
+                    trace.note(format!(
+                        "server: EOF after {} B in {} reads",
+                        collected.len(),
+                        stats.reads()
+                    ));
                     break;
                 }
                 collected.extend_from_slice(&chunk[..n]);
-                tokio::time::sleep(drip_delay.mul_f64(n as f64 / drip_chunk as f64)).await;
+                let requested = drip_delay.mul_f64(n as f64 / drip_chunk as f64);
+                let slept_at = std::time::Instant::now();
+                tokio::time::sleep(requested).await;
+                let actual = slept_at.elapsed();
+                stats.record_sleep(requested, actual);
+                let reads = stats.reads();
+                if reads <= 5
+                    || reads & 127 == 0
+                    || actual > requested + Duration::from_millis(100)
+                {
+                    trace.note(format!(
+                        "server: read #{reads} {n} B, slept {actual:?} (asked {requested:?})"
+                    ));
+                }
+                previous_sleep_end = std::time::Instant::now();
             }
 
             tls.shutdown().await?;
+            trace.note("server: close_notify sent");
             Ok(collected)
         })
         .await
-        .expect("dripping TLS proxy must finish well within 30s")
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "dripping TLS proxy did not finish within 30s; {}",
+                on_timeout.render()
+            ))
+        })
     }
 
     /// Everything both tests share: build the throwaway TLS server config
@@ -373,6 +421,7 @@ mod tests {
     /// the server task handle (its output is everything collected until
     /// EOF).
     async fn connected_tls_upstream(
+        diag: &Diag,
         drip_chunk: usize,
         drip_delay: Duration,
     ) -> (
@@ -395,8 +444,15 @@ mod tests {
         let listener = small_buffer_listener();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(run_dripping_tls_proxy(
-            listener, acceptor, drip_chunk, drip_delay,
+            listener,
+            acceptor,
+            drip_chunk,
+            drip_delay,
+            Arc::clone(&diag.trace),
+            Arc::clone(&diag.drip),
         ));
+        diag.trace
+            .note(format!("client: listening on 127.0.0.1:{port}"));
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca_cert).unwrap();
@@ -416,6 +472,7 @@ mod tests {
         );
         let proxy = ProxyConfig::https("127.0.0.1", port);
 
+        let connect_started = std::time::Instant::now();
         let upstream = connect_proxy(
             "example.org:443",
             &proxy,
@@ -425,6 +482,10 @@ mod tests {
         )
         .await
         .unwrap();
+        diag.trace.note(format!(
+            "client: connect_proxy (TCP + TLS + CONNECT) done in {:?}",
+            connect_started.elapsed()
+        ));
         assert!(
             matches!(&upstream, AnyUpstream::Tls(_)),
             "the HTTPS path must produce AnyUpstream::Tls"
@@ -439,6 +500,10 @@ mod tests {
             .as_tcp()
             .expect("AnyUpstream::Tls exposes its innermost socket");
         SockRef::from(tcp).set_send_buffer_size(2048).unwrap();
+        diag.trace.note(format!(
+            "client: send buffer granted {:?} (asked 2048)",
+            SockRef::from(tcp).send_buffer_size()
+        ));
         upstream.set_nodelay(true).unwrap();
 
         (upstream, server)
@@ -464,8 +529,9 @@ mod tests {
     /// drip and the send must not share one starvable worker thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fragmented_send_through_real_tls_upstream_survives_slow_drip() {
+        let diag = Diag::new("fragmented_send_through_real_tls_upstream_survives_slow_drip");
         let (mut upstream, server) =
-            connected_tls_upstream(8 * 1024, Duration::from_millis(40)).await;
+            connected_tls_upstream(&diag, 8 * 1024, Duration::from_millis(40)).await;
 
         let mut payload = vec![0x16, 0x03, 0x01, 0x3E, 0x80, 0x01];
         payload.extend((0..1_535_994u32).map(|i| (i & 0xFF) as u8));
@@ -476,12 +542,25 @@ mod tests {
             delay_ms: 0,
         };
 
+        diag.trace.note(format!(
+            "client: send_possibly_fragmented starts ({} B, 60 KB fragments, idle window 5 s)",
+            payload.len()
+        ));
         let start = tokio::time::Instant::now();
         let outcome =
             send_possibly_fragmented(&mut upstream, &payload, &spec, Duration::from_secs(5))
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "send_possibly_fragmented failed after {:?}: {error} ({:?})",
+                        start.elapsed(),
+                        error.kind()
+                    )
+                });
         let elapsed = start.elapsed();
+        diag.trace.note(format!(
+            "client: send finished {outcome:?} after {elapsed:?}"
+        ));
 
         assert_eq!(
             outcome,
@@ -528,7 +607,9 @@ mod tests {
     /// burn through the idle window without any task getting polled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn steady_state_tunnel_through_real_tls_upstream_survives_slow_drip() {
-        let (upstream, server) = connected_tls_upstream(8 * 1024, Duration::from_millis(40)).await;
+        let diag = Diag::new("steady_state_tunnel_through_real_tls_upstream_survives_slow_drip");
+        let (upstream, server) =
+            connected_tls_upstream(&diag, 8 * 1024, Duration::from_millis(40)).await;
         let data: Vec<u8> = (0..1_572_864u32).map(|i| (i * 7 % 256) as u8).collect();
 
         let (mut feeder, client_half) = tokio::io::duplex(64 * 1024);
@@ -539,8 +620,23 @@ mod tests {
             Duration::ZERO,
         ));
 
-        feeder.write_all(&data).await.unwrap();
+        diag.trace.note(format!(
+            "client: feeding {} B into the tunnel (idle bound 5 s)",
+            data.len()
+        ));
+        let start = tokio::time::Instant::now();
+        feeder.write_all(&data).await.unwrap_or_else(|error| {
+            panic!(
+                "feeder.write_all failed after {:?} (tunnel torn down?): {error} ({:?})",
+                start.elapsed(),
+                error.kind()
+            )
+        });
         feeder.shutdown().await.unwrap();
+        diag.trace.note(format!(
+            "client: feeder done after {:?}, waiting for the server",
+            start.elapsed()
+        ));
 
         let collected = server.await.unwrap().unwrap();
         assert_eq!(
@@ -548,6 +644,8 @@ mod tests {
             "server must receive the tunneled data byte-for-byte"
         );
         let result = tunnel.await.unwrap();
+        diag.trace
+            .note(format!("client: tunnel ended with {result:?}"));
         assert!(result.is_ok(), "tunnel must end cleanly, got {result:?}");
     }
 
@@ -569,8 +667,9 @@ mod tests {
     /// guarantees a real stall regardless of what the OS actually granted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stalled_send_through_real_tls_upstream_is_bounded() {
+        let diag = Diag::new("stalled_send_through_real_tls_upstream_is_bounded");
         let (mut upstream, server) =
-            connected_tls_upstream(4 * 1024, Duration::from_secs(3600)).await;
+            connected_tls_upstream(&diag, 4 * 1024, Duration::from_secs(3600)).await;
 
         let mut payload = vec![0x16, 0x03, 0x01, 0x3E, 0x80, 0x01];
         payload.extend((0..20_000_000u32).map(|i| (i & 0xFF) as u8));
@@ -581,12 +680,23 @@ mod tests {
             delay_ms: 0,
         };
 
+        diag.trace
+            .note("client: send starts against a peer that never reads (idle window 5 s)");
         let start = tokio::time::Instant::now();
         let outcome =
             send_possibly_fragmented(&mut upstream, &payload, &spec, Duration::from_secs(5))
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "send_possibly_fragmented failed after {:?}: {error} ({:?})",
+                        start.elapsed(),
+                        error.kind()
+                    )
+                });
         let elapsed = start.elapsed();
+        diag.trace.note(format!(
+            "client: send finished {outcome:?} after {elapsed:?}"
+        ));
 
         assert_eq!(
             outcome,
