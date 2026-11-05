@@ -98,6 +98,27 @@ impl ProxyConfig {
         Self::new(ProxyProtocol::Https, host, port)
     }
 
+    /// Overwrite the `user` and `password` with zeros and clear them, here
+    /// and at every gate this value solely owns. `ProxyConfig` has no `Drop`:
+    /// clones, and gates shared with other configs, keep their values. Returns
+    /// `false` when a shared gate was left untouched.
+    #[cfg(feature = "zeroize")]
+    pub fn wipe_credentials(&mut self) -> bool {
+        use zeroize::Zeroize;
+        let mut node = self;
+        loop {
+            node.user.zeroize();
+            node.password.zeroize();
+            match node.gate.as_mut() {
+                None => return true,
+                Some(gate) => match Arc::get_mut(gate) {
+                    Some(gate) => node = gate,
+                    None => return false,
+                },
+            }
+        }
+    }
+
     /// Set username and password.
     pub fn with_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
         self.user = Some(user.into());
@@ -237,6 +258,34 @@ impl fmt::Debug for ProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wipe_credentials` clears every solely owned node and reports a shared
+    /// gate it could not touch. Mutation: stopping at the first node leaves
+    /// the gate's password.
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn wipe_credentials_clears_owned_nodes_and_reports_shared_gates() {
+        let gate = ProxyConfig::socks5("gate", 1).with_auth("gu", "gp");
+        let mut owned = ProxyConfig::socks5("exit", 2)
+            .with_auth("eu", "ep")
+            .with_gate(gate.clone());
+        assert!(owned.wipe_credentials());
+        let nodes = owned.nodes();
+        assert!(nodes
+            .iter()
+            .all(|n| n.user.is_none() && n.password.is_none()));
+
+        let mut shared = ProxyConfig::socks5("exit", 2)
+            .with_auth("eu", "ep")
+            .with_gate(gate);
+        let other = shared.clone();
+        assert!(
+            !shared.wipe_credentials(),
+            "the gate is shared with `other`"
+        );
+        assert_eq!(shared.password, None);
+        assert_eq!(other.gate.as_ref().unwrap().password.as_deref(), Some("gp"));
+    }
 
     fn config(host: &str, port: u16, user: Option<&str>, password: Option<&str>) -> ProxyConfig {
         let cfg = ProxyConfig::socks5(host, port);
