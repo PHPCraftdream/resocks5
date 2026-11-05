@@ -34,7 +34,7 @@ fn state_with_hash(hash: String) -> AuthState {
 // ─── SEC-03: timing-equalised rejection ───────────────────────────────
 
 #[tokio::test]
-async fn unknown_name_still_runs_hmac_and_rejects() {
+async fn unknown_name_still_runs_the_comparison_and_rejects() {
     let state = Arc::new(build_state(vec![make_user("alice", "s3cret", true)], false));
     let before = state.compare_probe_count();
     assert!(!state.verify_async("carol", "s3cret").await);
@@ -46,7 +46,7 @@ async fn unknown_name_still_runs_hmac_and_rejects() {
 }
 
 #[tokio::test]
-async fn disabled_name_still_runs_hmac_and_rejects() {
+async fn disabled_name_still_runs_the_comparison_and_rejects() {
     let state = Arc::new(build_state(vec![make_user("bob", "s3cret", false)], false));
     let before = state.compare_probe_count();
     assert!(!state.verify_async("bob", "s3cret").await);
@@ -162,4 +162,36 @@ fn a_remembered_password_is_wiped() {
     assert_eq!(cached.bytes(), b"hunter2-hunter2");
     cached.wipe();
     assert!(cached.bytes().iter().all(|&b| b == 0));
+}
+
+/// The remembered password lives in process memory only: an init-claim writes
+/// the Argon2id hash to the users file and never the password itself.
+/// Mutation: persisting the presented password (or caching it into the file)
+/// fails the contains-check.
+#[test]
+fn the_claimed_password_never_reaches_the_users_file() {
+    let (state, path) = build_state_persistent(vec![make_init_user("bob", true)], false);
+    assert!(state.verify("bob", "plain-text-secret-9"));
+    assert!(state.cache_matches("bob", "plain-text-secret-9"));
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("$argon2id$"), "the hash is persisted");
+    assert!(
+        !on_disk.contains("plain-text-secret-9"),
+        "the password must never be written to disk"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A changed password is not accepted from the remembered one: after the
+/// stored hash is replaced (a claim that lost to a disk edit adopts the disk
+/// hash), the old cache entry no longer authorises a different password.
+#[tokio::test]
+async fn a_different_password_never_matches_the_remembered_one() {
+    let state = Arc::new(build_state(vec![make_user("alice", "s3cret", true)], false));
+    assert!(state.verify_async("alice", "s3cret").await);
+    // Same name, other password: not served from the cache, and Argon2 rejects it.
+    assert!(!state.verify_async("alice", "other-pass").await);
+    // The remembered password is still the good one.
+    assert!(state.cache_matches("alice", "s3cret"));
+    assert!(!state.cache_matches("alice", "other-pass"));
 }

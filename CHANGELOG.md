@@ -97,8 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5`: new Argon2id hashes use m=19456 KiB, t=2, p=1 (OWASP minimum); stored
   hashes keep verifying with their own parameters. A stored hash that is not
   Argon2id v19 is rejected (it used to verify with the algorithm named in the
-  string). `verify_async` runs the cheap HMAC step for unknown and disabled names
-  too, so the first step takes the same time for every name.
+  string). `verify_async` runs the same single comparison (against a dummy)
+  for unknown and disabled names, so the first step costs the same for every name.
 - `resocks5`: cached chains honour the direct fallback reserve of
   `max_upstream_attempts` (a budget of 1 still serves the sticky cache first),
   and `network.*` time budgets above one day and limits above 2^30 are rejected

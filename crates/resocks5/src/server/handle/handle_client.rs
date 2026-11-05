@@ -936,7 +936,7 @@ mod tests {
         })
         .await
         .unwrap();
-        // Подтверждение «до verify_async»: закешированного HMAC нет —
+        // Подтверждение «до verify_async»: закешированного пароля нет —
         // успешный verify положил бы его в cache.
         assert!(!auth.cache_contains("alice"));
     }
