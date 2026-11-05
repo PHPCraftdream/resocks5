@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-05
+
 ### Added
 
 - `resocks5-net`: `ProxyConfig::validate()`, `validate_node()` and
@@ -990,7 +992,8 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...v0.3.0

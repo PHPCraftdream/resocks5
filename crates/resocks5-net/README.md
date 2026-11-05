@@ -238,7 +238,7 @@ bracketed or bare IPv6, and password may contain `:`.
 
 ```toml
 [dependencies]
-resocks5-net = "0.4"
+resocks5-net = "0.5"
 # resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

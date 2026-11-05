@@ -565,12 +565,12 @@ connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credentia
 storage, logging and routing policy stay in the host application.
 Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
 existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate` and the
-opt-in inbound options need 0.4.2), or as a
+opt-in inbound options need 0.5.0), or as a
 git dependency to follow unreleased changes:
 
 ```toml
 [dependencies]
-resocks5-net = "0.4"
+resocks5-net = "0.5"
 # resocks5-net = { git = "https://github.com/PHPCraftdream/resocks5" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
