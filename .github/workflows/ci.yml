@@ -341,7 +341,7 @@ jobs:
       - name: install Kerberos
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libkrb5-dev krb5-user krb5-kdc krb5-admin-server clang libclang-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libkrb5-dev krb5-user krb5-kdc krb5-admin-server clang libclang-dev libssl-dev
       - run: cargo clippy -p resocks5-net --features gssapi-system --all-targets --locked -- -D warnings
       - run: cargo clippy -p resocks5 --features gssapi-system --all-targets --locked -- -D warnings
       # The app's GSSAPI account mapping, on the mock mechanism.

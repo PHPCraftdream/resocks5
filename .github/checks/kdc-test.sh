@@ -81,10 +81,28 @@ export GSS_TEST_SERVICE="socks@$host"
 cargo test -p resocks5-net --features gssapi-system --locked -- --ignored --test-threads=1 gssapi::system
 
 # Interoperability: a third-party client (curl) against our server over real
-# Kerberos. A curl built without GSS-API is a CI image problem, so it fails
-# loudly instead of skipping.
-curl --version
-curl --version | grep -qi "gss" || { echo "kdc-test: this curl has no GSS-API" >&2; exit 1; }
+# Kerberos. Stock curl up to 8.11 (Ubuntu's 8.5.0 included) keeps its "GSS-API
+# allowed" flag in a local variable that is lost whenever the SOCKS5 state
+# machine returns to wait for the reply, so it rejects method 1 as "per-message
+# authentication is not supported" unless the reply is already buffered. Current
+# releases keep it in the options, so build one (checksum pinned).
+curl_version=8.23.0
+curl_sha256=8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+curl -fsSL -o "$root/curl.tar.xz" "https://github.com/curl/curl/releases/download/curl-8_23_0/curl-$curl_version.tar.xz"
+echo "$curl_sha256  $root/curl.tar.xz" | sha256sum -c -
+mkdir "$root/curl-src"
+tar -xJf "$root/curl.tar.xz" -C "$root/curl-src" --strip-components=1
+(
+    cd "$root/curl-src"
+    ./configure --prefix="$root/curl" --with-openssl --with-gssapi --disable-shared \
+        --without-libpsl --without-libidn2 --without-nghttp2 --without-brotli --without-zstd \
+        --disable-ldap --disable-manual > /dev/null
+    make -j"$(nproc)" > /dev/null
+    make install > /dev/null
+)
+curl_bin="$root/curl/bin/curl"
+"$curl_bin" --version
+"$curl_bin" --version | grep -qi "gss" || { echo "kdc-test: the built curl has no GSS-API" >&2; exit 1; }
 cargo build -p resocks5-net --features gssapi-system --example gssapi_interop_server --locked
 port=1081
 "${CARGO_TARGET_DIR:-target}/debug/examples/gssapi_interop_server" "127.0.0.1:$port" "$GSS_TEST_SERVICE"     > "$root/interop.out" 2> "$root/interop.err" &
@@ -95,19 +113,7 @@ until grep -q '^READY' "$root/interop.out" 2>/dev/null; do
     [ "$tries" -lt 30 ] || { echo "kdc-test: interop server did not start" >&2; cat "$root/interop.err" >&2; exit 1; }
     sleep 1
 done
-python3 -c 'import socket
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 1082))
-s.listen(1)
-c, _ = s.accept()
-print("greeting:", c.recv(64).hex(), flush=True)
-c.sendall(bytes([5, 1]))
-print("after reply:", c.recv(64).hex(), flush=True)' > "$root/greeting.out" 2>&1 &
-sleep 1
-curl -sS --max-time 5 --socks5-hostname "$host:1082" --socks5-gssapi-service socks "http://target.test:80/" > /dev/null 2>&1 || true
-cat "$root/greeting.out"
-body=$(curl -sS -v --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks     "http://target.test:80/" 2> "$root/curl.err") || {
+body=$("$curl_bin" -sS -v --max-time 30 --socks5-hostname "$host:$port" --socks5-gssapi-service socks "http://target.test:80/" 2> "$root/curl.err") || {
     echo "kdc-test: curl failed" >&2
     cat "$root/curl.err" "$root/interop.out" "$root/interop.err" >&2
     exit 1
