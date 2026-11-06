@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `resocks5-net`: without `cleartext-server`, HTTP 407 now advertises
+  `Proxy-Authenticate: Resocks5-Secure`, not Basic, to avoid inviting a
+  clear-text password transmission. Status 407 and its challenge remain;
+  feature-enabled builds retain the previous Basic realm and charset.
+  This does not implement secure authentication over HTTP. Preemptive Basic
+  from a preconfigured client cannot be prevented; browser prompt behavior
+  for the unknown scheme has not been tested.
+
 ### Added
 
 - `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by

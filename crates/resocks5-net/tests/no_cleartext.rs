@@ -4,11 +4,10 @@
 //! the real default build: no `cleartext-server` means the inbound side neither
 //! offers nor accepts SOCKS5 method 0x02 or HTTP Basic, and no
 //! `cleartext-client` means the dial side refuses, before the first byte, to
-//! send a user name and password in clear text. (The same tests are skipped in
-//! a build that turns the features on.)
+//! send a user name and password in clear text.
+//! Refusal checks are feature-gated; HTTP challenges are tested in both builds.
 
-#[cfg(not(feature = "cleartext-server"))]
-mod server_side {
+mod http_407 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -23,7 +22,7 @@ mod server_side {
 
     /// Run `accept` against `bytes` from a client; returns the result, everything
     /// the server wrote back, and how many times the credential callback ran.
-    async fn serve(
+    pub(super) async fn serve(
         bytes: &[u8],
         anonymous: bool,
         password: bool,
@@ -46,6 +45,53 @@ mod server_side {
         peer.read_to_end(&mut written).await.unwrap();
         (result, written, calls.load(Ordering::SeqCst))
     }
+
+    #[cfg(not(feature = "cleartext-server"))]
+    pub(super) const EXPECT_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    #[cfg(feature = "cleartext-server")]
+    pub(super) const EXPECT_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+    #[tokio::test]
+    async fn rejected_http_requests_advertise_only_the_enabled_challenge() {
+        for header in [
+            "",
+            "Proxy-Authorization: Basic !!!!\r\n",
+            "Proxy-Authorization: Basic bm9jb2xvbg==\r\n",
+            "Proxy-Authorization: Bearer token\r\n",
+        ] {
+            let request = format!("CONNECT example.com:443 HTTP/1.1\r\n{header}\r\n");
+            for password in [false, true] {
+                let (result, written, calls) = serve(request.as_bytes(), false, password).await;
+                assert!(matches!(result, Err(ServerError::Authentication(_))));
+                assert_eq!(written, EXPECT_407);
+                assert_eq!(calls, 0);
+                #[cfg(not(feature = "cleartext-server"))]
+                assert!(!String::from_utf8_lossy(&written)
+                    .to_ascii_lowercase()
+                    .contains("basic"));
+            }
+        }
+    }
+
+    #[cfg(feature = "cleartext-server")]
+    #[tokio::test]
+    async fn enabled_cleartext_server_still_accepts_basic() {
+        let (result, written, calls) = serve(
+            b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n",
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result.unwrap().target(), "example.com:443");
+        assert!(written.is_empty());
+        assert_eq!(calls, 1);
+    }
+}
+
+#[cfg(not(feature = "cleartext-server"))]
+mod server_side {
+    use super::http_407::{serve, EXPECT_407};
+    use resocks5_net::server::ServerError;
 
     /// SOCKS5 greeting offering the given methods, then (when a method was
     /// chosen) a CONNECT to `example.com:443`.
@@ -98,11 +144,13 @@ mod server_side {
             b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n";
         for (anonymous, password) in [(false, true), (true, true), (true, false)] {
             let (result, written, calls) = serve(request, anonymous, password).await;
-            assert!(
-                written.starts_with(b"HTTP/1.1 407 "),
-                "anonymous={anonymous} password={password}: {:?}",
-                String::from_utf8_lossy(&written)
+            assert_eq!(
+                written, EXPECT_407,
+                "anonymous={anonymous} password={password}"
             );
+            assert!(!String::from_utf8_lossy(&written)
+                .to_ascii_lowercase()
+                .contains("basic"));
             assert!(result.is_err());
             assert_eq!(
                 calls, 0,

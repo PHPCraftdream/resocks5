@@ -346,6 +346,21 @@ method 0x80); `handle_client` calls `server::accept_secure`, which never
 offers SOCKS5 username/password and answers any HTTP `Proxy-Authorization`
 with 407.
 
+Without the SDK's `cleartext-server` feature, every HTTP 407 contains
+`Proxy-Authenticate: Resocks5-Secure`, not Basic: the server does not invite
+the client to send a clear-text password. Enabling the feature preserves
+`Basic realm="resocks5", charset="UTF-8"`. `Resocks5-Secure` is a marker
+rejecting Basic, not an implementation of secure authentication over HTTP;
+secure authentication remains a SOCKS5 mechanism. Status 407 and its challenge
+are retained as required by RFC 9110 §15.5.8; 403 expresses an access denial,
+not a request for proxy authentication.
+
+A client with preconfigured credentials, such as `curl --proxy-user`, may send
+Basic before receiving a challenge. The server cannot prevent that transmission;
+it rejects the credentials without passing the password to the callback.
+Browser prompt behavior for the unknown scheme has not been tested and is not
+guaranteed.
+
 - `users[].hash` is an Argon2id v19 PHC string: salt, parameters and the
   32-byte key `K = Argon2id(password, salt)`. It is exactly what the earlier
   password-hash code wrote, so old accounts keep working.

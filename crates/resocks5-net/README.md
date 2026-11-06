@@ -94,6 +94,19 @@ storage, or egress policy. Inbound authentication is supplied by the host closur
   clear-text password. The integration tests in `tests/no_cleartext.rs` pin
   both on the default build.
 
+  Without `cleartext-server`, every HTTP 407 advertises
+  `Proxy-Authenticate: Resocks5-Secure`, never Basic. Enabling the feature
+  preserves `Basic realm="resocks5", charset="UTF-8"`. The `Resocks5-Secure`
+  marker does not implement secure authentication over HTTP; use SOCKS5 for
+  that. Status 407 and its required challenge are retained (RFC 9110 §15.5.8),
+  rather than replaced with 403. A preconfigured client, such as
+  `curl --proxy-user`, may send Basic before receiving a challenge; the server
+  cannot prevent that transmission, only reject it without invoking the
+  credential callback. Browser prompt behavior for the unknown scheme has
+  not been tested and is not guaranteed. The integration test checks both
+  feature configurations; SDK unit tests allow cleartext through `cfg(test)`
+  and do not establish the feature-off policy.
+
 ## Inbound server API
 
 `server` is unconditional, including `default-features = false`; it requires no
