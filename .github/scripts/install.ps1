@@ -29,17 +29,34 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 
-function Save-HttpsFile([uri] $Uri, [string] $Destination) {
-    for ($redirect = 0; $redirect -le 5; $redirect++) {
-        if ($Uri.Scheme -ne 'https') {
-            throw 'Загрузка и все перенаправления должны использовать HTTPS.'
-        }
+# Временные сбои (таймаут, 429, 5xx) повторяются до трёх раз, как curl --retry 3.
+function Get-HttpsResponse([uri] $Uri) {
+    for ($attempt = 0; ; $attempt++) {
         $request = [Net.HttpWebRequest]::Create($Uri)
         $request.AllowAutoRedirect = $false
         $request.Timeout = 120000
         $request.ReadWriteTimeout = 300000
         $request.UserAgent = 'resocks5-installer'
-        $response = $request.GetResponse()
+        try {
+            return $request.GetResponse()
+        }
+        catch {
+            $web = $_.Exception
+            while ($web -and $web -isnot [Net.WebException]) { $web = $web.InnerException }
+            if (-not $web -or $attempt -ge 3) { throw }
+            $status = if ($web.Response) { [int] $web.Response.StatusCode } else { 0 }
+            if ($status -ne 0 -and $status -ne 429 -and $status -lt 500) { throw }
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
+function Save-HttpsFile([uri] $Uri, [string] $Destination) {
+    for ($redirect = 0; $redirect -le 5; $redirect++) {
+        if ($Uri.Scheme -ne 'https') {
+            throw 'Загрузка и все перенаправления должны использовать HTTPS.'
+        }
+        $response = Get-HttpsResponse $Uri
         try {
             $status = [int] $response.StatusCode
             if ($status -in @(301, 302, 303, 307, 308)) {

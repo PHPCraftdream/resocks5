@@ -657,7 +657,8 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
     let gate_orders_before = gate_rotator.pick_order_calls();
     let v4_orders_before = v4.pick_order_calls();
 
-    let result = establish_connection(
+    let mut plan_trace = PlanBuildTrace::new();
+    let result = establish_connection_traced(
         target,
         &gates,
         &None,
@@ -668,6 +669,7 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         &network,
         None,
         None,
+        &mut plan_trace,
     )
     .await;
 
@@ -698,6 +700,19 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         v4_orders_before,
         "budget exhaustion must skip building the direct order"
     );
+    // Счётчики `pick_order_calls` выше сохранены для прямого пути; gate-план
+    // строится из ленивых курсоров, поэтому авторитетный негативный оракул
+    // gate-фазы — trace построений: полный gate-план строиться не может.
+    assert!(
+        plan_trace.iter().all(|(gates, _)| *gates == 0),
+        "budget exhaustion must skip building the gate plan, trace: {plan_trace:?}"
+    );
+}
+
+/// Production-наблюдатель должен быть zero-sized: никаких полей и аллокаций.
+#[test]
+fn noop_plan_build_recorder_is_zero_sized() {
+    assert_eq!(std::mem::size_of::<NoopPlanBuildRecorder>(), 0);
 }
 
 /// SOCKS5 stub that answers every handshake round on a socket with

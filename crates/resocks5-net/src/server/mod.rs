@@ -34,7 +34,11 @@ mod prefixed;
 
 pub use prefixed::Prefixed;
 
+#[cfg(feature = "secure-auth")]
+mod secure;
 mod strict_http;
+#[cfg(feature = "secure-auth")]
+pub use secure::{accept_secure, accept_with, AuthMethods, NoSecrets};
 
 /// Independent authentication capabilities and the host-supplied absolute deadline.
 ///
@@ -99,10 +103,30 @@ pub enum Protocol {
     Http,
 }
 
+/// How an inbound client authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuthMethod {
+    /// No authentication (SOCKS5 method 0x00, or HTTP without credentials).
+    Anonymous,
+    /// A clear-text password (SOCKS5 0x02, HTTP Basic); only with
+    /// `cleartext-server`.
+    ClearText,
+    /// Secure auth (SOCKS5 method 0x80): `username()` is the user name.
+    Secure,
+    /// GSSAPI (SOCKS5 method 0x01): `username()` is the authenticated
+    /// principal (for Kerberos, `name@REALM`).
+    Gssapi,
+}
+
 /// An authenticated, unresolved request and the exact payload already consumed.
 pub struct IncomingRequest {
     protocol: Protocol,
     target: String,
+    auth: AuthMethod,
+    /// The GSSAPI session whose protection the SOCKS reply travels under.
+    #[cfg(feature = "gssapi")]
+    gss: Option<std::sync::Mutex<crate::gssapi::GssSession>>,
     username: Option<String>,
     username_raw: Option<Vec<u8>>,
     credentials: Option<Credentials>,
@@ -114,6 +138,7 @@ impl fmt::Debug for IncomingRequest {
         f.debug_struct("IncomingRequest")
             .field("protocol", &self.protocol)
             .field("target", &self.target)
+            .field("auth", &self.auth)
             .field("has_username", &self.username.is_some())
             .field("has_credentials", &self.credentials.is_some())
             .field("pipeline_len", &self.pipeline.len())
@@ -130,6 +155,27 @@ impl IncomingRequest {
     pub fn target(&self) -> &str {
         &self.target
     }
+    /// How the client authenticated.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth
+    }
+
+    /// Record how the client authenticated (and, for GSSAPI, the session the
+    /// reply is protected under).
+    #[cfg(feature = "secure-auth")]
+    pub(crate) fn authenticated_with(
+        mut self,
+        auth: AuthMethod,
+        #[cfg(feature = "gssapi")] gss: Option<crate::gssapi::GssSession>,
+    ) -> Self {
+        self.auth = auth;
+        #[cfg(feature = "gssapi")]
+        {
+            self.gss = gss.map(std::sync::Mutex::new);
+        }
+        self
+    }
+
     /// Verified username, including an empty HTTP username if the closure accepts it.
     /// Anonymous acceptance is always `None`, never a synthetic empty identity.
     pub fn username(&self) -> Option<&str> {
@@ -149,6 +195,15 @@ impl IncomingRequest {
     /// ran; hands ownership to the caller. Second call: `None`.
     pub fn take_credentials(&mut self) -> Option<Credentials> {
         self.credentials.take()
+    }
+
+    /// Replace the authenticated identity: for a host that maps an
+    /// authenticated GSSAPI principal (`name@REALM`) to a local account name,
+    /// so that everything downstream sees the account. `auth_method()` is
+    /// unchanged.
+    pub fn set_identity(&mut self, name: String) {
+        discard_wiped(&mut self.username_raw);
+        self.username = Some(name);
     }
 
     /// Moves the verified username out; afterwards `username()` is `None`. Independent
@@ -180,6 +235,16 @@ impl IncomingRequest {
         reply: Reply,
     ) -> Result<(), ServerError> {
         let bytes = reply_bytes(self.protocol, reply);
+        #[cfg(feature = "gssapi")]
+        if let Some(gss) = &self.gss {
+            let framed = gss
+                .lock()
+                .expect("gss session lock")
+                .seal(bytes)
+                .map_err(|error| ServerError::Protocol(error.to_string()))?;
+            stream.write_all(&framed).await?;
+            return stream.flush().await.map_err(ServerError::Io);
+        }
         stream.write_all(bytes).await?;
         stream.flush().await.map_err(ServerError::Io)
     }
@@ -332,14 +397,17 @@ where
     let nmethods = stream.read_u8().await?;
     let mut methods = vec![0; usize::from(nmethods)];
     stream.read_exact(&mut methods).await?;
-    let chosen = if options.password && methods.contains(&2) {
+    // Method 0x02 (RFC 1929) carries the password in clear text: offered only
+    // by a build with `cleartext-server`.
+    let password_offered = crate::CLEARTEXT_SERVER && options.password;
+    let chosen = if password_offered && methods.contains(&2) {
         2
     } else if options.anonymous && methods.contains(&0) {
         0
     } else {
         stream.write_all(&[5, 255]).await?;
         stream.flush().await?;
-        return Err(ServerError::Authentication(format!("No mutually supported SOCKS5 auth method (server: anonymous={}, user/pass={}; client offered {} method(s))", options.anonymous, options.password, methods.len())));
+        return Err(ServerError::Authentication(format!("No mutually supported SOCKS5 auth method (server: anonymous={}, user/pass={}; client offered {} method(s))", options.anonymous, password_offered, methods.len())));
     };
     stream.write_all(&[5, chosen]).await?;
     stream.flush().await?;
@@ -414,6 +482,21 @@ where
     } else {
         (None, None)
     };
+    socks_request(stream, username, username_raw, retained).await
+}
+
+/// The SOCKS5 request after authentication: `CONNECT` and its target.
+///
+/// cancel-safe: NO — exact reads and replies may be partial.
+pub(super) async fn socks_request<S>(
+    stream: &mut S,
+    username: Option<String>,
+    username_raw: Option<Vec<u8>>,
+    retained: Option<Credentials>,
+) -> Result<IncomingRequest, ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut header = [0; 4];
     stream.read_exact(&mut header).await?;
     if header[0] != 5 {
@@ -478,6 +561,13 @@ where
     Ok(IncomingRequest {
         protocol: Protocol::Socks5,
         target,
+        auth: if username.is_some() {
+            AuthMethod::ClearText
+        } else {
+            AuthMethod::Anonymous
+        },
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username,
         username_raw,
         credentials: retained,
@@ -672,6 +762,17 @@ where
             let mut parts = value.splitn(2, ' ');
             let scheme = parts.next().unwrap_or("");
             let token = parts.next().map(str::trim);
+            if !crate::CLEARTEXT_SERVER && scheme.eq_ignore_ascii_case("Basic") {
+                // HTTP Basic is the password in (base64) clear text.
+                return http_fail(
+                    stream,
+                    407,
+                    ServerError::Authentication(
+                        "clear-text credentials (HTTP Basic) are not accepted".into(),
+                    ),
+                )
+                .await;
+            }
             let Some(token) = token.filter(|_| scheme.eq_ignore_ascii_case("Basic")) else {
                 return http_fail(
                     stream,
@@ -695,8 +796,9 @@ where
                     .await
                 }
             };
-            let text = match std::str::from_utf8(&decoded) {
-                Ok(s) => s,
+            // Ошибка UTF-8 не владеет буфером до await.
+            let text = match String::from_utf8(decoded).map_err(|error| error.utf8_error()) {
+                Ok(text) => text,
                 Err(_) => {
                     return http_fail(
                         stream,
@@ -725,7 +827,8 @@ where
                 .await;
             }
             let identity = user.to_owned();
-            let credentials = Credentials::new(identity.clone(), password.to_owned());
+            let credentials =
+                Credentials::with_basic_payload(identity.clone(), password.to_owned(), text);
             retained = options.retain_credentials.then(|| credentials.duplicate());
             if !authenticate(credentials).await {
                 return http_fail(
@@ -754,6 +857,13 @@ where
     Ok(IncomingRequest {
         protocol: Protocol::Http,
         target: target.to_owned(),
+        auth: if username.is_some() {
+            AuthMethod::ClearText
+        } else {
+            AuthMethod::Anonymous
+        },
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username,
         username_raw: None,
         credentials: retained,

@@ -3,7 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::connect::{parse_proxy_str, ParseProxyError};
+use crate::connect::{
+    parse_proxy_str, parse_proxy_uri, ParseProxyError, ProxyUriError, ProxyUriOptions,
+};
 use crate::types::ProxyProtocol;
 
 /// Placeholder printed by [`ProxyConfig`]'s [`Debug`](std::fmt::Debug) impl in
@@ -48,6 +50,17 @@ pub struct ProxyConfig {
     pub user: Option<String>,
     /// Optional password, paired with [`user`](ProxyConfig::user).
     pub password: Option<String>,
+    /// Secure-auth credentials (SOCKS5 method 0x80): when set, the greeting
+    /// uses them instead of `user`/`password`, and the password never crosses
+    /// the wire. Set with [`ProxyConfig::with_secure_auth`].
+    #[cfg(feature = "secure-auth")]
+    pub secure_auth: Option<Arc<crate::secure_auth::SecureCredentials>>,
+    /// GSSAPI credentials (SOCKS5 method 0x01, RFC 1961). When set (alone or
+    /// with `secure_auth`) the greeting offers the strong methods — GSSAPI
+    /// first — and the server picks; no password crosses the wire. Set with
+    /// [`ProxyConfig::with_gssapi`].
+    #[cfg(feature = "gssapi")]
+    pub gssapi: Option<Arc<crate::gssapi::GssCredentials>>,
     /// The number of leading `*` markers; 0 denotes an ordinary/exit proxy.
     /// `is_gate == (gate_level > 0)`.
     pub gate_level: u8,
@@ -75,6 +88,10 @@ impl ProxyConfig {
             port,
             user: None,
             password: None,
+            #[cfg(feature = "secure-auth")]
+            secure_auth: None,
+            #[cfg(feature = "gssapi")]
+            gssapi: None,
             is_gate: false,
             gate_level: 0,
             gate: None,
@@ -94,6 +111,57 @@ impl ProxyConfig {
     /// Shortcut for [`ProxyConfig::new`] with [`ProxyProtocol::Https`].
     pub fn https(host: impl Into<String>, port: u16) -> Self {
         Self::new(ProxyProtocol::Https, host, port)
+    }
+
+    /// Authenticate to this SOCKS5 proxy with secure auth (method 0x80): the
+    /// user name is kept in `user` (the upstream's identity), the password
+    /// only inside the credentials, never in `password` and never on the wire.
+    #[cfg(feature = "secure-auth")]
+    pub fn with_secure_auth(mut self, credentials: crate::secure_auth::SecureCredentials) -> Self {
+        self.user = Some(credentials.user().to_owned());
+        self.password = None;
+        self.secure_auth = Some(Arc::new(credentials));
+        self
+    }
+
+    /// Authenticate to this SOCKS5 proxy with GSSAPI (method 0x01, RFC 1961).
+    /// Can be combined with [`ProxyConfig::with_secure_auth`]: both are offered,
+    /// GSSAPI first, and the server chooses.
+    #[cfg(feature = "gssapi")]
+    pub fn with_gssapi(mut self, credentials: crate::gssapi::GssCredentials) -> Self {
+        self.gssapi = Some(Arc::new(credentials));
+        self
+    }
+
+    /// Overwrite the clear-text `user` and `password` with zeros and clear
+    /// them, here and at every gate this value solely owns; drop the
+    /// secure-auth credentials (their password is wiped when the last copy
+    /// goes). `ProxyConfig` has no `Drop`: clones, and gates shared with other
+    /// configs, keep their values. Returns `false` when a shared gate was left
+    /// untouched.
+    #[cfg(feature = "zeroize")]
+    pub fn wipe_credentials(&mut self) -> bool {
+        use zeroize::Zeroize;
+        let mut node = self;
+        loop {
+            node.user.zeroize();
+            node.password.zeroize();
+            #[cfg(feature = "secure-auth")]
+            {
+                node.secure_auth = None;
+                #[cfg(feature = "gssapi")]
+                {
+                    node.gssapi = None;
+                }
+            }
+            match node.gate.as_mut() {
+                None => return true,
+                Some(gate) => match Arc::get_mut(gate) {
+                    Some(gate) => node = gate,
+                    None => return false,
+                },
+            }
+        }
     }
 
     /// Set username and password.
@@ -116,6 +184,44 @@ impl ProxyConfig {
     /// compatibility).
     pub fn from_addr(protocol: ProxyProtocol, addr: &str) -> Result<Self, ParseProxyError> {
         parse_proxy_str(addr, protocol)
+    }
+
+    /// Parse `scheme://[user:password@]host:port` (schemes `socks5`, `socks5h`,
+    /// `http`, `https`) with the default [`ProxyUriOptions`]: percent-decoded
+    /// credentials, a required port, no path, query or fragment. Errors carry no
+    /// input text. See [`parse_proxy_uri`] for the grammar.
+    ///
+    /// # Errors
+    ///
+    /// A [`ProxyUriError`] naming the first problem.
+    pub fn from_uri(uri: &str) -> Result<Self, ProxyUriError> {
+        parse_proxy_uri(uri, &ProxyUriOptions::new())
+    }
+
+    /// [`ProxyConfig::from_uri`] with explicit [`ProxyUriOptions`] (for example
+    /// `ip_literal_only(true)` to refuse host names).
+    ///
+    /// # Errors
+    ///
+    /// A [`ProxyUriError`] naming the first problem.
+    pub fn from_uri_with(uri: &str, options: &ProxyUriOptions) -> Result<Self, ProxyUriError> {
+        parse_proxy_uri(uri, options)
+    }
+
+    /// Would using this entry send its credentials in clear text? SOCKS5
+    /// UNAME/PASSWD always does; HTTP Basic does unless the proxy is reached over
+    /// TLS (`https`).
+    pub(crate) fn sends_cleartext_credentials(&self) -> bool {
+        self.user.is_some() && self.password.is_some() && self.protocol != ProxyProtocol::Https
+    }
+
+    /// Refuse an entry that would have to send credentials in clear text when
+    /// the build does not allow it (feature `cleartext-client`).
+    pub(crate) fn refuse_cleartext(&self) -> Result<(), crate::ConnectError> {
+        if !crate::CLEARTEXT_CLIENT && self.sends_cleartext_credentials() {
+            return Err(crate::ConnectError::CleartextCredentialsRefused);
+        }
+        Ok(())
     }
 
     /// Link this entry to the outer `gate` node dialed first.
@@ -213,6 +319,34 @@ impl fmt::Debug for ProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `wipe_credentials` clears every solely owned node and reports a shared
+    /// gate it could not touch. Mutation: stopping at the first node leaves
+    /// the gate's password.
+    #[cfg(feature = "zeroize")]
+    #[test]
+    fn wipe_credentials_clears_owned_nodes_and_reports_shared_gates() {
+        let gate = ProxyConfig::socks5("gate", 1).with_auth("gu", "gp");
+        let mut owned = ProxyConfig::socks5("exit", 2)
+            .with_auth("eu", "ep")
+            .with_gate(gate.clone());
+        assert!(owned.wipe_credentials());
+        let nodes = owned.nodes();
+        assert!(nodes
+            .iter()
+            .all(|n| n.user.is_none() && n.password.is_none()));
+
+        let mut shared = ProxyConfig::socks5("exit", 2)
+            .with_auth("eu", "ep")
+            .with_gate(gate);
+        let other = shared.clone();
+        assert!(
+            !shared.wipe_credentials(),
+            "the gate is shared with `other`"
+        );
+        assert_eq!(shared.password, None);
+        assert_eq!(other.gate.as_ref().unwrap().password.as_deref(), Some("gp"));
+    }
 
     fn config(host: &str, port: u16, user: Option<&str>, password: Option<&str>) -> ProxyConfig {
         let cfg = ProxyConfig::socks5(host, port);

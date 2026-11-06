@@ -7,6 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `resocks5-net`: without `cleartext-server`, HTTP 407 now advertises
+  `Proxy-Authenticate: Resocks5-Secure`, not Basic, to avoid inviting a
+  clear-text password transmission. Status 407 and its challenge remain;
+  feature-enabled builds retain the previous Basic realm and charset.
+  This does not implement secure authentication over HTTP. Preemptive Basic
+  from a preconfigured client cannot be prevented; browser prompt behavior
+  for the unknown scheme has not been tested.
+
+### Added
+
+- `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by
+  default), SOCKS5 private method 0x80: the password never crosses the wire. The
+  server stores a per-user Argon2id salt, parameters and the derived key `K`
+  (`UserSecret`, behind the `SecretStore` trait); a login is a mutual HMAC-SHA256
+  challenge-response over `K` with fresh nonces on both sides, so a recorded
+  exchange cannot be replayed and a server without `K` cannot pass. Unknown users
+  get a decoy (`DecoyKey`) indistinguishable from a wrong password; the client
+  refuses server parameters below its floor (`KdfParams::DEFAULT`, 19 MiB / t=2 /
+  p=1) and above hard limits.
+- `resocks5-net`: init enrollment for `secure_auth`: a user stored as "waiting"
+  (`StoredUser::Init`) is enrolled by its first client, which sends `K` sealed
+  with X25519 + HKDF-SHA256 + ChaCha20-Poly1305 bound to both nonces;
+  `SecretStore::claim` stores it atomically (one winner). A client enrolls only
+  with `SecureCredentials::allow_enrollment(true)`.
+- `resocks5-net`: `ProxyConfig::with_secure_auth(SecureCredentials)` — dial and
+  chain hops authenticate to a SOCKS5 upstream with secure auth;
+  `server::accept_secure(stream, options, store, decoy)` — inbound SOCKS5 with
+  method 0x80 (or 0x00), never username/password; any HTTP `Proxy-Authorization`
+  is answered 407.
+- `resocks5-net`: `ProxyConfig::from_uri` / `from_uri_with(ProxyUriOptions)` parse
+  `socks5://`, `http://`, `https://` URIs with percent-decoded credentials; the
+  typed `ProxyUriError` never carries the input.
+- `resocks5-net`: `ConnectError::suggested_reply()` maps a dial failure to the
+  `server::Reply` to send the client (SOCKS5 REP 2/3/4/5/6, HTTP 403/502/503/504).
+- `resocks5-net`: `connect::socks5_handshake_until` and
+  `http_connect_handshake_until` run a handshake under an absolute deadline and
+  fail with a typed `ConnectError::Timeout`.
+- `resocks5-net`: `server::Credentials::basic_payload()` — the whole decoded HTTP
+  Basic token, without splitting at `:`.
+- `resocks5-net`: `DialOptions::with_nodelay` / `with_keepalive` (fields `nodelay`,
+  `keepalive`) set `TCP_NODELAY` and TCP keepalive on the socket to the proxy
+  (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
+  returns the bare `TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (HTTPS is refused
+  before any connect).
+- `resocks5-net`: GSSAPI authentication for SOCKS5 (`gssapi` module, feature
+  `gssapi`, RFC 1961, method 0x01): the context exchange, abort, protection-level
+  negotiation and, optionally, protected SOCKS request/reply are implemented over the
+  `GssBackend` / `GssContext` traits; no password or credential crosses the wire.
+  `ProxyConfig::with_gssapi(GssCredentials)` on the client,
+  `server::accept_with(stream, options, &AuthMethods)` on the server, where
+  `IncomingRequest::auth_method()` tells how the client authenticated and
+  `username()` is the principal for GSSAPI. By default only the authentication is
+  protected (level 0, which `curl --socks5-gssapi` and Dante's `clear` speak: the
+  context is mutual, the SOCKS request and reply are not wrapped); levels 1 and 2
+  (`GssAcceptor::with_protection`, `GssCredentials::with_min_protection`) wrap
+  them. The tunnel data is never protected. Ships with a test-only
+  mock mechanism (`gssapi::mock`); the Kerberos backend is a separate feature.
+- `resocks5-net`: methods adapt on the fly, strongest first. A client with several
+  strong methods configured (GSSAPI, secure auth) offers them all in that order and
+  never anything weaker (no anonymous, no clear text, no downgrade if the server
+  answers another method); `accept_with` picks the strongest the server has enabled
+  and the client offers: GSSAPI, then secure auth, then anonymous (if allowed).
+- `resocks5-net`: `testing::MockUpstream` (feature `test-instrumentation`): a
+  scripted SOCKS5 / HTTP CONNECT upstream on `127.0.0.1:0` for tests — `Script`
+  (tunnel with echo, refuse with a REP/status, silent greeting, silent CONNECT,
+  hang-up), `MockAuth` (none, clear-text, secure auth), and the recorded CONNECT
+  targets.
+- `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
+  and clears `user`/`password` at this node and every solely owned gate, and
+  reports a shared gate it left untouched. Opt-in: `ProxyConfig` has no `Drop`.
+
+### Changed
+
+- `resocks5-net` (**breaking**): clear-text credentials are off by default. A
+  client never sends a password in clear text (SOCKS5 username/password, HTTP
+  Basic) unless feature `cleartext-client` is on — otherwise the dial fails with
+  `ConnectError::CleartextCredentialsRefused` before any byte is sent; the server
+  (`server::accept`) never offers or accepts them unless feature
+  `cleartext-server` is on (SOCKS5 0x02 not chosen, HTTP Basic answered 407).
+- `resocks5` (**breaking**): inbound users authenticate with secure auth only.
+  SOCKS5 username/password and HTTP Basic are refused; standard clients
+  (browsers, curl) can connect only anonymously, a password needs a
+  `resocks5-net` client (`ProxyConfig::with_secure_auth`). HTTP CONNECT has no
+  password authentication. Upstream proxy credentials work as before.
+- `resocks5`: `users[].hash` keeps the Argon2id v19 PHC form; it is now read as
+  the secure-auth key. Hashes written by earlier versions are exactly that, so
+  existing accounts keep working with the same password. A stored value in
+  another format, or derived below m=19456,t=2,p=1 (default clients refuse it),
+  is reported at startup; reset it with `users set-password`.
+- `resocks5`: `hash: init` accounts are claimed by the first enrolling client
+  (only the sealed key travels); concurrent first logins have exactly one winner,
+  the others are denied. A user filtered by `allowed_clients` is answered like a
+  wrong password and cannot claim an init account.
+
+- `resocks5` (**breaking**): upstream credentials stay in
+  `resocks5.proxy_list.ktav` as written but are never sent in clear text. A SOCKS5
+  upstream with `user:pass` authenticates with secure auth (method 0x80), so it
+  must be an upstream that speaks it (another resocks5 or a `resocks5-net` client);
+  a username/password-only SOCKS5 server is refused without receiving the
+  password. HTTPS upstreams send Basic inside TLS as before; a plain HTTP upstream
+  with credentials is reported at startup and its dials are refused. The app no
+  longer enables `cleartext-client`.
+
+- `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
+  the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
+  system Kerberos backend; not in the release binaries). `auth.gssapi_service`
+  (and `auth.gssapi_protection`) enable it; `users add-gssapi <principal>`
+  creates a password-less account named like the principal (`hash: gssapi`) to
+  which that principal maps; a SOCKS5 upstream entry may end in
+  `;gssapi=<service@host>`. Methods adapt on the fly, strongest first: the server
+  picks GSSAPI, then secure auth, then anonymous; a client with several methods
+  offers them all and nothing weaker.
+- `resocks5-net`: `server::IncomingRequest::set_identity` replaces the
+  authenticated identity (a host mapping a principal to an account).
+- `resocks5-net`: feature `gssapi-system` and `gssapi::system::SystemBackend`,
+  Kerberos 5 through the system GSS-API (MIT Kerberos / Heimdal on Linux, Apple
+  GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC, which also
+  checks interoperability with a third-party client (`curl --socks5-gssapi`) against the
+  `gssapi_interop_server` example.
+
+### Removed
+
+- `resocks5`: the server-side password verify path and its in-memory password
+  cache: the server neither receives nor holds passwords and never runs Argon2
+  for a login.
+
 ## [0.5.0] - 2026-11-05
 
 ### Added

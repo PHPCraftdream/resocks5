@@ -65,6 +65,7 @@ pub fn run_user_command(action: UserAction) -> Result<()> {
     let op = match action {
         UserAction::Add { name } => add_user(&users, &name)?,
         UserAction::AddInit { name } => add_init_user(&users, &name)?,
+        UserAction::AddGssapi { principal } => add_gssapi_user(&users, &principal)?,
         UserAction::SetPassword { name } => set_password(&users, &name)?,
         UserAction::Remove { name, yes } => match remove_user(&users, &name, yes)? {
             Some(op) => op,
@@ -115,6 +116,18 @@ fn add_init_user(users: &UsersConfig, name: &str) -> Result<UserOp> {
         direct: false,
         allowed_clients: None,
     }))
+}
+
+/// Create a password-less account named like a Kerberos principal.
+fn add_gssapi_user(users: &UsersConfig, principal: &str) -> Result<UserOp> {
+    validate_name(principal)?;
+    if users.users.iter().any(|u| u.name == principal) {
+        bail!("user '{}' already exists", principal);
+    }
+    Ok(UserOp::Add(build_added_user(
+        principal,
+        crate::auth::state::gssapi::GSSAPI_HASH.to_string(),
+    )))
 }
 
 fn set_password(users: &UsersConfig, name: &str) -> Result<UserOp> {

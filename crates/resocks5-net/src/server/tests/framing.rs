@@ -141,6 +141,60 @@ async fn basic_uses_first_header_first_colon_and_redacts_credentials() {
     assert_eq!(result.unwrap().username(), Some("")); // Verified empty identity is not anonymous.
 }
 
+/// `basic_payload()` is the whole decoded Basic token, never split: a trailing
+/// `:`, an empty password and colons inside the password stay unambiguous,
+/// while `username()` / `password()` still split at the FIRST colon.
+/// Mutation: building the payload by re-joining `username:password` is the same
+/// text here, so the rows pin the exact text; returning only the password half
+/// or `None` fails every row.
+#[tokio::test]
+async fn basic_payload_is_the_whole_decoded_token() {
+    timeout(Duration::from_secs(10), async {
+        for (token, plain, user, pass) in [
+            ("dTpw", "u:p", "u", "p"),
+            ("dTo=", "u:", "u", ""),
+            ("dTpwOnE=", "u:p:q", "u", "p:q"),
+            ("OnA=", ":p", "", "p"),
+            ("dTpwOg==", "u:p:", "u", "p:"),
+        ] {
+            let bytes =
+                format!("CONNECT h:443 HTTP/1.1\r\nProxy-Authorization: Basic {token}\r\n\r\n");
+            let (mut peer, mut stream) = duplex(1024);
+            peer.write_all(bytes.as_bytes()).await.unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let sink = Arc::clone(&seen);
+            let req = accept(&mut stream, &options(true, true), move |c| async move {
+                *sink.lock().unwrap() = Some((
+                    c.basic_payload().map(str::to_owned),
+                    c.username().to_owned(),
+                    c.password().to_owned(),
+                ));
+                true
+            })
+            .await
+            .unwrap();
+            assert_eq!(req.username(), Some(user), "{plain}");
+            let (payload, got_user, got_pass) = seen.lock().unwrap().take().unwrap();
+            assert_eq!(payload.as_deref(), Some(plain), "payload of {plain:?}");
+            assert_eq!(
+                (got_user.as_str(), got_pass.as_str()),
+                (user, pass),
+                "{plain}"
+            );
+        }
+    })
+    .await
+    .expect("bounded basic payload rows");
+}
+
+/// SOCKS5 credentials carry no Basic payload.
+/// Mutation: filling it for SOCKS5 would hand out a token that never existed.
+#[test]
+fn socks5_credentials_have_no_basic_payload() {
+    let credentials = Credentials::with_raw("u".to_owned(), "p".to_owned(), None, None);
+    assert_eq!(credentials.basic_payload(), None);
+}
+
 /// DT-06 pin: Proxy-Authorization token strictness is intentional. STANDARD
 /// base64 requires canonical padding, and only a single SP may separate
 /// scheme and token — every shape here answers 407 without authenticating.

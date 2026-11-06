@@ -101,6 +101,7 @@ async fn dial_chain_over_example() {
 
 /// README "Inbound options" example: validate a config, accept with the opt-in
 /// options, take the retained credentials, read the pipeline through `Prefixed`.
+#[cfg(feature = "cleartext-server")]
 #[tokio::test]
 async fn inbound_options_example() {
     use resocks5_net::server::{accept, ServerOptions};

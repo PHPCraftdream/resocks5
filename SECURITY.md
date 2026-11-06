@@ -47,7 +47,7 @@ Advisory unless you ask to remain anonymous.
 - The `resocks5` binary and the `resocks5-net` library, from a checkout of this
   repository or a release artifact we ship.
 - Anything in the request path: protocol detection (SOCKS5 / HTTP CONNECT),
-  authentication (Argon2id verify + the HMAC verify-cache), upstream selection,
+  authentication (secure auth: SOCKS5 method 0x80, init enrollment), upstream selection,
   the TCP pool, tunnel forwarding, TLS ClientHello fragmentation.
 - Bypass of the safety rails: `max_concurrent_clients`, `max_per_upstream`,
   the protocol timeouts, or the banned-pattern filter.
@@ -92,6 +92,6 @@ These aren't vulnerabilities, they're defaults worth knowing about:
   require a restart.
 - `direct: true` users leak the **server's real IP** and the server's DNS
   resolver to every target they contact. Reserve it for trusted internal use.
-- `resocks5.*.ktav` files contain the auth salt, upstream credentials, and
-  Argon2 hashes. They are git-ignored; never commit them, never world-read
-  them.
+- `resocks5.*.ktav` files contain upstream credentials and the users'
+  Argon2id keys; a stored key logs its user in like the password does. They
+  are git-ignored; never commit them, never world-read them.

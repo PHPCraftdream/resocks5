@@ -80,8 +80,13 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - **Optional pre-warmed TCP pool** to cut connection latency.
 - **TLS fragmentation:** splits the ClientHello across TCP segments to defeat
   SNI-based DPI blocking.
-- **Authentication:** Argon2id password hashing, with an optional
-  init-on-first-login mode.
+- **Authentication:** secure auth (SOCKS5 method 0x80): the password never
+  crosses the wire and is never stored (an Argon2id-derived key and a mutual
+  HMAC challenge-response), with an optional init-on-first-login mode.
+  Clear-text passwords (SOCKS5 username/password, HTTP Basic) are refused.
+  Optionally GSSAPI/Kerberos (RFC 1961, feature `gssapi-system`): no password
+  at all. Methods adapt on the fly, strongest first (GSSAPI, secure auth,
+  anonymous), on the server and for upstreams.
 - **Safety rails:** idle/lifetime tunnel timeouts, TCP keepalive, a
   max-concurrent-clients cap, and regex-based banned-target patterns.
 - **Configurable logging** by category, with optional non-blocking file output.
@@ -111,7 +116,7 @@ upstream is probed for free because its weight never hits zero.
 | Front end | SOCKS5 + HTTP CONNECT (auto) | many | many | many |
 | Rotation model | sand-rating soft-weight, self-recovering | round-robin / parent | chaining-first | failover |
 | Per-target stickiness | yes | — | — | — |
-| Auth | Argon2id + verify-cache (пароль в памяти) | basic | basic | basic |
+| Auth | secure auth: пароль не передаётся и не хранится | basic | basic | basic |
 | TLS ClientHello fragmentation | yes | no | no | no |
 | Single-port dual-protocol | yes | — | — | — |
 
@@ -414,7 +419,7 @@ resocks5 users direct --help        # самостоятельный proxy по 
 | Установка и обновление | Последний GitHub Release, SHA-256, Windows rename/cleanup и Unix atomic rename |
 | Отдельные экземпляры | Конфиги из cwd, снимок на старте, перезапуск для применения изменений |
 | Контейнер и остановка | Docker amd64/arm64, UID 65532, writable volume; Ctrl+C/SIGTERM и bounded drain |
-| Безопасность и диагностика | Не открывать anonymous наружу; входной TCP не шифрует пароль; см. [SECURITY.md](SECURITY.md) |
+| Безопасность и диагностика | Не открывать anonymous наружу; пароль не передаётся, но трафик не шифруется; см. [SECURITY.md](SECURITY.md) |
 
 Настройки, допустимые значения и практические ограничения каждой строки
 раскрыты в справочнике, а устройство реализации — в [ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -424,8 +429,12 @@ resocks5 users direct --help        # самостоятельный proxy по 
 For each accepted connection:
 
 1. **Protocol detect** — the first bytes decide SOCKS5 vs HTTP CONNECT.
-2. **Authenticate** — credentials are checked against the user table (Argon2id).
-   Anonymous clients are accepted only when `auth.allow_anonymous` is `true`.
+2. **Authenticate** — a SOCKS5 user proves its password with secure auth
+   (method 0x80) against the stored Argon2id key; the password never crosses
+   the wire. Standard clients (browsers, curl) can only connect anonymously:
+   a password needs a `resocks5-net` client (`ProxyConfig::with_secure_auth`).
+   HTTP CONNECT has no password authentication. Anonymous clients are
+   accepted only when `auth.allow_anonymous` is `true`.
 3. **Pick an upstream** — if this target was reached before, reuse the sticky
    upstream that last worked; otherwise draw one with sand-rating's
    weighted-random order. IPv6 targets prefer the IPv6 upstream set.
@@ -457,8 +466,9 @@ notes — with:
 resocks5 config
 ```
 
-> **Security:** these files hold secrets — the auth salt, upstream proxy
-> credentials, and Argon2 user hashes. They are git-ignored; never commit them.
+> **Security:** these files hold secrets — upstream proxy credentials and
+> the users' Argon2id keys (a key logs its user in, like a password). They
+> are git-ignored; never commit them.
 
 ### Upstream proxy list
 
@@ -472,10 +482,15 @@ socks5_v4: [
   alice:s3cret@198.51.100.7:1080
   *gateuser:gatepass@203.0.113.9:1080
 ]
-http_v4:  [ user:pass@198.51.100.20:8080 ]
+http_v4:  [ 198.51.100.20:8080 ]            # no credentials: Basic would be clear text
 https_v4: [ user:pass@198.51.100.30:443 ]
 ## …and the corresponding *_v6 arrays for IPv6 upstreams.
 ```
+
+Credentials stay in this file but never cross the network in clear text: a
+SOCKS5 upstream with `user:pass` is authenticated with secure auth (the
+upstream must speak it, e.g. another resocks5), an HTTPS upstream gets Basic
+inside TLS, and a plain HTTP upstream with credentials is refused.
 
 One node at each rank contributes one gate, ordered from highest to lowest,
 then one ordinary exit and the target. Missing ranks are allowed. One star
@@ -516,10 +531,9 @@ The route is server -> h1 -> h3 -> h4 -> target.
 строку `allowed_clients`. Итоговая проверка — **И глобального правила,
 и правила пользователя** (поле пользователя добавляет ограничение только
 если задано); элементы внутри одного списка — альтернативы **ИЛИ**.
-Фильтр пользователя выполняется **до проверки пароля**, поэтому
-отклонённый IP получает обычный отказ аутентификации (SOCKS5 `[1,1]` /
-HTTP 407) без работы Argon2, без попадания в кеш паролей и без записи
-init-claim на диск. К anonymous-клиентам он не применяется вообще
+Фильтр пользователя применяется при поиске секрета, поэтому отклонённый
+IP получает тот же отказ, что и неверный пароль (secure auth `Denied`), и
+не может зарегистрировать init-аккаунт. К anonymous-клиентам он не применяется вообще
 (они подчиняются только глобальному правилу); direct-пользователи
 подчиняются ему как все.
 
@@ -696,7 +710,7 @@ This is a Cargo workspace with two crates:
 | Crate | Role |
 |-------|------|
 | [`resocks5-net`](crates/resocks5-net) | Reusable proxy networking toolkit — SOCKS5/HTTP/HTTPS upstream connectors, a pre-connect TCP pool, a sand-rating soft-weight rotator with exponential decay, and TLS ClientHello fragmentation. |
-| [`resocks5`](crates/resocks5) | The CLI proxy server binary — wires `resocks5-net` together with KTAV configuration, Argon2 user auth, logging, and the SOCKS5/HTTP listener. |
+| [`resocks5`](crates/resocks5) | The CLI proxy server binary — wires `resocks5-net` together with KTAV configuration, secure-auth users, logging, and the SOCKS5/HTTP listener. |
 
 ```bash
 cargo test --workspace      # run the test suite

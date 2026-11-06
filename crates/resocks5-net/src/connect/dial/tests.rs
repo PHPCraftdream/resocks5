@@ -147,6 +147,11 @@ fn options_defaults_and_builders() {
     assert_eq!(o.connect_timeout, Duration::from_secs(1));
     assert_eq!(o.handshake_timeout, Duration::from_secs(2));
     assert_eq!(o.total_timeout, Some(Duration::from_secs(3)));
+    assert!(!d.nodelay);
+    assert_eq!(d.keepalive, None);
+    let o = o.with_nodelay(true).with_keepalive(Duration::from_secs(30));
+    assert!(o.nodelay);
+    assert_eq!(o.keepalive, Some(Duration::from_secs(30)));
 }
 
 #[tokio::test]
@@ -609,4 +614,98 @@ async fn https_in_lean_build_is_tls_feature_missing() {
         matches!(&err, ConnectError::TlsFeatureMissing { host } if host == "proxy.example"),
         "{err:?}"
     );
+}
+
+// ── dial_tcp and socket options ─────────────────────────────────
+
+async fn dial_tcp_guarded(
+    proxy: &ProxyConfig,
+    opts: &DialOptions,
+) -> Result<tokio::net::TcpStream, ConnectError> {
+    timeout(GUARD, dial_tcp(proxy, "example.com", 443, opts))
+        .await
+        .expect("test guard")
+}
+
+/// `dial_tcp` hands back the bare socket to the proxy, already past the
+/// handshake: the tunnel bytes are the first thing it reads. Mutation:
+/// returning the socket before the CONNECT reply is consumed reads the
+/// reply instead of the payload.
+#[tokio::test]
+async fn dial_tcp_returns_the_tunnel_socket() {
+    for http in [false, true] {
+        let (l, port) = bind().await;
+        let (stub, proxy) = if http {
+            (
+                http_stub(l, b"HTTP/1.1 200 OK\r\n\r\nok"),
+                ProxyConfig::http("127.0.0.1", port),
+            )
+        } else {
+            (
+                socks5_stub(l, None, 0x05, 0),
+                ProxyConfig::socks5("127.0.0.1", port),
+            )
+        };
+        let mut tcp = dial_tcp_guarded(&proxy, &opts()).await.unwrap();
+        assert_eq!(tcp.peer_addr().unwrap().port(), port);
+        let mut buf = [0u8; 2];
+        tcp.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok", "http={http}");
+        drop(tcp);
+        stub.await.unwrap();
+    }
+}
+
+/// An HTTPS upstream is refused before any connect: its tunnel is TLS.
+/// Mutation: dialing first leaves an accepted connection on the listener.
+#[tokio::test]
+async fn dial_tcp_refuses_https_without_connecting() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let err = dial_tcp_guarded(&ProxyConfig::https("127.0.0.1", port), &opts())
+        .await
+        .unwrap_err();
+    #[cfg(feature = "tls")]
+    assert!(
+        matches!(&err, ConnectError::Tls { source: None, .. }),
+        "{err:?}"
+    );
+    #[cfg(not(feature = "tls"))]
+    assert!(
+        matches!(&err, ConnectError::TlsFeatureMissing { .. }),
+        "{err:?}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "nothing may connect"
+    );
+}
+
+/// `nodelay` and `keepalive` reach the socket to the proxy; by default the
+/// OS defaults (both off) stay. Mutation: not applying the options leaves
+/// both off.
+#[tokio::test]
+async fn socket_options_reach_the_proxy_socket() {
+    for set in [false, true] {
+        let (l, port) = bind().await;
+        let stub = socks5_stub(l, None, 0x05, 0);
+        let mut options = opts();
+        if set {
+            options = options
+                .with_nodelay(true)
+                .with_keepalive(Duration::from_secs(45));
+        }
+        let tcp = dial_tcp_guarded(&ProxyConfig::socks5("127.0.0.1", port), &options)
+            .await
+            .unwrap();
+        assert_eq!(tcp.nodelay().unwrap(), set, "nodelay, set={set}");
+        assert_eq!(
+            socket2::SockRef::from(&tcp).keepalive().unwrap(),
+            set,
+            "keepalive, set={set}"
+        );
+        drop(tcp);
+        stub.await.unwrap();
+    }
 }
