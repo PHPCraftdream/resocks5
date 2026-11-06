@@ -324,17 +324,19 @@ fn singleton_plan_semantics_and_no_extra_materialization() {
         dedup_hosts(&[&order_hosts(&twin_x)]),
     ]);
     let gates = GateLevels::new(vec![(2, gate0.clone()), (1, gate1.clone())]);
-    let construction;
-    let picks: Vec<_> = {
-        let (plan, counts) =
-            crate::perf::measure(|| ChainPlan::new(&gates, std::slice::from_ref(&exit)));
-        // Строки ledger: construction ничего не материализует и не сортирует.
-        assert_eq!(counts.chain_builds, 0);
-        assert_eq!(counts.config_clones, 0);
-        assert_eq!(counts.sort_comparisons, 0);
-        construction = counts;
-        plan.collect()
-    };
+    let build = || ChainPlan::new(&gates, std::slice::from_ref(&exit));
+    #[cfg(feature = "test-instrumentation")]
+    let (plan, construction) = crate::perf::measure(build);
+    #[cfg(not(feature = "test-instrumentation"))]
+    let plan = build();
+    #[cfg(feature = "test-instrumentation")]
+    {
+        assert_eq!(construction.chain_builds, 0);
+        assert_eq!(construction.config_clones, 0);
+        assert_eq!(construction.sort_comparisons, 0);
+        assert_eq!(construction.chain_nodes, 0);
+    }
+    let picks: Vec<_> = plan.collect();
     assert_eq!(pick_combos(&picks), expected);
     assert_eq!(expected.len(), 1);
     let pick = &picks[0];
@@ -342,8 +344,6 @@ fn singleton_plan_semantics_and_no_extra_materialization() {
     assert!(Arc::ptr_eq(&pick.hops()[0].rotator, &gate0));
     assert!(Arc::ptr_eq(&pick.hops()[1].rotator, &gate1));
     assert!(Arc::ptr_eq(&pick.exit().rotator, &exit));
-    assert_eq!(construction.chain_nodes, 0);
-    let _ = construction;
 
     // (b) Пустой план остаётся пустым: без exits и singleton-план с `&[]` exits.
     assert_eq!(ChainPlan::new(&GateLevels::default(), &[]).count(), 0);
@@ -366,14 +366,22 @@ fn singleton_plan_semantics_and_no_extra_materialization() {
     let mut exhausted = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     assert!(exhausted.next().is_some());
     assert!(exhausted.next().is_none());
-    let (_, drained) = crate::perf::measure(|| {
+    #[cfg(not(feature = "test-instrumentation"))]
+    {
         assert!(exhausted.next().is_none());
         assert!(exhausted.next().is_none());
-    });
-    assert_eq!(drained.config_clones, 0);
-    assert_eq!(drained.chain_builds, 0);
-    assert_eq!(drained.chain_nodes, 0);
-    assert_eq!(drained.sort_comparisons, 0);
+    }
+    #[cfg(feature = "test-instrumentation")]
+    {
+        let (_, drained) = crate::perf::measure(|| {
+            assert!(exhausted.next().is_none());
+            assert!(exhausted.next().is_none());
+        });
+        assert_eq!(drained.config_clones, 0);
+        assert_eq!(drained.chain_builds, 0);
+        assert_eq!(drained.chain_nodes, 0);
+        assert_eq!(drained.sort_comparisons, 0);
+    }
 
     // (д) exclude единственного ключа pick'а → следующий next() None.
     let gates = GateLevels::new(vec![(2, gate0.clone()), (1, gate1.clone())]);
