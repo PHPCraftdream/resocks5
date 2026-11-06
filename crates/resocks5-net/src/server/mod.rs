@@ -726,11 +726,8 @@ where
                 .await;
             }
             let identity = user.to_owned();
-            let credentials = Credentials::with_basic_payload(
-                identity.clone(),
-                password.to_owned(),
-                text,
-            );
+            let credentials =
+                Credentials::with_basic_payload(identity.clone(), password.to_owned(), text);
             retained = options.retain_credentials.then(|| credentials.duplicate());
             if !authenticate(credentials).await {
                 return http_fail(
