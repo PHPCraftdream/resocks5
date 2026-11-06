@@ -320,22 +320,19 @@ impl ChainPlan {
                     crate::perf::operation(|c| c.mark_dead_cursor_visits += 1);
                     #[cfg(all(test, feature = "test-instrumentation"))]
                     crate::perf::operation(|c| c.mark_dead_index_lookups += 1);
-                    cursor
-                        .rotator()
-                        .index_of(proxy)
-                        .is_some_and(|i| {
-                            #[cfg(all(test, feature = "test-instrumentation"))]
-                            {
-                                cursor.eligible().iter().any(|eligible| {
-                                    crate::perf::operation(|c| c.mark_dead_eligible_checks += 1);
-                                    *eligible == i
-                                })
-                            }
-                            #[cfg(not(all(test, feature = "test-instrumentation")))]
-                            {
-                                cursor.eligible().contains(&i)
-                            }
-                        })
+                    cursor.rotator().index_of(proxy).is_some_and(|i| {
+                        #[cfg(all(test, feature = "test-instrumentation"))]
+                        {
+                            cursor.eligible().iter().any(|eligible| {
+                                crate::perf::operation(|c| c.mark_dead_eligible_checks += 1);
+                                *eligible == i
+                            })
+                        }
+                        #[cfg(not(all(test, feature = "test-instrumentation")))]
+                        {
+                            cursor.eligible().contains(&i)
+                        }
+                    })
                 })
             };
             if present {
@@ -639,11 +636,11 @@ impl Iterator for ChainPlan {
 mod accounting_tests;
 #[cfg(test)]
 mod lazy_oracle_tests;
-#[cfg(test)]
-mod selection_tests;
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "mark_dead_perf_tests.rs"]
 mod mark_dead_perf_tests;
+#[cfg(test)]
+mod selection_tests;
 
 impl std::fmt::Debug for ChainPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

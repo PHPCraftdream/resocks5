@@ -120,9 +120,8 @@ fn accept_measured(
         counted.fetch_add(1, Ordering::SeqCst);
         async move { ok }
     };
-    let (result, counts) = measure(|| {
-        runtime.block_on(async { accept(&mut server, &options, authenticate).await })
-    });
+    let (result, counts) =
+        measure(|| runtime.block_on(async { accept(&mut server, &options, authenticate).await }));
     // peer держим до конца accept: сервер пишет в него ответы; dealloc после measure — вне scope.
     drop(peer);
     let called = calls.load(Ordering::SeqCst);
@@ -169,10 +168,19 @@ fn perf208_basic_payload_copy_guard() {
             let bytes = format!(
                 "CONNECT exit.invalid:443 HTTP/1.1\r\nHost: exit.invalid\r\nProxy-Authorization: Basic {token}\r\n\r\n"
             ).into_bytes();
-            let case = WireCase { bytes, anonymous: false, raw: false, retain };
+            let case = WireCase {
+                bytes,
+                anonymous: false,
+                raw: false,
+                retain,
+            };
             let expected = Expectation {
-                user: b"user", password: password.as_bytes(), payload: Some(payload.as_bytes()),
-                utf8: true, req_user: Some("user"), retain,
+                user: b"user",
+                password: password.as_bytes(),
+                payload: Some(payload.as_bytes()),
+                utf8: true,
+                req_user: Some("user"),
+                retain,
             };
             // Одинаковая форма callback/runtime: меряем длину данных внутри полного wire-пути.
             let run = || accept_measured(&case, &expected, true);
@@ -192,7 +200,10 @@ fn perf208_basic_payload_copy_guard() {
         // Оракул относительный: буфер decoded payload и password растут на 96 байт каждый;
         // retention копирует также payload и password. Так обнаруживается лишний to_owned,
         // без привязки к абсолютным счётчикам аллокатора Windows.
-        assert_eq!(long.requested_bytes - short.requested_bytes, if retain { 384 } else { 192 });
+        assert_eq!(
+            long.requested_bytes - short.requested_bytes,
+            if retain { 384 } else { 192 }
+        );
     }
 }
 
@@ -329,7 +340,10 @@ fn perf208_credentials_wire_parse_retention() {
         // Свежий runtime на каждый прогон, без warm-up.
         let (result, counts) = run();
         let (again, repeated) = run();
-        assert_eq!(counts, repeated, "детерминизм счётчиков на одинаковом входе");
+        assert_eq!(
+            counts, repeated,
+            "детерминизм счётчиков на одинаковом входе"
+        );
         report(name, counts);
         // Сохранность контракта на ОБОИХ запросах.
         let mut first = result.expect("accept ok");
