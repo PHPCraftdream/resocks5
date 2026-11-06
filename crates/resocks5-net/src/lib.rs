@@ -68,3 +68,13 @@ pub mod server;
 #[path = "session/testing/mod.rs"]
 pub mod testing;
 pub mod types;
+
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf.rs"]
+mod perf;
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf_cases.rs"]
+mod perf_cases;
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf_credentials.rs"]
+mod perf_credentials;

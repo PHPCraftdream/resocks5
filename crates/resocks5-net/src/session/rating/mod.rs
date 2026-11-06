@@ -339,34 +339,76 @@ impl Ratings {
         self.pick_order_at(Instant::now())
     }
 
-    fn pick_order_at(&self, now: Instant) -> Vec<usize> {
-        let (eligible, keyed) = {
-            let mut inner = self.inner.lock().unwrap();
-            let Inner {
-                cells,
-                quarantine,
-                rng,
-            } = &mut *inner;
-            let eligible: Vec<usize> = if self.quarantine.enabled()
-                && quarantine.iter().any(|c| c.state(now) == State::Healthy)
-            {
-                (0..cells.len())
-                    .filter(|&i| quarantine[i].state(now) == State::Healthy)
-                    .collect()
-            } else {
-                (0..cells.len()).collect()
-            };
-            let keyed = select::weighted_keys(
-                eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
-                rng,
-            );
-            (eligible, keyed)
+    /// Снапшот выбора: eligibility и все N ключей под одним взятием lock
+    /// (тот же объём работы и момент, что у полного pick_order); порядок
+    /// отдаётся лениво курсором вне lock.
+    fn eligible_and_keyed(&self, now: Instant) -> (Vec<usize>, Vec<(usize, f64)>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner {
+            cells,
+            quarantine,
+            rng,
+        } = &mut *inner;
+        let eligible: Vec<usize> = if self.quarantine.enabled()
+            && quarantine.iter().any(|c| c.state(now) == State::Healthy)
+        {
+            (0..cells.len())
+                .filter(|&i| quarantine[i].state(now) == State::Healthy)
+                .collect()
+        } else {
+            (0..cells.len()).collect()
         };
+        let keyed = select::weighted_keys(
+            eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
+            rng,
+        );
+        (eligible, keyed)
+    }
+
+    fn pick_order_at(&self, now: Instant) -> Vec<usize> {
+        let (eligible, keyed) = self.eligible_and_keyed(now);
         // The O(n log n) sort does not hold the ratings lock.
         select::order_keys(keyed)
             .into_iter()
             .map(|j| eligible[j])
             .collect()
+    }
+
+    /// Ленивый снапшот: тот же lock-объём, что pick_order_at, сортировка —
+    /// по мере потребления. Доступен при feature rotator.
+    #[cfg(feature = "rotator")]
+    pub(crate) fn pick_order_lazy_at(&self, now: Instant) -> OrderSnapshot {
+        let (eligible, keyed) = self.eligible_and_keyed(now);
+        OrderSnapshot {
+            eligible,
+            cursor: select::LazyOrder::from_keyed(keyed),
+        }
+    }
+
+    /// Текущий момент; см. pick_order_lazy_at.
+    #[cfg(feature = "rotator")]
+    pub(crate) fn pick_order_lazy(&self) -> OrderSnapshot {
+        self.pick_order_lazy_at(Instant::now())
+    }
+
+    /// Пересеять внутренний RNG (тестовый хук).
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn reseed(&self, seed: u64) {
+        self.inner.lock().unwrap().rng = SmallRng::from_seed(seed);
+    }
+
+    /// Тестовый хук: Ratings с фиксированным seed RNG.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn with_rng_seed(
+        n: usize,
+        policy: RatingPolicy,
+        quarantine: QuarantinePolicy,
+        seed: u64,
+    ) -> Ratings {
+        let ratings = Ratings::try_with_quarantine(n, policy, quarantine)
+            .expect("валидные параметры в тесте");
+        ratings.reseed(seed);
+        ratings
     }
 
     /// Claim the upstreams that are due for a probe: their quarantine has
@@ -410,6 +452,42 @@ impl Ratings {
                     .map(|token| ProbeClaim { index: i, token })
             })
             .collect()
+    }
+}
+
+/// Снимок порядка выбора: eligibility и RNG зафиксированы в момент
+/// создания; порядок выдаётся лениво с ограниченной работой сравнения.
+/// Доступен при feature rotator (потребитель — rotator/chain).
+#[cfg(feature = "rotator")]
+pub(crate) struct OrderSnapshot {
+    eligible: Vec<usize>,
+    cursor: select::LazyOrder,
+}
+
+#[cfg(feature = "rotator")]
+impl OrderSnapshot {
+    /// Следующий индекс в точном порядке pick_order, или None после
+    /// исчерпания.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn next_index(&mut self) -> Option<usize> {
+        self.cursor.next().map(|j| self.eligible[j])
+    }
+
+    /// Число eligible-слотов в снапшоте.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn eligible_len(&self) -> usize {
+        self.eligible.len()
+    }
+
+    /// Разобрать снимок: eligible-индексы и курсор порядка, без копий.
+    pub(crate) fn into_parts(self) -> (Vec<usize>, select::LazyOrder) {
+        (self.eligible, self.cursor)
+    }
+
+    /// Полный дренаж в тот же Vec, что вернул бы pick_order.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn into_indices(mut self) -> Vec<usize> {
+        std::iter::from_fn(|| self.next_index()).collect()
     }
 }
 
@@ -522,6 +600,181 @@ mod tests {
             w[0]
         );
     }
+
+    #[cfg(all(test, feature = "rotator"))]
+    #[cfg(all(test, feature = "rotator"))]
+    fn quarantined_ratings(n: usize) -> Ratings {
+        Ratings::try_with_quarantine(
+            n,
+            RatingPolicy::default(),
+            QuarantinePolicy::default()
+                .with_threshold(3)
+                .with_initial(Duration::from_secs(30))
+                .with_max(Duration::from_secs(600))
+                .with_probe_lease(Duration::from_secs(25)),
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(test, feature = "rotator"))]
+    fn trip(r: &Ratings, i: usize, now: Instant) {
+        for _ in 0..3 {
+            r.on_hard_failure_at(i, now);
+        }
+    }
+
+    /// Ленивый снапшот обязан совпадать с полным pick_order: префиксы 1 и 3
+    /// на свежих снапшотах того же seed и полный дренаж — для n от 1 до 257,
+    /// с карантином и в режиме fail-open (все в карантине).
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_snapshot_matches_pick_order_prefix_and_full() {
+        let seed = 208u64;
+        for n in [1usize, 8, 64, 257] {
+            let expected = Ratings::with_rng_seed(
+                n,
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                seed,
+            )
+            .pick_order();
+            // Префикс 1.
+            let mut s1 = Ratings::with_rng_seed(
+                n,
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                seed,
+            )
+            .pick_order_lazy();
+            assert_eq!(
+                s1.next_index(),
+                expected.first().copied(),
+                "n {n}, без карантина, prefix 1"
+            );
+            // Префикс 3 на свежем снапшоте.
+            let mut s3 = Ratings::with_rng_seed(
+                n,
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                seed,
+            )
+            .pick_order_lazy();
+            let got3: Vec<usize> = (0..3).filter_map(|_| s3.next_index()).collect();
+            assert_eq!(
+                got3,
+                expected[..3.min(expected.len())],
+                "n {n}, без карантина, prefix 3"
+            );
+            // Полный дренаж на свежем снапшоте.
+            let full = Ratings::with_rng_seed(
+                n,
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                seed,
+            )
+            .pick_order_lazy()
+            .into_indices();
+            assert_eq!(full, expected, "n {n}, без карантина, full");
+
+            // Тот же сценарий с карантином (ничего не trips — eligible = все).
+            let expected = quarantined_ratings_with_seed(n).pick_order();
+            let full = quarantined_ratings_with_seed(n)
+                .pick_order_lazy()
+                .into_indices();
+            assert_eq!(full, expected, "n {n}, с карантином, full");
+            let mut sq = quarantined_ratings_with_seed(n).pick_order_lazy();
+            assert_eq!(
+                sq.next_index(),
+                expected.first().copied(),
+                "n {n}, с карантином, prefix 1"
+            );
+            let mut sq3 = quarantined_ratings_with_seed(n).pick_order_lazy();
+            let got3: Vec<usize> = (0..3).filter_map(|_| sq3.next_index()).collect();
+            assert_eq!(
+                got3,
+                expected[..3.min(expected.len())],
+                "n {n}, с карантином, prefix 3"
+            );
+        }
+        // Fail-open: все в карантине — eligible = все индексы. Два
+        // одинаковых seed-инстанса: expected и снапшот не могут делить RNG.
+        let t0 = Instant::now();
+        let trip_all = |r: &Ratings| {
+            for i in 0..4 {
+                trip(r, i, t0);
+            }
+        };
+        let r1 = quarantined_ratings_with_seed(4);
+        trip_all(&r1);
+        let expected = r1.pick_order_at(t0);
+        let r2 = quarantined_ratings_with_seed(4);
+        trip_all(&r2);
+        let s = r2.pick_order_lazy_at(t0);
+        assert_eq!(s.eligible_len(), 4);
+        assert_eq!(s.into_indices(), expected, "fail-open full");
+    }
+
+    /// Eligibility заморожен в момент снапшота: карантин после снапшота не
+    /// меняет дренаж, но меняет свежий полный pick_order.
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_snapshot_keeps_eligibility_frozen_at_snapshot() {
+        let r = quarantined_ratings(4);
+        let s = r.pick_order_lazy();
+        r.quarantine_now(2);
+        let drained = s.into_indices();
+        assert!(
+            drained.contains(&2),
+            "снапшот должен отдать индекс 2 на его снапшот-позиции"
+        );
+        let fresh = r.pick_order();
+        assert!(
+            !fresh.contains(&2),
+            "свежий порядок уже без index 2: {fresh:?}"
+        );
+    }
+
+    /// Снапшот потребляет все N значений RNG под lock в момент создания:
+    /// частичное потребление порядка не меняет состояние RNG.
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_snapshot_advances_rng_identically_to_full_pick_order() {
+        let seed = 42u64;
+        let a = Ratings::with_rng_seed(
+            8,
+            RatingPolicy::default(),
+            QuarantinePolicy::disabled(),
+            seed,
+        );
+        let b = Ratings::with_rng_seed(
+            8,
+            RatingPolicy::default(),
+            QuarantinePolicy::disabled(),
+            seed,
+        );
+        let _ = a.pick_order();
+        let mut sa = b.pick_order_lazy();
+        let _ = sa.next_index();
+        drop(sa);
+        let pa: Vec<usize> = (0..5).map(|_| a.pick()).collect();
+        let pb: Vec<usize> = (0..5).map(|_| b.pick()).collect();
+        assert_eq!(pa, pb, "последовательности pick() должны совпасть");
+    }
+}
+
+/// Тестовый хук: Ratings с карантином и фиксированным seed RNG.
+#[cfg(all(test, feature = "rotator"))]
+fn quarantined_ratings_with_seed(n: usize) -> Ratings {
+    Ratings::with_rng_seed(
+        n,
+        RatingPolicy::default(),
+        QuarantinePolicy::default()
+            .with_threshold(3)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::from_secs(600))
+            .with_probe_lease(Duration::from_secs(25)),
+        208,
+    )
 }
 
 #[cfg(test)]

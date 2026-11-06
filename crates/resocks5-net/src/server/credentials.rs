@@ -136,6 +136,41 @@ impl fmt::Debug for Credentials {
 impl Drop for Credentials {
     fn drop(&mut self) {
         self.wipe();
+        #[cfg(test)]
+        drop_observer::notify(self);
+    }
+}
+
+#[cfg(all(test, feature = "zeroize"))]
+pub(super) mod drop_observer {
+    use super::Credentials;
+    use std::cell::Cell;
+
+    thread_local! {
+        static OBSERVER: Cell<Option<fn(&Credentials)>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| slot.set(None));
+        }
+    }
+
+    pub(crate) fn install(observer: fn(&Credentials)) -> Guard {
+        OBSERVER.with(|slot| {
+            assert!(slot.get().is_none(), "nested credentials drop observer");
+            slot.set(Some(observer));
+        });
+        Guard
+    }
+
+    pub(super) fn notify(credentials: &Credentials) {
+        let observer = OBSERVER.try_with(Cell::get).ok().flatten();
+        if let Some(observer) = observer {
+            observer(credentials);
+        }
     }
 }
 

@@ -12,6 +12,10 @@ categories = ["network-programming", "command-line-utilities"]
 # The binary ships via the GitHub Release and the container image only.
 publish = false
 
+[features]
+# Счётчики #208 включаются только в unit tests; production API не меняется.
+test-instrumentation = ["resocks5-net/test-instrumentation"]
+
 [dependencies]
 # `version` is what a registry build would resolve from crates.io (`path` is
 # only for the local workspace build); the crate is `publish = false`, so

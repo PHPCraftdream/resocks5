@@ -21,25 +21,30 @@ pub(crate) struct TunnelLabel<'a> {
 /// Bytes moved through a [`Counted`] stream, readable after it is gone.
 #[derive(Clone, Default)]
 pub(crate) struct Counters {
-    sent: Arc<AtomicU64>,
-    received: Arc<AtomicU64>,
+    shared: Arc<CounterState>,
+}
+
+#[derive(Default)]
+struct CounterState {
+    sent: AtomicU64,
+    received: AtomicU64,
     /// An I/O call on the upstream stream returned an error.
-    upstream_failed: Arc<AtomicBool>,
+    upstream_failed: AtomicBool,
 }
 
 impl Counters {
     pub(crate) fn sent(&self) -> u64 {
-        self.sent.load(Ordering::Relaxed)
+        self.shared.sent.load(Ordering::Relaxed)
     }
 
     pub(crate) fn received(&self) -> u64 {
-        self.received.load(Ordering::Relaxed)
+        self.shared.received.load(Ordering::Relaxed)
     }
 
     /// Which end broke the tunnel: the upstream stream reported an I/O error,
     /// otherwise the error came from the client's side.
     pub(crate) fn failed_side(&self) -> &'static str {
-        if self.upstream_failed.load(Ordering::Relaxed) {
+        if self.shared.upstream_failed.load(Ordering::Relaxed) {
             "upstream"
         } else {
             "client"
@@ -48,7 +53,7 @@ impl Counters {
 
     fn note<T>(&self, poll: &Poll<io::Result<T>>) {
         if matches!(poll, Poll::Ready(Err(_))) {
-            self.upstream_failed.store(true, Ordering::Relaxed);
+            self.shared.upstream_failed.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -81,7 +86,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<S> {
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = poll {
             let n = (buf.filled().len() - before) as u64;
-            self.counters.received.fetch_add(n, Ordering::Relaxed);
+            self.counters
+                .shared
+                .received
+                .fetch_add(n, Ordering::Relaxed);
         }
         self.counters.note(&poll);
         poll
@@ -96,7 +104,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<S> {
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = poll {
-            self.counters.sent.fetch_add(n as u64, Ordering::Relaxed);
+            self.counters
+                .shared
+                .sent
+                .fetch_add(n as u64, Ordering::Relaxed);
         }
         self.counters.note(&poll);
         poll
@@ -128,6 +139,11 @@ pub(crate) fn report(
 ) {
     let sent = counters.sent();
     let received = counters.received();
+    if !label.logger.tunnels_enabled()
+        && !(received == 0 && sent > 0 && label.logger.proxy_failures_enabled())
+    {
+        return;
+    }
     let secs = elapsed.as_secs_f64();
     let ctag = match label.client {
         Some(user) => format!(" [client={user}]"),
@@ -150,6 +166,98 @@ pub(crate) fn report(
                 label.target, sent, end, secs, ctag
             )
         });
+    }
+}
+
+#[cfg(all(test, feature = "test-instrumentation"))]
+mod perf_tests {
+    use super::*;
+    use crate::logger::LogConfig;
+    use crate::perf::{measure, report as perf_report};
+
+    #[test]
+    fn perf208_tunnel_counter_creation_and_clone() {
+        let (counters, creation) = measure(Counters::default);
+        let (copy, cloning) = measure(|| counters.clone());
+        assert_eq!(counters.sent(), copy.sent());
+        assert_eq!(counters.received(), copy.received());
+        assert_eq!(creation.alloc + creation.alloc_zeroed + creation.realloc, 1);
+        assert_eq!(cloning.alloc + cloning.alloc_zeroed + cloning.realloc, 0);
+        perf_report("tunnel/counters/create", creation);
+        perf_report("tunnel/counters/clone", cloning);
+    }
+
+    #[test]
+    fn perf208_tunnel_report_with_logging_disabled() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let logger = Logger::new(
+            tx,
+            LogConfig {
+                tunnels: false,
+                proxy_failures: false,
+                ..LogConfig::default()
+            },
+        );
+        let counters = Counters::default();
+        let label = TunnelLabel {
+            logger: &logger,
+            target: "target.invalid:443",
+            client: Some("synthetic-user"),
+        };
+        let (_, counts) = measure(|| report(&label, &Ok("eof"), &counters, Duration::ZERO));
+        assert_eq!(counts, crate::perf::Counts::default());
+        perf_report("tunnel/report/logging=off", counts);
+    }
+
+    #[test]
+    fn perf208_report_preserves_warning_only_and_category_combinations() {
+        for tunnels in [false, true] {
+            for proxy_failures in [false, true] {
+                for (sent, received) in [(0, 0), (5, 0), (5, 3)] {
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                    let logger = Logger::new(
+                        tx,
+                        LogConfig {
+                            tunnels,
+                            proxy_failures,
+                            ..LogConfig::default()
+                        },
+                    );
+                    let counters = Counters::default();
+                    counters.shared.sent.store(sent, Ordering::Relaxed);
+                    counters.shared.received.store(received, Ordering::Relaxed);
+                    let label = TunnelLabel {
+                        logger: &logger,
+                        target: "target.invalid:443",
+                        client: Some("synthetic-user"),
+                    };
+                    report(&label, &Ok("closed"), &counters, Duration::from_secs(2));
+                    let mut logs = 0;
+                    let mut warnings = 0;
+                    while let Ok(line) = rx.try_recv() {
+                        match line {
+                            crate::logger::ELog::Log(text) => {
+                                assert_eq!(text, format!(
+                                    "Tunnel target.invalid:443 closed after 2.0s: sent {sent} B, received {received} B [client=synthetic-user]"
+                                ));
+                                logs += 1;
+                            }
+                            crate::logger::ELog::Error(text) => {
+                                assert_eq!(text, format!(
+                                    "Tunnel target.invalid:443: upstream sent nothing back (sent {sent} B, closed after 2.0s) [client=synthetic-user]"
+                                ));
+                                warnings += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(logs, usize::from(tunnels));
+                    assert_eq!(
+                        warnings,
+                        usize::from(proxy_failures && sent > 0 && received == 0)
+                    );
+                }
+            }
+        }
     }
 }
 

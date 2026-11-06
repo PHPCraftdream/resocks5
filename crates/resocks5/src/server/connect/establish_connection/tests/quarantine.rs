@@ -717,7 +717,8 @@ async fn a_healthy_cached_chain_is_still_a_cache_hit() {
         handshake_timeout_sec: 2,
         ..Default::default()
     });
-    let stream = establish_connection(
+    let mut plan_trace = PlanBuildTrace::new();
+    let stream = establish_connection_traced(
         target,
         &gates,
         &None,
@@ -728,6 +729,7 @@ async fn a_healthy_cached_chain_is_still_a_cache_hit() {
         &network,
         None,
         None,
+        &mut plan_trace,
     )
     .await
     .expect("the cached chain is healthy");
@@ -738,6 +740,10 @@ async fn a_healthy_cached_chain_is_still_a_cache_hit() {
         gate_rotator.pick_order_calls(),
         0,
         "a cache hit must not walk the plan"
+    );
+    assert!(
+        plan_trace.is_empty(),
+        "a cache hit must not build any plan, trace: {plan_trace:?}"
     );
     let hit = tokio::time::timeout(Duration::from_secs(5), logs.recv())
         .await
@@ -846,8 +852,8 @@ async fn dual_exit(quarantine_v6: bool, budget: usize) -> DualExit {
     }
 }
 
-async fn request_dual(fx: &DualExit) -> Result<(), anyhow::Error> {
-    establish_connection(
+async fn request_dual(fx: &DualExit, plan_trace: &mut PlanBuildTrace) -> Result<(), anyhow::Error> {
+    establish_connection_traced(
         &fx.target,
         &fx.gates,
         &Some(fx.v6.clone()),
@@ -858,6 +864,7 @@ async fn request_dual(fx: &DualExit) -> Result<(), anyhow::Error> {
         &fx.network,
         None,
         None,
+        plan_trace,
     )
     .await
     .map(drop)
@@ -873,7 +880,8 @@ async fn request_dual(fx: &DualExit) -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn a_quarantined_foreign_exit_copy_keeps_the_cached_route_serving() {
     let mut fx = dual_exit(true, 10).await;
-    request_dual(&fx)
+    let mut plan_trace = PlanBuildTrace::new();
+    request_dual(&fx, &mut plan_trace)
         .await
         .expect("the healthy v4 cache must serve the target");
     assert_eq!(fx.gate_accepts.load(Ordering::SeqCst), 1);
@@ -882,6 +890,10 @@ async fn a_quarantined_foreign_exit_copy_keeps_the_cached_route_serving() {
         fx.gate_rotator.pick_order_calls(),
         0,
         "a cache hit must not walk the plan"
+    );
+    assert!(
+        plan_trace.is_empty(),
+        "a cache hit must not build any plan, trace: {plan_trace:?}"
     );
     let hit = tokio::time::timeout(Duration::from_secs(5), fx.logs.recv())
         .await
@@ -907,11 +919,20 @@ async fn a_quarantined_foreign_exit_copy_keeps_the_cached_route_serving() {
 #[tokio::test]
 async fn a_quarantined_owning_exit_copy_serves_through_the_plan() {
     let fx = dual_exit(false, 10).await;
-    request_dual(&fx)
+    let mut plan_trace = PlanBuildTrace::new();
+    request_dual(&fx, &mut plan_trace)
         .await
         .expect("the healthy v6 copy must serve the target");
     assert_eq!(fx.gate_accepts.load(Ordering::SeqCst), 1);
     assert_eq!(fx.exit_accepts.load(Ordering::SeqCst), 0);
+    // Позитивный контроль для trace построений плана: кэш скрыт,
+    // поэтому запрос обслуживается свежепостроенным планом с одним
+    // gate-уровнем (gate-ротатор) и обоими exit-ротаторами (v6 + v4).
+    assert_eq!(
+        plan_trace,
+        vec![(1, 2)],
+        "the serving plan must be built with 1 gate level and 2 exits, trace: {plan_trace:?}"
+    );
     assert!(
         fx.v4.get_linked(&fx.target).is_none(),
         "the dead v4 copy stays hidden"
@@ -939,7 +960,8 @@ async fn a_quarantined_owning_exit_copy_serves_through_the_plan() {
 #[tokio::test]
 async fn a_quarantined_foreign_exit_copy_serves_the_cache_within_budget_one() {
     let mut fx = dual_exit(true, 1).await;
-    request_dual(&fx)
+    let mut plan_trace = PlanBuildTrace::new();
+    request_dual(&fx, &mut plan_trace)
         .await
         .expect("the cached chain is the one allowed attempt");
     assert_eq!(
@@ -952,6 +974,10 @@ async fn a_quarantined_foreign_exit_copy_serves_the_cache_within_budget_one() {
         fx.gate_rotator.pick_order_calls(),
         0,
         "no plan may be walked on the spent budget"
+    );
+    assert!(
+        plan_trace.iter().all(|(gates, _)| *gates == 0),
+        "budget exhaustion must skip building the gate plan, trace: {plan_trace:?}"
     );
     let hit = tokio::time::timeout(Duration::from_secs(5), fx.logs.recv())
         .await

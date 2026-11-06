@@ -1,0 +1,49 @@
+{
+  "accepted": true,
+  "runner": {
+    "accepted": true,
+    "budget_seconds": 15.0,
+    "elapsed_seconds": 0.6870000000344589
+  },
+  "test_executions": {
+    "app": 8,
+    "check-0": 12,
+    "check-1": 7,
+    "check-2": 5,
+    "check-3": 1,
+    "check-4": 1,
+    "check-5": 22,
+    "check-6": 15,
+    "check-7": 11,
+    "check-8": 20,
+    "sdk": 22
+  },
+  "total_test_executions": 124,
+  "perf208_rows": {
+    "sdk": 189,
+    "app": 24
+  },
+  "all_213_counters_match_mark_dead": true,
+  "graphs": {
+    "sdk": {
+      "artifacts": 89,
+      "sha256": "a0dd10907eb632cec95ba2081adb97193fba1bba28e40df5ed26183a60702a08"
+    },
+    "app": {
+      "artifacts": 129,
+      "sha256": "3117075e57c1ce907bb084b5fd15986f361d8ac8ef84904696126bf30061a598"
+    }
+  },
+  "lock_sha256": "dc3acbef3693ce42b520478640cacde26cced2ee45dc714b10ef3f51003bd4f0",
+  "user_reference_sha256": "11f3f477123dc1c9dc7eb3b9b2aae449883844bfbd986a271113c961c4e55669",
+  "sdk_build_exit_code": 0,
+  "app_build_exit_code": 0,
+  "sdk_clippy_exit_code": 0,
+  "app_clippy_exit_code": 0,
+  "hammer_executed": false,
+  "ci_executed": false,
+  "msrv_executed": false,
+  "commit_created": false,
+  "push_performed": false,
+  "proof": "target/perf208/integrated-final"
+}

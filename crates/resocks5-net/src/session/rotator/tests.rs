@@ -71,6 +71,69 @@ fn rating_index_checks_identity_on_hash_collision() {
     assert_eq!(rotator.index_of(&first), None);
 }
 
+/// Принудительные коллизии для индексного resolve: совпадение hash не
+/// доказывает identity — путь сканирует bucket до первого совпадения полей
+/// и возвращает свой слот. Позиции target в bucket: начало, середина,
+/// конец; плюс miss при непустом bucket. Mutation: доверять hash — вернётся
+/// чужой слот; скан без раннего выхода — счётчик превысит позицию.
+#[test]
+fn perf208_resolve_identity_scans_forced_collision_bucket() {
+    let target = make_proxy("target", 1000);
+    let other = make_proxy("other", 1001);
+    let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone()]);
+    let hash = upstream_hash(&rotator.identity_hasher, &target);
+    rotator.by_identity.insert(hash, vec![1, 0]);
+    let resolved = rotator.resolve_identity(&target).unwrap();
+    assert!(Arc::ptr_eq(resolved, &rotator.proxies[0]));
+    // Bucket из чужих слотов: ни одно сравнение identity не подтверждает.
+    rotator.by_identity.insert(hash, vec![1]);
+    assert!(rotator.resolve_identity(&target).is_none());
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    {
+        rotator.by_identity.insert(hash, vec![1, 0]);
+        let (_, counts) = crate::perf::measure(|| rotator.resolve_identity(&target));
+        assert_eq!(counts.resolve_comparisons, 2);
+        crate::perf::report("resolve/collision/bucket=2", counts);
+    }
+
+    // Матрица позиций на bucket из трёх слотов: результат — свой слот,
+    // счётчик равен позиции совпадения (1/2/3) или длине bucket для miss.
+    let extra = make_proxy("extra", 1002);
+    let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone(), extra.clone()]);
+    let hash = upstream_hash(&rotator.identity_hasher, &target);
+    rotator.by_identity.insert(hash, vec![0, 1, 2]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 0, 2]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 2, 0]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 2]);
+    assert!(rotator.resolve_identity(&target).is_none());
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    {
+        // Счётчик: 1 (начало), 2 (середина), 3 (конец), 2 (miss = длина bucket [1,2]).
+        for (bucket, expected) in [
+            (vec![0usize, 1, 2], 1u64),
+            (vec![1, 0, 2], 2),
+            (vec![1, 2, 0], 3),
+            (vec![1, 2], 2),
+        ] {
+            rotator.by_identity.insert(hash, bucket);
+            let (_, counts) = crate::perf::measure(|| rotator.resolve_identity(&target));
+            assert_eq!(counts.resolve_comparisons, expected);
+        }
+    }
+}
+
 #[test]
 fn duplicate_identity_collapses_onto_the_first_slot() {
     let proxy = make_proxy("one", 1000);
@@ -482,4 +545,48 @@ fn gate_composite_maps_to_original_rating_slot() {
         "unrelated upstream must be untouched, got {}",
         w[1]
     );
+}
+
+/// Ленивые кандидаты обязаны совпадать с полным pick_order: префиксы 1 и 3
+/// на свежих снапшотах того же seed и полный дренаж.
+#[test]
+fn lazy_candidates_match_pick_order_exactly() {
+    fn fresh() -> std::sync::Arc<ProxyRotator> {
+        std::sync::Arc::new(
+            ProxyRotator::with_rng_seed(
+                (0..40)
+                    .map(|i| make_proxy(&format!("host{i}"), 1000 + i as u16))
+                    .collect(),
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+                DEFAULT_STICKY_CACHE_TTL,
+                208,
+            )
+            .expect("валидные параметры в тесте"),
+        )
+    }
+    let addr = |p: &Arc<ProxyConfig>| (p.host.clone(), p.port);
+    let expected: Vec<_> = fresh().pick_order().iter().map(&addr).collect();
+    // Префикс 1.
+    let mut c1 = fresh().pick_order_lazy();
+    assert_eq!(c1.next_proxy().map(|p| addr(&p)).as_ref(), expected.first());
+    // Префикс 3 на свежем снапшоте.
+    let mut c3 = fresh().pick_order_lazy();
+    let got3: Vec<_> = (0..3)
+        .filter_map(|_| c3.next_proxy())
+        .map(|p| addr(&p))
+        .collect();
+    assert_eq!(got3, expected[..3], "prefix 3");
+    // Полный дренаж на свежем снапшоте.
+    let full: Vec<_> = fresh()
+        .pick_order_lazy()
+        .into_proxies()
+        .iter()
+        .map(addr)
+        .collect();
+    assert_eq!(full, expected, "full");
+    // Длина eligible = длине полного порядка.
+    let c = fresh().pick_order_lazy();
+    assert_eq!(c.eligible().len(), expected.len());
 }
