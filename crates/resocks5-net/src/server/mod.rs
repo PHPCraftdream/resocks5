@@ -796,8 +796,9 @@ where
                     .await
                 }
             };
-            let text = match std::str::from_utf8(&decoded) {
-                Ok(s) => s,
+            // Ошибка UTF-8 не владеет буфером до await.
+            let text = match String::from_utf8(decoded).map_err(|error| error.utf8_error()) {
+                Ok(text) => text,
                 Err(_) => {
                     return http_fail(
                         stream,
@@ -829,7 +830,7 @@ where
             let credentials = Credentials::with_basic_payload(
                 identity.clone(),
                 password.to_owned(),
-                text.to_owned(),
+                text,
             );
             retained = options.retain_credentials.then(|| credentials.duplicate());
             if !authenticate(credentials).await {

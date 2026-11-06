@@ -13,6 +13,8 @@ categories = ["network-programming", "command-line-utilities"]
 publish = false
 
 [features]
+# Счётчики #208 включаются только в unit tests; production API не меняется.
+test-instrumentation = ["resocks5-net/test-instrumentation"]
 # GSSAPI (Kerberos) authentication of inbound clients and of SOCKS5 upstreams:
 # the protocol and the account mapping. Without a backend (below) a server
 # configured for GSSAPI refuses to start.
