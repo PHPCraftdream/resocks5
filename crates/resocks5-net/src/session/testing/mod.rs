@@ -13,14 +13,28 @@
 //! tunnel.write_all(b"ping").await?;   // echoed back
 //! assert_eq!(mock.targets(), ["example.test:443"]);
 //! ```
+//!
+//! In-memory peers use the same protocol handler without using a socket for the
+//! returned stream (the mock itself still binds its listener in `spawn`):
+//!
+//! ```text
+//! let mock = MockUpstream::http().reply_delay(Duration::from_millis(25)).spawn().await?;
+//! let mut stream = mock.connect_in_memory();
+//! http_connect_handshake(&mut stream, "example.test:443", &mock.proxy()).await?;
+//! ```
+//!
+//! `AuthStatus(byte)` answers the client's first secure-auth message with the
+//! two bytes `[VERSION, byte]`: `0xFF` reads as a refusal, `0x01` as an
+//! enrollment offer, any other non-zero value as a bad version.
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::connect::HostPort;
@@ -58,6 +72,21 @@ pub enum MockAuth {
         /// Its stored secret.
         secret: crate::secure_auth::UserSecret,
     },
+    /// Refuse SOCKS5 method negotiation with `[5, 255]`, regardless of offer;
+    /// HTTP answers CONNECT with 407.
+    NoAcceptableMethod,
+    /// Select secure auth and deny using the real exchange against an empty
+    /// user store (unknown users receive the normal decoy response); HTTP
+    /// answers 407.
+    #[cfg(feature = "secure-auth")]
+    SecureDenied,
+    /// Select secure auth and answer the client's first authentication message
+    /// with `[VERSION, status]`, then close. The client maps `0xFF` to
+    /// `SecureAuthError::Refused`, `0x01` to `EnrollmentNotAllowed` (unless it
+    /// allows enrollment) and any other non-zero status to `BadVersion`; HTTP
+    /// answers 407.
+    #[cfg(feature = "secure-auth")]
+    AuthStatus(u8),
 }
 
 impl std::fmt::Debug for MockAuth {
@@ -66,6 +95,11 @@ impl std::fmt::Debug for MockAuth {
             Self::None => "MockAuth::None",
             #[cfg(feature = "secure-auth")]
             Self::Secure { .. } => "MockAuth::Secure { .. }",
+            Self::NoAcceptableMethod => "MockAuth::NoAcceptableMethod",
+            #[cfg(feature = "secure-auth")]
+            Self::AuthStatus(_) => "MockAuth::AuthStatus(..)",
+            #[cfg(feature = "secure-auth")]
+            Self::SecureDenied => "MockAuth::SecureDenied",
         })
     }
 }
@@ -77,6 +111,8 @@ pub struct MockUpstreamBuilder {
     protocol: ProxyProtocol,
     auth: MockAuth,
     script: Script,
+    reply_delay: Duration,
+    drip: bool,
 }
 
 impl MockUpstreamBuilder {
@@ -92,6 +128,25 @@ impl MockUpstreamBuilder {
         self
     }
 
+    /// Delay each mock-generated method selection or CONNECT response by
+    /// `delay` (default zero). In-memory streams observe this delay; TCP
+    /// clients get best-effort timing subject to kernel scheduling/coalescing.
+    /// Secure-auth exchange messages are generated internally and are not
+    /// delayed by this option.
+    pub fn reply_delay(mut self, delay: Duration) -> Self {
+        self.reply_delay = delay;
+        self
+    }
+
+    /// Write mock-generated method selections and CONNECT responses one byte
+    /// at a time, flushing and yielding between bytes. In-memory streams expose
+    /// this fragmentation; TCP observation is best-effort and may be coalesced
+    /// by the kernel. Secure-auth exchange messages are not dripped.
+    pub fn drip(mut self, enabled: bool) -> Self {
+        self.drip = enabled;
+        self
+    }
+
     /// Bind `127.0.0.1:0` and start serving.
     ///
     /// # Errors
@@ -103,6 +158,8 @@ impl MockUpstreamBuilder {
         let state = Arc::new(Shared {
             auth: self.auth,
             script: self.script,
+            reply_delay: self.reply_delay,
+            drip: self.drip,
             targets: Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
             #[cfg(feature = "secure-auth")]
@@ -123,6 +180,7 @@ impl MockUpstreamBuilder {
                             _ => serve_socks5(stream, &state).await,
                         };
                     });
+                    while connections.try_join_next().is_some() {}
                 }
             }
         });
@@ -131,6 +189,7 @@ impl MockUpstreamBuilder {
             protocol,
             state,
             task,
+            in_memory_tasks: Mutex::new(JoinSet::new()),
         })
     }
 }
@@ -138,6 +197,8 @@ impl MockUpstreamBuilder {
 struct Shared {
     auth: MockAuth,
     script: Script,
+    reply_delay: Duration,
+    drip: bool,
     targets: Mutex<Vec<String>>,
     connections: AtomicUsize,
     #[cfg(feature = "secure-auth")]
@@ -157,6 +218,7 @@ pub struct MockUpstream {
     protocol: ProxyProtocol,
     state: Arc<Shared>,
     task: JoinHandle<()>,
+    in_memory_tasks: Mutex<JoinSet<()>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -183,7 +245,29 @@ impl MockUpstream {
             protocol,
             auth: MockAuth::None,
             script: Script::Tunnel,
+            reply_delay: Duration::ZERO,
+            drip: false,
         }
+    }
+
+    /// Make an in-memory client stream served by this mock. It shares script,
+    /// auth and observability state with TCP connections. The returned stream
+    /// uses no socket (although this mock was created by `spawn`, which binds
+    /// its TCP listener).
+    pub fn connect_in_memory(&self) -> DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let state = Arc::clone(&self.state);
+        let protocol = self.protocol;
+        state.connections.fetch_add(1, Ordering::SeqCst);
+        let mut tasks = self.in_memory_tasks.lock().expect("in-memory tasks lock");
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _ = match protocol {
+                ProxyProtocol::Http => serve_http(server, &state).await,
+                _ => serve_socks5(server, &state).await,
+            };
+        });
+        client
     }
 
     /// The listening address.
@@ -202,7 +286,7 @@ impl MockUpstream {
         self.state.targets.lock().expect("targets lock").clone()
     }
 
-    /// The TCP connections accepted so far.
+    /// The TCP connections accepted and in-memory streams created so far.
     pub fn connections(&self) -> usize {
         self.state.connections.load(Ordering::SeqCst)
     }
@@ -213,6 +297,30 @@ impl Drop for MockUpstream {
         // Aborting the accept loop drops its JoinSet, which aborts every
         // connection task.
         self.task.abort();
+        match self.in_memory_tasks.get_mut() {
+            Ok(tasks) => tasks.abort_all(),
+            Err(poisoned) => poisoned.into_inner().abort_all(),
+        }
+    }
+}
+
+async fn write_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    state: &Shared,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if !state.reply_delay.is_zero() {
+        tokio::time::sleep(state.reply_delay).await;
+    }
+    if state.drip {
+        for byte in bytes {
+            stream.write_all(std::slice::from_ref(byte)).await?;
+            stream.flush().await?;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    } else {
+        stream.write_all(bytes).await
     }
 }
 
@@ -226,7 +334,10 @@ async fn echo<S: AsyncRead + AsyncWrite + Unpin>(stream: S) -> io::Result<()> {
     Ok(())
 }
 
-async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
+async fn serve_socks5<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut stream: S,
+    state: &Shared,
+) -> io::Result<()> {
     if state.script == Script::Hangup {
         return Ok(());
     }
@@ -238,16 +349,18 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
         return forever().await;
     }
     let wanted = match &state.auth {
-        MockAuth::None => 0x00,
+        MockAuth::None | MockAuth::NoAcceptableMethod => 0x00,
         #[cfg(feature = "secure-auth")]
-        MockAuth::Secure { .. } => crate::secure_auth::METHOD,
+        MockAuth::Secure { .. } | MockAuth::AuthStatus(_) | MockAuth::SecureDenied => {
+            crate::secure_auth::METHOD
+        }
     };
-    if !methods.contains(&wanted) {
-        return stream.write_all(&[0x05, 0xFF]).await;
+    if matches!(&state.auth, MockAuth::NoAcceptableMethod) || !methods.contains(&wanted) {
+        return write_reply(&mut stream, state, &[0x05, 0xFF]).await;
     }
-    stream.write_all(&[0x05, wanted]).await?;
+    write_reply(&mut stream, state, &[0x05, wanted]).await?;
     match &state.auth {
-        MockAuth::None => {}
+        MockAuth::None | MockAuth::NoAcceptableMethod => {}
         #[cfg(feature = "secure-auth")]
         MockAuth::Secure { user, secret } => {
             let store = OneUser { user, secret };
@@ -257,6 +370,26 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
             {
                 return Ok(());
             }
+        }
+        #[cfg(feature = "secure-auth")]
+        MockAuth::SecureDenied => {
+            if crate::secure_auth::server_authenticate(&mut stream, &EmptyUsers, &state.decoy)
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        #[cfg(feature = "secure-auth")]
+        MockAuth::AuthStatus(status) => {
+            let mut first_head = [0u8; 2];
+            stream.read_exact(&mut first_head).await?;
+            let user_len = usize::from(first_head[1]);
+            let mut first_rest = vec![0u8; user_len + 32];
+            stream.read_exact(&mut first_rest).await?;
+            let reply = [crate::secure_auth::VERSION, *status];
+            write_reply(&mut stream, state, &reply).await?;
+            return Ok(());
         }
     }
     if state.script == Script::SilentConnect {
@@ -281,9 +414,7 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
             String::from_utf8_lossy(&name).into_owned()
         }
         _ => {
-            return stream
-                .write_all(&[0x05, 0x08, 0, 1, 0, 0, 0, 0, 0, 0])
-                .await
+            return write_reply(&mut stream, state, &[0x05, 0x08, 0, 1, 0, 0, 0, 0, 0, 0]).await;
         }
     };
     let port = stream.read_u16().await?;
@@ -291,18 +422,19 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
     match state.script {
         Script::Refuse(code) => {
             let rep = u8::try_from(code).expect("a SOCKS5 REP fits a byte");
-            stream.write_all(&[0x05, rep, 0, 1, 0, 0, 0, 0, 0, 0]).await
+            write_reply(&mut stream, state, &[0x05, rep, 0, 1, 0, 0, 0, 0, 0, 0]).await
         }
         _ => {
-            stream
-                .write_all(&[0x05, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])
-                .await?;
+            write_reply(&mut stream, state, &[0x05, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             echo(stream).await
         }
     }
 }
 
-async fn serve_http(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
+async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    mut stream: S,
+    state: &Shared,
+) -> io::Result<()> {
     if state.script == Script::Hangup {
         return Ok(());
     }
@@ -326,28 +458,48 @@ async fn serve_http(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
         .to_owned();
     let authorized = match &state.auth {
         MockAuth::None => true,
+        MockAuth::NoAcceptableMethod => false,
         #[cfg(feature = "secure-auth")]
-        MockAuth::Secure { .. } => false,
+        MockAuth::Secure { .. } | MockAuth::AuthStatus(_) | MockAuth::SecureDenied => false,
     };
     if !authorized {
-        return stream
-            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        return write_reply(
+            &mut stream,
+            state,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
     }
     state.record(target);
     match state.script {
         Script::SilentConnect => forever().await,
         Script::Refuse(code) => {
-            stream
-                .write_all(format!("HTTP/1.1 {code} Mock\r\nContent-Length: 0\r\n\r\n").as_bytes())
-                .await
+            let response = format!("HTTP/1.1 {code} Mock\r\nContent-Length: 0\r\n\r\n");
+            write_reply(&mut stream, state, response.as_bytes()).await
         }
         _ => {
-            stream
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await?;
+            write_reply(
+                &mut stream,
+                state,
+                b"HTTP/1.1 200 Connection established\r\n\r\n",
+            )
+            .await?;
             echo(stream).await
         }
+    }
+}
+
+#[cfg(feature = "secure-auth")]
+struct EmptyUsers;
+
+#[cfg(feature = "secure-auth")]
+impl crate::secure_auth::SecretStore for EmptyUsers {
+    async fn lookup(&self, _user: &str) -> Option<crate::secure_auth::StoredUser> {
+        None
+    }
+
+    async fn claim(&self, _user: &str, _secret: crate::secure_auth::UserSecret) -> bool {
+        false
     }
 }
 

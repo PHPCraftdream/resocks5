@@ -584,15 +584,22 @@ feature), `secure_auth` (`secure-auth` feature), `gssapi` (`gssapi`
 feature), and `testing` (`test-instrumentation` feature).
 
 `testing::MockUpstream` (feature `test-instrumentation`) is a scripted
-upstream proxy for tests: `MockUpstream::socks5()` / `::http()` with
-`.auth(MockAuth)` (default `MockAuth::None`;
-`Secure { user, secret }` — SOCKS5 method 0x80, HTTP answered 407) and
-`.script(Script)` (default `Script::Tunnel` — handshake then echo; also
-`Refuse(code)`, `SilentGreeting`, `SilentConnect`, `Hangup`). `.spawn()`
-listens on `127.0.0.1:0`; `addr()`, `proxy()` (a ready `ProxyConfig`
-pointing at it), `targets()` (the recorded CONNECT targets) and
-`connections()` report what happened; dropping it stops the listener and
-every open connection.
+SOCKS5/HTTP CONNECT proxy for tests. `.auth(MockAuth)` defaults to `None`;
+`Secure { user, secret }` and `SecureDenied` use secure auth;
+`AuthStatus(byte)` answers the first secure-auth message with
+`[VERSION, byte]` (`0xFF` refused, `0x01` enrollment, other non-zero bad
+version); `NoAcceptableMethod` forces SOCKS5
+`[5, 255]`. Every non-None auth mode answers HTTP 407. `.script(Script)`
+defaults to `Tunnel`; it also supports `Refuse(code)`, `SilentGreeting`,
+`SilentConnect`, and `Hangup`. `.spawn()` binds `127.0.0.1:0`; `addr()`,
+`proxy()`, `targets()`, and `connections()` report activity.
+`connect_in_memory()` returns a socket-free `DuplexStream` served by the same
+handler and sharing auth, targets, and counts. `.spawn()` still binds the TCP
+listener; dropping the mock aborts in-memory tasks. `.reply_delay(Duration)`
+(default zero) and `.drip(true)` affect method selections and CONNECT/HTTP
+responses. In-memory clients observe these precisely; TCP timing and
+fragmentation are best-effort and subject to kernel scheduling/coalescing.
+Secure-auth exchange messages are not delayed or dripped.
 
 A working version of the pooled example lives at
 [`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).

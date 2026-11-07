@@ -116,6 +116,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (tunnel with echo, refuse with a REP/status, silent greeting, silent CONNECT,
   hang-up), `MockAuth` (none, secure auth), and the recorded CONNECT
   targets.
+- `resocks5-net`: `MockUpstream` v2. `connect_in_memory()` serves a socket-free
+  `DuplexStream` with the same script, auth and recorded state, so timing tests
+  can run on a paused clock; `.reply_delay(Duration)` pauses before every
+  mock-generated reply and `.drip(true)` writes replies one byte at a time
+  (exact in memory, best-effort on TCP). New `MockAuth` variants for explicit
+  rejections: `NoAcceptableMethod` (SOCKS5 `[5, 255]`), `SecureDenied` (any
+  password fails the real secure-auth exchange) and `AuthStatus(byte)`
+  (answers the first secure-auth message with `[VERSION, byte]`); all answer
+  HTTP with 407.
 - `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
   and clears `user`/`password` at this node and every solely owned gate, and
   reports a shared gate it left untouched. Opt-in: `ProxyConfig` has no `Drop`.
