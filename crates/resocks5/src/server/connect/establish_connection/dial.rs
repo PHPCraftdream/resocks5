@@ -339,7 +339,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
         if attempts + candidates.len() >= max_attempts {
             break;
         }
-        for proxy_config in rotator.pick_order() {
+        for proxy_config in rotator.pick_iter() {
             let route = ChainKey::singleton(&proxy_config);
             if tried_routes.contains(&route) {
                 continue;
