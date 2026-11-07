@@ -47,7 +47,11 @@ pub async fn handle_http_client(
 
     // If the authenticated user has direct=true, bypass the pool and
     // connect straight to the target. Anonymous clients NEVER take the
-    // direct path.
+    // direct path. In this application an HTTP request never carries an
+    // identity (Basic is refused with 407 before any account lookup, see
+    // `http_requests_accepted_by_the_app_never_carry_an_identity`), so
+    // this branch is only reachable for a host whose SDK build accepts
+    // clear-text HTTP identities (`cleartext-server`).
     let is_direct = client_user.is_some_and(|user| auth.is_direct(user));
 
     // Acquire a direct-limiter permit when taking the bypass path.
