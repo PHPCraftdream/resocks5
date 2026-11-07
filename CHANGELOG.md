@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `resocks5-net`: `ConnectError::suggested_reply()` answers a TCP-connect,
+  SOCKS5-greeting or HTTPS-TLS-handshake timeout with `UpstreamUnavailable`
+  (the upstream hop itself failed) instead of `TimedOut`. Timeouts of the
+  CONNECT exchange and the total budget stay `TimedOut`, as do I/O timeouts.
 - `resocks5-net`: fewer copies on the dial path, behavior unchanged.
   `ChainKey::singleton(&Arc<ProxyConfig>)` keys one node without copying it
   (a gate-less node is shared); `ChainPick::config_arc()` returns the pick's
@@ -46,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `resocks5-net`: `DialOptions::with_keepalive_interval(Duration)` (field
+  `keepalive_interval`, default `None`) sets the TCP keepalive probe interval
+  next to the idle time from `with_keepalive`. It applies only together with
+  `with_keepalive` and is best-effort: platforms where `socket2` has no
+  `with_interval` ignore it.
 - `resocks5-net`: `ProxyRotator::pick_iter` returns the direct-path candidate
   order lazily (`PickOrder`, a fused iterator); `pick_order` stays the full
   reference order. `ProxyConfig::chain_arc` builds a chain as a shared `Arc`
