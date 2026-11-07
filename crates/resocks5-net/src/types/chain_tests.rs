@@ -460,6 +460,7 @@ fn chain_arc_shares_only_the_first_node_of_a_multi_node_chain() {
         outermost = gate;
     }
     assert!(Arc::ptr_eq(&outermost, &first), "first node shared");
+    drop(outermost);
     assert!(
         !Arc::ptr_eq(built.gate.as_ref().unwrap(), &second),
         "later nodes are copies"
