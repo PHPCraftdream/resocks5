@@ -161,6 +161,20 @@ expect net_test_args=--no-run
 expect run_test=false
 expect run_unification=false
 
+# session/testing (mock upstream, perf counters) -> testing:: SDK tests, not a bare build
+files crates/resocks5-net/src/session/testing/mod.rs
+case testing
+expect run_net=true
+expect net_test_args=-- testing::
+expect run_unification=false
+
+# other session modules (auth, health, ...) -> whole session:: SDK test tree
+files crates/resocks5-net/src/session/auth/secure_auth/server.rs
+case session-rest
+expect run_net=true
+expect net_test_args=-- session::
+expect run_unification=false
+
 # the fixture workspace itself: only the feature-unification job
 files tests/feature_unification/lean-consumer/src/main.rs
 case fixture
@@ -334,6 +348,15 @@ if [ "$full" = false ]; then
         rust=true
         net_f="$net_f server::"
         app_f="$app_f server:: http_proxy::"
+        ;;
+      crates/resocks5-net/src/session/testing/*)
+        rust=true
+        net_f="$net_f testing::"
+        ;;
+      # Remaining session modules (auth, health, ...): the whole session tree.
+      crates/resocks5-net/src/session/*)
+        rust=true
+        net_f="$net_f session::"
         ;;
       crates/*/README.md)
         ;;
