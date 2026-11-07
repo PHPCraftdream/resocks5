@@ -40,7 +40,7 @@ workflow; более ранние этапы подтверждены локал
 `x86_64-unknown-linux-gnu`, allocator `std::alloc::System`, профиль `test`,
 `RUSTFLAGS=-D warnings`, SDK с `zeroize,test-instrumentation`. Значения взяты
 из artifact `perf208-counters` прогона на коммите `ac7eace`
-([results/cow.json](perf208/results/cow.json)). Ячейка — «до → после».
+([baseline/cow.json](perf208/baseline/cow.json)). Ячейка — «до → после».
 «До» — дословные replica прежнего кода в самих тестах, «после» — текущий код.
 
 <!-- perf208:cow:begin -->
@@ -60,7 +60,7 @@ workflow; более ранние этапы подтверждены локал
 
 Блок между маркерами генерирует `tests/perf208/render.py`; руками его не
 правят. Workflow `perf.yml` вызывает `render.py check`: он сравнивает блок с
-`results/cow.json` и сохранённые значения со свежими строками `PERF208`. Если
+`baseline/cow.json` и сохранённые значения со свежими строками `PERF208`. Если
 счётчики изменились намеренно, обновить оба места командой
 `python -I tests/perf208/render.py update --counters <каталог counters из artifact>`.
 
@@ -239,5 +239,5 @@ sort в закреплённом compiler; при смене compiler baseline �
 5. Для кандидатов с неполным path coverage сначала добавить соответствующий
    детерминированный сценарий, а не экстраполировать компонентный результат.
 6. Новые строки добавлять в `EXPECTED_ROWS`; значения для сводной таблицы —
-   в `results/cow.json` (или новый файл того же формата) и обновлять через
+   в `baseline/cow.json` (или новый файл того же формата) и обновлять через
    `render.py update`.

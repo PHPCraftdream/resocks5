@@ -1,4 +1,4 @@
-"""Сверка CoW-таблицы PERF208: results/cow.json, блок в docs/PERF208.md и свежие счётчики CI.
+"""Сверка CoW-таблицы PERF208: baseline/cow.json, блок в docs/PERF208.md и свежие счётчики CI.
 
 check  — структура results, блок в документе равен таблице из results; с --counters
          ещё и свежие строки PERF208 равны сохранённым значениям.
@@ -145,7 +145,7 @@ def dump(results):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("command", choices=("check", "update", "render"))
-    parser.add_argument("--results", type=Path, default=Path("docs/perf208/results/cow.json"))
+    parser.add_argument("--results", type=Path, default=Path("docs/perf208/baseline/cow.json"))
     parser.add_argument("--doc", type=Path, default=Path("docs/PERF208.md"))
     parser.add_argument("--counters", type=Path, help="каталог с sdk.txt и app.txt")
     args = parser.parse_args(argv)

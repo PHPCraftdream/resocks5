@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cleartext-server`.
 - `docs/PERF208.md` is rewritten as a status table per candidate with commits,
   evidence and counters; the CoW table is generated from
-  `docs/perf208/results/cow.json` by `tests/perf208/render.py` and checked by
+  `docs/perf208/baseline/cow.json` by `tests/perf208/render.py` and checked by
   the perf workflow against the fresh counters (PERF208 rows: 209 SDK, 24 app).
 
 ### Added

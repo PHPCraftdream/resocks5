@@ -232,7 +232,7 @@ class RepositoryFilesTests(unittest.TestCase):
     """Закоммиченные results и PERF208.md согласованы между собой."""
 
     def setUp(self):
-        self.path = ROOT / "docs" / "perf208" / "results" / "cow.json"
+        self.path = ROOT / "docs" / "perf208" / "baseline" / "cow.json"
         self.text = self.path.read_text(encoding="utf-8")
         self.results = json.loads(self.text)
 
