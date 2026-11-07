@@ -1,4 +1,4 @@
-//! Детерминированные PERF208-сценарии смерти кандидатов и singleton-слоёв.
+//! Deterministic PERF208 scenarios of candidate death and singleton layers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +79,7 @@ fn perf208_mark_dead_layered_repeated_pruning_and_exhaustion() {
         assert_eq!(absent_gate_counts.mark_dead_eligible_checks, 0);
         assert_eq!(absent_exit_counts.mark_dead_eligible_checks, 0);
 
-        // Оставляем план частично живым: размерные случаи не перечисляют декартово произведение.
+        // Keep the plan partially alive: sized cases must not enumerate the Cartesian product.
         let mut sampled = Vec::new();
         let ((), prune_steps) = measure(|| {
             for _ in 0..width.min(8) {
@@ -120,7 +120,7 @@ fn perf208_mark_dead_layered_repeated_pruning_and_exhaustion() {
         );
     }
 
-    // Полный небольшой план закрепляет отвод одометра после частичной смерти и после исключения.
+    // Full small plan pins the odometer reset after partial death and after exclusion.
     let gates = gate_levels(3, 2);
     let exits = [rotator(vec![p(200_000), p(200_001)])];
     let mut prune = ChainPlan::new(&gates, &exits);
@@ -174,7 +174,7 @@ fn exit_rotators(size: usize, overlap: bool) -> Vec<Arc<ProxyRotator>> {
 fn perf208_singleton_exit_scaling_boundary_and_owner() {
     for size in [2usize, 3, 8, 64, 256] {
         for overlap in [false, true] {
-            // Фикстуры исключены из measured construction.
+            // Fixtures are excluded from the measured construction.
             let exits = exit_rotators(size, overlap);
             let gates = GateLevels::default();
             let (plan, construction) = measure(|| ChainPlan::new(&gates, &exits));
@@ -194,7 +194,7 @@ fn perf208_singleton_exit_scaling_boundary_and_owner() {
             );
             assert_eq!(construction.singleton_emitted_inserts, 0);
 
-            // Независимый oracle считает фактические identity comparisons reference-eager пути.
+            // Independent oracle counts the actual identity comparisons of the reference-eager path.
             let mut reference_comparisons = 0u64;
             let mut owners: Vec<&ProxyConfig> = Vec::new();
             for exit in &exits {

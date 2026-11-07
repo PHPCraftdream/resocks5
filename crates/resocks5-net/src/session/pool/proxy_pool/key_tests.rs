@@ -1,5 +1,5 @@
-//! Прямые проверки консистентности owning и borrowed представлений
-//! ключа пула: поток Hasher, eq и lookup в map.
+//! Direct checks of owning and borrowed views of the pool key:
+//! Hasher stream, eq and lookup in a map.
 
 use std::hash::{Hash, Hasher};
 
@@ -7,8 +7,8 @@ use dashmap::DashMap;
 
 use super::{ProxyEndpoint, ProxyKey};
 
-/// Копит сырой поток байтов Hasher: сравнение по потоку, а не по
-/// digest, ловит рассогласование ручного dyn Hash с кортежным.
+/// Accumulates the raw Hasher byte stream: comparing by stream, not
+/// digest, catches mismatch between manual dyn Hash and tuple-based.
 #[derive(Default)]
 struct Recorder(Vec<u8>);
 
@@ -78,7 +78,7 @@ fn borrowed_lookup_resolves_owned_entries_distinctly() {
     map.insert(owned("", 0), 5);
 
     let hit = |host: &str, port: u16| -> Option<u32> {
-        // Owning-ключ не строится, как в production-коде.
+        // No owning key is built, as in production code.
         let key: &dyn ProxyEndpoint = &(host, port);
         map.get(key).map(|entry| *entry)
     };
@@ -89,7 +89,7 @@ fn borrowed_lookup_resolves_owned_entries_distinctly() {
     assert_eq!(hit("прокси-тест.invalid", 1), Some(4));
     assert_eq!(hit("", 0), Some(5));
 
-    // Host и port различаются: перекрёстных попаданий нет.
+    // Host and port differ: no cross hits.
     assert_eq!(hit("proxy.example.invalid", 1082), None);
     assert_eq!(hit("proxy.example.invalid2", 1080), None);
     assert_eq!(hit("2001:db8::1", 9051), None);

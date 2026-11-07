@@ -241,9 +241,9 @@ fn a_stored_secret_does_not_contain_the_password() {
     }
 }
 
-// ─── allowed_clients: пользовательский фильтр ───────────────────────
+// ─── allowed_clients: user filter ───────────────────────────────────
 
-/// `None` у пользователя не ограничивает IP.
+/// A user's `None` does not restrict IPs.
 #[test]
 fn user_rule_none_does_not_restrict() {
     let state = build_state(vec![make_user("alice", "s3cret", true)], false);
@@ -251,7 +251,7 @@ fn user_rule_none_does_not_restrict() {
     assert!(state.client_ip_allowed("alice", ip("::1")));
 }
 
-/// Пользовательское правило применяется; disabled/unknown → false.
+/// The user rule applies; disabled/unknown → false.
 #[test]
 fn user_rule_and_disabled_unknown_semantics() {
     let state = build_state(
@@ -265,11 +265,11 @@ fn user_rule_and_disabled_unknown_semantics() {
     assert!(!state.client_ip_allowed("alice", ip("10.9.0.2")));
     assert!(!state.client_ip_allowed("bob", ip("10.9.0.1")));
     assert!(!state.client_ip_allowed("carol", ip("10.9.0.1")));
-    // Недоступный адрес — fail-closed.
+    // An unroutable address is fail-closed.
     assert!(!state.client_ip_allowed("alice", None));
 }
 
-/// Невалидная строка у DISABLED пользователя валит build (старт).
+/// An invalid rule string on a DISABLED user fails the build (startup).
 #[test]
 fn disabled_user_invalid_rule_fails_build() {
     let res = AuthState::build(
@@ -293,7 +293,7 @@ fn disabled_user_invalid_rule_fails_build() {
     assert!(err.to_string().contains("alice"), "got: {err}");
 }
 
-/// Дубликат имени с невалидной строкой тоже валит build.
+/// A duplicate name with an invalid rule string also fails the build.
 #[test]
 fn duplicate_user_invalid_rule_fails_build() {
     let res = AuthState::build(
@@ -312,8 +312,8 @@ fn duplicate_user_invalid_rule_fails_build() {
     assert!(res.is_err());
 }
 
-/// First-wins для дубликатов имени: действует ПЕРВОЕ вхождение — и его
-/// правило, и его секрет.
+/// First-wins for duplicate names: the FIRST occurrence takes effect — both
+/// its rule and its secret.
 #[tokio::test]
 async fn duplicate_names_keep_the_first_entry() {
     let state = build_state(

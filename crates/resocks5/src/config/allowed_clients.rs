@@ -280,7 +280,7 @@ mod tests {
         ok(spec).matches(ip.parse().unwrap())
     }
 
-    // ─── парсер: поддержанные формы ─────────────────────────────────
+    // ─── parser: supported forms ─────────────────────────────────
 
     #[test]
     fn exact_addresses_parse() {
@@ -299,37 +299,37 @@ mod tests {
 
     #[test]
     fn rejected_forms() {
-        err(""); // пустая строка
-        err("a,,b"); // пустой элемент
-        err(" "); // только пробел
+        err(""); // empty string
+        err("a,,b"); // empty element
+        err(" "); // whitespace only
         err("example.com"); // hostname
         err("10.0.0.0/8"); // CIDR
-        err("1.2.3.4:80"); // порт
-        err("1*.2.3.4"); // частичная звёздочка
-        err("1*x"); // мусор рядом со звёздочкой
-        err("10.1.*"); // не 4 октета
-        err("10.*.*"); // не 4 октета
-        err("::1%eth0"); // зона
-        err("[::1]"); // скобки
-        err(":::"); // лишние ':'
-        err("1:2"); // мало групп без '::'
-        err("1.2.3"); // мало октетов
-        err("1.2.3.4.5"); // много октетов
-        err("256.1.1.1"); // октет вне диапазона
-        err("01.2.3.4"); // ведущие нули
-        err("2001:db8::*::*"); // два '::'
-        err("2001:db8:00000::*"); // группа длиннее 4 hex-цифр
-        err("2001:db8::1*x"); // мусор рядом со '*' в IPv6
+        err("1.2.3.4:80"); // port
+        err("1*.2.3.4"); // partial star
+        err("1*x"); // junk next to the star
+        err("10.1.*"); // not 4 octets
+        err("10.*.*"); // not 4 octets
+        err("::1%eth0"); // zone
+        err("[::1]"); // brackets
+        err(":::"); // extra ':'
+        err("1:2"); // too few groups without '::'
+        err("1.2.3"); // too few octets
+        err("1.2.3.4.5"); // too many octets
+        err("256.1.1.1"); // octet out of range
+        err("01.2.3.4"); // leading zeros
+        err("2001:db8::*::*"); // two '::'
+        err("2001:db8:00000::*"); // group longer than 4 hex digits
+        err("2001:db8::1*x"); // junk next to '*' in IPv6
     }
 
     #[test]
     fn too_many_groups_rejected() {
-        // 9 явных групп без '::'
+        // 9 explicit groups without '::'
         err("1:2:3:4:5:6:7:8:9");
-        // 9 явных групп с '::'
+        // 9 explicit groups with '::'
         err("::1:2:3:4:5:6:7:8:9");
         err("1:2:3:4:5:6:7:8::9");
-        // 8 явных групп + '::'
+        // 8 explicit groups + '::'
         err("1:2:3:4:5:6:7:8::");
         err("::1:2:3:4:5:6:7:8");
         err("2001:db8::1:2:3:4:5:6:7:8");
@@ -337,13 +337,13 @@ mod tests {
 
     #[test]
     fn wildcard_group_count_negatives() {
-        // '*' не обходит подсчёт групп/запретов: и с '::', и без.
-        err("1:2:3:4:5:6:7:8:*"); // 9 явных групп без '::'
-        err("1:2:3:4:5:6:7:*::"); // 8 явных групп + '::'
-        err("::1:2:3:4:5:6:7:8:*"); // 9 явных групп + '::'
-        err("2001:db8:*"); // 3 группы без '::' — '*' не расширяет до 8
-        err("01.*.2.3"); // ведущие нули октета и под '*'
-        err("2001:::*"); // ':::' — лишние ':'
+        // '*' does not bypass group count/ban rules: with '::' and without.
+        err("1:2:3:4:5:6:7:8:*"); // 9 explicit groups without '::'
+        err("1:2:3:4:5:6:7:*::"); // 8 explicit groups + '::'
+        err("::1:2:3:4:5:6:7:8:*"); // 9 explicit groups + '::'
+        err("2001:db8:*"); // 3 groups without '::' — '*' does not expand to 8
+        err("01.*.2.3"); // leading zeros of an octet, also under '*'
+        err("2001:::*"); // ':::' — extra ':'
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn mapped_exact_rules_are_normalized() {
-        // '::ffff:127.0.0.1' и '127.0.0.1' — один и тот же Exact.
+        // '::ffff:127.0.0.1' and '127.0.0.1' are the same Exact.
         assert_eq!(ok("::ffff:127.0.0.1"), ok("127.0.0.1"));
         assert_eq!(ok("::ffff:10.0.0.1"), ok("10.0.0.1"));
     }
@@ -407,33 +407,33 @@ mod tests {
 
     #[test]
     fn v6_wildcard_mask() {
-        // '::' — только нулевые группы; '*' — ровно одна группа.
-        // "2001:db8::*" = 2001:db8:0:0:0:0:0:* (НЕ /64).
+        // '::' is zero groups only; '*' is exactly one group.
+        // "2001:db8::*" = 2001:db8:0:0:0:0:0:* (NOT /64).
         assert!(m("2001:db8::*", "2001:db8::1"));
         assert!(m("2001:db8::*", "2001:db8:0:0:0:0:0:5"));
         assert!(m("2001:db8::*", "2001:db8::ffff"));
-        // группы 3..6 фиксированы нулями → /64-подобных адресов не покрывает
+        // groups 3..6 are fixed to zeros → does not cover /64-like addresses
         assert!(!m("2001:db8::*", "2001:db8:1::1"));
         assert!(!m("2001:db8::*", "2001:db8::dead:beef"));
         assert!(!m("2001:db8::*", "2001:db9::1"));
-        // "2001:db8:*::1" — wildcard только группа 3
+        // "2001:db8:*::1" — only group 3 is a wildcard
         assert!(m("2001:db8:*::1", "2001:db8:5::1"));
         assert!(m("2001:db8:*::1", "2001:db8:0::1"));
         assert!(m("2001:db8:*::1", "2001:db8::1"));
         assert!(!m("2001:db8:*::1", "2001:db8::2"));
         assert!(!m("2001:db8:*::1", "2001:db8:5::2"));
-        // несколько '*' в разных явных группах при '::'
+        // multiple '*' in different explicit groups with '::'
         assert!(m("2001:*:db8:*::1", "2001:0:db8:ffff:0:0:0:1"));
         assert!(!m("2001:*:db8:*::1", "2001:0:db8:ffff:0:0:0:2"));
-        // без '::' — ровно 8 групп
+        // without '::' — exactly 8 groups
         assert!(m("2001:db8:0:0:0:0:0:*", "2001:db8::7"));
         assert!(!m("2001:db8:0:0:0:0:*:0", "2001:db8::7"));
     }
 
     #[test]
     fn mapped_hextet_mask_matches_ipv4_as_mapped() {
-        // "::ffff:7f00:*" фиксирует группу 7 = 0x7f00 (октеты 127.0),
-        // группа 8 — любая; IPv4 рассматривается как ::ffff:a.b.c.d.
+        // "::ffff:7f00:*" pins group 7 = 0x7f00 (octets 127.0),
+        // group 8 is any; IPv4 is treated as ::ffff:a.b.c.d.
         assert!(m("::ffff:7f00:*", "127.0.0.1"));
         assert!(m("::ffff:7f00:*", "::ffff:127.0.0.1"));
         assert!(m("::ffff:7f00:*", "127.0.255.255"));
@@ -446,7 +446,7 @@ mod tests {
     fn v4_mask_rejects_native_v6_but_accepts_mapped() {
         assert!(m("10.*.2.3", "::ffff:10.1.2.3"));
         assert!(!m("10.*.2.3", "2001:db8::1"));
-        // non-mapped IPv4-compatible не расширяется в IPv4
+        // non-mapped IPv4-compatible is not expanded to IPv4
         assert!(!m("1.2.3.4", "::102:304"));
         assert!(!m("::1", "127.0.0.1"));
     }

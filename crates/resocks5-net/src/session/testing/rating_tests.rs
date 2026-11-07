@@ -128,9 +128,9 @@ fn trip(r: &Ratings, i: usize, now: Instant) {
     }
 }
 
-/// Ленивый снапшот обязан совпадать с полным pick_order: префиксы 1 и 3
-/// на свежих снапшотах того же seed и полный дренаж — для n от 1 до 257,
-/// с карантином и в режиме fail-open (все в карантине).
+/// Lazy snapshot must match full pick_order: prefixes 1 and 3
+/// on fresh snapshots of the same seed and full drain — for n from 1 to 257,
+/// with quarantine and in fail-open mode (all in quarantine).
 #[cfg(all(test, feature = "rotator"))]
 #[test]
 fn lazy_snapshot_matches_pick_order_prefix_and_full() {
@@ -143,7 +143,7 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
             seed,
         )
         .pick_order();
-        // Префикс 1.
+        // Prefix 1.
         let mut s1 = Ratings::with_rng_seed(
             n,
             RatingPolicy::default(),
@@ -156,7 +156,7 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
             expected.first().copied(),
             "n {n}, без карантина, prefix 1"
         );
-        // Префикс 3 на свежем снапшоте.
+        // Prefix 3 on a fresh snapshot.
         let mut s3 = Ratings::with_rng_seed(
             n,
             RatingPolicy::default(),
@@ -170,7 +170,7 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
             expected[..3.min(expected.len())],
             "n {n}, без карантина, prefix 3"
         );
-        // Полный дренаж на свежем снапшоте.
+        // Full drain on a fresh snapshot.
         let full = Ratings::with_rng_seed(
             n,
             RatingPolicy::default(),
@@ -181,7 +181,7 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
         .into_indices();
         assert_eq!(full, expected, "n {n}, без карантина, full");
 
-        // Тот же сценарий с карантином (ничего не trips — eligible = все).
+        // Same scenario with quarantine (nothing trips — eligible = all).
         let expected = quarantined_ratings_with_seed(n).pick_order();
         let full = quarantined_ratings_with_seed(n)
             .pick_order_lazy()
@@ -201,8 +201,8 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
             "n {n}, с карантином, prefix 3"
         );
     }
-    // Fail-open: все в карантине — eligible = все индексы. Два
-    // одинаковых seed-инстанса: expected и снапшот не могут делить RNG.
+    // Fail-open: all in quarantine — eligible = all indices. Two
+    // identical seed instances: expected and snapshot cannot share the RNG.
     let t0 = Instant::now();
     let trip_all = |r: &Ratings| {
         for i in 0..4 {
@@ -219,8 +219,8 @@ fn lazy_snapshot_matches_pick_order_prefix_and_full() {
     assert_eq!(s.into_indices(), expected, "fail-open full");
 }
 
-/// Eligibility заморожен в момент снапшота: карантин после снапшота не
-/// меняет дренаж, но меняет свежий полный pick_order.
+/// Eligibility is frozen at snapshot time: quarantine after the snapshot
+/// does not change the drain, but changes a fresh full pick_order.
 #[cfg(all(test, feature = "rotator"))]
 #[test]
 fn lazy_snapshot_keeps_eligibility_frozen_at_snapshot() {
@@ -239,8 +239,8 @@ fn lazy_snapshot_keeps_eligibility_frozen_at_snapshot() {
     );
 }
 
-/// Снапшот потребляет все N значений RNG под lock в момент создания:
-/// частичное потребление порядка не меняет состояние RNG.
+/// Snapshot consumes all N RNG values under lock at creation time:
+/// partial consumption of the order does not change the RNG state.
 #[cfg(all(test, feature = "rotator"))]
 #[test]
 fn lazy_snapshot_advances_rng_identically_to_full_pick_order() {

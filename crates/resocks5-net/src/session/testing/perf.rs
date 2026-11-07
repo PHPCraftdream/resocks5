@@ -1,4 +1,4 @@
-//! Закрытые счётчики #208; подключаются только в unit tests с instrumentation.
+//! Private counters #208; linked only in unit tests with instrumentation.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -9,7 +9,7 @@ pub(crate) struct Counts {
     pub alloc_zeroed: u64,
     pub realloc: u64,
     pub dealloc: u64,
-    /// Запрошенные байты, не RSS и не размер блоков allocator.
+    /// Requested bytes, not RSS and not allocator block sizes.
     pub requested_bytes: u64,
     pub config_clones: u64,
     pub chain_builds: u64,
@@ -85,14 +85,14 @@ struct CountingSystem;
 #[global_allocator]
 static ALLOCATOR: CountingSystem = CountingSystem;
 
-// SAFETY: все вызовы и layouts без изменений передаются System; учёт не выделяет память.
+// SAFETY: all calls and layouts are passed to System unchanged; accounting does not allocate.
 unsafe impl GlobalAlloc for CountingSystem {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         operation(|c| {
             c.alloc = c.alloc.saturating_add(1);
             c.requested_bytes = c.requested_bytes.saturating_add(layout.size() as u64);
         });
-        // SAFETY: layout удовлетворяет контракту GlobalAlloc::alloc.
+        // SAFETY: layout satisfies the GlobalAlloc::alloc contract.
         unsafe { System.alloc(layout) }
     }
 
@@ -101,13 +101,13 @@ unsafe impl GlobalAlloc for CountingSystem {
             c.alloc_zeroed = c.alloc_zeroed.saturating_add(1);
             c.requested_bytes = c.requested_bytes.saturating_add(layout.size() as u64);
         });
-        // SAFETY: layout удовлетворяет контракту GlobalAlloc::alloc_zeroed.
+        // SAFETY: layout satisfies the GlobalAlloc::alloc_zeroed contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         operation(|c| c.dealloc = c.dealloc.saturating_add(1));
-        // SAFETY: ptr и layout исходного блока переданы вызывающей стороной.
+        // SAFETY: ptr and layout of the original block are passed by the caller.
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -116,7 +116,7 @@ unsafe impl GlobalAlloc for CountingSystem {
             c.realloc = c.realloc.saturating_add(1);
             c.requested_bytes = c.requested_bytes.saturating_add(new_size as u64);
         });
-        // SAFETY: исходный блок и new_size удовлетворяют GlobalAlloc::realloc.
+        // SAFETY: original block and new_size satisfy GlobalAlloc::realloc.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -129,7 +129,7 @@ impl Drop for Scope {
     }
 }
 
-/// Только синхронная работа: нельзя переносить scope через await или в другой поток.
+/// Synchronous work only: the scope must not cross await or move to another thread.
 pub(crate) fn measure<T>(work: impl FnOnce() -> T) -> (T, Counts) {
     ACTIVE.with(|active| assert!(!active.get(), "nested perf scope"));
     COUNTS.with(|cell| cell.set(Counts::default()));
@@ -186,7 +186,7 @@ fn perf208_scopes_are_thread_local() {
             barrier.wait();
         });
         worker.join().unwrap();
-        // Barrier может инициализировать платформенное ожидание; проверяем свой маркер.
+        // Barrier may initialize a platform wait; we check our own marker.
         assert_eq!(counts.chain_builds, 0);
     });
 }

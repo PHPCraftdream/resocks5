@@ -1,6 +1,6 @@
-//! Оракулы ленивого ChainPlan: последовательности ленивого обхода сверяются
-//! с эталоном из полных `pick_order()` ротаторов-близнецов на фиксированных
-//! seed (порядок `next_proxy` доказанно совпадает с `pick_order`).
+//! Lazy ChainPlan oracles: lazy traversal sequences are verified
+//! against a reference built from full `pick_order()` of twin rotators
+//! on fixed seeds (the `next_proxy` order provably matches `pick_order`).
 
 use super::{singleton_key, ChainPick, ChainPlan, GateLevels};
 use crate::rating::{QuarantinePolicy, RatingPolicy};
@@ -12,7 +12,7 @@ use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(3600);
 
-/// Ротатор-близнец с фиксированным seed рейтингового RNG.
+/// Twin rotator with a fixed rating RNG seed.
 fn seeded(names: &[&str], port: u16, seed: u64) -> Arc<ProxyRotator> {
     Arc::new(
         ProxyRotator::with_rng_seed(
@@ -34,7 +34,7 @@ fn proxy(host: &str) -> ProxyConfig {
     ProxyConfig::socks5(host, 1080)
 }
 
-/// Хосты полного pick_order — эталонный порядок слоя.
+/// Hosts of the full pick_order — the reference layer order.
 fn order_hosts(rotator: &ProxyRotator) -> Vec<String> {
     rotator
         .pick_order()
@@ -43,8 +43,8 @@ fn order_hosts(rotator: &ProxyRotator) -> Vec<String> {
         .collect()
 }
 
-/// Слияние порядков нескольких ротаторов слоя с first-owner дедупликацией
-/// по singleton-идентичности (прежняя логика построения слоя).
+/// Merge orders of several layer rotators with first-owner deduplication
+/// by singleton identity (the previous layer build logic).
 fn dedup_hosts(parts: &[&[String]]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -58,7 +58,7 @@ fn dedup_hosts(parts: &[&[String]]) -> Vec<String> {
     out
 }
 
-/// Декартово произведение слоёв в порядке одометра (последний слой — самый быстрый).
+/// Cartesian product of layers in odometer order (last layer is fastest).
 fn cartesian(layers: &[Vec<String>]) -> Vec<Vec<String>> {
     layers.iter().fold(vec![Vec::new()], |acc, layer| {
         let mut next = Vec::new();
@@ -73,7 +73,7 @@ fn cartesian(layers: &[Vec<String>]) -> Vec<Vec<String>> {
     })
 }
 
-/// Комбо-хосты каждого pick (позиция слоя → host).
+/// Combo hosts of each pick (layer position → host).
 fn pick_combos(picks: &[ChainPick]) -> Vec<Vec<String>> {
     picks
         .iter()
@@ -120,7 +120,7 @@ fn lazy_plan_traverses_eager_reference_sequence_exactly() {
     let picks: Vec<_> = plan.collect();
     assert_eq!(picks.len(), expected.len());
     assert_eq!(pick_combos(&picks), expected);
-    // Владельцы hops — исходные ротаторы плана.
+    // Hop owners are the plan's original rotators.
     assert!(picks.iter().all(|pick| {
         Arc::ptr_eq(&pick.hops()[0].rotator, &gate0)
             && Arc::ptr_eq(&pick.hops()[1].rotator, &gate1)
@@ -166,7 +166,7 @@ fn lazy_plan_snapshot_stays_frozen_when_quarantine_changes_after_construction() 
     let gates = GateLevels::new(vec![(1, gate.clone())]);
     let mut plan = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     let first = plan.next().unwrap();
-    // Карантин ПОСЛЕ построения плана: снапшот ленивого курсора заморожен.
+    // Quarantine AFTER plan construction: the lazy cursor snapshot is frozen.
     gate.quarantine_now(&victim);
     assert_eq!(first.hops()[0].proxy.host, snapshot[0]);
     let rest: Vec<_> = plan.collect();
@@ -174,8 +174,8 @@ fn lazy_plan_snapshot_stays_frozen_when_quarantine_changes_after_construction() 
         .iter()
         .any(|pick| pick.hops()[0].proxy.host == snapshot[1]));
 
-    // Новый план (свежий ротатор-близнец с тем же seed и карантином) уже не
-    // содержит отправленного в карантин и совпадает с reference pick_order.
+    // A new plan (fresh twin rotator with the same seed and quarantine) no
+    // longer contains the quarantined host and matches the reference pick_order.
     let twin2 = seeded(&hosts, 1080, 301);
     twin2.quarantine_now(&victim);
     let reference = order_hosts(&twin2);
@@ -218,7 +218,7 @@ fn lazy_plan_mark_dead_before_and_during_traversal_matches_reference() {
             .collect()
     };
 
-    // (а) mark_dead до обхода: один узел в каждом слое.
+    // (a) mark_dead BEFORE traversal: one node per layer.
     let dead: Vec<&str> = vec![&g0[0], &g1[1], &e[0]];
     let expected = reference(&dead);
     let (r0, r1, r2) = mk(401);
@@ -230,7 +230,7 @@ fn lazy_plan_mark_dead_before_and_during_traversal_matches_reference() {
     let picks: Vec<_> = before.collect();
     assert_eq!(pick_combos(&picks), expected);
 
-    // (б) первый pick, mark_dead его exit, продолжение обхода.
+    // (b) first pick, mark_dead its exit, continue traversal.
     let (r0, r1, r2) = mk(401);
     let gates = GateLevels::new(vec![(2, r0), (1, r1)]);
     let mut during = ChainPlan::new(&gates, &[r2]);
@@ -284,7 +284,7 @@ fn lazy_plan_gate_link_duplicates_share_singleton_identity() {
     );
     assert_eq!(singleton_key(&wrapped), singleton_key(&proxy("exit")));
 
-    // Полный обход без mark_dead совпадает с эталоном.
+    // Full traversal without mark_dead matches the reference.
     let plan = ChainPlan::new(&GateLevels::default(), std::slice::from_ref(&rotator));
     let picks: Vec<_> = plan.collect();
     assert_eq!(
@@ -295,7 +295,7 @@ fn lazy_plan_gate_link_duplicates_share_singleton_identity() {
         dedup_hosts(&[&order_hosts(&twin)])
     );
 
-    // mark_dead по wrapped-конфигурации убирает идентичность из ленивого плана.
+    // mark_dead on the wrapped config removes that identity from the lazy plan.
     let mut plan = ChainPlan::new(&GateLevels::default(), std::slice::from_ref(&rotator));
     plan.mark_dead(&wrapped);
     let rest: Vec<_> = plan.collect();
@@ -303,21 +303,21 @@ fn lazy_plan_gate_link_duplicates_share_singleton_identity() {
     assert_eq!(rest[0].exit().proxy.host, "other");
 }
 
-/// Оракул singleton fast-path: план из слоёв по одному узлу (1×1×1) при
-/// identical семантике не материализует и не сортирует ничего при
-/// construction и повторном next() на исчерпанном плане.
+/// Singleton fast-path oracle: a plan of one-node layers (1×1×1) with
+/// identical semantics materializes and sorts nothing at construction
+/// and on repeated next() over an exhausted plan.
 #[test]
 fn singleton_plan_semantics_and_no_extra_materialization() {
-    let gate0 = seeded(&["g0"], 1080, 701); // ранг 2, 1 узел
-    let gate1 = seeded(&["g1"], 1080, 702); // ранг 1, 1 узел
-    let exit = seeded(&["e0"], 1080, 703); // ранг 0 (обычный socks5), 1 узел
+    let gate0 = seeded(&["g0"], 1080, 701); // rank 2, 1 node
+    let gate1 = seeded(&["g1"], 1080, 702); // rank 1, 1 node
+    let exit = seeded(&["e0"], 1080, 703); // rank 0 (plain socks5), 1 node
     let twin0 = seeded(&["g0"], 1080, 701);
     let twin1 = seeded(&["g1"], 1080, 702);
     let twin_x = seeded(&["e0"], 1080, 703);
 
-    // (a) Полный обход singleton-плана == декартово произведение эталонных
-    // порядков twin'ов (1×1×1 = единственный pick); hop-ранги по позициям
-    // [2, 1, 0] подтверждены владельцами-ротаторами (ptr_eq исходным).
+    // (a) Full traversal of the singleton plan == Cartesian product of the
+    // twin reference orders (1×1×1 = the single pick); hop ranks by positions
+    // [2, 1, 0] confirmed by owner rotators (ptr_eq to the originals).
     let expected = cartesian(&[
         order_hosts(&twin0),
         order_hosts(&twin1),
@@ -345,24 +345,24 @@ fn singleton_plan_semantics_and_no_extra_materialization() {
     assert!(Arc::ptr_eq(&pick.hops()[1].rotator, &gate1));
     assert!(Arc::ptr_eq(&pick.exit().rotator, &exit));
 
-    // (b) Пустой план остаётся пустым: без exits и singleton-план с `&[]` exits.
+    // (b) Empty plan stays empty: no exits, and a singleton plan with `&[]` exits.
     assert_eq!(ChainPlan::new(&GateLevels::default(), &[]).count(), 0);
     assert_eq!(ChainPlan::new(&gates, &[]).count(), 0);
 
-    // (c) mark_dead ДО первого next(): единственный exit-узел мёртв → None.
+    // (c) mark_dead BEFORE the first next(): the only exit node is dead → None.
     let gates = GateLevels::new(vec![(2, gate0.clone()), (1, gate1.clone())]);
     let mut before = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     before.mark_dead(&proxy("e0"));
     assert!(before.next().is_none());
 
-    // mark_dead ПОСЛЕ первого next(): единственный pick выдан, узел мёртв.
+    // mark_dead AFTER the first next(): the only pick was emitted, node is dead.
     let gates = GateLevels::new(vec![(2, gate0.clone()), (1, gate1.clone())]);
     let mut after = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     assert!(after.next().is_some());
     after.mark_dead(&proxy("e0"));
     assert!(after.next().is_none());
 
-    // (г) Повторное next() после исчерпания: дважды None подряд.
+    // (d) Repeated next() after exhaustion: None twice in a row.
     let mut exhausted = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     assert!(exhausted.next().is_some());
     assert!(exhausted.next().is_none());
@@ -383,7 +383,7 @@ fn singleton_plan_semantics_and_no_extra_materialization() {
         assert_eq!(drained.sort_comparisons, 0);
     }
 
-    // (д) exclude единственного ключа pick'а → следующий next() None.
+    // (e) exclude the single key of the pick → next next() is None.
     let gates = GateLevels::new(vec![(2, gate0.clone()), (1, gate1.clone())]);
     let mut excluded = ChainPlan::new(&gates, std::slice::from_ref(&exit));
     let first = excluded.next().expect("один pick");

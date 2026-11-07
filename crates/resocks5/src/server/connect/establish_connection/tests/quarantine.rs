@@ -925,9 +925,9 @@ async fn a_quarantined_owning_exit_copy_serves_through_the_plan() {
         .expect("the healthy v6 copy must serve the target");
     assert_eq!(fx.gate_accepts.load(Ordering::SeqCst), 1);
     assert_eq!(fx.exit_accepts.load(Ordering::SeqCst), 0);
-    // Позитивный контроль для trace построений плана: кэш скрыт,
-    // поэтому запрос обслуживается свежепостроенным планом с одним
-    // gate-уровнем (gate-ротатор) и обоими exit-ротаторами (v6 + v4).
+    // Positive control for the plan build trace: the cache is bypassed,
+    // so the request is served by a freshly built plan with one
+    // gate level (one gate rotator) and both exit rotators (v6 + v4).
     assert_eq!(
         plan_trace,
         vec![(1, 2)],

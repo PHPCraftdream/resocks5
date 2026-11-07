@@ -16,23 +16,23 @@ use resocks5_net::pool::{AnyUpstream, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ChainKey, ProxyConfig};
 
-/// Наблюдатель построений gate-плана для dial-маршрута.
-/// Production использует `NoopPlanBuildRecorder` (ZST без состояния):
-/// пустое тело `record` не может аллоцировать — отсутствие стоимости
-/// гарантировано конструкцией, а не оптимизатором.
+/// Gate-plan build observer for the dial route.
+/// Production uses `NoopPlanBuildRecorder` (a stateless ZST):
+/// the empty `record` body cannot allocate — zero cost is
+/// guaranteed by construction, not by the optimizer.
 pub(super) trait PlanBuildRecorder {
-    /// Зафиксировать построение плана: (число gate-уровней, число exit-ротаторов); пустой план — (0, 0).
+    /// Record a plan build: (number of gate levels, number of exit rotators); empty plan — (0, 0).
     fn record(&mut self, gate_levels: usize, exit_rotators: usize);
 }
 
-/// Production-наблюдатель: zero-sized type без состояния и аллокаций.
+/// Production observer: zero-sized type with no state or allocations.
 pub(super) struct NoopPlanBuildRecorder;
 
 impl PlanBuildRecorder for NoopPlanBuildRecorder {
     fn record(&mut self, _gate_levels: usize, _exit_rotators: usize) {}
 }
 
-/// Тестовый наблюдатель: журнал `(gate_levels, exit_rotators)` каждого построения плана; пустой план — `(0, 0)`.
+/// Test observer: trace of `(gate_levels, exit_rotators)` for each plan build; empty plan — `(0, 0)`.
 pub(super) type PlanBuildTrace = Vec<(usize, usize)>;
 
 impl PlanBuildRecorder for PlanBuildTrace {

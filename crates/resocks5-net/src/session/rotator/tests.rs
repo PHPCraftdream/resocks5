@@ -71,11 +71,11 @@ fn rating_index_checks_identity_on_hash_collision() {
     assert_eq!(rotator.index_of(&first), None);
 }
 
-/// Принудительные коллизии для индексного resolve: совпадение hash не
-/// доказывает identity — путь сканирует bucket до первого совпадения полей
-/// и возвращает свой слот. Позиции target в bucket: начало, середина,
-/// конец; плюс miss при непустом bucket. Mutation: доверять hash — вернётся
-/// чужой слот; скан без раннего выхода — счётчик превысит позицию.
+/// Forced collisions for the index resolve: a hash match does not
+/// prove identity — the path scans the bucket to the first field match
+/// and returns its own slot. Target positions in the bucket: start, middle,
+/// end; plus a miss on a non-empty bucket. Mutation: trusting the hash — a
+/// foreign slot is returned; a scan without early exit — the counter exceeds the position.
 #[test]
 fn perf208_resolve_identity_scans_forced_collision_bucket() {
     let target = make_proxy("target", 1000);
@@ -85,7 +85,7 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
     rotator.by_identity.insert(hash, vec![1, 0]);
     let resolved = rotator.resolve_identity(&target).unwrap();
     assert!(Arc::ptr_eq(resolved, &rotator.proxies[0]));
-    // Bucket из чужих слотов: ни одно сравнение identity не подтверждает.
+    // Bucket of foreign slots: no identity comparison confirms.
     rotator.by_identity.insert(hash, vec![1]);
     assert!(rotator.resolve_identity(&target).is_none());
     #[cfg(all(test, feature = "test-instrumentation"))]
@@ -96,8 +96,8 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
         crate::perf::report("resolve/collision/bucket=2", counts);
     }
 
-    // Матрица позиций на bucket из трёх слотов: результат — свой слот,
-    // счётчик равен позиции совпадения (1/2/3) или длине bucket для miss.
+    // Position matrix on a three-slot bucket: the result is the own slot,
+    // the counter equals the match position (1/2/3) or the bucket length for a miss.
     let extra = make_proxy("extra", 1002);
     let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone(), extra.clone()]);
     let hash = upstream_hash(&rotator.identity_hasher, &target);
@@ -120,7 +120,7 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
     assert!(rotator.resolve_identity(&target).is_none());
     #[cfg(all(test, feature = "test-instrumentation"))]
     {
-        // Счётчик: 1 (начало), 2 (середина), 3 (конец), 2 (miss = длина bucket [1,2]).
+        // Counter: 1 (start), 2 (middle), 3 (end), 2 (miss = bucket length [1,2]).
         for (bucket, expected) in [
             (vec![0usize, 1, 2], 1u64),
             (vec![1, 0, 2], 2),
@@ -547,8 +547,8 @@ fn gate_composite_maps_to_original_rating_slot() {
     );
 }
 
-/// Ленивые кандидаты обязаны совпадать с полным pick_order: префиксы 1 и 3
-/// на свежих снапшотах того же seed и полный дренаж.
+/// Lazy candidates must match the full pick_order: prefixes 1 and 3
+/// on fresh snapshots of the same seed, and a full drain.
 #[test]
 fn lazy_candidates_match_pick_order_exactly() {
     fn fresh() -> std::sync::Arc<ProxyRotator> {
@@ -568,17 +568,17 @@ fn lazy_candidates_match_pick_order_exactly() {
     }
     let addr = |p: &Arc<ProxyConfig>| (p.host.clone(), p.port);
     let expected: Vec<_> = fresh().pick_order().iter().map(&addr).collect();
-    // Префикс 1.
+    // Prefix 1.
     let mut c1 = fresh().pick_order_lazy();
     assert_eq!(c1.next_proxy().map(|p| addr(&p)).as_ref(), expected.first());
-    // Префикс 3 на свежем снапшоте.
+    // Prefix 3 on a fresh snapshot.
     let mut c3 = fresh().pick_order_lazy();
     let got3: Vec<_> = (0..3)
         .filter_map(|_| c3.next_proxy())
         .map(|p| addr(&p))
         .collect();
     assert_eq!(got3, expected[..3], "prefix 3");
-    // Полный дренаж на свежем снапшоте.
+    // Full drain on a fresh snapshot.
     let full: Vec<_> = fresh()
         .pick_order_lazy()
         .into_proxies()
@@ -586,7 +586,7 @@ fn lazy_candidates_match_pick_order_exactly() {
         .map(addr)
         .collect();
     assert_eq!(full, expected, "full");
-    // Длина eligible = длине полного порядка.
+    // Eligible length = full order length.
     let c = fresh().pick_order_lazy();
     assert_eq!(c.eligible().len(), expected.len());
 }
