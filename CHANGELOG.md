@@ -7,46 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- `resocks5-net`: HTTP 407 now advertises `Proxy-Authenticate: Resocks5-Secure`,
-  never Basic, to avoid inviting a clear-text password transmission. Status 407
-  and its challenge remain. This does not implement secure authentication over
-  HTTP. Preemptive Basic from a preconfigured client cannot be prevented;
-  browser prompt behavior for the unknown scheme has not been tested.
-
-### Changed
-
-- `resocks5-net`: `ConnectError::suggested_reply()` answers a TCP-connect,
-  SOCKS5-greeting or HTTPS-TLS-handshake timeout with `UpstreamUnavailable`
-  (the upstream hop itself failed) instead of `TimedOut`. Timeouts of the
-  CONNECT exchange and the total budget stay `TimedOut`, as do I/O timeouts.
-- `resocks5-net`: fewer copies on the dial path, behavior unchanged.
-  `ChainKey::singleton(&Arc<ProxyConfig>)` keys one node without copying it
-  (a gate-less node is shared); `ChainPick::config_arc()` returns the pick's
-  linked configuration as a shared `Arc` (`config()` still returns an owned
-  copy); `ProxyRotator::link_proxy` takes `impl AsRef<str>` (source compatible:
-  `String`, `&String` and `&str` all work) and only allocates a key for a new
-  address; hedged attempts share one `Arc<str>` target. The application uses
-  these on its dial path and no longer clones the client and target for the
-  direct-cap log line.
-- `resocks5-net`: the direct dial path consumes upstream candidates lazily and
-  `ChainPlan` pick keys no longer round-trip through an owned `ProxyConfig`;
-  behavior unchanged. With one candidate of 256 consumed, the sort does 255
-  comparisons instead of 2138; a one-node pick key allocates nothing. The
-  allocation and comparison counters are pinned by PERF208 rows (Linux,
-  rustc 1.88 baseline in `docs/PERF208.md`). The URI parser's percent-decoding
-  borrows when there is nothing to decode.
-- Code comments are now English throughout (comments only; the clap `--help`
-  text and user documentation keep their language).
-- `resocks5`: an HTTP request accepted by the application never carries an
-  identity (any `Proxy-Authorization` is a 407 before any account lookup), so
-  the HTTP handler lost its direct-user branch and its direct limiter; direct
-  accounts are served over SOCKS5 only.
-- `docs/PERF208.md` is rewritten as a status table per candidate with commits,
-  evidence and counters; the CoW table is generated from
-  `docs/perf208/baseline/cow.json` by `tests/perf208/render.py` and checked by
-  the perf workflow against the fresh counters (PERF208 rows: 199 SDK, 24 app).
+## [0.5.0] - 2026-11-07
 
 ### Added
 
@@ -59,8 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order lazily (`PickOrder`, a fused iterator); `pick_order` stays the full
   reference order. `ProxyConfig::chain_arc` builds a chain as a shared `Arc`
   (a gate-less first node is reused, not copied). `README.md` of the crate now
-  documents secure auth, GSSAPI, method negotiation and the smaller APIs added
-  on `main` (none of them are in a published release yet).
+  documents secure auth, GSSAPI, method negotiation and the smaller APIs.
 - `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by
   default), SOCKS5 private method 0x80: the password never crosses the wire. The
   server stores a per-user Argon2id salt, parameters and the derived key `K`
@@ -128,9 +88,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
   and clears `user`/`password` at this node and every solely owned gate, and
   reports a shared gate it left untouched. Opt-in: `ProxyConfig` has no `Drop`.
+- `resocks5-net`: `ProxyConfig::validate()`, `validate_node()` and
+  `try_with_auth()` with the typed `ProxyConfigError`, `ChainConfigError` and
+  `CredentialField`: host, port, gate flag, credential pairing, SOCKS5 1..=255 byte
+  fields (RFC 1929) and HTTP Basic rules (no `:` in the username, no control
+  characters, RFC 7617). No I/O, no values in error texts; the dial functions are
+  unchanged.
+- `resocks5-net`: `server::Reply::{ConnectionRefused, NetworkUnreachable, TimedOut}`
+  (SOCKS5 REP 5 / 3 / 6, HTTP 502 / 502 / 504).
+- `resocks5-net`: `server::Prefixed<S>` and `IncomingRequest::into_prefixed(stream)`
+  serve the over-read request bytes before the stream.
+- `resocks5-net`: `IncomingRequest::take_username`.
+- `resocks5-net`: `ServerOptions::strict_http`: opt-in RFC 9112 validation of the
+  CONNECT request (bracketed IPv6, numeric port, HTTP/1.0 and 1.1 only with 505
+  otherwise, a single `Host`, token header names, no obs-fold, one
+  `Proxy-Authorization`); the default stays permissive.
+- `resocks5-net`: `ProxyRotator::probe_due_with` and `probe_all_with` take a
+  per-probe reservation hook (`Fn(&ProxyConfig) -> Option<guard>`): `None` defers
+  the probe (no connection, no health change, no event), `Some(guard)` holds the
+  guard for the probe. `probe_due` / `probe_all` are unchanged.
+- `resocks5-net`: `chain::GateLevels::try_new` (duplicate ranks are an error in
+  release builds too, `GateLevelsError`), `types::MAX_CHAIN_NODES` (64) with
+  `ProxyConfigError::ChainTooLong`, `error::TimeoutKind::Socks5Greeting`, and
+  `ProxyRotator::{take_probe_claims, record_success_for, record_hard_failure_for,
+  quarantine_now_unless_tripped}` with `UpstreamProbeClaim`.
+- `resocks5-net`: feature `test-instrumentation` adds `progress::ProgressScopeProbe`,
+  an instance-scoped observer of confirmed write progress.
+- CI: a `feature-unification` job builds the `tests/feature_unification` fixture,
+  `release-behavior` runs a few release-mode suites on full runs, every job has a
+  `timeout-minutes`, and `changed-areas.sh --self-test` pins the classifier.
 
 ### Changed
 
+- `resocks5-net`: `ConnectError::suggested_reply()` answers a TCP-connect,
+  SOCKS5-greeting or HTTPS-TLS-handshake timeout with `UpstreamUnavailable`
+  (the upstream hop itself failed) instead of `TimedOut`. Timeouts of the
+  CONNECT exchange and the total budget stay `TimedOut`, as do I/O timeouts.
+- `resocks5-net`: fewer copies on the dial path, behavior unchanged.
+  `ChainKey::singleton(&Arc<ProxyConfig>)` keys one node without copying it
+  (a gate-less node is shared); `ChainPick::config_arc()` returns the pick's
+  linked configuration as a shared `Arc` (`config()` still returns an owned
+  copy); `ProxyRotator::link_proxy` takes `impl AsRef<str>` (source compatible:
+  `String`, `&String` and `&str` all work) and only allocates a key for a new
+  address; hedged attempts share one `Arc<str>` target. The application uses
+  these on its dial path and no longer clones the client and target for the
+  direct-cap log line.
+- `resocks5-net`: the direct dial path consumes upstream candidates lazily and
+  `ChainPlan` pick keys no longer round-trip through an owned `ProxyConfig`;
+  behavior unchanged. With one candidate of 256 consumed, the sort does 255
+  comparisons instead of 2138; a one-node pick key allocates nothing. The
+  allocation and comparison counters are pinned by PERF208 rows (Linux,
+  rustc 1.88 baseline in `docs/PERF208.md`). The URI parser's percent-decoding
+  borrows when there is nothing to decode.
+- Code comments are now English throughout (comments only; the clap `--help`
+  text and user documentation keep their language).
+- `resocks5`: an HTTP request accepted by the application never carries an
+  identity (any `Proxy-Authorization` is a 407 before any account lookup), so
+  the HTTP handler lost its direct-user branch and its direct limiter; direct
+  accounts are served over SOCKS5 only.
+- `docs/PERF208.md` is rewritten as a status table per candidate with commits,
+  evidence and counters; the CoW table is generated from
+  `docs/perf208/baseline/cow.json` by `tests/perf208/render.py` and checked by
+  the perf workflow against the fresh counters (PERF208 rows: 199 SDK, 24 app).
 - `resocks5-net` (**breaking**): clear-text credentials are gone, not just off:
   the crate never sends or accepts a password in clear text and no feature
   turns that on (see Removed). A dial that would send one (SOCKS5 without secure
@@ -151,7 +170,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (only the sealed key travels); concurrent first logins have exactly one winner,
   the others are denied. A user filtered by `allowed_clients` is answered like a
   wrong password and cannot claim an init account.
-
 - `resocks5` (**breaking**): upstream credentials stay in
   `resocks5.proxy_list.ktav` as written but are never sent in clear text. A SOCKS5
   upstream with `user:pass` authenticates with secure auth (method 0x80), so it
@@ -159,7 +177,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a username/password-only SOCKS5 server is refused without receiving the
   password. HTTPS upstreams send Basic inside TLS as before; a plain HTTP upstream
   with credentials is reported at startup and its dials are refused.
-
 - `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
   the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
   system Kerberos backend; not in the release binaries). `auth.gssapi_service`
@@ -176,74 +193,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC, which also
   checks interoperability with a third-party client (`curl --socks5-gssapi`) against the
   `gssapi_interop_server` example.
-
-### Removed
-
-- `resocks5`: the server-side password verify path and its in-memory password
-  cache: the server neither receives nor holds passwords and never runs Argon2
-  for a login.
-- `resocks5-net` (**breaking**): clear-text passwords are removed from the
-  protocol code, not just disabled. Gone: the features `cleartext-client` and
-  `cleartext-server`; SOCKS5 method 0x02 (RFC 1929) on both sides; HTTP Basic
-  acceptance and the Basic header sent to a plain-HTTP proxy (HTTP Basic inside
-  TLS to an HTTPS proxy stays); the `server::accept` authentication callback,
-  `server::Credentials`, `ServerOptions::retain_credentials` / `raw_credentials`,
-  `IncomingRequest::take_credentials` / `username_bytes`, `AuthMethod::ClearText`;
-  the `auth` argument of `socks5_handshake`, `socks5_handshake_until` and
-  `handshake_over_stream`; `ConnectError::AuthFailed` and the
-  `ProtocolViolation::{Socks5BadAuthVersion, Socks5CredentialsTooLong}` variants;
-  `MockAuth::Cleartext`; the `serve_local` example. `server::accept(stream,
-  options)` now serves anonymous clients only; users authenticate through
-  `accept_secure` / `accept_with`. `ServerOptions::new`'s last argument now means
-  "users exist" (they need a strong method). `MethodUnsupported` now refers to
-  the strong methods when `with_auth` is true.
-
-## [0.5.0] - 2026-11-05
-
-### Added
-
-- `resocks5-net`: `ProxyConfig::validate()`, `validate_node()` and
-  `try_with_auth()` with the typed `ProxyConfigError`, `ChainConfigError` and
-  `CredentialField`: host, port, gate flag, credential pairing, SOCKS5 1..=255 byte
-  fields (RFC 1929) and HTTP Basic rules (no `:` in the username, no control
-  characters, RFC 7617). No I/O, no values in error texts; the dial functions are
-  unchanged.
-- `resocks5-net`: `server::Reply::{ConnectionRefused, NetworkUnreachable, TimedOut}`
-  (SOCKS5 REP 5 / 3 / 6, HTTP 502 / 502 / 504).
-- `resocks5-net`: `server::Prefixed<S>` and `IncomingRequest::into_prefixed(stream)`
-  serve the over-read request bytes before the stream.
-- `resocks5-net`: `ServerOptions::retain_credentials`,
-  `IncomingRequest::take_credentials` / `take_username` and
-  `Credentials::into_parts`.
-- `resocks5-net`: `ServerOptions::raw_credentials` with
-  `Credentials::{username_bytes, password_bytes, is_utf8}` and
-  `IncomingRequest::username_bytes`: SOCKS5 UNAME/PASSWD that are not valid UTF-8
-  (a character split across the two fields at 255 bytes) are accepted as bytes.
-- `resocks5-net`: `ServerOptions::strict_http`: opt-in RFC 9112 validation of the
-  CONNECT request (bracketed IPv6, numeric port, HTTP/1.0 and 1.1 only with 505
-  otherwise, a single `Host`, token header names, no obs-fold, one
-  `Proxy-Authorization`); the default stays permissive.
-- `resocks5-net`: optional feature `zeroize` wipes inbound credentials on drop.
-- `resocks5-net`: `ProxyRotator::probe_due_with` and `probe_all_with` take a
-  per-probe reservation hook (`Fn(&ProxyConfig) -> Option<guard>`): `None` defers
-  the probe (no connection, no health change, no event), `Some(guard)` holds the
-  guard for the probe. `probe_due` / `probe_all` are unchanged.
-- `resocks5-net`: `chain::GateLevels::try_new` (duplicate ranks are an error in
-  release builds too, `GateLevelsError`), `types::MAX_CHAIN_NODES` (64) with
-  `ProxyConfigError::ChainTooLong`, `error::TimeoutKind::Socks5Greeting`, and
-  `ProxyRotator::{take_probe_claims, record_success_for, record_hard_failure_for,
-  quarantine_now_unless_tripped}` with `UpstreamProbeClaim`.
-- `resocks5-net`: feature `test-instrumentation` adds `progress::ProgressScopeProbe`,
-  an instance-scoped observer of confirmed write progress.
-- CI: a `feature-unification` job builds the `tests/feature_unification` fixture,
-  `release-behavior` runs a few release-mode suites on full runs, every job has a
-  `timeout-minutes`, and `changed-areas.sh --self-test` pins the classifier.
-
-### Changed
-
 - `resocks5-net`: `ServerError::Authentication` texts no longer contain the
   submitted username, and `Debug` of `IncomingRequest` no longer prints the
-  username or the pipeline bytes (`has_username`, `has_credentials` and
+  username or the pipeline bytes (`has_username` and
   `pipeline_len` instead).
 - `resocks5-net`: `ProxyRotator` (and every constructor) now deduplicates identical
   upstreams (same endpoint, protocol, account and gate level) at construction,
@@ -285,11 +237,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (generation token): a result for a slot that was reset, re-tripped or leased
   again meanwhile is dropped; only destination-unreachable replies (SOCKS5 REP
   3-6, HTTP 502-504) of the final CONNECT quarantine the tested gate.
-- `resocks5`: new Argon2id hashes use m=19456 KiB, t=2, p=1 (OWASP minimum); stored
-  hashes keep verifying with their own parameters. A stored hash that is not
-  Argon2id v19 is rejected (it used to verify with the algorithm named in the
-  string). `verify_async` runs the same single comparison (against a dummy)
-  for unknown and disabled names, so the first step costs the same for every name.
+- `resocks5`: new Argon2id hashes use m=19456 KiB, t=2, p=1 (OWASP minimum).
 - `resocks5`: cached chains honour the direct fallback reserve of
   `max_upstream_attempts` (a budget of 1 still serves the sticky cache first),
   and `network.*` time budgets above one day and limits above 2^30 are rejected
@@ -298,8 +246,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   valid, bracketed IPvFuture is accepted, no 1..65535 range); the app enables the
   `zeroize` feature of `resocks5-net`.
 
+### Removed
+
+- `resocks5`: the server-side password verify path and its in-memory password
+  cache: the server neither receives nor holds passwords and never runs Argon2
+  for a login.
+- `resocks5-net` (**breaking**): clear-text passwords are removed from the
+  protocol code. Gone: SOCKS5 method 0x02 (RFC 1929) on both sides; HTTP Basic
+  acceptance and the Basic header sent to a plain-HTTP proxy (HTTP Basic inside
+  TLS to an HTTPS proxy stays); the authentication callback of
+  `server::accept` and `server::Credentials`; the `auth` argument of
+  `socks5_handshake`, `socks5_handshake_until` and `handshake_over_stream`;
+  `ConnectError::AuthFailed` and the
+  `ProtocolViolation::{Socks5BadAuthVersion, Socks5CredentialsTooLong}`
+  variants; the `serve_local` example. `server::accept(stream, options)` now
+  serves anonymous clients only; users authenticate through `accept_secure` /
+  `accept_with`. `ServerOptions::new`'s last argument now means "users exist"
+  (they need a strong method). `MethodUnsupported` now refers to the strong
+  methods when `with_auth` is true.
+
 ### Fixed
 
+- `resocks5-net`: HTTP 407 now advertises `Proxy-Authenticate: Resocks5-Secure`,
+  never Basic, to avoid inviting a clear-text password transmission. Status 407
+  and its challenge remain. This does not implement secure authentication over
+  HTTP. Preemptive Basic from a preconfigured client cannot be prevented;
+  browser prompt behavior for the unknown scheme has not been tested.
 - `resocks5-net`: `ChainPlan` ends at once when every candidate of a layer is
   dead; it no longer walks the whole gate odometer (a product of the layer
   sizes, synchronously) after the only exit failed.
@@ -343,20 +315,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http_error` falls back to a 500 head for an unknown status instead of panicking.
 - `resocks5-net`: strict HTTP accepts an uppercase `V` in a bracketed IPvFuture
   `Host` (`[V1.example]`), as the RFC 3986 ABNF string is case-insensitive.
-- `resocks5`: the verify-cache keeps the presented password in process memory
-  (wiped on drop, never persisted) instead of an HMAC of it, so a repeated login is
-  one constant-time comparison and nothing is recomputed; unknown and disabled
-  names run the same single comparison against a dummy. Anyone who can read the
-  process memory (dump, debugger) can read the cached passwords of users who
-  logged in since the start.
 - `resocks5`: the health writer compares quarantine deadlines with a two-second
   tolerance (the whole-second truncation jitter) instead of one save interval, so a
   re-trip with unchanged counters is saved whenever its expiry really moved.
 - `resocks5-net`: a `Duration::MAX` handshake budget no longer panics the dial
   paths (SOCKS5 and TLS hops use a checked deadline); `same_upstream` documents
   that `gate_level` is part of an upstream's identity and the `gate` link is not.
-- `resocks5-net`: SOCKS5 server credentials are not cloned in raw mode and a rejected
-  buffer is wiped before it is freed (feature `zeroize`).
 - `resocks5-net`: a probe lease too large for the `Instant` range still excludes a
   second probe, and `probe_all_with` trips an upstream atomically.
 - `resocks5`: the health file lock now outlives a blocking write that the bounded
