@@ -95,3 +95,7 @@ mod perf_cases;
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "session/testing/perf_credentials.rs"]
 mod perf_credentials;
+
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf_cow.rs"]
+mod perf_cow;
