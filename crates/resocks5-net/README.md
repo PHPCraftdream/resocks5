@@ -130,45 +130,43 @@ closure, or by a `SecretStore` / `GssAcceptor` with the strong acceptors
   `pick_order_calls()` diagnostic counter. Dependents enable it from
   `[dev-dependencies]`; it is not default, so release builds compile it to
   nothing.
-- `zeroize` (off by default): wipes inbound credentials from memory when
-  `server::Credentials` and `server::IncomingRequest` are dropped (the
-  `zeroize` crate, already part of the TLS dependency tree). Outbound
-  `ProxyConfig` credentials are plain public `String` fields and are not wiped.
+- `zeroize` (off by default): wipes the retained user name of
+  `server::IncomingRequest` when it is dropped, and the secure-auth password when
+  the last copy of its credentials goes (the `zeroize` crate, already part of the
+  TLS dependency tree). Outbound `ProxyConfig` credentials are plain public
+  `String` fields and are not wiped.
   With the feature, `ProxyConfig::wipe_credentials()` also overwrites and
   clears `user`/`password` at this node and every gate it solely owns, drops
-  the secure-auth/GSSAPI credentials (the secure-auth password is wiped when
-  the last copy goes), and returns `false` when a shared gate was left
-  untouched — `ProxyConfig` has no `Drop`, so clones keep their values.
-- `cleartext-client` / `cleartext-server` (**off by default**): the only way this
-  crate sends or accepts a password in clear text. Without `cleartext-client`
-  a dial that would send SOCKS5 UNAME/PASSWD (RFC 1929) or HTTP Basic to a
-  plain-HTTP proxy fails with `ConnectError::CleartextCredentialsRefused`
-  before the first byte is written (HTTP Basic inside the TLS connection to an
-  HTTPS proxy is not clear text and is always allowed). Without
-  `cleartext-server` the inbound side never offers SOCKS5 method 0x02 and
-  answers HTTP Basic with 407, so the credential callback never sees a
-  clear-text password. The integration tests in `tests/no_cleartext.rs` pin
-  both on the default build.
+  the secure-auth/GSSAPI credentials, and returns `false` when a shared gate was
+  left untouched — `ProxyConfig` has no `Drop`, so clones keep their values.
 
-  Without `cleartext-server`, every HTTP 407 advertises
-  `Proxy-Authenticate: Resocks5-Secure`, never Basic. Enabling the feature
-  preserves `Basic realm="resocks5", charset="UTF-8"`. The `Resocks5-Secure`
-  marker does not implement secure authentication over HTTP; use SOCKS5 for
-  that. Status 407 and its required challenge are retained (RFC 9110 §15.5.8),
-  rather than replaced with 403. A preconfigured client, such as
-  `curl --proxy-user`, may send Basic before receiving a challenge; the server
-  cannot prevent that transmission, only reject it without invoking the
-  credential callback. Browser prompt behavior for the unknown scheme has
-  not been tested and is not guaranteed. The integration test checks both
-  feature configurations; SDK unit tests allow cleartext through `cfg(test)`
-  and do not establish the feature-off policy.
+## No clear-text passwords
+
+This crate never sends or accepts a password in clear text, and no feature
+turns that on. The inbound side never offers or accepts SOCKS5 method 0x02
+(RFC 1929) and answers any HTTP `Proxy-Authorization` (Basic included) with 407.
+The dial side refuses, with `ConnectError::CleartextCredentialsRefused` and
+before the first byte is written, an entry that would have to send a user name
+and password in clear text: SOCKS5 without secure auth or GSSAPI, or HTTP Basic
+to a plain-HTTP proxy. HTTP Basic inside the TLS connection to an HTTPS proxy is
+not clear text and is allowed. The integration tests in `tests/no_cleartext.rs`
+pin both.
+
+Every HTTP 407 advertises `Proxy-Authenticate: Resocks5-Secure`, never Basic.
+The marker does not implement secure authentication over HTTP; use SOCKS5 for
+that. Status 407 and its required challenge are retained (RFC 9110 §15.5.8),
+rather than replaced with 403. A preconfigured client, such as
+`curl --proxy-user`, may send Basic before receiving a challenge; the server
+cannot prevent that transmission, only reject it. Browser prompt behavior for
+the unknown scheme has not been tested and is not guaranteed.
 
 ## Inbound server API
 
 `server` is unconditional, including `default-features = false`; it requires no
 pool, TLS, serde, rating, or rotator feature. `accept` borrows any
-`AsyncRead + AsyncWrite + Unpin` stream and invokes an owned-credentials
-`FnOnce(Credentials) -> Future<Output = bool>` at most once. No public auth trait.
+`AsyncRead + AsyncWrite + Unpin` stream and serves anonymous clients only;
+users authenticate with a strong method through `accept_secure` / `accept_with`
+(feature `secure-auth`, below).
 
 ```text
 use std::time::Duration;
@@ -177,11 +175,8 @@ use tokio::{io::AsyncWriteExt, net::TcpStream, time::{timeout, Instant}};
 
 async fn serve(mut client: TcpStream) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5); // anchor at accept in the host
-    let options = ServerOptions::new(deadline, false, true);
-    let mut req = accept(&mut client, &options, |credentials| async move {
-        // Demo only: substitute the host's bounded credential verifier.
-        credentials.username() == "demo" && credentials.password() == "demo"
-    }).await?;
+    let options = ServerOptions::new(deadline, true, false); // anonymous clients, no users
+    let mut req = accept(&mut client, &options).await?;
     // Apply destination policy before dialing: this sample permits one local target.
     if req.target() != "127.0.0.1:20084" {
         req.reply(&mut client, Reply::Forbidden).await?;
@@ -200,11 +195,8 @@ async fn serve(mut client: TcpStream) -> anyhow::Result<()> {
 }
 ```
 
-The host must additionally bound response writes/admission; the finite
-[`serve_local` example](examples/serve_local.rs) bounds the whole client operation,
-requires explicit loopback listener/echo-target arguments, and serves exactly two
-clients on one port. The echo service is separate: the example performs a real TCP
-dial, never manufactures egress or substitutes an echo stream.
+The host must additionally bound response writes/admission, and perform a real
+TCP dial: the parser never manufactures egress.
 
 Contracts:
 - One supplied absolute Tokio deadline covers detection, framing, authentication,
@@ -212,16 +204,18 @@ Contracts:
   No DNS or egress occurs in `accept`. The deadline never renews on read/write progress.
 - `target()` stays unresolved. HTTP authority spelling is preserved; SOCKS IPs are
   canonical. Validation reuses `HostPort` (including legacy bare IPv6 and port zero).
-- `username()` is `Some` only after verification; anonymous is `None`. Verified empty
-  HTTP usernames stay `Some("")`; routing privileges are exclusively host policy.
-- SOCKS prefers username/password if offered and enabled, otherwise anonymous when
-  offered and enabled. HTTP verifies supplied Basic credentials even if anonymous
-  access is allowed; supplied credentials fail when no password capability exists.
+- `username()` is `Some` only after a strong authentication (secure-auth user or
+  GSSAPI principal); anonymous is `None`. Routing privileges are exclusively host
+  policy.
+- SOCKS selects "no authentication" when offered and enabled, otherwise answers
+  `[5, 255]`. HTTP serves a request without `Proxy-Authorization` when anonymous
+  access is allowed; any `Proxy-Authorization` is a 407 and never falls back to
+  anonymous.
 - HTTP request line and headers are limited to 16KiB **including** `\r\n\r\n`.
-  Unused headers remain bytes and accept obs-text. Basic credentials require UTF-8;
-  only the first auth header is used. By default the parser stays permissive (any
-  `HTTP/…` version, no `Host` requirement, bare IPv6 authority, ignored SOCKS RSV in
-  requests); `ServerOptions::strict_http(true)` opts in to RFC 9112 validation.
+  Unused headers remain bytes and accept obs-text; only the first auth header is
+  looked at. By default the parser stays permissive (any `HTTP/…` version, no
+  `Host` requirement, bare IPv6 authority, ignored SOCKS RSV in requests);
+  `ServerOptions::strict_http(true)` opts in to RFC 9112 validation.
 - `take_pipeline()` transfers exact owned HTTP over-read bytes once; remaining bytes
   stay on the stream. SOCKS consumes exactly its frame. Forward the prefix before
   reading/relaying further data. Failure or cancellation during a partial write is
@@ -234,55 +228,39 @@ Contracts:
   (HTTP 503). Parsing never sends tunnel success.
   Hosts doing early-success recovery must not send another protocol reply afterward.
   Every completed protocol response uses `write_all` followed by `flush`, including
-  method selection, password success/failure, refusals and public final replies.
+  method selection, refusals and public final replies.
   Buffered streams therefore need no extra host write, manual flush or shutdown to
   expose a completed reply. Flush/write errors propagate as `ServerError::Io`.
   Final `reply` writes and flushes have no implicit SDK timeout: the host owns their
   response budget, separately from the absolute `accept` deadline.
-- After method selection and any successful password authentication, unsupported
-  commands (including BIND and UDP ASSOCIATE) receive exactly
-  `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]`; unknown ATYP receives exactly
+- After method selection, unsupported commands (including BIND and UDP ASSOCIATE)
+  receive exactly `[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]`; unknown ATYP receives exactly
   `[5, 8, 0, 1, 0, 0, 0, 0, 0, 0]`. Both are flushed before a terminal protocol
-  error. Wrong request/auth versions retain the terminal no-failure-response contract.
+  error. Wrong request versions retain the terminal no-failure-response contract.
 - On error, timeout, or cancellation discard the stream and any buffered wrapper;
   never retry parsing or replay a partial reply, even if a write completed but its
   flush did not. Successful flushing is not a peer acknowledgement.
-  Authentication side effects (such as admitted blocking password persistence) may
-  finish after cancellation; the host retains its own admission permits accordingly.
-  `Debug` of `Credentials` and of `IncomingRequest` is redacted (no username,
-  password or pipeline bytes), and `ServerError::Authentication` texts never
-  contain submitted credentials; transport encryption is not supplied here.
+  `Debug` of `IncomingRequest` is redacted (no username or pipeline bytes), and
+  `ServerError::Authentication` texts never contain submitted credentials;
+  transport encryption is not supplied here.
 
 ### Inbound options
 
 All options are opt-in builders on `ServerOptions`; the defaults keep the
 behaviour described above.
 
-- `retain_credentials(true)`: `accept` keeps a copy of the verified credentials;
-  `IncomingRequest::take_credentials()` hands them over once. Without it no
-  password outlives the authentication closure. `take_username()` moves the
-  verified username out of the request.
-- `raw_credentials(true)`: SOCKS5 UNAME/PASSWD that are not valid UTF-8 are
-  accepted and exposed as exact bytes (`Credentials::username_bytes()`,
-  `password_bytes()`, `is_utf8()`; `IncomingRequest::username_bytes()`). This
-  serves clients that split one UTF-8 string across the two RFC 1929 fields at the
-  255-byte limit (pluggable-transport arguments). `username()`/`password()`
-  stay `&str`: lossy for non-UTF-8 fields, do not use them for identity then.
-  HTTP Basic is unchanged (still UTF-8 only); zero-length fields stay refused.
 - `strict_http(true)`: RFC 9112 validation of the CONNECT request before any
-  authentication: exactly `method SP target SP HTTP/d.d`, versions other than
-  1.0/1.1 answer 505, authority-form with bracketed IPv6 and a 1..=65535 numeric
-  port, exactly one non-empty `Host` for HTTP/1.1, header names that are tokens
-  with no whitespace before the colon, no obs-fold, and at most one
+  authentication decision: exactly `method SP target SP HTTP/d.d`, versions other
+  than 1.0/1.1 answer 505, authority-form with bracketed IPv6 and a 1..=65535
+  numeric port, exactly one non-empty `Host` for HTTP/1.1, header names that are
+  tokens with no whitespace before the colon, no obs-fold, and at most one
   `Proxy-Authorization`. Violations answer 400/505 and return
-  `ServerError::Protocol` with a fixed reason; the authentication closure is not
-  called. Many real clients omit `Host` or send HTTP/1.0, so it is off by default.
+  `ServerError::Protocol` with a fixed reason. Many real clients omit `Host` or
+  send HTTP/1.0, so it is off by default.
 - `IncomingRequest::into_prefixed(stream)` wraps the stream in
   `server::Prefixed<S>`, which serves the over-read pipeline bytes before the
   stream itself (writes pass through), instead of forwarding `take_pipeline()` by
-  hand.
-- `server::Credentials::basic_payload()` is the whole decoded HTTP Basic
-  token as `Option<&str>`, without splitting at `:`.
+  hand. `take_username()` moves the authenticated user name out of the request.
 
 ```text
 use resocks5_net::server::{accept, ServerOptions};
@@ -292,12 +270,8 @@ use resocks5_net::types::ProxyConfig;
 let proxy = ProxyConfig::socks5("198.51.100.7", 1080).try_with_auth("user", "pass")?;
 proxy.validate()?;
 
-let options = ServerOptions::new(deadline, false, true)
-    .retain_credentials(true)
-    .raw_credentials(true)
-    .strict_http(true);
-let mut req = accept(&mut client, &options, |c| async move { /* verify */ true }).await?;
-let credentials = req.take_credentials();   // exact bytes via username_bytes()/password_bytes()
+let options = ServerOptions::new(deadline, true, false).strict_http(true);
+let req = accept(&mut client, &options).await?;
 let mut stream = req.into_prefixed(client); // pipelined bytes first, then the socket
 ```
 
@@ -305,13 +279,12 @@ let mut stream = req.into_prefixed(client); // pipelined bytes first, then the s
 
 `server::accept_secure(stream, options, store, decoy)` is like `accept`, but
 users authenticate with secure auth (SOCKS5 method 0x80). SOCKS5 offers 0x80
-(when the options allow passwords) and 0x00 (when they allow anonymous),
-never 0x02, whatever the build. HTTP has no strong method here: the HTTP side
-runs as "no users configured", any `Proxy-Authorization` is answered 407 and
-the credential callback never runs — secure auth is SOCKS5-only, consistent
-with the HTTP 407 policy above. `decoy` (a `DecoyKey`) answers unknown user
-names. The returned request carries the authenticated user in `username()`;
-no credentials are retained.
+(when the options say users exist) and 0x00 (when they allow anonymous),
+never 0x02. HTTP has no strong method here: the HTTP side runs as "no users
+configured", any `Proxy-Authorization` is answered 407 — secure auth is
+SOCKS5-only, consistent with the HTTP 407 policy above. `decoy` (a `DecoyKey`)
+answers unknown user names. The returned request carries the authenticated user
+in `username()`; no credentials are retained.
 
 `server::accept_with(stream, options, &AuthMethods)` takes the chosen set of
 strong methods: `AuthMethods::secure(store, decoy)`, then `.with_gssapi(&acceptor)`
@@ -320,13 +293,11 @@ strong methods: `AuthMethods::secure(store, decoy)`, then `.with_gssapi(&accepto
 several methods the server picks the strongest it has enabled: GSSAPI
 (0x01), then secure auth (0x80), then anonymous (0x00) if `options` allow
 it; if nothing matches it answers `[5, 255]` and fails with
-`ServerError::Authentication`. Clear text is never offered or accepted,
-regardless of features.
+`ServerError::Authentication`.
 
 `IncomingRequest::auth_method()` returns `server::AuthMethod` — `Anonymous`,
-`ClearText` (only the plain `accept` with `cleartext-server`), `Secure`
-(method 0x80), `Gssapi` (method 0x01); the enum is `#[non_exhaustive]`. With
-GSSAPI `username()` is the authenticated principal (Kerberos `name@REALM`),
+`Secure` (method 0x80), `Gssapi` (method 0x01); the enum is `#[non_exhaustive]`.
+With GSSAPI `username()` is the authenticated principal (Kerberos `name@REALM`),
 and when a protection level was negotiated the SOCKS reply written by
 `IncomingRequest::reply` is wrapped in the negotiated protection.
 `set_identity(name)` replaces the identity everything downstream sees (map a
@@ -446,7 +417,7 @@ use resocks5_net::connect::{dial_plain, DialOptions};
 use resocks5_net::types::ProxyConfig;
 
 # async fn run() -> Result<(), resocks5_net::ConnectError> {
-let proxy = ProxyConfig::socks5("198.51.100.7", 1080).with_auth("user", "pass");
+let proxy = ProxyConfig::socks5("198.51.100.7", 1080); // anonymous upstream
 let opts = DialOptions::new().with_total_timeout(Duration::from_secs(20));
 let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 # drop(stream);
@@ -488,14 +459,14 @@ let stream = dial_chain_over(base, &proxy, "example.com", 80, &opts, None).await
 
 Connect and pool calls return `resocks5_net::ConnectError`
 (`#[non_exhaustive]`): match on `Timeout { stage, .. }`, `ProxyRejected`,
-`AuthFailed`, `MethodUnsupported`, `Protocol(ProtocolViolation)`,
+`MethodUnsupported`, `Protocol(ProtocolViolation)`,
 `InvalidTarget`, `SecureAuth(SecureAuthError)`, `Gssapi(GssapiError)`
 (these carry the typed exchange errors, re-exported from the crate root),
 `TlsFeatureMissing`, `Io` (the `io::Error` is reachable via `source()`)
 and, with `pool`, `AtCapacity` — no message parsing needed.
 `Protocol` carries a structured `ProtocolViolation` (e.g.
 `Socks5BadVersion { got }`, `Socks5UnknownAddressType { got }`,
-`Socks5DomainTooLong { len }`, `Socks5CredentialsTooLong`,
+`Socks5DomainTooLong { len }`,
 `Socks5BadReserved { got }`, `Socks5EmptyBoundDomain`,
 `HttpInvalidConnectTarget`, `HttpResponseTooLarge`, `HttpClosedEarly`)
 with the offending byte or length; its `Display` still prints the
@@ -609,7 +580,7 @@ feature), and `testing` (`test-instrumentation` feature).
 
 `testing::MockUpstream` (feature `test-instrumentation`) is a scripted
 upstream proxy for tests: `MockUpstream::socks5()` / `::http()` with
-`.auth(MockAuth)` (default `MockAuth::None`; `Cleartext { user, password }`;
+`.auth(MockAuth)` (default `MockAuth::None`;
 `Secure { user, secret }` — SOCKS5 method 0x80, HTTP answered 407) and
 `.script(Script)` (default `Script::Tunnel` — handshake then echo; also
 `Refuse(code)`, `SilentGreeting`, `SilentConnect`, `Hangup`). `.spawn()`

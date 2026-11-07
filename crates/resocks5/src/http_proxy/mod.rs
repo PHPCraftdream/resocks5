@@ -15,8 +15,7 @@
 //! the wire. With `allow_anonymous` a request without `Proxy-Authorization`
 //! is served anonymously; any request carrying credentials, and any request
 //! when anonymous access is off, gets `407 Proxy Authentication Required`.
-//! Without SDK feature `cleartext-server`, the challenge is `Resocks5-Secure`,
-//! not Basic; enabling the feature preserves the previous Basic challenge.
+//! The challenge is `Resocks5-Secure`, not Basic.
 //! This is not HTTP secure auth. RFC 9110 §15.5.8 requires the 407 challenge;
 //! 403 denotes an access denial. A client may send Basic preemptively, which
 //! the server cannot prevent. Browser prompt behavior has not been tested.

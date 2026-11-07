@@ -18,33 +18,14 @@ fn deadline_after_survives_unrepresentable_budgets() {
 }
 
 /// Minimal SOCKS5 server stub over a duplex half: completes the greeting
-/// (plus username/password sub-negotiation when `auth` is set, asserting
-/// the credentials), captures the CONNECT request (head + address + port),
+/// (the greeting must offer only method 0x00), captures the CONNECT request
+/// (head + address + port),
 /// then replies with success and the payload `ok`.
-async fn stub_server(mut upstream: tokio::io::DuplexStream, auth: bool) -> ([u8; 4], Vec<u8>) {
+async fn stub_server(mut upstream: tokio::io::DuplexStream) -> ([u8; 4], Vec<u8>) {
     let mut greeting = [0u8; 3];
     upstream.read_exact(&mut greeting).await.unwrap();
-    if auth {
-        assert_eq!(greeting, [0x05, 0x01, 0x02]);
-        upstream.write_all(&[0x05, 0x02]).await.unwrap();
-        let mut ver = [0u8; 1];
-        upstream.read_exact(&mut ver).await.unwrap();
-        assert_eq!(ver[0], 0x01);
-        let mut ulen = [0u8; 1];
-        upstream.read_exact(&mut ulen).await.unwrap();
-        let mut uname = vec![0u8; ulen[0] as usize];
-        upstream.read_exact(&mut uname).await.unwrap();
-        let mut plen = [0u8; 1];
-        upstream.read_exact(&mut plen).await.unwrap();
-        let mut passwd = vec![0u8; plen[0] as usize];
-        upstream.read_exact(&mut passwd).await.unwrap();
-        assert_eq!(uname, b"user");
-        assert_eq!(passwd, b"pass");
-        upstream.write_all(&[0x01, 0x00]).await.unwrap();
-    } else {
-        assert_eq!(greeting, [0x05, 0x01, 0x00]);
-        upstream.write_all(&[0x05, 0x00]).await.unwrap();
-    }
+    assert_eq!(greeting, [0x05, 0x01, 0x00]);
+    upstream.write_all(&[0x05, 0x00]).await.unwrap();
 
     let mut head = [0u8; 4];
     upstream.read_exact(&mut head).await.unwrap();
@@ -82,8 +63,8 @@ async fn stub_server(mut upstream: tokio::io::DuplexStream, auth: bool) -> ([u8;
 /// carries the stub's `ok` payload.
 async fn exchange(target: &str) -> anyhow::Result<([u8; 4], Vec<u8>)> {
     let (mut client, upstream) = duplex(4096);
-    let server = tokio::spawn(stub_server(upstream, false));
-    let stream = handshake_over_stream(&mut client, target, None).await?;
+    let server = tokio::spawn(stub_server(upstream));
+    let stream = handshake_over_stream(&mut client, target).await?;
     let mut payload = Vec::new();
     tokio::pin!(stream);
     stream.read_to_end(&mut payload).await?;
@@ -160,14 +141,11 @@ async fn full_ipv6_bracketed() {
 /// buffering layer: `BufStream::write_all` only reaches its own internal
 /// buffer until an explicit `flush`, so this times out unless every
 /// handshake message is flushed to the peer before the matching read.
-async fn exchange_buffered(
-    target: &str,
-    auth: Option<(&str, &str)>,
-) -> anyhow::Result<([u8; 4], Vec<u8>)> {
+async fn exchange_buffered(target: &str) -> anyhow::Result<([u8; 4], Vec<u8>)> {
     let (client, upstream) = duplex(4096);
     let mut buffered = tokio::io::BufStream::new(client);
-    let server = tokio::spawn(stub_server(upstream, auth.is_some()));
-    let stream = handshake_over_stream(&mut buffered, target, auth).await?;
+    let server = tokio::spawn(stub_server(upstream));
+    let stream = handshake_over_stream(&mut buffered, target).await?;
     tokio::pin!(stream);
     let mut payload = Vec::new();
     stream.read_to_end(&mut payload).await?;
@@ -177,26 +155,11 @@ async fn exchange_buffered(
 
 #[tokio::test]
 async fn no_auth_completes_through_buffered_client() {
-    let (head, addr) = tokio::time::timeout(
-        Duration::from_secs(5),
-        exchange_buffered("1.2.3.4:443", None),
-    )
-    .await
-    .expect("handshake stalled: greeting/CONNECT never flushed to the peer")
-    .unwrap();
-    assert_eq!(head, [0x05, 0x01, 0x00, 0x01]);
-    assert_eq!(addr, vec![0x01, 1, 2, 3, 4, 0x01, 0xBB]);
-}
-
-#[tokio::test]
-async fn auth_completes_through_buffered_client() {
-    let (head, addr) = tokio::time::timeout(
-        Duration::from_secs(5),
-        exchange_buffered("1.2.3.4:443", Some(("user", "pass"))),
-    )
-    .await
-    .expect("handshake stalled: greeting/auth/CONNECT never flushed to the peer")
-    .unwrap();
+    let (head, addr) =
+        tokio::time::timeout(Duration::from_secs(5), exchange_buffered("1.2.3.4:443"))
+            .await
+            .expect("handshake stalled: greeting/CONNECT never flushed to the peer")
+            .unwrap();
     assert_eq!(head, [0x05, 0x01, 0x00, 0x01]);
     assert_eq!(addr, vec![0x01, 1, 2, 3, 4, 0x01, 0xBB]);
 }
@@ -217,7 +180,7 @@ async fn strict_reply_errors_are_typed_and_classified() {
                 server.read_exact(&mut address).await.unwrap();
                 server.write_all(&reply).await.unwrap();
             });
-            let error = super::socks5_handshake(client, "1.2.3.4", 80, None)
+            let error = super::socks5_handshake(client, "1.2.3.4", 80)
                 .await
                 .unwrap_err();
             match expected {
@@ -260,7 +223,7 @@ async fn empty_bound_domain_rejected_without_waiting_for_address() {
     });
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        super::socks5_handshake(client, "1.2.3.4", 80, None),
+        super::socks5_handshake(client, "1.2.3.4", 80),
     )
     .await
     .expect("handshake waited for missing address")
@@ -290,7 +253,7 @@ async fn invalid_targets_write_no_bytes() {
                 server.read_to_end(&mut bytes).await.unwrap();
                 bytes
             });
-            let error = super::socks5_handshake(client, host, port, None)
+            let error = super::socks5_handshake(client, host, port)
                 .await
                 .unwrap_err();
             assert!(matches!(error, ConnectError::InvalidTarget(_)));
@@ -322,7 +285,7 @@ async fn success_reply_shapes_preserve_payload() {
                 server.write_all(&bound).await.unwrap();
                 server.write_all(b"payload").await.unwrap();
             });
-            let mut stream = super::socks5_handshake(client, "1.2.3.4", 80, None)
+            let mut stream = super::socks5_handshake(client, "1.2.3.4", 80)
                 .await
                 .unwrap();
             let mut payload = [0; 7];

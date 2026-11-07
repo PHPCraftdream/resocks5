@@ -252,8 +252,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p resocks5-net ${{ matrix.args }} --locked ${{ needs.changes.outputs.net_test_args }}
-      - name: HTTP challenge policy without unit-test cleartext override
-        if: (matrix.name == 'default' || matrix.name == 'cleartext-server') && needs.changes.outputs.net_test_args != ''
+      - name: No clear-text password policy (integration test, no cfg(test))
+        if: matrix.name == 'default' && needs.changes.outputs.net_test_args != ''
         run: cargo test -p resocks5-net ${{ matrix.args }} --locked --test no_cleartext
 
   # Lean clippy for the library: dead-code and unused-import lints surface

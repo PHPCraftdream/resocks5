@@ -363,36 +363,6 @@ fn perf208_pool_reservation_cold_warm_and_capacity() {
     report("pool/checkout_then_reserve/warm", fallback_counts);
 }
 
-#[test]
-fn perf208_credentials_retention_valid_raw_and_basic() {
-    use crate::server::Credentials;
-
-    let cases = [
-        Credentials::new("user".to_owned(), "password".to_owned()),
-        Credentials::with_raw(
-            "u\u{fffd}".to_owned(),
-            "p\u{fffd}".to_owned(),
-            Some(vec![b'u', 0xff]),
-            Some(vec![b'p', 0xfe]),
-        ),
-        Credentials::with_basic_payload(
-            "user".to_owned(),
-            "pass:word".to_owned(),
-            "user:pass:word".to_owned(),
-        ),
-    ];
-    for (label, original) in ["utf8", "raw", "basic"].into_iter().zip(cases) {
-        let (copy, counts) = measure(|| original.duplicate());
-        let (again, repeated) = measure(|| original.duplicate());
-        assert_eq!(counts, repeated);
-        assert_eq!(copy.username_bytes(), original.username_bytes());
-        assert_eq!(copy.password_bytes(), original.password_bytes());
-        assert_eq!(copy.basic_payload(), original.basic_payload());
-        assert_eq!(again.is_utf8(), original.is_utf8());
-        report(&format!("credentials/duplicate/{label}"), counts);
-    }
-}
-
 /// Lazy weighted order: snapshot consumes exactly N keys,
 /// Arc configs materialize on consumption.
 #[test]

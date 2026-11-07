@@ -132,21 +132,7 @@ where
     .await?;
     match first {
         5 => phase(options.deadline, socks_strong(stream, options, methods)).await,
-        b if b.is_ascii_alphabetic() => {
-            // HTTP has no strong method here: a password-capable host must not
-            // see Basic at all, so the HTTP side runs as "no users configured"
-            // (any Proxy-Authorization is a 407, the callback never runs).
-            let http_options = ServerOptions {
-                password: false,
-                retain_credentials: false,
-                ..*options
-            };
-            phase(
-                options.deadline,
-                http(stream, b, &http_options, |_| async { false }),
-            )
-            .await
-        }
+        b if b.is_ascii_alphabetic() => phase(options.deadline, http(stream, b, options)).await,
         other => Err(ServerError::Protocol(format!(
             "unrecognised first byte {other:#04x} — neither SOCKS5 (0x05) nor an HTTP method"
         ))),
@@ -216,7 +202,7 @@ where
     let nmethods = stream.read_u8().await?;
     let mut offered = vec![0; usize::from(nmethods)];
     stream.read_exact(&mut offered).await?;
-    let strong = options.password;
+    let strong = options.users;
     // The strongest method both sides have, in the server's order.
     let chosen = if strong && methods.has_gssapi() && offered.contains(&0x01) {
         0x01
@@ -246,10 +232,10 @@ where
         let user = server_authenticate(stream, store, decoy)
             .await
             .map_err(auth_error)?;
-        let request = socks_request(stream, Some(user), None, None).await?;
+        let request = socks_request(stream, Some(user)).await?;
         return Ok(authenticated(request, AuthMethod::Secure));
     }
-    socks_request(stream, None, None, None).await
+    socks_request(stream, None).await
 }
 
 #[cfg(feature = "gssapi")]
@@ -281,7 +267,7 @@ where
         .map_err(gss_error)?;
     if !session.is_protected() {
         // Level 0: the request and reply are plain SOCKS5 on the stream.
-        let request = socks_request(stream, Some(principal), None, None).await?;
+        let request = socks_request(stream, Some(principal)).await?;
         return Ok(request.authenticated_with(AuthMethod::Gssapi, None));
     }
     let request = session.read_message(stream).await.map_err(gss_error)?;
@@ -289,7 +275,7 @@ where
         input: std::io::Cursor::new(request),
         output: Vec::new(),
     };
-    let parsed = socks_request(&mut memory, Some(principal), None, None).await;
+    let parsed = socks_request(&mut memory, Some(principal)).await;
     if !memory.output.is_empty() {
         // An error reply the request parser wrote: send it protected.
         let _ = session.write_message(stream, &memory.output).await;

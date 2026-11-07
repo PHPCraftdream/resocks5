@@ -75,12 +75,6 @@ pub enum ProtocolViolation {
         /// The version byte the proxy sent.
         got: u8,
     },
-    /// The first byte of an RFC 1929 username/password reply was not
-    /// `0x01`.
-    Socks5BadAuthVersion {
-        /// The sub-negotiation version byte the proxy sent.
-        got: u8,
-    },
     /// The ATYP byte of a SOCKS5 CONNECT reply was not 1/3/4.
     Socks5UnknownAddressType {
         /// The ATYP byte the proxy sent.
@@ -98,14 +92,6 @@ pub enum ProtocolViolation {
         /// Domain length in bytes.
         len: usize,
     },
-    /// SOCKS5 username/password credentials exceeded the 255-byte
-    /// per-field RFC 1929 limit.
-    Socks5CredentialsTooLong {
-        /// Username length in bytes.
-        username_len: usize,
-        /// Password length in bytes.
-        password_len: usize,
-    },
     /// The HTTP CONNECT target contained control or whitespace bytes.
     HttpInvalidConnectTarget,
     /// The HTTP CONNECT response headers exceeded the 4 KiB buffer.
@@ -121,9 +107,6 @@ impl fmt::Display for ProtocolViolation {
             ProtocolViolation::Socks5BadVersion { .. } => {
                 write!(f, "[SOCKS5] Invalid proxy response version")
             }
-            ProtocolViolation::Socks5BadAuthVersion { .. } => {
-                write!(f, "[SOCKS5] Invalid authentication response version")
-            }
             ProtocolViolation::Socks5UnknownAddressType { .. } => {
                 write!(f, "[SOCKS5] Unknown address type in response")
             }
@@ -135,9 +118,6 @@ impl fmt::Display for ProtocolViolation {
             }
             ProtocolViolation::Socks5DomainTooLong { .. } => {
                 write!(f, "[SOCKS5] Domain name too long")
-            }
-            ProtocolViolation::Socks5CredentialsTooLong { .. } => {
-                write!(f, "[SOCKS5] Username or password too long")
             }
             ProtocolViolation::HttpInvalidConnectTarget => {
                 write!(f, "[HTTP] invalid CONNECT target")
@@ -291,17 +271,12 @@ pub enum ConnectError {
         /// The raw status line for HTTP (`response`), empty for SOCKS5.
         response: String,
     },
-    /// SOCKS5 username/password sub-negotiation failed.
-    AuthFailed {
-        /// The status byte the proxy returned.
-        status: u8,
-    },
     /// The proxy refused the requested SOCKS5 authentication method.
     MethodUnsupported {
         /// The method byte the proxy returned.
         got: u8,
-        /// Whether we had asked for username/password auth (`true`) or
-        /// no-auth (`false`) — the two legacy messages differ.
+        /// Whether we had asked for strong auth, secure auth or GSSAPI (`true`) or
+        /// no-auth (`false`) — the two messages differ.
         with_auth: bool,
     },
     /// Protocol violation with the offending detail carried in a
@@ -312,8 +287,8 @@ pub enum ConnectError {
     /// The target address could not be parsed into a SOCKS5 request.
     InvalidTarget(String),
     /// The upstream is configured with a user name and password that this
-    /// build would have to send in clear text (SOCKS5 UNAME/PASSWD, or HTTP
-    /// Basic to a plain-HTTP proxy), and the feature `cleartext-client` is off.
+    /// crate would have to send in clear text (SOCKS5 UNAME/PASSWD, or HTTP
+    /// Basic to a plain-HTTP proxy); it never does.
     /// Raised before the first byte of the handshake; nothing was sent.
     CleartextCredentialsRefused,
     /// The secure-auth exchange (SOCKS5 method 0x80) with the upstream failed.
@@ -425,14 +400,11 @@ impl fmt::Display for ConnectError {
                     write!(f, "[HTTP] upstream proxy rejected CONNECT: {}", response)
                 }
             },
-            ConnectError::AuthFailed { status } => {
-                write!(f, "[SOCKS5] Authentication failed (status {:02x})", status)
-            }
             ConnectError::MethodUnsupported { got, with_auth } => {
                 if *with_auth {
                     write!(
                         f,
-                        "[SOCKS5] Proxy does not support username/password authentication (received: {:02x})",
+                        "[SOCKS5] Proxy does not support the offered strong authentication methods (received: {:02x})",
                         got
                     )
                 } else {
@@ -461,7 +433,7 @@ impl fmt::Display for ConnectError {
             ConnectError::SecureAuth(error) => write!(f, "{}", error),
             ConnectError::Gssapi(error) => write!(f, "{}", error),
             ConnectError::CleartextCredentialsRefused => f.write_str(
-                "refusing to send credentials in clear text (feature `cleartext-client` is off)",
+                "refusing to send credentials in clear text (use secure auth, GSSAPI or an https proxy)",
             ),
         }
     }

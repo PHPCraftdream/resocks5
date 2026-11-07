@@ -286,7 +286,7 @@ async fn dial_inner(
                 stream,
                 host,
                 port,
-                socks5_auth(proxy),
+                socks5_auth(proxy)?,
                 deadline_after(hs),
                 &format!("{}:{}", proxy.host, proxy.port),
                 hs,

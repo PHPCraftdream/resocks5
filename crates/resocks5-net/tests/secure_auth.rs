@@ -245,8 +245,8 @@ async fn the_first_dial_enrolls_an_init_user() {
 }
 
 /// `accept_secure` never takes a clear-text password: SOCKS5 method 0x02 is
-/// not offered and HTTP Basic is a 407, even in a build with
-/// `cleartext-server`. Mutation: delegating to the clear-text path accepts them.
+/// not offered and HTTP Basic is a 407. Mutation: delegating to a clear-text
+/// path accepts them.
 #[tokio::test]
 async fn accept_secure_never_takes_a_cleartext_password() {
     timeout(Duration::from_secs(10), async {

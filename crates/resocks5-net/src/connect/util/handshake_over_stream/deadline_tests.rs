@@ -16,7 +16,7 @@ fn soon() -> Instant {
 #[tokio::test]
 async fn silent_greeting_is_a_greeting_timeout() {
     let (client, _server) = duplex(64);
-    let error = socks5_handshake_until(client, "example.test", 443, None, soon(), "up:1080")
+    let error = socks5_handshake_until(client, "example.test", 443, soon(), "up:1080")
         .await
         .unwrap_err();
     match &error {
@@ -49,7 +49,7 @@ async fn silent_connect_reply_is_a_handshake_timeout() {
         server.read_exact(&mut request).await.unwrap();
         std::future::pending::<()>().await; // never answers the CONNECT
     });
-    let error = socks5_handshake_until(client, "10.0.0.1", 80, None, soon(), "up:1080")
+    let error = socks5_handshake_until(client, "10.0.0.1", 80, soon(), "up:1080")
         .await
         .unwrap_err();
     assert!(
@@ -71,7 +71,7 @@ async fn silent_connect_reply_is_a_handshake_timeout() {
 #[tokio::test]
 async fn an_expired_deadline_fails_immediately() {
     let (client, _server) = duplex(64);
-    let error = socks5_handshake_until(client, "h", 80, None, Instant::now(), "up:1")
+    let error = socks5_handshake_until(client, "h", 80, Instant::now(), "up:1")
         .await
         .unwrap_err();
     assert!(matches!(
@@ -104,7 +104,6 @@ async fn a_handshake_inside_the_deadline_succeeds() {
         client,
         "10.0.0.1",
         80,
-        None,
         Instant::now() + Duration::from_secs(10),
         "up:1080",
     )
@@ -121,7 +120,7 @@ async fn a_handshake_inside_the_deadline_succeeds() {
 async fn an_invalid_target_is_refused_before_any_byte() {
     for (host, port) in [("", 80u16), ("h", 0u16)] {
         let (client, mut server) = duplex(64);
-        let error = socks5_handshake_until(client, host, port, None, soon(), "up:1")
+        let error = socks5_handshake_until(client, host, port, soon(), "up:1")
             .await
             .unwrap_err();
         assert!(

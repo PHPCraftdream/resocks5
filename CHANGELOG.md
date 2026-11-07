@@ -9,13 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `resocks5-net`: without `cleartext-server`, HTTP 407 now advertises
-  `Proxy-Authenticate: Resocks5-Secure`, not Basic, to avoid inviting a
-  clear-text password transmission. Status 407 and its challenge remain;
-  feature-enabled builds retain the previous Basic realm and charset.
-  This does not implement secure authentication over HTTP. Preemptive Basic
-  from a preconfigured client cannot be prevented; browser prompt behavior
-  for the unknown scheme has not been tested.
+- `resocks5-net`: HTTP 407 now advertises `Proxy-Authenticate: Resocks5-Secure`,
+  never Basic, to avoid inviting a clear-text password transmission. Status 407
+  and its challenge remain. This does not implement secure authentication over
+  HTTP. Preemptive Basic from a preconfigured client cannot be prevented;
+  browser prompt behavior for the unknown scheme has not been tested.
 
 ### Changed
 
@@ -37,14 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   borrows when there is nothing to decode.
 - Code comments are now English throughout (comments only; the clap `--help`
   text and user documentation keep their language).
-- Tests: an HTTP request accepted by the application never carries an identity
-  (Basic is refused with 407 before any account lookup), so the direct-user
-  branch of the HTTP handler is reachable only in a host built with
-  `cleartext-server`.
+- `resocks5`: an HTTP request accepted by the application never carries an
+  identity (any `Proxy-Authorization` is a 407 before any account lookup), so
+  the HTTP handler lost its direct-user branch and its direct limiter; direct
+  accounts are served over SOCKS5 only.
 - `docs/PERF208.md` is rewritten as a status table per candidate with commits,
   evidence and counters; the CoW table is generated from
   `docs/perf208/baseline/cow.json` by `tests/perf208/render.py` and checked by
-  the perf workflow against the fresh counters (PERF208 rows: 209 SDK, 24 app).
+  the perf workflow against the fresh counters (PERF208 rows: 199 SDK, 24 app).
 
 ### Added
 
@@ -81,8 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: `connect::socks5_handshake_until` and
   `http_connect_handshake_until` run a handshake under an absolute deadline and
   fail with a typed `ConnectError::Timeout`.
-- `resocks5-net`: `server::Credentials::basic_payload()` — the whole decoded HTTP
-  Basic token, without splitting at `:`.
 - `resocks5-net`: `DialOptions::with_nodelay` / `with_keepalive` (fields `nodelay`,
   `keepalive`) set `TCP_NODELAY` and TCP keepalive on the socket to the proxy
   (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
@@ -109,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: `testing::MockUpstream` (feature `test-instrumentation`): a
   scripted SOCKS5 / HTTP CONNECT upstream on `127.0.0.1:0` for tests — `Script`
   (tunnel with echo, refuse with a REP/status, silent greeting, silent CONNECT,
-  hang-up), `MockAuth` (none, clear-text, secure auth), and the recorded CONNECT
+  hang-up), `MockAuth` (none, secure auth), and the recorded CONNECT
   targets.
 - `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
   and clears `user`/`password` at this node and every solely owned gate, and
@@ -117,12 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `resocks5-net` (**breaking**): clear-text credentials are off by default. A
-  client never sends a password in clear text (SOCKS5 username/password, HTTP
-  Basic) unless feature `cleartext-client` is on — otherwise the dial fails with
-  `ConnectError::CleartextCredentialsRefused` before any byte is sent; the server
-  (`server::accept`) never offers or accepts them unless feature
-  `cleartext-server` is on (SOCKS5 0x02 not chosen, HTTP Basic answered 407).
+- `resocks5-net` (**breaking**): clear-text credentials are gone, not just off:
+  the crate never sends or accepts a password in clear text and no feature
+  turns that on (see Removed). A dial that would send one (SOCKS5 without secure
+  auth or GSSAPI, HTTP Basic to a plain-HTTP proxy) fails with
+  `ConnectError::CleartextCredentialsRefused` before any byte is sent; the
+  server never offers SOCKS5 0x02 and answers any `Proxy-Authorization` with 407.
 - `resocks5` (**breaking**): inbound users authenticate with secure auth only.
   SOCKS5 username/password and HTTP Basic are refused; standard clients
   (browsers, curl) can connect only anonymously, a password needs a
@@ -144,8 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must be an upstream that speaks it (another resocks5 or a `resocks5-net` client);
   a username/password-only SOCKS5 server is refused without receiving the
   password. HTTPS upstreams send Basic inside TLS as before; a plain HTTP upstream
-  with credentials is reported at startup and its dials are refused. The app no
-  longer enables `cleartext-client`.
+  with credentials is reported at startup and its dials are refused.
 
 - `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
   the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
@@ -169,6 +164,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5`: the server-side password verify path and its in-memory password
   cache: the server neither receives nor holds passwords and never runs Argon2
   for a login.
+- `resocks5-net` (**breaking**): clear-text passwords are removed from the
+  protocol code, not just disabled. Gone: the features `cleartext-client` and
+  `cleartext-server`; SOCKS5 method 0x02 (RFC 1929) on both sides; HTTP Basic
+  acceptance and the Basic header sent to a plain-HTTP proxy (HTTP Basic inside
+  TLS to an HTTPS proxy stays); the `server::accept` authentication callback,
+  `server::Credentials`, `ServerOptions::retain_credentials` / `raw_credentials`,
+  `IncomingRequest::take_credentials` / `username_bytes`, `AuthMethod::ClearText`;
+  the `auth` argument of `socks5_handshake`, `socks5_handshake_until` and
+  `handshake_over_stream`; `ConnectError::AuthFailed` and the
+  `ProtocolViolation::{Socks5BadAuthVersion, Socks5CredentialsTooLong}` variants;
+  `MockAuth::Cleartext`; the `serve_local` example. `server::accept(stream,
+  options)` now serves anonymous clients only; users authenticate through
+  `accept_secure` / `accept_with`. `ServerOptions::new`'s last argument now means
+  "users exist" (they need a strong method). `MethodUnsupported` now refers to
+  the strong methods when `with_auth` is true.
 
 ## [0.5.0] - 2026-11-05
 

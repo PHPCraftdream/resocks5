@@ -717,21 +717,14 @@ mod upstream_auth {
         assert_eq!(mock.targets(), ["example.test:443"]);
     }
 
-    /// The password is never sent in clear text: an upstream that only takes
-    /// username/password gets no password from the converted entry (method
-    /// 0x02 is not even offered), and the unconverted entry is refused before
-    /// any connect. Mutation: enabling `cleartext-client` in the app makes
-    /// the second dial reach the mock and send the password.
+    /// The password is never sent in clear text: against an upstream that
+    /// offers only "no authentication" the converted entry offers secure
+    /// auth alone (method 0x02 does not exist) and is turned away, and the
+    /// unconverted entry is refused before any connect. Mutation: sending the
+    /// password in clear text makes the second dial reach the mock.
     #[tokio::test]
     async fn a_cleartext_only_upstream_never_receives_the_password() {
-        let mock = MockUpstream::socks5()
-            .auth(MockAuth::Cleartext {
-                user: "alice".into(),
-                password: "pw".into(),
-            })
-            .spawn()
-            .await
-            .unwrap();
+        let mock = MockUpstream::socks5().spawn().await.unwrap();
         let converted = secure_upstream_auth(mock.proxy().with_auth("alice", "pw"));
         let error = dial(&converted).await.unwrap_err();
         assert!(

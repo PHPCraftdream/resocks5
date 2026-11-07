@@ -46,7 +46,9 @@ fn upstream_down_signals_are_hard_failures() {
         TimeoutKind::HttpsTlsHandshake
     )));
     assert!(hard(io(Stage::Connect)));
-    assert!(hard(ConnectError::AuthFailed { status: 1 }));
+    assert!(hard(ConnectError::SecureAuth(
+        resocks5_net::SecureAuthError::Denied
+    )));
     assert!(hard(ConnectError::MethodUnsupported {
         got: 0xff,
         with_auth: false

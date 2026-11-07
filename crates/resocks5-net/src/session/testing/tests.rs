@@ -1,12 +1,14 @@
 //! The scripted upstream mock drives the dial API through every script:
-//! tunnel, refusal, silent phases, hang-up, clear-text and secure auth.
+//! tunnel, refusal, silent phases, hang-up and secure auth.
 
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use super::{MockAuth, MockUpstream, Script};
+#[cfg(feature = "secure-auth")]
+use super::MockAuth;
+use super::{MockUpstream, Script};
 use crate::connect::{dial_tcp, DialOptions};
 use crate::error::{Stage, TimeoutKind};
 use crate::types::{ProxyConfig, ProxyProtocol};
@@ -148,57 +150,4 @@ async fn the_secure_auth_mock_checks_the_password() {
     assert!(mock.targets().is_empty());
     assert_echo(dial(&with("right")).await.unwrap()).await;
     assert_eq!(mock.targets(), ["example.test:443"]);
-}
-
-/// The clear-text mock takes only its credentials (method 0x02), and an
-/// anonymous client is refused. Unit tests may send clear text.
-#[tokio::test]
-async fn the_cleartext_mock_checks_the_credentials() {
-    let mock = MockUpstream::socks5()
-        .auth(MockAuth::Cleartext {
-            user: "u".into(),
-            password: "p".into(),
-        })
-        .spawn()
-        .await
-        .unwrap();
-    let error = dial(&mock.proxy()).await.unwrap_err();
-    assert!(
-        matches!(error, ConnectError::MethodUnsupported { .. }),
-        "{error:?}"
-    );
-    let error = dial(&mock.proxy().with_auth("u", "wrong"))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, ConnectError::AuthFailed { .. }),
-        "{error:?}"
-    );
-    assert_echo(dial(&mock.proxy().with_auth("u", "p")).await.unwrap()).await;
-    assert_eq!(mock.targets(), ["example.test:443"]);
-}
-
-/// The HTTP mock checks Basic credentials: 407 without, a tunnel with.
-#[tokio::test]
-async fn the_http_mock_checks_basic_credentials() {
-    let mock = MockUpstream::http()
-        .auth(MockAuth::Cleartext {
-            user: "u".into(),
-            password: "p".into(),
-        })
-        .spawn()
-        .await
-        .unwrap();
-    let error = dial(&mock.proxy()).await.unwrap_err();
-    assert!(
-        matches!(
-            &error,
-            ConnectError::ProxyRejected {
-                code: Some(407),
-                ..
-            }
-        ),
-        "{error:?}"
-    );
-    assert_echo(dial(&mock.proxy().with_auth("u", "p")).await.unwrap()).await;
 }

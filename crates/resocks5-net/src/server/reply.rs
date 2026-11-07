@@ -2,11 +2,7 @@
 
 use super::Protocol;
 
-const RESP_407: &[u8] = if crate::CLEARTEXT_SERVER {
-    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-} else {
-    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-};
+const RESP_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// Fallback for a status no caller sends today: a well-formed 500 head.
 /// Callers use private fixed statuses, so this arm is unreachable now — a

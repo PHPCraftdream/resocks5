@@ -6,119 +6,64 @@ use super::*;
 #[tokio::test]
 async fn buffered_http_failure_paths_are_visible_before_drop() {
     timeout(Duration::from_secs(10), async {
-        for (bytes, anonymous, password, verified, expected, calls) in [
+        for (bytes, anonymous, expected) in [
             (
                 b"CONNECT \xff:1 HTTP/x\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_400,
-                0,
             ),
             (
                 b"CONNECT h:1 broken\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_400,
-                0,
             ),
-            (
-                b"GET h:1 HTTP/x\r\n\r\n".as_slice(),
-                true,
-                true,
-                true,
-                EXPECT_HTTP_501,
-                0,
-            ),
+            (b"GET h:1 HTTP/x\r\n\r\n".as_slice(), true, EXPECT_HTTP_501),
             (
                 b"CONNECT a\0b:1 HTTP/x\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_400,
-                0,
             ),
             (
                 b"CONNECT :1 HTTP/x\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_400,
-                0,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: \xff\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_407,
-                0,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Bearer token\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_407,
-                0,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic !!!\r\n\r\n".as_slice(),
                 true,
-                true,
-                true,
                 EXPECT_HTTP_407,
-                0,
-            ),
-            (
-                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic /w==\r\n\r\n".as_slice(),
-                true,
-                true,
-                true,
-                EXPECT_HTTP_407,
-                0,
-            ),
-            (
-                b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dQ==\r\n\r\n".as_slice(),
-                true,
-                true,
-                true,
-                EXPECT_HTTP_407,
-                0,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
                 true,
-                false,
-                true,
                 EXPECT_HTTP_407,
-                0,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
-                true,
-                true,
                 false,
                 EXPECT_HTTP_407,
-                1,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\n\r\n".as_slice(),
                 false,
-                true,
-                true,
                 EXPECT_HTTP_407,
-                0,
             ),
         ] {
-            let (error, actual_calls) =
-                buffered_failure(bytes, anonymous, password, verified, expected).await;
+            let error = buffered_failure(bytes, anonymous, true, expected).await;
             assert!(matches!(
                 error,
                 ServerError::Protocol(_) | ServerError::Authentication(_)
             ));
-            assert_eq!(actual_calls, calls);
         }
         for delimiter in [false, true] {
             let mut bytes = b"CONNECT h:1 HTTP/x\r\nX: ".to_vec();
@@ -128,9 +73,8 @@ async fn buffered_http_failure_paths_are_visible_before_drop() {
             } else {
                 bytes.extend_from_slice(b"aaaa");
             }
-            let (error, calls) = buffered_failure(&bytes, true, true, true, EXPECT_HTTP_431).await;
+            let error = buffered_failure(&bytes, true, true, EXPECT_HTTP_431).await;
             assert!(matches!(error, ServerError::HeaderTooLarge));
-            assert_eq!(calls, 0);
         }
     })
     .await
@@ -220,22 +164,21 @@ fn flush_fault(inner: DuplexStream, fault_at: usize, fail_write: bool, stall: bo
 async fn reply_write_and_flush_errors_propagate_without_replay() {
     timeout(Duration::from_secs(10), async {
         for fail_write in [false, true] {
-            for (bytes, anonymous, password, verified, fault_at) in [
-                (vec![5, 1, 0], true, false, true, 1),
-                (vec![5, 0], true, true, true, 1),
-                (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, true, 2),
-                (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, false, 2),
-                (vec![5, 1, 2, 1, 0], false, true, true, 2),
-                (socks_request(b"a b"), true, false, true, 2),
-                (vec![5, 1, 0, 5, 2, 0, 1], true, false, true, 2),
-                (vec![5, 1, 0, 5, 1, 0, 9], true, false, true, 2),
-                (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, true, 1),
-                (b"CONNECT h:1 HTTP/x\r\n\r\n".to_vec(), false, true, true, 1),
+            for (bytes, anonymous, users, fault_at) in [
+                (vec![5, 1, 0], true, false, 1),
+                (vec![5, 0], true, true, 1),
+                (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, 1),
+                (vec![5, 1, 2, 1, 0], false, true, 1),
+                (socks_request(b"a b"), true, false, 2),
+                (vec![5, 1, 0, 5, 2, 0, 1], true, false, 2),
+                (vec![5, 1, 0, 5, 1, 0, 9], true, false, 2),
+                (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, 1),
+                (b"CONNECT h:1 HTTP/x\r\n\r\n".to_vec(), false, true, 1),
             ] {
                 let (mut peer, inner) = duplex(1024);
                 peer.write_all(&bytes).await.unwrap();
                 let mut stream = flush_fault(inner, fault_at, fail_write, false);
-                let result = accept(&mut stream, &options(anonymous, password), |_| async { verified }).await;
+                let result = accept(&mut stream, &options(anonymous, users)).await;
                 assert!(matches!(result, Err(ServerError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe));
                 assert_eq!(stream.write_calls, fault_at);
                 assert_eq!(stream.flush_calls, fault_at - 1);
@@ -247,8 +190,6 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
         auth: crate::server::AuthMethod::Anonymous,
         #[cfg(feature = "gssapi")]
         gss: None,
-                    username_raw: None,
-                    credentials: None,
                         protocol, target: "h:1".into(), username: None, pipeline: Vec::new(),
                     };
                     let (_peer, inner) = duplex(64);
@@ -266,16 +207,15 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
 #[tokio::test(start_paused = true)]
 async fn stalled_handshake_and_error_flushes_share_absolute_deadline() {
     timeout(Duration::from_secs(10), async {
-        for (bytes, anonymous, password, verified, fault_at) in [
-            (vec![5, 1, 0], true, false, true, 1),
-            (vec![5, 0], true, true, true, 1),
-            (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, true, 2),
-            (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, false, 2),
-            (vec![5, 1, 2, 1, 0], false, true, true, 2),
-            (socks_request(b"a b"), true, false, true, 2),
-            (vec![5, 1, 0, 5, 2, 0, 1], true, false, true, 2),
-            (vec![5, 1, 0, 5, 1, 0, 9], true, false, true, 2),
-            (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, true, 1),
+        for (bytes, anonymous, users, fault_at) in [
+            (vec![5, 1, 0], true, false, 1),
+            (vec![5, 0], true, true, 1),
+            (vec![5, 1, 2, 1, 1, b'u', 1, b'p'], false, true, 1),
+            (vec![5, 1, 2, 1, 0], false, true, 1),
+            (socks_request(b"a b"), true, false, 2),
+            (vec![5, 1, 0, 5, 2, 0, 1], true, false, 2),
+            (vec![5, 1, 0, 5, 1, 0, 9], true, false, 2),
+            (b"GET h:1 HTTP/x\r\n\r\n".to_vec(), true, false, 1),
         ] {
             let (mut peer, inner) = duplex(1024);
             peer.write_all(&bytes).await.unwrap();
@@ -285,8 +225,8 @@ async fn stalled_handshake_and_error_flushes_share_absolute_deadline() {
                 stream.first_flush_delay =
                     Some(Box::pin(tokio::time::sleep(Duration::from_millis(900))));
             }
-            let opts = ServerOptions::new(start + Duration::from_secs(1), anonymous, password);
-            let result = accept(&mut stream, &opts, |_| async { verified }).await;
+            let opts = ServerOptions::new(start + Duration::from_secs(1), anonymous, users);
+            let result = accept(&mut stream, &opts).await;
             assert!(matches!(result, Err(ServerError::Deadline)));
             assert_eq!(start.elapsed(), Duration::from_secs(1));
             assert_eq!(stream.write_calls, fault_at);
@@ -306,18 +246,9 @@ async fn external_cancellation_during_accept_flush_is_terminal() {
             .await
             .unwrap();
         let mut stream = flush_fault(inner, 1, false, true);
-        let calls = AtomicUsize::new(0);
         let opts = options(true, false);
-        let result = timeout(
-            Duration::from_secs(1),
-            accept(&mut stream, &opts, |_| async {
-                calls.fetch_add(1, Ordering::SeqCst);
-                true
-            }),
-        )
-        .await;
+        let result = timeout(Duration::from_secs(1), accept(&mut stream, &opts)).await;
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(stream.writes, [5, 0]);
         assert_eq!(stream.write_calls, 1);
         assert_eq!(stream.flush_calls, 0);
@@ -335,8 +266,6 @@ async fn host_budget_cancels_final_flush_without_replay() {
                 auth: crate::server::AuthMethod::Anonymous,
                 #[cfg(feature = "gssapi")]
                 gss: None,
-                username_raw: None,
-                credentials: None,
                 protocol,
                 target: "h:1".into(),
                 username: None,
@@ -373,12 +302,12 @@ async fn socks_ip_targets_keep_canonical_spelling() {
     ipv6.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
     ipv6.extend_from_slice(&443u16.to_be_bytes());
     assert_eq!(
-        parse(&ipv6, true, false, true).await.0.unwrap().target(),
+        parse(&ipv6, true, false).await.0.unwrap().target(),
         "[::1]:443"
     );
     let ipv4 = [5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 1, 187];
     assert_eq!(
-        parse(&ipv4, true, false, true).await.0.unwrap().target(),
+        parse(&ipv4, true, false).await.0.unwrap().target(),
         "1.2.3.4:443"
     );
 }
@@ -389,59 +318,47 @@ async fn thousands_of_header_lines_are_still_fully_scanned() {
     bytes.extend_from_slice(&b"X:\r\n".repeat(4000));
     let mut with_auth = bytes.clone();
     with_auth.extend_from_slice(b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n");
-    let (result, response, calls) = parse(&with_auth, true, false, true).await;
+    let (result, response) = parse(&with_auth, true, false).await;
     assert!(matches!(result, Err(ServerError::Authentication(_))));
     assert_eq!(response, EXPECT_HTTP_407);
-    assert_eq!(calls, 0);
     bytes.extend_from_slice(b"\r\n");
-    let (result, response, _) = parse(&bytes, true, false, true).await;
+    let (result, response) = parse(&bytes, true, false).await;
     assert_eq!(result.unwrap().target(), "example.com:443");
     assert!(response.is_empty());
 }
 
 #[tokio::test]
-async fn proxy_auth_challenge_declares_utf8_charset() {
-    let (_, response, _) = parse(
+async fn proxy_auth_challenge_names_only_the_secure_scheme() {
+    let (_, response) = parse(
         b"CONNECT h:443 HTTP/x\r\nProxy-Authorization: Bearer token\r\n\r\n",
         true,
         false,
-        true,
     )
     .await;
-    assert!(String::from_utf8(response)
-        .unwrap()
-        .contains("Proxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\""));
+    let text = String::from_utf8(response).unwrap();
+    assert!(text.contains("Proxy-Authenticate: Resocks5-Secure"));
+    assert!(!text.contains("Basic"));
 }
 
 #[tokio::test]
 async fn socks_single_method_offers_and_no_match_rows() {
     for anonymous in [false, true] {
-        for password in [false, true] {
+        for users in [false, true] {
             for offered in [0, 2, 99] {
-                let supported = (offered == 0 && anonymous) || (offered == 2 && password);
+                // Only "no authentication" can be selected; 2 never is.
+                let supported = offered == 0 && anonymous;
                 let mut bytes = vec![5, 1, offered];
-                if offered == 2 && supported {
-                    bytes.extend_from_slice(&[1, 1, b'u', 1, b'p']);
-                }
                 bytes.extend_from_slice(&socks_request(b"h")[3..]);
-                let (result, response, calls) = parse(&bytes, anonymous, password, true).await;
+                let (result, response) = parse(&bytes, anonymous, users).await;
                 assert_eq!(result.is_ok(), supported);
-                assert_eq!(calls, usize::from(supported && offered == 2));
-                let expected = if !supported {
-                    vec![5, 255]
-                } else if offered == 2 {
-                    vec![5, 2, 1, 0]
-                } else {
-                    vec![5, 0]
-                };
+                let expected = if supported { vec![5, 0] } else { vec![5, 255] };
                 assert_eq!(response, expected);
             }
         }
     }
-    let (result, response, calls) = parse(&[5, 0], true, true, true).await;
+    let (result, response) = parse(&[5, 0], true, true).await;
     assert!(matches!(result, Err(ServerError::Authentication(_))));
     assert_eq!(response, [5, 255]);
-    assert_eq!(calls, 0);
 }
 
 #[tokio::test]
@@ -454,11 +371,7 @@ async fn maximum_valid_headers_do_not_count_binary_payload() {
     let (mut peer, mut stream) = duplex(64 * 1024);
     peer.write_all(&bytes).await.unwrap();
     peer.shutdown().await.unwrap();
-    let mut req = accept(&mut stream, &options(true, false), |_| async {
-        panic!("anonymous auth")
-    })
-    .await
-    .unwrap();
+    let mut req = accept(&mut stream, &options(true, false)).await.unwrap();
     let mut received = req.take_pipeline();
     assert!(
         !received.is_empty(),
@@ -472,28 +385,21 @@ async fn maximum_valid_headers_do_not_count_binary_payload() {
 async fn fragmented_obs_headers_reach_the_real_auth_field() {
     let bytes = b"CONNECT h:443 HTTP/x\r\nX-Opaque: \xff\xfe\r\ncolonless\r\n Proxy-Authorization : Basic dTpw\r\n\r\n";
     let (mut peer, mut stream) = duplex(8);
-    let writer = async {
+    let client = async {
         for byte in bytes {
             peer.write_all(&[*byte]).await.unwrap();
         }
+        // The padded header name was found: the 407 comes back.
+        let mut response = vec![0; EXPECT_HTTP_407.len()];
+        peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, EXPECT_HTTP_407);
     };
-    let reader = async {
-        let req = accept(
-            &mut stream,
-            &options(false, true),
-            |credentials| async move {
-                assert_eq!(credentials.username(), "u");
-                assert_eq!(credentials.password(), "p");
-                true
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(req.username(), Some("u"));
-        assert_eq!(req.target(), "h:443");
+    let server = async {
+        let result = accept(&mut stream, &options(true, true)).await;
+        assert!(matches!(result, Err(ServerError::Authentication(_))));
     };
     timeout(Duration::from_secs(5), async {
-        tokio::join!(writer, reader);
+        tokio::join!(client, server);
     })
     .await
     .unwrap();

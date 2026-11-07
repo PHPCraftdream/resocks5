@@ -19,8 +19,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
@@ -51,13 +49,6 @@ pub enum Script {
 pub enum MockAuth {
     /// No authentication (SOCKS5 method 0x00; HTTP ignores credentials).
     None,
-    /// Clear-text credentials: SOCKS5 RFC 1929 (method 0x02), HTTP Basic.
-    Cleartext {
-        /// Expected user name.
-        user: String,
-        /// Expected password.
-        password: String,
-    },
     /// Secure auth (SOCKS5 method 0x80) against this one user; HTTP answers
     /// every CONNECT with 407.
     #[cfg(feature = "secure-auth")]
@@ -73,7 +64,6 @@ impl std::fmt::Debug for MockAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::None => "MockAuth::None",
-            Self::Cleartext { .. } => "MockAuth::Cleartext { .. }",
             #[cfg(feature = "secure-auth")]
             Self::Secure { .. } => "MockAuth::Secure { .. }",
         })
@@ -249,7 +239,6 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
     }
     let wanted = match &state.auth {
         MockAuth::None => 0x00,
-        MockAuth::Cleartext { .. } => 0x02,
         #[cfg(feature = "secure-auth")]
         MockAuth::Secure { .. } => crate::secure_auth::METHOD,
     };
@@ -259,19 +248,6 @@ async fn serve_socks5(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
     stream.write_all(&[0x05, wanted]).await?;
     match &state.auth {
         MockAuth::None => {}
-        MockAuth::Cleartext { user, password } => {
-            let mut version_and_len = [0u8; 2];
-            stream.read_exact(&mut version_and_len).await?;
-            let mut got_user = vec![0u8; usize::from(version_and_len[1])];
-            stream.read_exact(&mut got_user).await?;
-            let mut got_password = vec![0u8; usize::from(stream.read_u8().await?)];
-            stream.read_exact(&mut got_password).await?;
-            let ok = got_user == user.as_bytes() && got_password == password.as_bytes();
-            stream.write_all(&[0x01, u8::from(!ok)]).await?;
-            if !ok {
-                return Ok(());
-            }
-        }
         #[cfg(feature = "secure-auth")]
         MockAuth::Secure { user, secret } => {
             let store = OneUser { user, secret };
@@ -348,18 +324,8 @@ async fn serve_http(mut stream: TcpStream, state: &Shared) -> io::Result<()> {
         .and_then(|rest| rest.split(' ').next())
         .unwrap_or_default()
         .to_owned();
-    let authorization = lines.find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("proxy-authorization")
-            .then(|| value.trim().to_owned())
-    });
     let authorized = match &state.auth {
         MockAuth::None => true,
-        MockAuth::Cleartext { user, password } => {
-            authorization.as_deref()
-                == Some(format!("Basic {}", B64.encode(format!("{user}:{password}"))).as_str())
-        }
         #[cfg(feature = "secure-auth")]
         MockAuth::Secure { .. } => false,
     };
