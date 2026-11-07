@@ -180,7 +180,13 @@ impl ChainPick {
     pub fn key(&self) -> ChainKey {
         self.key.clone()
     }
-    /// Build the linked configuration for this chain.
+    /// The linked configuration for this chain, shared with the pick's key:
+    /// a refcount bump, no copy. Prefer it over [`config`](Self::config)
+    /// unless an owned, mutable value is needed.
+    pub fn config_arc(&self) -> Arc<ProxyConfig> {
+        Arc::clone(self.key.exit())
+    }
+    /// Build the linked configuration for this chain (an owned copy).
     pub fn config(&self) -> ProxyConfig {
         #[cfg(all(test, feature = "test-instrumentation"))]
         crate::perf::operation(|c| c.config_clones += 1);
@@ -425,7 +431,7 @@ fn lazy_layer(rotators: &[Arc<ProxyRotator>]) -> Layer {
                 if !duplicate {
                     #[cfg(all(test, feature = "test-instrumentation"))]
                     crate::perf::operation(|c| c.singleton_candidates_inserted += 1);
-                    let key = singleton_key_arc(&proxy);
+                    let key = ChainKey::singleton(&proxy);
                     candidates.push(Candidate {
                         hop: Hop {
                             rotator: cursor.rotator().clone(),
@@ -518,7 +524,7 @@ impl Layer {
     fn pull(&mut self) -> Result<(), ()> {
         while self.cursor_index < self.cursors.len() {
             if let Some(proxy) = self.cursors[self.cursor_index].next_proxy() {
-                let key = singleton_key_arc(&proxy);
+                let key = ChainKey::singleton(&proxy);
                 if self
                     .emitted
                     .get_or_insert_with(Default::default)
@@ -552,16 +558,6 @@ fn singleton_key(proxy: &ProxyConfig) -> ChainKey {
     let mut plain = proxy.clone();
     plain.gate = None;
     ChainKey::new(Arc::new(plain))
-}
-
-/// То же для прокси, уже принадлежащих Arc: без gate-ссылки идентичность
-/// совпадает, ключ можно позаимствовать без клона конфига и без нового Arc
-/// (гейт-ссылки есть только у узлов цепочек; узлы ротаторов всегда без gate).
-fn singleton_key_arc(proxy: &Arc<ProxyConfig>) -> ChainKey {
-    if proxy.gate.is_none() {
-        return ChainKey::new(Arc::clone(proxy));
-    }
-    singleton_key(proxy)
 }
 
 impl ChainPlan {

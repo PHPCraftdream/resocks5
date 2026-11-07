@@ -169,7 +169,7 @@ async fn exercise(protocol: Protocol, case: Case) {
         let address = listener.local_addr().unwrap();
         let no_rotator = None;
         let no_gates = Arc::new(GateLevels::default());
-        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         let logger = Arc::new(Logger::new(sender, LogConfig::default()));
         let banned = Arc::new(if case == Case::Banned {
             regex::RegexSet::new([format!("^127[.]0[.]0[.]1:{port}$")]).unwrap()
@@ -243,6 +243,26 @@ async fn exercise(protocol: Protocol, case: Case) {
             );
         }
         assert_eq!(direct_limiter.available_permits(), slots);
+        let cap_lines: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|entry| match entry {
+                crate::logger::ELog::Error(line) if line.starts_with("Direct cap reached") => {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect();
+        if case == Case::AtCapacity {
+            // The line is built from borrowed values: its text must match.
+            assert_eq!(
+                cap_lines,
+                [format!(
+                    "Direct cap reached ({}) — dropping client=alice target=127.0.0.1:{port}",
+                    network.max_concurrent_direct
+                )]
+            );
+        } else {
+            assert!(cap_lines.is_empty(), "{cap_lines:?}");
+        }
     })
     .await
     .expect("обмен обязан завершиться в общем бюджете");

@@ -368,7 +368,7 @@ async fn a_dead_cached_upstream_is_raced_not_waited_for() {
     let live = socks5_config(spawn_socks5_stub().await, false);
     let v4 = Arc::new(ProxyRotator::new(vec![dead.clone(), live]));
     let target = "sticky.example.com:443";
-    v4.link_proxy(target.to_string(), Arc::new(dead));
+    v4.link_proxy(target, Arc::new(dead));
     let took = hedged_request(&v4, target, 100).await;
     assert!(took < Duration::from_millis(900), "request waited {took:?}");
 }
@@ -429,7 +429,7 @@ async fn a_slow_target_answer_is_not_hedged() {
     ]));
     let target = "slow.example.com:443";
     // The sticky upstream leads the race.
-    v4.link_proxy(target.to_string(), Arc::new(slow));
+    v4.link_proxy(target, Arc::new(slow));
     let pool = Arc::new(ProxyPool::new(
         Default::default(),
         Duration::from_secs(5),
@@ -476,7 +476,7 @@ async fn a_late_loser_leaves_the_winners_sticky_link() {
     let live = socks5_config(spawn_socks5_stub().await, false);
     let v4 = Arc::new(ProxyRotator::new(vec![dead.clone(), live.clone()]));
     let target = "relink.example.com:443";
-    v4.link_proxy(target.to_string(), Arc::new(dead));
+    v4.link_proxy(target, Arc::new(dead));
     hedged_request(&v4, target, 100).await;
     // Let the abandoned `dead` attempt time out (1 s) in the background.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -616,7 +616,7 @@ async fn a_cached_chain_with_a_quarantined_gate_is_not_dialed() {
         ])
         .unwrap(),
     );
-    exit.link_proxy(target.to_string(), cached);
+    exit.link_proxy(target, cached);
     // Quarantine the gate out of band: the state get_linked cannot see.
     assert!(gate_rotator.record_hard_failure(&bad).is_some());
     let logger = test_logger();
@@ -697,7 +697,7 @@ async fn a_healthy_cached_chain_is_still_a_cache_hit() {
         ])
         .unwrap(),
     );
-    exit.link_proxy(target.to_string(), cached);
+    exit.link_proxy(target, cached);
     let (log_tx, mut logs) = mpsc::channel(32);
     let logger = Arc::new(Logger::new(
         log_tx,

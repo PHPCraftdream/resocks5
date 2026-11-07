@@ -759,3 +759,100 @@ async fn dead_gates_and_exits_stop_at_attempt_budget() {
     assert_eq!(attempts, 3);
     assert!(attempts <= network.max_upstream_attempts);
 }
+
+/// Refuses every client at the SOCKS5 greeting and counts the connections.
+async fn counting_refuser() -> (Stub, Arc<std::sync::atomic::AtomicUsize>) {
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = accepts.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut greeting = [0; 3];
+                if socket.read_exact(&mut greeting).await.is_ok() {
+                    let _ = socket.write_all(&[5, 255]).await;
+                }
+            });
+        }
+    });
+    (Stub { addr, task }, accepts)
+}
+
+async fn failing_dial(
+    v6: Option<Arc<ProxyRotator>>,
+    v4: Option<Arc<ProxyRotator>>,
+) -> anyhow::Error {
+    let (log_tx, _logs) = mpsc::channel(8);
+    let logger = Arc::new(Logger::new(log_tx, LogConfig::default()));
+    let network = Arc::new(crate::config::NetworkConfig {
+        max_upstream_attempts: 4,
+        handshake_timeout_sec: 2,
+        connect_timeout_sec: 1,
+        ..Default::default()
+    });
+    let pool = Arc::new(ProxyPool::new(
+        Default::default(),
+        Duration::from_secs(2),
+        8,
+    ));
+    timeout(
+        Duration::from_secs(8),
+        establish_connection(
+            "example.com:443",
+            &Arc::new(GateLevels::default()),
+            &v6,
+            &v4,
+            &logger,
+            &Arc::new(RegexSet::empty()),
+            &pool,
+            &network,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("the dial stops on its own")
+    .err()
+    .expect("the only upstream refuses")
+}
+
+/// The same upstream listed by both rotators is one route: it is attempted
+/// once, not once per rotator. Mutation: a route key that is not equal across
+/// rotators (or not shared at all) gives two connections.
+#[tokio::test]
+async fn one_proxy_listed_by_both_rotators_is_attempted_once() {
+    let (stub, accepts) = counting_refuser().await;
+    let proxy = config(stub.addr, 0);
+    let v6 = Arc::new(ProxyRotator::new(vec![proxy.clone()]));
+    let v4 = Arc::new(ProxyRotator::new(vec![proxy]));
+    failing_dial(Some(v6), Some(v4)).await;
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A cached one-node route is the same route as that proxy in the rotator
+/// list, so it is not tried a second time as a direct candidate. Mutation: a
+/// cached key that differs from the listed one gives two connections.
+#[tokio::test]
+async fn cached_proxy_is_not_retried_as_a_direct_candidate() {
+    let (stub, accepts) = counting_refuser().await;
+    let proxy = config(stub.addr, 0);
+    let v4 = Arc::new(ProxyRotator::new(vec![proxy.clone()]));
+    v4.link_proxy("example.com:443", Arc::new(proxy));
+    failing_dial(None, Some(v4)).await;
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Distinct upstreams stay distinct routes: both are attempted. Guards the
+/// two tests above against a key that equates everything.
+#[tokio::test]
+async fn distinct_proxies_are_both_attempted() {
+    let (first, first_accepts) = counting_refuser().await;
+    let (second, second_accepts) = counting_refuser().await;
+    let v6 = Arc::new(ProxyRotator::new(vec![config(first.addr, 0)]));
+    let v4 = Arc::new(ProxyRotator::new(vec![config(second.addr, 0)]));
+    failing_dial(Some(v6), Some(v4)).await;
+    assert_eq!(first_accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(second_accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

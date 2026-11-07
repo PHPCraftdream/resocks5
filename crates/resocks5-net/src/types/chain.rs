@@ -59,6 +59,22 @@ impl ChainKey {
         Self(exit)
     }
 
+    /// Key of one node on its own, without its gate link.
+    ///
+    /// A gate-less node is shared as is (refcount only); a node with a gate
+    /// is copied once with the link dropped. Equal to the key of
+    /// `ProxyConfig::chain([node])`, without that call's copies.
+    pub fn singleton(node: &Arc<ProxyConfig>) -> Self {
+        if node.gate.is_none() {
+            return Self(Arc::clone(node));
+        }
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.config_clones += 1);
+        let mut plain = (**node).clone();
+        plain.gate = None;
+        Self(Arc::new(plain))
+    }
+
     /// Return the exit configuration.
     pub fn exit(&self) -> &Arc<ProxyConfig> {
         &self.0

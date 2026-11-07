@@ -599,7 +599,7 @@ async fn cached_gate_connect_failure_penalizes_gate_not_inner_proxy() {
     ));
     let gates = Arc::new(GateLevels::new(vec![(1, gate_rotator.clone())]));
     let composite = ProxyConfig::chain([Arc::new(dead), Arc::new(inner_a.clone())]).unwrap();
-    v4.link_proxy(target.to_string(), Arc::new(composite));
+    v4.link_proxy(target, Arc::new(composite));
     let result = establish_connection(
         target,
         &gates,

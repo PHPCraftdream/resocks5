@@ -828,3 +828,105 @@ pub(super) async fn recovery_request() -> IncomingRequest {
     .await
     .unwrap()
 }
+
+/// A real request whose accept callback admitted the user `alice`.
+async fn request_as_alice() -> IncomingRequest {
+    let (mut peer, mut stream) = tokio::io::duplex(256);
+    peer.write_all(
+        b"CONNECT 203.0.113.9:443 HTTP/1.1
+Proxy-Authorization: Basic YWxpY2U6cHc=
+
+",
+    )
+    .await
+    .unwrap();
+    resocks5_net::server::accept(
+        &mut stream,
+        &resocks5_net::server::ServerOptions::new(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            false,
+            true,
+        ),
+        |_| async { true },
+    )
+    .await
+    .unwrap()
+}
+
+/// A direct account at its direct-connection cap gets 503 and one log line
+/// that names the client and the target (built from borrowed values).
+/// Mutation: dropping or reordering a value in the line, or answering
+/// something other than Overloaded, fails here.
+#[tokio::test]
+async fn direct_cap_overload_replies_503_and_logs_client_and_target() {
+    let auth = Arc::new(
+        AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous: true,
+            },
+            &crate::config::UsersConfig {
+                users: vec![crate::config::User {
+                    name: "alice".into(),
+                    hash: "init".into(),
+                    is_enabled: true,
+                    direct: true,
+                    allowed_clients: None,
+                }],
+            },
+            "unused-direct-cap",
+        )
+        .unwrap(),
+    );
+    let request = request_as_alice().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (log_tx, mut logs) = tokio::sync::mpsc::channel(8);
+    let logger = Arc::new(crate::logger::Logger::new(
+        log_tx,
+        crate::logger::LogConfig::default(),
+    ));
+    let network = Arc::new(NetworkConfig::default());
+    handle_http_client(
+        socket,
+        request,
+        &auth,
+        &Arc::new(GateLevels::default()),
+        &None,
+        &None,
+        &logger,
+        &Arc::new(RegexSet::empty()),
+        &Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(1),
+            1,
+        )),
+        &Arc::new(TlsFragmentConfig::default()),
+        &network,
+        None,
+        &Arc::new(Semaphore::new(0)),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 503 "),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    match logs.try_recv().unwrap() {
+        crate::logger::ELog::Error(line) => assert_eq!(
+            line,
+            format!(
+                "Direct cap reached ({}) — dropping client=alice target=203.0.113.9:443",
+                network.max_concurrent_direct
+            )
+        ),
+        crate::logger::ELog::Log(line) => panic!("unexpected plain log entry: {line}"),
+    }
+    assert!(logs.try_recv().is_err(), "exactly one line");
+}

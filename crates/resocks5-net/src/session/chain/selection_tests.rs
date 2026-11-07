@@ -480,3 +480,43 @@ fn exclude_and_mark_dead_stay_independent_sets() {
     assert_eq!(plan.seen.len(), 1);
     assert!(plan.seen.contains(&excluded));
 }
+
+/// `config_arc` is the pick's own linked configuration: the very allocation
+/// its key holds (no copy), equal to what `config` builds, with the gates
+/// shared. Mutation: building a fresh `Arc` from a copy breaks `ptr_eq`.
+#[test]
+fn config_arc_shares_the_keys_chain_and_matches_config() {
+    let gates = GateLevels::new(vec![(2, r(&["outer"])), (1, r(&["inner"]))]);
+    let exits = [r(&["exit-a", "exit-b"])];
+    let picks: Vec<_> = ChainPlan::new(&gates, &exits).collect();
+    assert_eq!(picks.len(), 2);
+    for pick in &picks {
+        let shared = pick.config_arc();
+        assert!(Arc::ptr_eq(&shared, pick.key().exit()));
+        assert_eq!(ChainKey::new(shared.clone()), pick.key());
+        assert_eq!(ChainKey::new(Arc::new(pick.config())), pick.key());
+        assert_eq!(shared.chain_len(), 3);
+        // A second call shares again; nothing was copied behind the scenes.
+        assert!(Arc::ptr_eq(&shared, &pick.config_arc()));
+        // `config` stays an independent owned copy: editing it leaves the
+        // shared chain alone.
+        let mut owned = pick.config();
+        owned.host.push_str("-edited");
+        assert_ne!(owned.host, shared.host);
+        assert_eq!(ChainKey::new(shared), pick.key());
+    }
+}
+
+/// The shared configuration keeps the hops' order: gates outermost, exit last.
+#[test]
+fn config_arc_orders_hops_outermost_first() {
+    let gates = GateLevels::new(vec![(2, r(&["outer"])), (1, r(&["inner"]))]);
+    let pick = ChainPlan::new(&gates, &[r(&["exit"])]).next().unwrap();
+    let hosts: Vec<_> = pick
+        .config_arc()
+        .chain_nodes()
+        .iter()
+        .map(|node| node.host.clone())
+        .collect();
+    assert_eq!(hosts, ["outer", "inner", "exit"]);
+}
