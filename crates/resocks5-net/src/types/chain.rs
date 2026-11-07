@@ -29,6 +29,38 @@ impl ProxyConfig {
         chain.map(|chain| Arc::try_unwrap(chain).unwrap_or_else(|shared| (*shared).clone()))
     }
 
+    /// Build a shared chain from outermost node to exit, discarding input gates.
+    ///
+    /// Same contract as [`Self::chain`], but the result stays in an `Arc`
+    /// without the unwrap-and-rewrap round trip. Copy-on-write: the first
+    /// node is reused as is (a refcount bump, no copy) when it carries no
+    /// gate; a first node that carries a gate is copied once with the gate
+    /// dropped; every later node is copied because its gate link changes.
+    /// Returns `None` for an empty iterator.
+    pub fn chain_arc<I>(nodes: I) -> Option<Arc<ProxyConfig>>
+    where
+        I: IntoIterator<Item = Arc<ProxyConfig>>,
+    {
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.chain_builds += 1);
+        let mut chain: Option<Arc<ProxyConfig>> = None;
+        for node in nodes {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| c.chain_nodes += 1);
+            if chain.is_none() && node.gate.is_none() {
+                // Copy-on-write: the first gate-less node is shared as is.
+                chain = Some(node);
+            } else {
+                #[cfg(all(test, feature = "test-instrumentation"))]
+                crate::perf::operation(|c| c.config_clones += 1);
+                let mut linked = (*node).clone();
+                linked.gate = chain.take();
+                chain = Some(Arc::new(linked));
+            }
+        }
+        chain
+    }
+
     /// Borrow this chain's nodes, outermost first and exit last.
     pub fn chain_nodes(&self) -> Vec<&ProxyConfig> {
         self.nodes()
