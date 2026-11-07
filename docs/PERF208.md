@@ -1,31 +1,76 @@
-# #208 — детерминированные счётчики перед оптимизацией
+# #208 — детерминированные счётчики аллокаций и копирований
 
 ## Статус
 
-Получены локальный baseline и результат пяти узких оптимизаций в одном
-Windows/Rust1.97 окружении. Счётчики подтвердили снижение аллокаций; timing,
-latency и throughput не измерялись. Полное закрытие всех кандидатов #208
-не заявляется: weighted order, pool keys, линейный resolve и retention
-credentials пока оставлены без изменений.
+Работа #208 измеряет не время, а счётчики: вызовы allocator, запрошенные
+байты, явно отмеченные клонирования и выполненные операции в production-
+компонентах. Timing, latency и throughput не измерялись и не заявляются.
+Компонентная экономия не доказывает влияние на пропускную способность всего
+приложения, а экономия разных строк не складывается.
 
-Исходные 48 пар счётчиков, параметры сборки и статусы прогонов сохранены в
-[PERF208-RESULTS.json](PERF208-RESULTS.json). Оба результата приняты runner
-с общим лимитом 15 секунд на прогон; компиляция выполнялась отдельно.
-GitHub CI в этой сессии не запускался.
+Каждый кандидат из сводной таблицы ниже имеет итоговый статус. Для CoW-этапа есть
+Linux/Rust 1.88 baseline из CI (блок «CI-baseline»), сверяемый тестом и
+workflow; более ранние этапы подтверждены локальным Windows/Rust 1.97 A/B,
+исторические цифры которого приведены в своих отчётах.
 
-Исходная ревизия для этой работы: `4fc5968`. Git blob исходного `Cargo.lock`:
-`21b918f3b72c33829d5f4cde306cff5ae1da3095`. Lock-файл не изменён.
-Существенные resolved versions: Tokio 1.54.1, DashMap 6.1.0,
-crossbeam-queue 0.3.12, serde 1.0.228, rustls 0.23.46.
+## Сводная таблица кандидатов
+
+| Кандидат | Статус | Коммит | Доказательство | Счётчики до → после | Не покрыто |
+|---|---|---|---|---|---|
+| DT-03: `mark_dead` | сделано: один Clone вместо двух | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | первый вызов 10 → 5 alloc, 402 → 211 B; повтор 9 → 4 | другие распределения capacity HashSet |
+| `ChainKey::hash` собирал Vec | сделано: стековый буфер до 64 узлов | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16/64 узла: 1 → 0 alloc (16 и 64 узла: ещё 2/4 realloc → 0) | CPU не измерялся; цепочки длиннее 64 идут прежней Vec-веткой |
+| P02: двойная materialization `pick.config()` | сделано: один Clone корня | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16 узлов: 4/16/64 → 3 alloc | частота пути в реальном трафике |
+| Три Arc на туннель | сделано: одна Arc-аллокация | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | создание 3 → 1 alloc, 72 → 40 B | contention атомарных полей |
+| Предварительный log formatting | сделано: отключённые категории не форматируют | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | report с выключенными категориями 2/1 → 0/0 | остальные места логирования |
+| DT-04 / GA-04: gate label | сделано: один буфер | `dc67806` | [gate-formatter](perf208/reports/gate-formatter.md) | depth16: 18 alloc + 16 realloc → 1 / 0; 1987 → 659 B | частота cached failures; end-to-end dial |
+| CC-06: pool key | сделано: borrowed lookup | `dc67806` | [pool](perf208/reports/pool.md) | warm lookup 1 → 0 alloc; checkout + reserve 2 → 0; cold insert без изменений | живые spares, DNS, конкуренция |
+| Cached resolve | сделано: индекс по identity | `dc67806` | [resolve](perf208/reports/resolve.md) | N=256, last/miss: 256 → 1/0 сравнений | несколько gate levels и exit groups |
+| Полный weighted order при малом бюджете | сделано: внутренний lazy-план; публичный `pick_order` остался контрольным | `dc67806` | [weighted](perf208/reports/weighted.md) | N=256, первый кандидат: 1042 → 12 alloc, 2138 → 255 сравнений; полный drain: 2138 → 5018 сравнений | ускорение полного drain не заявляется |
+| Raw credentials | сделано в успешной Basic-ветке; `Credentials::duplicate` остаётся по контракту | `dc67806` | [credentials](perf208/reports/credentials.md) | Basic retain 11 → 10 alloc; plain 8 → 7; UTF-8/raw/Basic duplicate: 2/4/3 owning-копии | очистка всех копий компилятора и хоста |
+| `mark_dead` и singleton при росте числа ротаторов | только счётчики, оптимизаций продукта нет | `dc67806` | [mark-dead](perf208/reports/mark-dead.md) | R=256, непересекающиеся: 0 сравнений против 32640 у eager-эталона | большие декартовы планы проверяются выборочно |
+| Dial-путь: singleton route key, `ChainPick::config_arc`, borrowed `link_proxy`, общий hedge target | сделано | `f0928df`, счётчики `fb7b644` | CI-baseline ниже | см. таблицу CI-baseline | hedge target проверен тестом, строк PERF208 нет |
+| Прямой путь: порядок кандидатов по мере потребления | сделано: `ProxyRotator::pick_iter` | `cacf0d0` | CI-baseline ниже | 1 из 256: 2138 → 255 сравнений | ускорение полного drain не заявляется |
+| `ProxyConfig::chain_arc` для ключей `ChainPlan`, `percent_decode` без копии | сделано | `5fa5716` | CI-baseline ниже | 1 узел: 6 → 0 alloc; 4 узла: 18 → 12 | `percent_decode` проверен тестами borrowed/owned, строк PERF208 нет |
+| Снимок health в Arc | отклонено: холодный путь, риск в конкурентной зоне | — | — | — | — |
+| Пароль как `Arc<str>` | отклонено: ломает `wipe_credentials` и zeroize | — | — | — | — |
+
+## CI-baseline: CoW-этап (Linux, Rust 1.88)
+
+Окружение: `ubuntu-24.04`, rustc/Cargo 1.88.0, target
+`x86_64-unknown-linux-gnu`, allocator `std::alloc::System`, профиль `test`,
+`RUSTFLAGS=-D warnings`, SDK с `zeroize,test-instrumentation`. Значения взяты
+из artifact `perf208-counters` прогона на коммите `ac7eace`
+([results/cow.json](perf208/results/cow.json)). Ячейка — «до → после».
+«До» — дословные replica прежнего кода в самих тестах, «после» — текущий код.
+
+<!-- perf208:cow:begin -->
+| Сценарий | `alloc` | `realloc` | `requested_bytes` | `config_clones` | `sort_comparisons` |
+|---|---:|---:|---:|---:|---:|
+| singleton route key, gate-less node | 5 → 0 | 0 → 0 | 271 → 0 | 1 → 0 | 0 → 0 |
+| singleton route key, gated node | 5 → 4 | 0 → 0 | 271 → 159 | 1 → 1 | 0 → 0 |
+| ChainPick::config_arc, 1 hop | 4 → 0 | 0 → 0 | 159 → 0 | 1 → 0 | 0 → 0 |
+| ChainPick::config_arc, 4 hops | 4 → 0 | 0 → 0 | 159 → 0 | 1 → 0 | 0 → 0 |
+| ChainPick::config_arc, 16 hops | 4 → 0 | 0 → 0 | 159 → 0 | 1 → 0 | 0 → 0 |
+| link_proxy, known address | 1 → 0 | 0 → 0 | 18 → 0 | 0 → 0 | 0 → 0 |
+| link_proxy, new address | 5 → 4 | 0 → 0 | 1157 → 1140 | 0 → 0 | 0 → 0 |
+| ProxyConfig::chain_arc, 1 node | 6 → 0 | 0 → 0 | 279 → 0 | 1 → 0 | 0 → 0 |
+| ProxyConfig::chain_arc, 4 nodes | 18 → 12 | 0 → 0 | 780 → 477 | 4 → 3 | 0 → 0 |
+| direct order, 1 of 256 consumed | 1032 → 1032 | 0 → 0 | 131650 → 131650 | 0 → 0 | 2138 → 255 |
+<!-- perf208:cow:end -->
+
+Блок между маркерами генерирует `tests/perf208/render.py`; руками его не
+правят. Workflow `perf.yml` вызывает `render.py check`: он сравнивает блок с
+`results/cow.json` и сохранённые значения со свежими строками `PERF208`. Если
+счётчики изменились намеренно, обновить оба места командой
+`python -I tests/perf208/render.py update --counters <каталог counters из artifact>`.
 
 ## Измерительная граница
 
 Закрытый модуль `perf` подключается в каждом unit-test binary только при
 `cfg(all(test, feature = "test-instrumentation"))`. Публичные SDK-типы,
 сигнатуры и traits не изменяются. Обычная сборка, даже с этой фичей,
-не включает новый allocator или счётчики #208. Уже существующая SDK-фича
-сохраняет прежнюю instrumentation; приложению добавлена одноимённая фича,
-передающая её SDK.
+не включает allocator или счётчики #208. Приложение имеет одноимённую фичу,
+передающую её SDK.
 
 `measure` считает синхронную работу текущего потока. Настройка fixture,
 инициализация TLS счётчиков, assertions над результатом и печать отчёта
@@ -42,60 +87,36 @@ Allocator — обёртка над `std::alloc::System`, без собстве�
 - `requested_bytes`: сумма запрошенных размеров для `alloc`, `alloc_zeroed`
   и новых размеров для `realloc`. Это не RSS, peak memory, live bytes,
   копируемые байты или размер блоков внутри системного allocator;
-- `config_clones`: явно отмеченные вызовы клонирования в `mark_dead`,
-  `singleton_key`, цикле `ProxyConfig::chain` и `ChainPick::config`, не все
+- `config_clones`: явно отмеченные вызовы клонирования в `singleton_key`
+  (его использует `mark_dead`), `ChainKey::singleton`, циклах
+  `ProxyConfig::chain` и `ProxyConfig::chain_arc`, `ChainPick::config`; не все
   Clone в процессе;
 - `chain_builds`, `chain_nodes`, `hash_nodes`, `resolve_comparisons`,
-  `weighted_keys`, `sort_comparisons`, `gate_formats`: выполненные операции
-  в соответствующих production-компонентах.
+  `weighted_keys`, `sort_comparisons`, `gate_formats` и счётчики singleton/
+  `mark_dead`: выполненные операции в соответствующих production-компонентах.
+  `pick_order_calls` считает и `pick_order`, и `pick_iter`.
 
 Счётчики не выделяют память. Allocator использует непаникующий доступ к TLS
 при завершении потока. Тест калибровки проверяет пустой scope, известную
 аллокацию, освобождение, realloc и восстановление после panic; отдельный тест —
 изоляцию маркера операций между потоками. Это не доказательство отсутствия
-аллокаций внутри платформенного ожидания `Barrier`.
-
-## Матрица кандидатов
-
-| Кандидат | Сценарий | Что результат докажет | Что не покрыто |
-|---|---|---|---|
-| DT-03: `mark_dead` | Первое и повторное исключение одного proxy | Аллокации вызова и clone-sites до/после оптимизации | Другие распределения capacity HashSet |
-| DT-04 / GA-04: gate label | 0, 1, 4, 16 gates | Стоимость одного реального formatter | Частота cached failures и end-to-end стоимость dial |
-| CC-06: pool key | Cold/warm reserve, capacity refusal, empty checkout и checkout+reserve | Стоимость map key и semaphore-path без сокетов | Живые spares, DNS, connect, конкуренция |
-| P02: двойная materialization | `plan.next()` отдельно от `pick.config()`, 1/4/16 nodes | Число chain builds, nodes и аллокации каждого вызова | Частота этих путей в реальном трафике |
-| Полный weighted order при малом бюджете | N=1/8/64/256, seed=208, consumption budget=1/3 | Ключи для всего N и сравнения сортировки независимо от consumption | Общая стоимость Ratings lock/quarantine; timings |
-| `ChainKey::hash` собирает Vec | Depth=1/4/16/64 | Аллокации hash и посещённые nodes | Частота hash в реальном запросе |
-| Cached resolve | First/last/miss в exit-rotator, N=1/8/64/256 | Сравнения при линейном поиске и аллокации | Несколько gate levels и exit groups |
-| Raw credentials | Retention duplicate: UTF-8, invalid raw bytes, HTTP Basic | Аллокации реального `Credentials::duplicate`, сохранность полей | Остальные копии при парсинге и весь handshake |
-| Предварительный log formatting | Реальный tunnel report с выключенными категориями + Logger control | Затраты вокруг отключённого Logger и отсутствие затрат самого closure | Все logging call sites приложения |
-| Три Arc на туннель | `Counters::default` отдельно от `Counters::clone` | Allocator requests при создании и refcount-only clone | Общая стоимость tunnel setup и atomics под конкуренцией |
-
-В baseline gate formatter вынесен в закрытую `gate_label` без изменения
-алгоритма, условий и количества вызовов. После измерений вызовы перенесены
-в `log_chain_attempt`: label строится только внутри принятого Logger closure,
-один раз для конкретного результата, а не заранее и повторно при cached
-failure. Алгоритм formatter и текст логов не менялись. Проверены включённая
-и выключенная категория, а также заполненная очередь: в последних двух
-случаях число gate formats и аллокаций равно нулю. Компонентные строки
-`gate_label/depth=*` намеренно остались одинаковыми в A/B; это цена formatter,
-а не частота его вызова в реальном трафике.
+аллокаций внутри платформенного ожидания `Barrier`. Сообщение panic
+`scope cleanup` в калибровке перехватывается `catch_unwind` и не является
+падением теста.
 
 Сценарии проверяют свойства результатов: permutation, identity, исключение
-мёртвого узла, capacity, сохранение credentials. Повторные вызовы с одинаковым
-входом в ряде сценариев сверяют и счётчики. Это не замена существующим
-функциональным и конкурентным тестам.
+мёртвого узла, capacity, сохранение credentials. Они не заменяют
+функциональные и конкурентные тесты.
 
-## Локальное A/B: фактические результаты
+## Историческое локальное A/B (Windows, Rust 1.97, до `dc67806`)
 
 Окружение: rustc/Cargo 1.97.0, target `x86_64-pc-windows-msvc`, allocator
 `System`, профиль `test` с `opt-level=0`, `RUSTFLAGS=-D warnings`, incremental
-отключён. Для SDK включены defaults, zeroize и test-instrumentation; для
-приложения — test-instrumentation и обычные dependency defaults.
-
-Параметры и полные dependency artifact graphs A/B совпали: 89 артефактов
-SDK и 129 приложения. Их fingerprints сохранены в JSON. Lock-файл не
-изменялся. Измерены два этапа незакоммиченного рабочего дерева на базе
-`4fc5968`, а не два отдельных Git-коммита.
+отключён. Параметры и dependency artifact graphs до и после совпали (89
+артефактов SDK, 129 приложения), `Cargo.lock` не менялся. Базовая ревизия
+`4fc5968`. Полные пары счётчиков и fingerprints — в
+[PERF208-RESULTS.json](PERF208-RESULTS.json). Эти цифры нельзя смешивать с
+Linux/Rust 1.88 baseline.
 
 | Сценарий | До: alloc / realloc | После: alloc / realloc | Запрошено байт: до → после |
 |---|---:|---:|---:|
@@ -110,15 +131,15 @@ SDK и 129 приложения. Их fingerprints сохранены в JSON. L
 | Tunnel counters, создание | 3 / 0 | 1 / 0 | 72 → 40 |
 | Tunnel report, категории выключены | 2 / 1 | 0 / 0 | 63 → 0 |
 
-`mark_dead` теперь выполняет один отмеченный Clone вместо двух.
-`pick.config()` больше не строит цепочку повторно: один Clone корневого
-узла вместо 1/4/16 клонирований узлов и нового связывания; неизменяемые gates
-разделяются через существующие Arc. Проверено, что изменения возвращённого
-корня и `Arc::make_mut` gate не изменяют сохранённый ключ.
+`mark_dead` выполняет один отмеченный Clone вместо двух. `pick.config()` не
+строит цепочку повторно: один Clone корневого узла вместо 1/4/16
+клонирований и нового связывания; неизменяемые gates разделяются через
+существующие Arc. Изменения возвращённого корня и `Arc::make_mut` gate не
+изменяют сохранённый ключ.
 
 Hash сохраняет прежнюю последовательность хешируемых значений. Для цепочек
-до `MAX_CHAIN_NODES=64` используется стековый буфер из 64 ссылок — 512 байт
-на этом target. Это обмен heap allocations на ограниченный stack footprint;
+до `MAX_CHAIN_NODES=64` используется стековый буфер из 64 ссылок — 512 байт на
+этом target. Это обмен heap allocations на ограниченный stack footprint;
 снижение CPU cost не доказано. Более длинные невалидированные цепочки не
 отвергаются и используют прежнюю Vec-ветку. Границы 64/65 и глубина 128
 проверены сравнением с прежним потоком байтов Hasher.
@@ -128,41 +149,28 @@ Hash сохраняет прежнюю последовательность хе
 cache-line/contention поведения под конкуренцией не измерялось. У report
 проверены комбинации категорий и warning-only случай; текст логов сохранён.
 
-Неизменённые кандидаты тоже получили baseline:
-
-- weighted order при N=256 генерирует 256 ключей и делает 2112 сравнений
-  для consumption budget как 1, так и 3. Частичный порядок требует отдельной
-  проверки распределения и интеграции с маршрутным бюджетом;
-- warm pool reserve — одна аллокация, empty checkout + reserve — две.
-  Borrowed lookup пока не вводился;
-- resolve по последнему/отсутствующему элементу при N=256 — 256 сравнений;
-- retention duplicate — 2/4/3 аллокации для UTF-8/raw/Basic. Это owning copies
-  по действующему контракту, а не автоматически лишние копии.
-
-Baseline: 15 выполнений тестов, общий wall time runner 0,047 секунды.
-После оптимизации: 58 выполнений тестов, включая короткие функциональные
-фильтры, общий wall time 0,125 секунды. Logger control выполнен повторно
-в отдельном функциональном фильтре. Эти времена подтверждают соблюдение
-лимита, а не ускорение: наборы проверок различаются, время runner шумит.
-Дополнительно прошли четыре mock-теста deadline runner. Сообщение panic
-`scope cleanup` в калибровке намеренно перехватывается `catch_unwind`;
-это не падение теста.
+Gate label строится только внутри принятого Logger closure, один раз для
+конкретного результата, а не заранее и повторно при cached failure. Алгоритм
+formatter и текст логов не менялись; при выключенной категории и заполненной
+очереди число gate formats и аллокаций равно нулю. Строки
+`gate_label/depth=*` одинаковы в A/B намеренно: это цена formatter, а не
+частота его вызова.
 
 ## Воспроизводимость и CI
 
-Отдельный workflow `.github/workflows/perf.yml` запускает только тесты с
-фильтром `perf208_`, последовательно. Это небольшой конечный набор
-компонентных тестов, не нагрузочный benchmark. Внешние подключения, реальные
-proxy, sleeps и измерение latency для этих сценариев не нужны.
+Workflow `.github/workflows/perf.yml` запускает только тесты с фильтром
+`perf208_`, последовательно. Это небольшой конечный набор компонентных тестов,
+не нагрузочный benchmark. Внешние подключения, реальные proxy, sleeps и
+измерение latency не нужны.
 
-Фиксированные параметры CI (отличаются от локального A/B):
+Фиксированные параметры CI:
 
 - rustc/Cargo 1.88.0;
 - target `x86_64-unknown-linux-gnu`;
 - allocator wrapper над `std::alloc::System`;
 - профиль `test`, `RUSTFLAGS=-D warnings`, incremental отключён;
-- SDK с defaults и `zeroize,test-instrumentation`, как в обычной сборке приложения;
-  в частности, сохраняются размеры конфигураций с TLS/secure-auth;
+- SDK с defaults и `zeroize,test-instrumentation`, как в обычной сборке
+  приложения; в частности, сохраняются размеры конфигураций с TLS/secure-auth;
 - приложение с обычными dependency defaults и `test-instrumentation`;
 - `--locked`, неизменённый `Cargo.lock`, один test thread;
 - синтетические credentials и endpoints `.invalid`.
@@ -173,15 +181,16 @@ proxy, sleeps и измерение latency для этих сценариев �
 сам lock-файл и feature trees обоих прогонов. Для строгого A/B принимаются
 только результаты с одинаковым fingerprint окружения и графом фич. При
 расхождении требуется повтор baseline в том же окружении; сравнивать числа
-как будто окружение одинаково нельзя. Commit SHA различается при A/B
-ожидаемо, но должен быть указан у каждого результата.
+как будто окружение одинаково нельзя. Commit SHA при A/B различается ожидаемо,
+но указывается у каждого результата.
 
 Workflow сохраняет исходный вывод `PERF208` в artifact `perf208-counters`.
-Ожидается 40 SDK-строк и 8 строк приложения; проверка количества защищает
-от пустого/случайно суженного фильтра. Runner проверяет exit code каждого
-бинарника и непустой успешный libtest summary, включая дополнительные
-функциональные фильтры. Upload с `always()` сохраняет доступные свидетельства
-ошибки; наличие artifact само по себе не означает успешный прогон.
+Ожидаемое число строк задано в `EXPECTED_ROWS` файла `tests/perf208/run.py`
+(сейчас 209 строк SDK и 24 приложения); проверка защищает от пустого или
+случайно суженного фильтра. Runner проверяет exit code каждого бинарника и
+непустой успешный libtest summary, включая дополнительные функциональные
+фильтры. Upload с `always()` сохраняет доступные свидетельства ошибки; наличие
+artifact само по себе не означает успешный прогон.
 
 ### Общий лимит выполнения — 15 секунд
 
@@ -191,17 +200,15 @@ Workflow сохраняет исходный вывод `PERF208` в artifact `p
 делят один monotonic deadline на 15 секунд, а не получают по 15 секунд каждый.
 Ожидание дочернего процесса ограничено остатком бюджета; при timeout runner
 завершает только свой test executable и сохраняет частичный вывод со статусом
-`accepted: false`. Подтверждение завершения процесса и сохранение диагностики
-после timeout могут занять дополнительное системное время; продолжать
-измерения после deadline нельзя.
+`accepted: false`. Продолжать измерения после deadline нельзя.
 
-Создание fixtures, assertions и печать результатов также входят в бюджет
-выполнения. Компиляция, подготовка окружения и проверка mock-runner — нет.
-Дополнительные функциональные фильтры `--check sdk:filter` и `--check app:filter`
-используют тот же оставшийся бюджет. Пустой фильтр, ненулевой exit code,
-неполное число PERF208-строк и превышение deadline отклоняют весь результат.
-Каталог результата создаётся заново; повторно использовать старый каталог
-нельзя, чтобы прежний успешный статус не маскировал ошибку нового прогона.
+Создание fixtures, assertions и печать результатов входят в бюджет выполнения.
+Компиляция, подготовка окружения и проверка mock-runner — нет. Дополнительные
+функциональные фильтры `--check sdk:filter` и `--check app:filter` используют
+тот же оставшийся бюджет. Пустой фильтр, ненулевой exit code, неполное число
+PERF208-строк и превышение deadline отклоняют весь результат. Каталог
+результата создаётся заново, чтобы прежний успешный статус не маскировал
+ошибку нового прогона.
 
 Команды CI:
 
@@ -209,15 +216,12 @@ Workflow сохраняет исходный вывод `PERF208` в artifact `p
 cargo test --locked -p resocks5-net --lib --target x86_64-unknown-linux-gnu --features zeroize,test-instrumentation --no-run --message-format=json > perf-results/sdk-build.json
 cargo test --locked -p resocks5 --bin resocks5 --target x86_64-unknown-linux-gnu --features test-instrumentation --no-run --message-format=json > perf-results/app-build.json
 python -I tests/perf208/run.py --sdk perf-results/sdk-build.json --app perf-results/app-build.json --output perf-results/counters
+python -I tests/perf208/render.py check --counters perf-results/counters
 ```
 
-Локальные измерения отдельно разрешены пользователем. Их Windows/Rust1.97
-baseline нельзя смешивать с Linux/Rust1.88 CI baseline; A/B выполняется
-целиком в одном окружении.
-
 Абсолютные времена общего runner не являются acceptance criterion.
-Instrumentation меняет стоимость операций, поэтому измерять её timings
-как production performance нельзя. Число сравнений зависит от реализации
+Instrumentation меняет стоимость операций, поэтому её timings нельзя
+выдавать за production performance. Число сравнений зависит от реализации
 sort в закреплённом compiler; при смене compiler baseline снимается заново.
 
 ## Правила последующих оптимизаций
@@ -234,8 +238,6 @@ sort в закреплённом compiler; при смене compiler baseline �
    фактического устранённого механизма.
 5. Для кандидатов с неполным path coverage сначала добавить соответствующий
    детерминированный сценарий, а не экстраполировать компонентный результат.
-
-Локальный этап A/B выполнен для перечисленных узких механизмов. Для остальных
-кандидатов сначала нужны соответствующие проверки контрактов и дополнительные
-сценарии, а не правки на глаз. Отдельный Linux/Rust1.88 CI baseline ещё не
-получен. Commit, push и запуск workflow извне в этой сессии не выполнялись.
+6. Новые строки добавлять в `EXPECTED_ROWS`; значения для сводной таблицы —
+   в `results/cow.json` (или новый файл того же формата) и обновлять через
+   `render.py update`.
