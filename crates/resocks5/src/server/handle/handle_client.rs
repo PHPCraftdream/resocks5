@@ -72,8 +72,8 @@ where
     }
 }
 
-/// Глобальная проверка IP до любого handshake: только TCP peer-адрес,
-/// fail-closed, если адрес недоступен.
+/// Global IP check before any handshake: TCP peer address only,
+/// fail-closed if the address is unavailable.
 fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> anyhow::Result<()> {
     let Some(rule) = rule else {
         return Ok(());
@@ -110,9 +110,9 @@ pub async fn handle_client(
     allowed_clients: &Option<Arc<AllowedClients>>,
     client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    // Глобальный фильтр — ДО протокольного peek/handshake. Правило
-    // приходит уже скомпилированным (одна компиляция на старте), здесь
-    // только проверка.
+    // Global filter — BEFORE protocol peek/handshake. The rule arrives
+    // already compiled (compiled once at startup); here it is
+    // only checked.
     global_allowed(&client_stream, allowed_clients)?;
     let peer_ip = client_stream.peer_addr().ok().map(|a| a.ip());
     #[cfg(test)]

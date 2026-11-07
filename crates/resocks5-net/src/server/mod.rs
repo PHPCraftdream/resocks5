@@ -695,7 +695,7 @@ where
                     .await
                 }
             };
-            // Ошибка UTF-8 не владеет буфером до await.
+            // The UTF-8 error does not own the buffer until the await.
             let text = match String::from_utf8(decoded).map_err(|error| error.utf8_error()) {
                 Ok(text) => text,
                 Err(_) => {

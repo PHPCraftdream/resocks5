@@ -110,11 +110,11 @@ struct ProxySpares {
 /// that the semaphore defends is keyed the same way.
 type ProxyKey = (String, u16);
 
-/// Borrowed-форма [`ProxyKey`] для lookup'ов без аллокаций. `std`
-/// даёт `Borrow<str> for String`, но borrowed-формы кортежа нет, и
-/// поиск по `(&str, u16)` требовал owning-ключ. `ProxyKey:
-/// Borrow<dyn ProxyEndpoint>` принимает в `get` ссылку, собранную
-/// на стеке из `&str`/`u16`; вставки сохраняют owning-ключ.
+/// Borrowed form of [`ProxyKey`] for allocation-free lookups. `std`
+/// provides `Borrow<str> for String` but no borrowed form of a tuple,
+/// so lookups by `(&str, u16)` would need an owning key. `ProxyKey:
+/// Borrow<dyn ProxyEndpoint>` lets `get` take a reference assembled
+/// on the stack from `&str`/`u16`; inserts keep the owning key.
 trait ProxyEndpoint {
     fn endpoint_host(&self) -> &str;
     fn endpoint_port(&self) -> u16;
@@ -140,8 +140,8 @@ impl ProxyEndpoint for (&str, u16) {
     }
 }
 
-// Hash и eq читают те же поля в том же порядке, что и производные
-// impls кортежа — контракт Borrow для ручных impls.
+// Hash and eq read the same fields in the same order as the derived
+// tuple impls — the Borrow contract for the manual impls.
 impl Hash for dyn ProxyEndpoint + '_ {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.endpoint_host().hash(state);
@@ -274,18 +274,18 @@ impl ProxyPool {
     /// connections to this `(host, port)`. First-acquire for a new
     /// upstream allocates the Semaphore inline.
     fn upstream_semaphore(&self, host: &str, port: u16) -> Arc<Semaphore> {
-        // Borrowed-lookup: owning-ключ на тёплом пути не строится.
-        // Явная аннотация задаёт unsized coercion: без неё вывод
-        // выберет Q = (&str, u16) и не найдёт Borrow impl.
+        // Borrowed lookup: no owning key is built on the hot path.
+        // The explicit annotation forces the unsized coercion: without
+        // it inference picks Q = (&str, u16) and finds no Borrow impl.
         let key: &dyn ProxyEndpoint = &(host, port);
         if let Some(s) = self.upstream_caps.get(key) {
             return s.value().clone();
         }
-        // Холодный путь: owning-ключ строится здесь, где запись может
-        // создаваться. Race-safe insert без изменений: другой
-        // вызывающий мог заполнить запись между нашим get() и
-        // entry().or_insert_with(); DashMap сериализует entry,
-        // побеждает записавший первым.
+        // Cold path: the owning key is built here, where an entry may
+        // be created. Race-safe insert unchanged: another caller may
+        // have filled the entry between our get() and
+        // entry().or_insert_with(); DashMap serializes entry, first
+        // writer wins.
         self.upstream_caps
             .entry((host.to_string(), port))
             .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_upstream)))

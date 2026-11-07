@@ -80,24 +80,25 @@ pub(super) fn order_keys(mut keyed: Vec<(usize, f64)>) -> Vec<usize> {
     keyed.into_iter().map(|(i, _)| i).collect()
 }
 
-/// Компаратор ключей: total_cmp по ключу, затем по индексу. Все вызовы
-/// обоих путей (full-sort и ленивого) инструментируются в `sort_comparisons`.
+/// Key comparator: total_cmp by key, then by index. Calls from both
+/// paths (full-sort and lazy) are instrumented in `sort_comparisons`.
 fn compare_keyed(a: &(usize, f64), b: &(usize, f64)) -> std::cmp::Ordering {
     #[cfg(all(test, feature = "test-instrumentation"))]
     crate::perf::operation(|c| c.sort_comparisons += 1);
     a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
 }
 
-/// Ленивый курсор точного порядка `order_keys` над готовым снимком ключей.
-/// Конструкция O(1) без сравнений; каждый следующий элемент расширяет
-/// отсортированный префикс геометрически: select_nth_unstable_by выделяет
-/// следующую порцию рангов из необработанного пула, затем sort_unstable_by
-/// упорядочивает только её. Когда остаток пула мал по сравнению с шагом,
-/// пул один раз досортировывается целиком — полное исчерпание остаётся
-/// O(N log N), ни один путь не квадратичен. Все вызовы компаратора обоих
-/// алгоритмов инструментированы в `sort_comparisons`, поэтому счётчик
-/// отражает реальные сравнения нового пути, включая перестройку.
-/// Доступен при feature rotator (потребитель — rotator/chain).
+/// Lazy cursor over the exact `order_keys` order of a ready key
+/// snapshot. O(1) construction with no comparisons; each next element
+/// grows the sorted prefix geometrically: select_nth_unstable_by picks
+/// the next batch of ranks from the unprocessed pool, then
+/// sort_unstable_by orders only that batch. When the remaining pool is
+/// small relative to the step, the pool is fully sorted once — total
+/// exhaustion stays O(N log N), no path is quadratic. All comparator
+/// calls of both algorithms are instrumented in `sort_comparisons`, so
+/// the counter reflects the new path's real comparisons, including
+/// rebuilds. Available under the rotator feature (consumer:
+/// rotator/chain).
 #[cfg(feature = "rotator")]
 pub(crate) struct LazyOrder {
     keyed: Vec<(usize, f64)>,
@@ -107,7 +108,7 @@ pub(crate) struct LazyOrder {
 
 #[cfg(feature = "rotator")]
 impl LazyOrder {
-    /// O(1): без сортировок и сравнений.
+    /// O(1): no sorts or comparisons.
     pub(crate) fn from_keyed(keyed: Vec<(usize, f64)>) -> Self {
         Self {
             keyed,
@@ -116,8 +117,8 @@ impl LazyOrder {
         }
     }
 
-    /// Следующий индекс в точном порядке `order_keys`, или `None` после
-    /// исчерпания.
+    /// Next index in the exact `order_keys` order, or `None` once
+    /// exhausted.
     pub(crate) fn next(&mut self) -> Option<usize> {
         if self.served == self.sorted && self.sorted < self.keyed.len() {
             self.extend();
@@ -130,15 +131,15 @@ impl LazyOrder {
         Some(i)
     }
 
-    /// Полный дренаж (для тестов/оракулов).
+    /// Full drain (for tests/oracles).
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn into_vec(mut self) -> Vec<usize> {
         std::iter::from_fn(|| self.next()).collect()
     }
 
-    /// Расширить отсортированный префикс геометрически; инвариант:
-    /// `keyed[0..sorted]` — точные первые `sorted` элементы полного
-    /// порядка, весь пул `keyed[sorted..]` >= префикса.
+    /// Grow the sorted prefix geometrically; invariant:
+    /// `keyed[0..sorted]` is exactly the first `sorted` elements of the
+    /// full order, and all of pool `keyed[sorted..]` >= the prefix.
     fn extend(&mut self) {
         let len = self.keyed.len();
         debug_assert_eq!(self.sorted, self.served);

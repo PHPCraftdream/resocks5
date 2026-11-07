@@ -13,7 +13,7 @@ categories = ["network-programming", "command-line-utilities"]
 publish = false
 
 [features]
-# Счётчики #208 включаются только в unit tests; production API не меняется.
+# Counters #208 are enabled only in unit tests; the production API is unchanged.
 test-instrumentation = ["resocks5-net/test-instrumentation"]
 
 [dependencies]

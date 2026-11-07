@@ -148,19 +148,19 @@ struct Candidate {
     key: ChainKey,
 }
 struct Layer {
-    /// Ленивые курсоры: gate-слой — 1; exit-слой — N, потребляются по порядку.
+    /// Lazy cursors: gate layer — 1; exit layer — N, consumed in order.
     cursors: Vec<LazyCandidates>,
-    /// Различных singleton-идентичностей в объединении eligible.
+    /// Distinct singleton identities in the eligible union.
     live: usize,
-    /// Идентичности уже выданных кандидатов (first-owner dedup).
-    /// Лениво выделенная таблица: у lazy-слоёв аллоцируется при первом pull;
-    /// eager-слой (cursors пуст) dedup'ирует сканом candidates — таблица
-    /// не создаётся вовсе и не аллоцирует.
+    /// Identities of already-emitted candidates (first-owner dedup).
+    /// Lazily allocated table: lazy layers allocate it on first pull;
+    /// the eager layer (cursors empty) dedups by scanning candidates —
+    /// the table is never created and never allocates.
     emitted: Option<HashSet<ChainKey>>,
-    /// Материализованный префикс в точном взвешенном порядке.
+    /// Materialized prefix in the exact weighted order.
     candidates: Vec<Candidate>,
     index: usize,
-    /// Какой курсор активен.
+    /// Which cursor is active.
     cursor_index: usize,
 }
 
@@ -219,8 +219,9 @@ pub struct ChainPlan {
     seen: HashSet<ChainKey>,
     dead: HashSet<ChainKey>,
     done: bool,
-    /// Отложенный advance одометра: выполняется в начале следующего `next_pick`,
-    /// чтобы материализовать кандидатов строго по фактическому потреблению.
+    /// Deferred odometer advance: performed at the start of the next
+    /// `next_pick`, so candidates materialize strictly by actual
+    /// consumption.
     need_advance: bool,
     /// Test-only count of `next_pick` loop iterations for work-bound oracles.
     #[cfg(test)]
@@ -230,9 +231,9 @@ pub struct ChainPlan {
 impl ChainPlan {
     /// Snapshot weighted-random gate orders and concatenate exit candidates into one layer.
     pub fn new(gates: &GateLevels, exits: &[Arc<ProxyRotator>]) -> Self {
-        // Точная ёмкость: один аллокат под все слои без роста и без
-        // минимального запаса RawVec (для вырожденных планов это вся
-        // разница с baseline по памяти).
+        // Exact capacity: one allocation for all layers, no growth and
+        // no RawVec minimum slack (for degenerate plans this is the
+        // entire memory difference vs baseline).
         let mut layers: Vec<Layer> = Vec::with_capacity(gates.len() + 1);
         layers.extend(
             gates
@@ -309,10 +310,10 @@ impl ChainPlan {
             #[cfg(all(test, feature = "test-instrumentation"))]
             crate::perf::operation(|c| c.mark_dead_layer_visits += 1);
             let present = if layer.cursors.is_empty() {
-                // Eager-слой: все кандидаты материализованы при construction —
-                // прежний скан по ключам (стоимость/семантика как в baseline).
-                // Кандидаты уникальны по идентичности (dedup при материализации),
-                // значит `any` даёт один decrement на слой.
+                // Eager layer: all candidates materialized at construction —
+                // the old key scan (same cost/semantics as baseline).
+                // Candidates are unique by identity (dedup at
+                // materialization), so `any` gives one decrement per layer.
                 let is_present = layer.candidates.iter().any(|candidate| {
                     #[cfg(all(test, feature = "test-instrumentation"))]
                     crate::perf::operation(|c| c.mark_dead_membership_checks += 1);
@@ -320,7 +321,7 @@ impl ChainPlan {
                 });
                 is_present
             } else {
-                // Ленивый слой: снапшот eligible + индексная проверка.
+                // Lazy layer: eligible snapshot + index check.
                 layer.cursors.iter().any(|cursor| {
                     #[cfg(all(test, feature = "test-instrumentation"))]
                     crate::perf::operation(|c| c.mark_dead_cursor_visits += 1);
@@ -398,25 +399,20 @@ impl ChainPlan {
     }
 }
 
-/// Слой из ленивых курсоров: только снапшоты eligible, ничего не
-/// материализуется до первого прохода одометра.
+/// Layer of lazy cursors: only eligible snapshots, nothing is
+/// materialized until the first odometer pass.
 fn lazy_layer(rotators: &[Arc<ProxyRotator>]) -> Layer {
     let cursors: Vec<_> = rotators.iter().map(|r| r.pick_order_lazy()).collect();
-    // Вырожденный слой: у каждого ротатора ≤1 eligible-кандидата — упорядочивать
-    // нечего, курсоры не нужны (курсор освобождается после единственной выдачи).
-    // Материализация — сразу, в порядке ротаторов; dedup — линейным сканом по уже
-    // материализованным (меж-ротаторные дубликаты идентичностей возможны и здесь).
-    // RNG уже потреблён при construction курсоров; next_proxy лишь выдаёт из
-    // снятого снимка, повторного потребления нет.
-    // Ограничение fast path не даёт линейному dedup выродиться в O(R²).
     if cursors.len() <= 2 && cursors.iter().all(|cursor| cursor.eligible().len() <= 1) {
-        // Вырожденный слой: у каждого ротатора ≤1 eligible-кандидата —
-        // упорядочивать нечего, курсоры не нужны (курсор освобождается после
-        // единственной выдачи). Материализация — при construction, как в
-        // прежнем пути; RNG уже потреблён при construction курсоров.
-        // Dedup — линейным сканом same_upstream по уже снятым прокси
-        // (меж-ротаторные дубликаты идентичностей возможны и здесь),
-        // поэтому emitted остаётся пустым и не аллоцирует.
+        // Degenerate layer: each rotator has ≤1 eligible candidate —
+        // nothing to order, no cursors needed (a cursor is dropped after
+        // its single emission). Materialization is immediate, in
+        // rotator order, as in the old path; the RNG was already
+        // consumed when the cursors were constructed. Dedup is a linear
+        // same_upstream scan over the already-materialized proxies
+        // (cross-rotator identity duplicates are possible here too), so
+        // `emitted` stays empty and never allocates; the fast-path cap
+        // keeps that linear dedup from degrading to O(R²).
         let mut candidates: Vec<Candidate> = Vec::new();
         for mut cursor in cursors {
             if let Some(proxy) = cursor.next_proxy() {
@@ -455,11 +451,11 @@ fn lazy_layer(rotators: &[Arc<ProxyRotator>]) -> Layer {
             cursor_index: 0,
         };
     }
-    // Инвариант ротатора: дедупликация прокси при construction по
-    // same_upstream («One rating slot per unique identity»), поэтому внутри
-    // одного ротатора курсор выдаёт уникальные идентичности — для
-    // single-rotator слоя distinct_identities не нужен. Дубликаты возможны
-    // только МЕЖДУ ротаторами (exit-слой из N > 1).
+    // Rotator invariant: proxies are deduplicated at construction by
+    // same_upstream ("One rating slot per unique identity"), so a cursor
+    // yields unique identities within one rotator — a single-rotator
+    // layer needs no distinct_identities. Duplicates are possible only
+    // BETWEEN rotators (an exit layer of N > 1).
     let live = if cursors.len() == 1 {
         cursors[0].eligible().len()
     } else {
@@ -480,11 +476,11 @@ fn lazy_layer(rotators: &[Arc<ProxyRotator>]) -> Layer {
     }
 }
 
-/// Число различных singleton-идентичностей в объединении eligible срезов.
-/// Идентичность = те же 6 полей, что у singleton_key/ChainKey-node
-/// (gate-ссылка и is_gate игнорируются); бакеты по upstream_hash со
-/// случайным ключом, коллизии разрешаются same_upstream — точность без
-/// клонов ключей.
+/// Number of distinct singleton identities in the union of eligible
+/// slices. Identity means the same 6 fields as a singleton_key /
+/// ChainKey node (gate reference and is_gate ignored); buckets keyed by
+/// upstream_hash with a random key, collisions resolved by
+/// same_upstream — accuracy without key clones.
 fn distinct_identities(pairs: &[(&Arc<ProxyRotator>, &[usize])]) -> usize {
     let state = RandomState::new();
     let mut buckets: HashMap<u64, Vec<&ProxyConfig>> = HashMap::new();
@@ -514,13 +510,13 @@ fn distinct_identities(pairs: &[(&Arc<ProxyRotator>, &[usize])]) -> usize {
 }
 
 impl Layer {
-    /// Догнать материализованный префикс до `upto` включительно.
+    /// Catch the materialized prefix up to and including `upto`.
     fn ensure_upto(&mut self, upto: usize) {
         while self.candidates.len() <= upto && self.pull().is_ok() {}
     }
 
-    /// Выдать следующую уникальную кандидатуру: Ok — добавлена,
-    /// Err — курсоры исчерпаны.
+    /// Emit the next unique candidate: Ok — added,
+    /// Err — cursors exhausted.
     fn pull(&mut self) -> Result<(), ()> {
         while self.cursor_index < self.cursors.len() {
             if let Some(proxy) = self.cursors[self.cursor_index].next_proxy() {
@@ -543,7 +539,7 @@ impl Layer {
                 }
                 #[cfg(all(test, feature = "test-instrumentation"))]
                 crate::perf::operation(|c| c.singleton_emitted_duplicates += 1);
-                // Дубликат идентичности: first-owner уже выдан.
+                // Duplicate identity: first-owner already emitted.
                 continue;
             }
             self.cursor_index += 1;
