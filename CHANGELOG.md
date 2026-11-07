@@ -28,9 +28,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address; hedged attempts share one `Arc<str>` target. The application uses
   these on its dial path and no longer clones the client and target for the
   direct-cap log line.
+- `resocks5-net`: the direct dial path consumes upstream candidates lazily and
+  `ChainPlan` pick keys no longer round-trip through an owned `ProxyConfig`;
+  behavior unchanged. With one candidate of 256 consumed, the sort does 255
+  comparisons instead of 2138; a one-node pick key allocates nothing. The
+  allocation and comparison counters are pinned by PERF208 rows (Linux,
+  rustc 1.88 baseline in `docs/PERF208.md`). The URI parser's percent-decoding
+  borrows when there is nothing to decode.
+- Code comments are now English throughout (comments only; the clap `--help`
+  text and user documentation keep their language).
+- Tests: an HTTP request accepted by the application never carries an identity
+  (Basic is refused with 407 before any account lookup), so the direct-user
+  branch of the HTTP handler is reachable only in a host built with
+  `cleartext-server`.
+- `docs/PERF208.md` is rewritten as a status table per candidate with commits,
+  evidence and counters; the CoW table is generated from
+  `docs/perf208/results/cow.json` by `tests/perf208/render.py` and checked by
+  the perf workflow against the fresh counters (PERF208 rows: 209 SDK, 24 app).
 
 ### Added
 
+- `resocks5-net`: `ProxyRotator::pick_iter` returns the direct-path candidate
+  order lazily (`PickOrder`, a fused iterator); `pick_order` stays the full
+  reference order. `ProxyConfig::chain_arc` builds a chain as a shared `Arc`
+  (a gate-less first node is reused, not copied). `README.md` of the crate now
+  documents secure auth, GSSAPI, method negotiation and the smaller APIs added
+  on `main` (none of them are in a published release yet).
 - `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by
   default), SOCKS5 private method 0x80: the password never crosses the wire. The
   server stores a per-user Argon2id salt, parameters and the derived key `K`
