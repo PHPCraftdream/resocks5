@@ -678,7 +678,7 @@ fn link_proxy_accepts_owned_and_borrowed_addresses() {
     assert_eq!(rotator.sticky.lock().unwrap().map.len(), 2);
 }
 
-/// `pick_iter` must equal `pick_order` element-wise for identically built,
+/// `pick_iter` must equal `pick_order` element-wise (same slots, same order) for identically built,
 /// identically seeded rotators: full drain (same `Arc`s), prefixes
 /// `take(1)`/`take(3)`, and exhaustion keeps returning `None`. Mutation:
 /// a different snapshot (eligibility, RNG, quarantine) or a different
@@ -703,16 +703,21 @@ fn pick_iter_matches_pick_order_across_seeds_and_sizes() {
     for n in [1usize, 2, 7, 64] {
         for seed in [0u64, 1, 7, 208] {
             let expected = make_rotator(n, seed).pick_order();
-            // Full drain: same slots, same Arc allocations as pick_order.
-            for (got, want) in make_rotator(n, seed).pick_iter().zip(&expected) {
-                assert!(Arc::ptr_eq(&got, want), "n {n}, seed {seed}");
+            // Each rotator owns its own proxies, so identity is compared by
+            // host and port (unique per slot here), not by `Arc::ptr_eq`.
+            let same = |a: &ProxyConfig, b: &ProxyConfig| a.host == b.host && a.port == b.port;
+            // Full drain: the same slots in the same order as pick_order.
+            let drained: Vec<_> = make_rotator(n, seed).pick_iter().collect();
+            assert_eq!(drained.len(), expected.len(), "n {n}, seed {seed}");
+            for (got, want) in drained.iter().zip(&expected) {
+                assert!(same(got, want), "n {n}, seed {seed}");
             }
             // Prefixes 1 and 3 on fresh snapshots.
             for take in [1usize, 3] {
                 let prefix: Vec<_> = make_rotator(n, seed).pick_iter().take(take).collect();
                 assert_eq!(prefix.len(), take.min(n), "n {n}, seed {seed}, take {take}");
                 for (got, want) in prefix.iter().zip(&expected) {
-                    assert!(Arc::ptr_eq(got, want), "n {n}, seed {seed}, take {take}");
+                    assert!(same(got, want), "n {n}, seed {seed}, take {take}");
                 }
             }
             // Exhaustion keeps returning None.
