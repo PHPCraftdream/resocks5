@@ -1,4 +1,4 @@
-//! Direct-аккаунт передаёт данные без upstream; остальные политики сохраняются.
+//! A direct account relays data without an upstream; the other policies still hold.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +53,7 @@ impl Case {
     }
 }
 
-/// cancel-safe: NO — владеет клиентским сокетом; отмена закрывает соединение.
+/// cancel-safe: NO — it owns the client socket; cancellation closes the connection.
 async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16) {
     let anonymous = case == Case::Anonymous;
     let password = if case == Case::WrongPassword {
@@ -133,7 +133,7 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
     }
 }
 
-/// cancel-safe: NO — отмена общего бюджета закрывает все три ноги обмена.
+/// cancel-safe: NO — cancelling the shared budget closes all three legs of the exchange.
 async fn exercise(protocol: Protocol, case: Case) {
     timeout(Duration::from_secs(20), async {
         let auth = Arc::new(
@@ -159,7 +159,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             let port = listener.local_addr().unwrap().port();
             (Some(listener), None, port)
         } else {
-            // Этот handle не клонируется и не регистрируется в Tokio.
+            // This handle is not cloned and not registered in Tokio.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -182,7 +182,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             1,
         ));
         let frag = Arc::new(TlsFragmentConfig::default());
-        // Для отказа pool нужен обычный CONNECT, не ранний recovery-ответ.
+        // Denying pool needs an ordinary CONNECT, not an early recovery response.
         let network = Arc::new(NetworkConfig {
             recover_host_from_payload: case == Case::Direct,
             ..Default::default()

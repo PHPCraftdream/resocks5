@@ -83,7 +83,7 @@ mod tests {
             ProxyConfig::https("a".repeat(300), 65535),
         ];
         for cfg in &cases {
-            // Оракул — прежний formatter: тот же format! дословно.
+            // The oracle is the previous formatter: the same format! verbatim.
             let expected = format!(
                 "ip {} - {:?}://{}:{}",
                 family_label(&cfg.host),
@@ -106,7 +106,7 @@ mod perf_tests {
     use super::*;
     use crate::perf::{measure, report};
 
-    /// Точное прежнее тело print_cfg (до вынесения в push_cfg).
+    /// The exact previous print_cfg body (before the push_cfg extraction).
     fn legacy_print_cfg(cfg: &ProxyConfig) -> String {
         format!(
             "ip {} - {:?}://{}:{}",
@@ -117,10 +117,10 @@ mod perf_tests {
         )
     }
 
-    /// Обычный print_cfg против прежнего format!: байты и аллокатор.
-    /// Страховка от ухудшения прямых/probe/error логов: они зовут
-    /// изменённый print_cfg, и не должны стать дороже прежнего пути
-    /// ни по alloc/alloc_zeroed/realloc, ни по requested_bytes.
+    /// Plain print_cfg against the previous format!: bytes and allocator.
+    /// A guard against regressing direct/probe/error logs: they call the
+    /// changed print_cfg and must not become costlier than the old path
+    /// in alloc/alloc_zeroed/realloc or requested_bytes.
     #[test]
     fn perf208_print_cfg_matches_legacy_allocations() {
         let cases: [(&str, ProxyConfig); 8] = [

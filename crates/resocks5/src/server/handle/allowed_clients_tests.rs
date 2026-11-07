@@ -1,11 +1,11 @@
-//! Регрессионные тесты AND-каскада allowed_clients через общий
-//! `handle_client`: реальные TCP-обмены, без вызова `client_ip_allowed`
-//! напрямую и без мока matcher'а.
+//! Regression tests of the allowed_clients AND-cascade via the shared
+//! `handle_client`: real TCP exchanges, without calling `client_ip_allowed`
+//! directly and without mocking the matcher.
 //!
-//! Observable boundary без внешнего upstream: rotators = None, target
-//! `blocked.invalid:443` запрещён banned-regex'ом → допущенный клиент
-//! получает 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); недопущенный —
-//! обычный auth failure (407 / [1,1]) или закрытие без единого байта.
+//! Observable boundary without an external upstream: rotators = None, target
+//! `blocked.invalid:443` banned by the banned-regex → an allowed client
+//! gets 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); a disallowed one —
+//! a plain auth failure (407 / [1,1]) or a close without a single byte.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +27,7 @@ const BANNED: &str = "^blocked[.]invalid:443$";
 const TARGET_HOST: &str = "blocked.invalid";
 const TARGET_PORT: u16 = 443;
 
-/// SOCKS5 reply `Forbidden` — ровно то, что шлёт negotiate.rs.
+/// SOCKS5 reply `Forbidden` — exactly what negotiate.rs sends.
 const SOCKS_FORBIDDEN: [u8; 10] = [5, 2, 0, 1, 0, 0, 0, 0, 0, 0];
 
 #[derive(Clone, Copy)]
@@ -36,14 +36,14 @@ enum Protocol {
     Http,
 }
 
-/// Ожидаемый исход всего каскада.
+/// Expected outcome of the ENTIRE cascade.
 #[derive(Clone, Copy)]
 enum Expect {
-    /// Глобальный фильтр: закрытие без единого байта ответа.
+    /// Global filter: close without a single response byte.
     GlobalDeny,
-    /// Обычный отказ аутентификации: [1,1] / 407.
+    /// A plain auth failure: [1,1] / 407.
     AuthFail,
-    /// Фильтры пройдены, дошли до routing: 403 / reply Forbidden.
+    /// Filters passed, reached routing: 403 / Forbidden reply.
     RouteBanned,
 }
 
@@ -84,8 +84,8 @@ fn test_logger() -> Arc<crate::logger::Logger> {
     ))
 }
 
-/// Собрать AuthState и прогнать один обмен; вернуть auth для проверок
-/// кеша. Сетевая часть выполняется в [`run_case_with_auth`].
+/// Build AuthState and run one exchange; return the auth for cache checks.
+/// The network part runs in [`run_case_with_auth`].
 async fn run_case(c: Case) -> Arc<AuthState> {
     let Case {
         protocol,
@@ -115,8 +115,8 @@ async fn run_case(c: Case) -> Arc<AuthState> {
     auth
 }
 
-/// То же с уже собранным AuthState (прогрев кеша, персистентный
-/// users-файл).
+/// Same with an already built AuthState (cache warm-up, persistent users
+/// file).
 async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
@@ -137,14 +137,14 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
         )
     });
 
-    // Общий таймаут на ВЕСЬ обмен: connect/accept, handler и клиентская
-    // нога в одном блоке. handler — будущий Future (не spawn): при панике
-    // или таймауте клиентской ноги join паникует/дропается, и handler
-    // вместе со stream уничтожается — задач не оставляем.
+    // One timeout for the ENTIRE exchange: connect/accept, handler and the
+    // client leg in one block. handler is a Future (not spawned): on panic
+    // or client-leg timeout the join panics/drops, and the handler
+    // is destroyed along with the stream — no tasks left behind.
     let result = timeout(Duration::from_secs(8), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        // connect до accept — хватает backlog'а слушателя.
+        // connect before accept — listener backlog suffices.
         let mut client = TcpStream::connect(address).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
 
@@ -165,7 +165,7 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
             &allowed,
             deadline,
         );
-        // Клиентская нога паникует — падает весь блок, тест завершён.
+        // Client leg panics — the whole block fails, test is done.
         let (handler_res, ()) = tokio::join!(handler, client_leg(&mut client, c));
         handler_res
     })
@@ -192,11 +192,11 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     }
 }
 
-/// Клиентская нога: обмен байтами по протоколу кейса, с проверками
-/// ровно тех ответов, которые отличают три исхода.
+/// Client leg: byte exchange per the case protocol, with checks
+/// of exactly the responses distinguishing the three outcomes.
 async fn client_leg(client: &mut TcpStream, c: &Case) {
     match (c.protocol, c.expect) {
-        // Глобальный отказ: ничего не пишем, ждём EOF/RST.
+        // Global deny: write nothing, wait for EOF/RST.
         (_, Expect::GlobalDeny) => {
             let mut reply = [0u8; 2];
             match client.read(&mut reply).await {
@@ -220,8 +220,8 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
             let mut verdict = [0u8; 2];
             client.read_exact(&mut verdict).await.unwrap();
             assert_eq!(verdict, [0x01, 0x01], "аутентификация обязана отказать");
-            // Сервер закрывает соединение после отказа: принимаем только
-            // EOF-класс исходы, любую другую Err не глотаем.
+            // The server closes the connection after rejection: accept only
+            // EOF-class outcomes, swallow no other Err.
             let mut rest = [0u8; 1];
             match client.read(&mut rest).await {
                 Ok(0) => {}
@@ -315,10 +315,10 @@ fn http_connect(b64_creds: Option<&str>) -> Vec<u8> {
 
 const BOTH: [Protocol; 2] = [Protocol::Socks5, Protocol::Http];
 
-/// Кейс 1a: глобальный deny сильнее разрешающего пользователя.
-/// Клиент ничего не шлёт; при удалении global-фильтра 403/407 не будет —
-/// handler повиснет до protocol timeout, тест упадёт на общем таймауте
-/// или другом error-исходе.
+/// Case 1a: global deny is stronger than a permissive user.
+/// The client sends nothing; with the global filter removed there would be
+/// no 403/407 — the handler would hang until the protocol timeout, and the
+/// test would fail on the shared timeout or another error outcome.
 #[tokio::test]
 async fn global_deny_beats_permissive_user() {
     for protocol in BOTH {
@@ -338,9 +338,9 @@ async fn global_deny_beats_permissive_user() {
     }
 }
 
-/// Кейс 1b: user-deny при глобальном `*` — обычный auth failure.
-/// Без user-фильтра SOCKS5 вернёт успешный verdict [1,0] вместо [1,1],
-/// а HTTP дойдёт до 403 вместо отказа 407.
+/// Case 1b: user-deny with a global `*` — a plain auth failure.
+/// Without the user filter SOCKS5 would return the success verdict [1,0]
+/// instead of [1,1], and HTTP would reach 403 instead of the 407 refusal.
 #[tokio::test]
 async fn user_deny_beats_global_star() {
     for protocol in BOTH {
@@ -360,10 +360,10 @@ async fn user_deny_beats_global_star() {
     }
 }
 
-/// Кейсы 1c и 3: global allow + user None → доходим до routing
-/// boundary (banned target → 403/Forbidden); None не ограничивает.
-/// Counterfactual: фильтр ложно запрещает loopback — будет [1,1]/407
-/// или закрытие.
+/// Cases 1c and 3: global allow + user None → reach the routing
+/// boundary (banned target → 403/Forbidden); None does not restrict.
+/// Counterfactual: a filter falsely banning loopback — would give [1,1]/407
+/// or a close.
 #[tokio::test]
 async fn global_allow_and_user_none_reach_routing_boundary() {
     for protocol in BOTH {
@@ -383,14 +383,14 @@ async fn global_allow_and_user_none_reach_routing_boundary() {
     }
 }
 
-/// Кейс 4: anonymous подчиняется ТОЛЬКО глобальному правилу (SOCKS5
-/// метод 0x00 и HTTP без Authorization не проходят user-фильтр).
-/// Counterfactual: anonymous через user-фильтр — будет отказ вместо
-/// 403.
+/// Case 4: anonymous obeys ONLY the global rule (SOCKS5
+/// method 0x00 and HTTP without Authorization do not pass the user filter).
+/// Counterfactual: anonymous through the user filter — would be a rejection
+/// instead of 403.
 #[tokio::test]
 async fn anonymous_obeys_only_global_rule() {
     for protocol in BOTH {
-        // Global allow → проходит до boundary, несмотря на restrictive alice.
+        // Global allow → passes to the boundary, despite restrictive alice.
         run_case(Case {
             protocol,
             expect: Expect::RouteBanned,
@@ -400,9 +400,9 @@ async fn anonymous_obeys_only_global_rule() {
             creds: None,
         })
         .await;
-        // Global deny → отклонение до auth/routing. При удалении
-        // global-фильтра handler ждёт protocol timeout — тест падает
-        // на общем таймауте, а не на 403.
+        // Global deny → rejection before auth/routing. With the
+        // global filter removed the handler waits for the protocol timeout — the test fails
+        // on the shared timeout, not on 403.
         run_case(Case {
             protocol,
             expect: Expect::GlobalDeny,
@@ -415,9 +415,10 @@ async fn anonymous_obeys_only_global_rule() {
     }
 }
 
-/// Кейс 5: прогретый кеш паролей не обходится user-фильтром. Прогрев —
-/// прямой `verify_async` без привязки к IP; проверяется, что фильтр
-/// срабатывает ДО cache-hit при обмене с запрещённого peer.
+/// Case 5: a warmed password cache is not bypassed by the user filter. The
+/// warm-up is a direct `verify_async` without an IP binding; this checks that
+/// the filter fires BEFORE the cache hit on an exchange from a forbidden
+/// peer.
 #[tokio::test]
 async fn warm_cache_does_not_bypass_user_filter() {
     let auth = Arc::new(
@@ -442,7 +443,7 @@ async fn warm_cache_does_not_bypass_user_filter() {
                 protocol,
                 expect: Expect::AuthFail,
                 global_rule: Some("*"),
-                users: Vec::new(), // auth собран отдельно
+                users: Vec::new(), // auth is built separately
                 allow_anonymous: false,
                 creds: Some(("alice", "pw")),
             },
@@ -450,16 +451,16 @@ async fn warm_cache_does_not_bypass_user_filter() {
         )
         .await;
     }
-    // Отказ дан фильтром, а не провалом verify: кеш остался на месте.
+    // The filter refused, not a failed verify: the cache is still in place.
     assert!(
         auth.cache_contains("alice"),
         "прогретый кеш не должен быть испорчен"
     );
 }
 
-/// Кейс 6: direct-пользователь подчиняется фильтру; запрещённый IP
-/// получает auth failure ДО direct-путей.
-/// Counterfactual: убрать user-фильтр — запрос ушёл бы в direct-ветку.
+/// Case 6: a direct user obeys the filter; a banned IP
+/// gets an auth failure BEFORE the direct paths.
+/// Counterfactual: remove the user filter — the request would go to the direct branch.
 #[tokio::test]
 async fn direct_user_denied_before_direct_paths() {
     for protocol in BOTH {
@@ -475,11 +476,13 @@ async fn direct_user_denied_before_direct_paths() {
     }
 }
 
-/// Кейс 7: user с hash='init' и фильтром, исключающим peer: валидные-looking
-/// credentials дают обычный auth failure; init-claim НЕ происходит —
-/// users-файл на диске байт-в-байт не меняется, кеш не заполняется.
-/// Counterfactual: убрать user-фильтр — claim прошёл бы, файл изменился бы,
-/// тест упал бы на сравнении байтов и на исходе.
+/// Case 7: a user with hash='init' and a filter excluding the peer:
+/// valid-looking credentials give a plain auth failure; the init-claim does
+/// NOT happen — the users file on disk is unchanged byte-for-byte, the cache
+/// is not filled.
+/// Counterfactual: remove the user filter — the claim would pass, the file
+/// would change, the test would fail on the byte comparison and on the
+/// outcome.
 #[tokio::test]
 async fn user_filter_blocks_init_claim() {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -495,7 +498,7 @@ async fn user_filter_blocks_init_claim() {
     let _ = std::fs::remove_file(&path);
 
     let users = vec![init_user("bob", Some("203.0.113.9"))];
-    // Базлайн на диске — как в auth-тестах с персистентным файлом.
+    // Baseline on disk — as in the auth tests with a persistent file.
     crate::config::users_file::write_atomic(
         std::path::Path::new(&path),
         &UsersConfig {
@@ -521,7 +524,7 @@ async fn user_filter_blocks_init_claim() {
                 protocol,
                 expect: Expect::AuthFail,
                 global_rule: Some("*"),
-                users: Vec::new(), // auth собран отдельно
+                users: Vec::new(), // auth is built separately
                 allow_anonymous: false,
                 creds: Some(("bob", "first-password")),
             },
@@ -529,7 +532,7 @@ async fn user_filter_blocks_init_claim() {
         )
         .await;
 
-        // Мутации нет: файл байт-в-байт неизменен после КАЖДОГО прогона.
+        // No mutation: the file is byte-for-byte unchanged after EVERY run.
         let after = std::fs::read(&path).unwrap();
         assert_eq!(
             before, after,

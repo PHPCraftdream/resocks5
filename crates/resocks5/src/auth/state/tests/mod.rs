@@ -184,13 +184,13 @@ fn disabled_user_rejects_even_with_correct_password() {
     assert!(!state.verify("alice", "s3cret"));
 }
 
-// ─── allowed_clients: пользовательский фильтр ───────────────────────
+// ─── allowed_clients: user filter ───────────────────────────────────
 
 fn ip(s: &str) -> Option<std::net::IpAddr> {
     Some(s.parse().unwrap())
 }
 
-/// `None` у пользователя не ограничивает IP.
+/// A user's `None` does not restrict IPs.
 #[test]
 fn user_rule_none_does_not_restrict() {
     let state = build_state(vec![make_user("alice", "s3cret", true)], false);
@@ -198,8 +198,8 @@ fn user_rule_none_does_not_restrict() {
     assert!(state.client_ip_allowed("alice", ip("::1")));
 }
 
-/// Пользовательское правило применяется; disabled/unknown → false
-/// (fail-closed: обычный отказ аутентификации, без хеширования).
+/// The user rule applies; disabled/unknown → false
+/// (fail-closed: a plain auth failure, no hashing).
 #[test]
 fn user_rule_and_disabled_unknown_semantics() {
     let state = build_state(
@@ -218,11 +218,11 @@ fn user_rule_and_disabled_unknown_semantics() {
     // Unknown — fail-closed.
     assert!(!state.client_ip_allowed("carol", ip("10.9.0.1")));
 
-    // Недоступный адрес — fail-closed.
+    // An unroutable address is fail-closed.
     assert!(!state.client_ip_allowed("alice", None));
 }
 
-/// Невалидная строка у DISABLED пользователя валит build (старт).
+/// An invalid rule string on a DISABLED user fails the build (startup).
 #[test]
 fn disabled_user_invalid_rule_fails_build() {
     let res = AuthState::build(
@@ -239,15 +239,15 @@ fn disabled_user_invalid_rule_fails_build() {
         },
         "/__resocks5_test_never_written__",
     );
-    // AuthState не реализует Debug (секреты) — берём ошибку без expect_err.
+    // AuthState does not implement Debug (secrets) — take the error without expect_err.
     let err = res
         .err()
         .expect("invalid rule of a disabled user must fail startup");
     assert!(err.to_string().contains("alice"), "got: {err}");
 }
 
-/// Дубликат имени с невалидной строкой тоже валит build, даже если
-/// first-wins сохраняет первую запись.
+/// A duplicate name with an invalid rule string also fails the build, even
+/// though first-wins keeps the first entry.
 #[test]
 fn duplicate_user_invalid_rule_fails_build() {
     let res = AuthState::build(
@@ -268,8 +268,8 @@ fn duplicate_user_invalid_rule_fails_build() {
     );
 }
 
-/// First-wins для дубликатов имени не изменился: действует правило
-/// ПЕРВОГО вхождения.
+/// First-wins for duplicate names is unchanged: the rule of the FIRST
+/// occurrence applies.
 #[test]
 fn duplicate_names_keep_first_rule() {
     let state = build_state(
@@ -279,7 +279,7 @@ fn duplicate_names_keep_first_rule() {
         ],
         false,
     );
-    // first wins: правило первого alice, None второго не расширяет его.
+    // first wins: the first alice's rule stands, the second's None does not widen it.
     assert!(state.client_ip_allowed("alice", ip("10.1.1.1")));
     assert!(!state.client_ip_allowed("alice", ip("203.0.113.7")));
 }

@@ -351,8 +351,8 @@ fn obsolete_cb_keys_are_detected() {
     assert!(obsolete_cb_keys(clean).is_empty());
 }
 
-/// Конфигурация для проверки общей точки валидации `allowed_clients`.
-/// Тесты проверяют ошибки правил, но не порядок вызовов всего startup.
+/// Configuration for checking the shared `allowed_clients` validation point.
+/// The tests check rule errors, not the call order of the whole startup.
 fn main_cfg_with_allowed(rule: &str) -> crate::config::MainConfig {
     crate::config::MainConfig {
         port: 20082,

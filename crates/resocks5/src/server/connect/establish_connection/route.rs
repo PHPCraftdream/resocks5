@@ -161,8 +161,8 @@ mod perf_tests {
             assert_eq!(label, again);
             assert_eq!(first, second);
             assert_eq!(first.gate_formats, 1);
-            // Новый formatter строит одну строку: единственная аллокация — итоговый
-            // буфер (depth=0 — ни одной), дорастаний нет: ёмкость по верхней границе.
+            // The new formatter builds one string: the only allocation is the final
+            // buffer (depth=0 — none), no regrowths: capacity sized to the upper bound.
             assert_eq!(first.alloc + first.alloc_zeroed, u64::from(depth > 0));
             assert_eq!(first.realloc, 0);
             assert_eq!(label.is_empty(), depth == 0);
@@ -289,9 +289,9 @@ mod tests {
         .expect("the successful probe must clear the quarantine");
     }
 
-    /// Оракул — прежний formatter: `format!` из старого print_cfg на каждый
-    /// gate, collect в Vec, `join(" -> ")`. Побайтовое сравнение с ним
-    /// доказывает эквивалентность нового single-buffer пути старому тексту.
+    /// The oracle is the old formatter: `format!` from the old print_cfg per
+    /// gate, collect into a Vec, `join(" -> ")`. Byte-for-byte comparison with it
+    /// proves the new single-buffer path is equivalent to the old text.
     fn reference_gate_label(pick: &ChainPick) -> String {
         pick.hops()
             .iter()
@@ -316,8 +316,8 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(index, mut node)| {
-                    // GateLevels::iter отдаёт уровни по убыванию ранга: первый hop —
-                    // максимальный ранг, поэтому первый элемент fixture — внешний gate.
+                    // GateLevels::iter yields levels in descending rank order: the first hop
+                    // has the maximum rank, so the first fixture element is the outer gate.
                     let rank = (total - index) as u8;
                     node.gate_level = rank;
                     node.is_gate = true;
@@ -354,13 +354,13 @@ mod tests {
             let pick = gate_pick(gates);
             let label = gate_label(&pick);
             assert_eq!(label, reference_gate_label(&pick));
-            // Повторный вызов с тем же входом даёт тот же текст.
+            // Calling again with the same input yields the same text.
             assert_eq!(gate_label(&pick), label);
-            // Exit-узел (последний hop) в label не входит.
+            // The exit node (last hop) is not part of the label.
             assert!(!label.contains("exit.invalid"));
         }
 
-        // Redaction: credentials gate-узлов не попадают в лог.
+        // Redaction: credentials of gate nodes do not reach the log.
         let pick = gate_pick(vec![
             ProxyConfig::socks5("secret.invalid", 1080).with_auth("secret-user", "secret-pass")
         ]);
@@ -370,7 +370,7 @@ mod tests {
         assert!(!label.contains("secret-user"));
         assert!(!label.contains("secret-pass"));
 
-        // Порядок hops и разделитель ровно " -> " между gates.
+        // Order of hops and exactly " -> " between gates.
         let pick = gate_pick(vec![
             ProxyConfig::socks5("a.invalid", 1),
             ProxyConfig::socks5("b.invalid", 2),

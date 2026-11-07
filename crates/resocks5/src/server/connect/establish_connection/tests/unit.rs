@@ -700,16 +700,16 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         v4_orders_before,
         "budget exhaustion must skip building the direct order"
     );
-    // Счётчики `pick_order_calls` выше сохранены для прямого пути; gate-план
-    // строится из ленивых курсоров, поэтому авторитетный негативный оракул
-    // gate-фазы — trace построений: полный gate-план строиться не может.
+    // The `pick_order_calls` counters above are saved for the direct path; the gate plan
+    // is built from lazy cursors, so the authoritative negative oracle
+    // for the gate phase is the build trace: no full gate plan can be built.
     assert!(
         plan_trace.iter().all(|(gates, _)| *gates == 0),
         "budget exhaustion must skip building the gate plan, trace: {plan_trace:?}"
     );
 }
 
-/// Production-наблюдатель должен быть zero-sized: никаких полей и аллокаций.
+/// The production observer must be zero-sized: no fields, no allocations.
 #[test]
 fn noop_plan_build_recorder_is_zero_sized() {
     assert_eq!(std::mem::size_of::<NoopPlanBuildRecorder>(), 0);

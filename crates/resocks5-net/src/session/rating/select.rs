@@ -408,9 +408,9 @@ mod tests {
         assert_eq!(weighted_index(&[], &mut rng), 0);
     }
 
-    /// Матрица длины × паттерны весов × seed: ленивый курсор обязан
-    /// выдавать побайтово тот же порядок, что full-sort `order_keys` —
-    /// префиксно (1 и 3 на свежих курсорах) и при полном дренаже.
+    /// Matrix of length × weight patterns × seed: the lazy cursor must
+    /// emit byte-for-byte the same order as full-sort `order_keys` —
+    /// as prefixes (1 and 3 on fresh cursors) and under full drain.
     #[cfg(all(test, feature = "rotator"))]
     #[test]
     fn lazy_order_matches_order_keys_exactly() {
@@ -429,7 +429,7 @@ mod tests {
                         weights.iter().copied(),
                         &mut SmallRng::from_seed(seed),
                     ));
-                    // Префикс 1.
+                    // Prefix 1.
                     let mut c1 = LazyOrder::from_keyed(weighted_keys(
                         weights.iter().copied(),
                         &mut SmallRng::from_seed(seed),
@@ -439,7 +439,7 @@ mod tests {
                         expected[0],
                         "n {n}, seed {seed}, prefix 1"
                     );
-                    // Префикс 3 на свежем курсоре.
+                    // Prefix 3 on a fresh cursor.
                     let mut c3 = LazyOrder::from_keyed(weighted_keys(
                         weights.iter().copied(),
                         &mut SmallRng::from_seed(seed),
@@ -450,7 +450,7 @@ mod tests {
                         expected[..3.min(expected.len())],
                         "n {n}, seed {seed}, prefix 3"
                     );
-                    // Полный дренаж на третьем свежем курсоре.
+                    // Full drain on a third fresh cursor.
                     let full = LazyOrder::from_keyed(weighted_keys(
                         weights.iter().copied(),
                         &mut SmallRng::from_seed(seed),
@@ -471,8 +471,8 @@ mod tests {
         assert!(c.into_vec().is_empty());
     }
 
-    /// Один курсор: частичный дренаж, затем полный — сумма префиксов
-    /// равна полному порядку без повторов.
+    /// One cursor: partial drain, then full — sum of prefixes equals
+    /// the full order with no repeats.
     #[cfg(all(test, feature = "rotator"))]
     #[test]
     fn lazy_order_serves_from_a_single_keyed_snapshot() {

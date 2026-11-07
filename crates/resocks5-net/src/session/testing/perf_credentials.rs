@@ -1,8 +1,8 @@
-//! Wire-path сценарии #208: реальный `crate::server::accept()` на
-//! предзаполненном in-memory duplex-потоке (чтение кадров, UTF-8-преобразования,
-//! построение `Credentials`, retention duplicate, конструирование `IncomingRequest`).
-//! Подготовка (runtime, duplex, запись байтов, опции) — вне scope; scope включает
-//! `runtime.block_on` и возможный Box future. Executor overhead не исключён.
+//! wire-path scenario #208: real `crate::server::accept()` on a
+//! pre-filled in-memory duplex stream (frame reads, UTF-8 conversions,
+//! `Credentials` construction, retention duplicate, `IncomingRequest` build).
+//! Prep (runtime, duplex, byte writes, options) is out of scope; scope includes
+//! `runtime.block_on` and a possible Box future. Executor overhead not excluded.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tokio::io::{duplex, AsyncWriteExt};
 use crate::perf::{measure, report, Counts};
 use crate::server::{accept, Credentials, IncomingRequest, ServerError, ServerOptions};
 
-/// Один wire-вход: байты клиента и флаги опций сервера.
+/// One wire input: client bytes and server option flags.
 struct WireCase {
     bytes: Vec<u8>,
     anonymous: bool,
@@ -23,8 +23,8 @@ struct WireCase {
     retain: bool,
 }
 
-/// RFC 1929 sub-negotiation: `VER, ULEN, UNAME, PLEN, PASSWD` (локальная
-/// реплика из server/tests, недоступных из session::testing).
+/// RFC 1929 sub-negotiation: `VER, ULEN, UNAME, PLEN, PASSWD` (local copy
+/// from server/tests, unavailable from session::testing).
 fn subneg(user: &[u8], pass: &[u8]) -> Vec<u8> {
     assert!(user.len() <= 255 && pass.len() <= 255);
     let mut frame = Vec::with_capacity(2 + user.len() + pass.len());
@@ -36,7 +36,7 @@ fn subneg(user: &[u8], pass: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// SOCKS5: greeting + subneg + CONNECT-запрос на exit.invalid:443 (ATYP=3).
+/// SOCKS5: greeting + subneg + CONNECT request to exit.invalid:443 (ATYP=3).
 fn socks5_bytes(user: &[u8], pass: &[u8]) -> Vec<u8> {
     let mut bytes = vec![5, 1, 2];
     bytes.extend_from_slice(&subneg(user, pass));
@@ -46,7 +46,7 @@ fn socks5_bytes(user: &[u8], pass: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// SOCKS5 аноним: greeting с методом 0x00 (без subneg) + CONNECT.
+/// SOCKS5 anonymous: greeting with method 0x00 (no subneg) + CONNECT.
 fn socks5_anonymous_bytes() -> Vec<u8> {
     let mut bytes = vec![5, 1, 0];
     bytes.extend_from_slice(&[5, 1, 0, 3, 12]);
@@ -55,7 +55,7 @@ fn socks5_anonymous_bytes() -> Vec<u8> {
     bytes
 }
 
-/// HTTP CONNECT на exit.invalid:443; с Basic-заголовком или без (контроль).
+/// HTTP CONNECT to exit.invalid:443; with or without Basic header (control).
 fn http_bytes(basic_token: &str) -> Vec<u8> {
     format!(
         "CONNECT exit.invalid:443 HTTP/1.1\r\nHost: exit.invalid\r\nProxy-Authorization: Basic {basic_token}\r\n\r\n"
@@ -69,7 +69,7 @@ fn http_anonymous_bytes() -> Vec<u8> {
         .to_vec()
 }
 
-/// Ожидания сохранности контракта для одного wire-сценария.
+/// Contract-preservation expectations for one wire scenario.
 struct Expectation<'a> {
     user: &'a [u8],
     password: &'a [u8],
@@ -79,15 +79,15 @@ struct Expectation<'a> {
     retain: bool,
 }
 
-/// Один прогон: prep вне measure (свежие runtime+duplex — одинаковые one-time
-/// стоимости tokio на каждый вызов), measure оборачивает только block_on(accept).
+/// One run: prep outside measure (fresh runtime+duplex — the same one-time
+/// tokio costs per call), measure wraps only block_on(accept).
 fn accept_measured(
     case: &WireCase,
     expected: &Expectation,
     authenticate_expected: bool,
 ) -> (Result<IncomingRequest, ServerError>, Counts) {
-    // Запись фикстуры — в отдельном одноразовом runtime без драйверов: duplex —
-    // чистый канал, reactor не нужен; измеряемый runtime остаётся нетронутым.
+    // Fixture write goes through a separate one-shot runtime without drivers: duplex is
+    // a pure channel, no reactor needed; the measured runtime stays untouched.
     let prep = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("prep runtime build");
@@ -111,7 +111,7 @@ fn accept_measured(
     .retain_credentials(case.retain);
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&calls);
-    // Замыкание не аллоцирует и не паникует; сигнатура повторяет accept.
+    // The closure allocates nothing and does not panic; signature mirrors accept.
     let authenticate = move |credentials: Credentials| {
         let ok = credentials.username_bytes() == expected.user
             && credentials.password_bytes() == expected.password
@@ -122,7 +122,7 @@ fn accept_measured(
     };
     let (result, counts) =
         measure(|| runtime.block_on(async { accept(&mut server, &options, authenticate).await }));
-    // peer держим до конца accept: сервер пишет в него ответы; dealloc после measure — вне scope.
+    // Keep peer alive until accept ends: the server writes responses to it; dealloc after measure — out of scope.
     drop(peer);
     let called = calls.load(Ordering::SeqCst);
     let expected_calls = usize::from(authenticate_expected);
@@ -130,7 +130,7 @@ fn accept_measured(
     (result, counts)
 }
 
-/// Контракт IncomingRequest одинаков на обоих прогонах; retain/anonymous ветки.
+/// IncomingRequest contract is identical on BOTH runs; retain/anonymous branches.
 fn assert_request(req: &mut IncomingRequest, expected: &Expectation, anonymous: bool) {
     assert_eq!(req.target(), "exit.invalid:443");
     assert_eq!(req.username(), expected.req_user);
@@ -176,7 +176,7 @@ fn perf208_basic_payload_copy_guard() {
                 req_user: Some("user"),
                 retain,
             };
-            // Одинаковая форма callback/runtime: меряем длину данных внутри полного wire-пути.
+            // Same callback/runtime shape: measuring data length within the full wire-path.
             let run = || accept_measured(&case, &expected, true);
             let (first, counts) = run();
             let (again, repeated) = run();
@@ -191,9 +191,9 @@ fn perf208_basic_payload_copy_guard() {
         assert_eq!(short.alloc, long.alloc);
         assert_eq!(short.alloc_zeroed, long.alloc_zeroed);
         assert_eq!(short.realloc, long.realloc);
-        // Оракул относительный: буфер decoded payload и password растут на 96 байт каждый;
-        // retention копирует также payload и password. Так обнаруживается лишний to_owned,
-        // без привязки к абсолютным счётчикам аллокатора Windows.
+        // Relative oracle: decoded payload buffer and password each grow by 96 bytes;
+        // retention also copies payload and password. This catches an extra to_owned
+        // without tying to absolute Windows allocator counters.
         assert_eq!(
             long.requested_bytes - short.requested_bytes,
             if retain { 384 } else { 192 }
@@ -205,7 +205,7 @@ fn perf208_basic_payload_copy_guard() {
 fn perf208_credentials_wire_parse_retention() {
     let basic_token = general_purpose::STANDARD.encode("user:pa:ss");
 
-    // (имя отчёта, case, ожидания) — 7 сценариев, по одной строке report.
+    // (report name, case, expectations) — 7 scenarios, one report line each.
     let scenarios: Vec<(&str, WireCase, Expectation)> = vec![
         (
             "wire/socks5/utf8/retain",
@@ -331,7 +331,7 @@ fn perf208_credentials_wire_parse_retention() {
     for (name, case, expected) in scenarios {
         let authenticate_expected = !case.anonymous;
         let run = || accept_measured(&case, &expected, authenticate_expected);
-        // Свежий runtime на каждый прогон, без warm-up.
+        // Fresh runtime per run, no warm-up.
         let (result, counts) = run();
         let (again, repeated) = run();
         assert_eq!(
@@ -339,7 +339,7 @@ fn perf208_credentials_wire_parse_retention() {
             "детерминизм счётчиков на одинаковом входе"
         );
         report(name, counts);
-        // Сохранность контракта на ОБОИХ запросах.
+        // Contract preservation on BOTH requests.
         let mut first = result.expect("accept ok");
         let mut second = again.expect("accept ok");
         for req in [&mut first, &mut second] {
