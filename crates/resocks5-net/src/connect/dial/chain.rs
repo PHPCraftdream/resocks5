@@ -14,10 +14,10 @@ use tokio::time::timeout;
 use super::{dial_inner, DialOptions};
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::handshake_over_stream;
+use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 use crate::connect::host_port::HostPort;
 use crate::connect::http_connect_handshake;
-use crate::connect::tcp_dial::tcp_dial;
+use crate::connect::tcp_dial::{apply_socket_options, tcp_dial};
 use crate::connect::{AnyUpstream, BoxedUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::progress::ProgressReportingWriter;
@@ -339,6 +339,8 @@ async fn chain_inner(
     let tcp = tcp_dial(nodes[0], opts.connect_timeout)
         .await
         .map_err(|e| ChainError::new(ChainStage::Connect, e))?;
+    apply_socket_options(&tcp, nodes[0], opts)
+        .map_err(|e| ChainError::new(ChainStage::Connect, e))?;
     // The one real socket sits under every tunnel: wrapping it here (and
     // only here) lets confirmed ciphertext writes below the first TLS hop
     // count as progress while nested plaintext cannot fake it.
@@ -418,12 +420,22 @@ async fn hop(
         endpoint: format!("{}:{}", node.host, node.port),
         after: hs,
     };
+    node.refuse_cleartext()?;
     match node.protocol {
         ProxyProtocol::Socks5 => {
-            match timeout(hs, handshake_over_stream(stream, target, socks5_auth(node))).await {
-                Ok(r) => r,
-                Err(_) => Err(timed_out(TimeoutKind::Socks5Handshake)),
-            }
+            let parsed = HostPort::parse(target)
+                .ok_or_else(|| ConnectError::InvalidTarget(target.to_string()))?;
+            // Target checks run before any byte is written (inside the helper).
+            socks5_handshake_bounded(
+                stream,
+                parsed.host,
+                parsed.port,
+                socks5_auth(node),
+                deadline_after(hs),
+                &format!("{}:{}", node.host, node.port),
+                hs,
+            )
+            .await
         }
         ProxyProtocol::Http => {
             match timeout(hs, http_connect_handshake(&mut stream, target, node)).await {
@@ -469,7 +481,7 @@ async fn https_hop(
             source: None,
         })?;
 
-    let deadline = tokio::time::Instant::now() + hs;
+    let deadline = deadline_after(hs);
     let mut tls =
         match tokio::time::timeout_at(deadline, connector.connect(server_name, stream)).await {
             Ok(Ok(s)) => s,

@@ -36,7 +36,8 @@ crates' `main` functions never dial anything.
     cargo build -p tls-consumer     # tls consumer alone
 
 All three must succeed with zero changes to `lean-consumer/src/main.rs`.
-Add `--locked` once `Cargo.lock` is present.
+CI's `feature-unification` job runs the lean and the combined build with
+`--locked` (the fixture's `Cargo.lock` is tracked).
 
 ## Sensitivity check (performed once, manually, by the orchestrator)
 

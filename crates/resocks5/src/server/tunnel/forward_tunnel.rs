@@ -100,6 +100,13 @@ where
     // message itself may span several TLS records (R2-17). Deciding at
     // the 6-byte signature would send every later SNI-bearing byte
     // unfragmented.
+    // One round of the prelude select: either the client-read arm has
+    // classified the accumulated prefix, or the upstream arm queued a
+    // server-first block for the relay.
+    enum Step {
+        Decide(bool),
+        Relay(usize),
+    }
     let mut first = initial;
     let mut len = first.len();
     first.resize(16 * 1024, 0);
@@ -126,23 +133,34 @@ where
                             exhausted || client_hello_is_complete(&first[..len])
                         }
                     };
-                    Ok(decided)
+                    Ok(Step::Decide(decided))
                 }
                 n = upstream.read(&mut reply) => {
                     let n = n?;
                     if n == 0 {
                         // Upstream half-closed: nothing more will arrive,
                         // flush whatever accumulated and stop deciding.
-                        Ok(true)
+                        Ok(Step::Decide(true))
                     } else {
-                        client.write_all(&reply[..n]).await?;
-                        Ok(false)
+                        Ok(Step::Relay(n))
                     }
                 }
             }
         };
         let decided = match within_idle(idle, step).await? {
-            Some(decided) => decided,
+            Some(Step::Decide(decided)) => decided,
+            Some(Step::Relay(n)) => {
+                // R3-H: the relay is progress-aware — every accepted
+                // chunk renews the idle budget, so a slow but steadily
+                // reading client is not measured as one whole-block
+                // duration. A window expiring with no accepted byte is
+                // a genuine stall; a prefix may be on the wire —
+                // terminal, never replay (R3-02).
+                if !write_with_idle_windows(client, &reply[..n], idle).await? {
+                    return Ok(false);
+                }
+                continue;
+            }
             // A cancelled read or relay may have moved bytes; never replay.
             None => return Ok(false),
         };
@@ -174,6 +192,46 @@ async fn within_idle<T>(
         Ok(result) => result.map(Some),
         Err(_) => Ok(None),
     }
+}
+
+/// Relay one server-first block with per-write idle windows: every
+/// chunk the client accepts renews the budget, so a slow-but-steady
+/// reader is not measured as one whole-block duration (R3-H). A window
+/// expiring without an accepted byte reports `Ok(false)` — a prefix may
+/// be on the wire; the caller treats the stream as terminal and never
+/// replays (R3-02). `Duration::ZERO` disables the bound.
+///
+/// cancel-safe: NO — like `write_all`, dropping the relay abandons a
+/// partially accepted block; callers close both streams.
+async fn write_with_idle_windows<A: AsyncWrite + Unpin>(
+    client: &mut A,
+    mut buf: &[u8],
+    idle: Duration,
+) -> anyhow::Result<bool> {
+    if idle.is_zero() {
+        client.write_all(buf).await?;
+        return Ok(true);
+    }
+    while !buf.is_empty() {
+        // A fresh window per write attempt, mirroring write_all's own
+        // poll-write loop: a Pending attempt consumed nothing, so
+        // re-offering the remainder cannot duplicate bytes. Ok(0) is
+        // the same WriteZero error write_all would raise.
+        let n = match tokio::time::timeout(idle, client.write(buf)).await {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "relay write accepted no bytes",
+                )
+                .into());
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Ok(false),
+        };
+        buf = &buf[n..];
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -777,3 +835,7 @@ mod tests {
         assert_eq!(upstream.accepted, hello);
     }
 }
+
+#[cfg(test)]
+#[path = "forward_tunnel_progress_tests.rs"]
+mod progress_tests;

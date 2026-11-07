@@ -16,16 +16,36 @@ use super::sibling_path;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
+/// `FILE_ATTRIBUTE_REPARSE_POINT`: symlinks and junctions. A sentinel
+/// that is a reparse point redirects the open and is refused.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+/// Windows: any reparse point (symlink or junction) redirects the open.
+#[cfg(windows)]
+fn sentinel_is_redirected(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Unix and others: a symlink at the sentinel path must not be followed.
+#[cfg(not(windows))]
+fn sentinel_is_redirected(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
 /// Advisory cross-process lock on the users file, released on drop.
 ///
 /// Acquisition opens the shared sentinel `<target>.lock` (created once,
 /// reused by every contender — never deleted) and takes a non-blocking
 /// OS exclusive lock on it (`flock(LOCK_EX|LOCK_NB)` on unix,
 /// `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on
-/// windows). The OS releases the lock if the holder dies — crash,
-/// `SIGKILL`, or `std::process::exit` all close fds/handles during
-/// teardown — so a timeout means the lock is genuinely held by a live
-/// process, not "possibly orphaned".
+/// windows). A redirected sentinel (symlink, junction) is refused, and
+/// the winner truncates the file and writes its pid once. The OS
+/// releases the lock if the holder dies — crash, `SIGKILL`, or
+/// `std::process::exit` all close fds/handles during teardown — so a
+/// timeout means the lock is genuinely held by a live process, not
+/// "possibly orphaned".
 #[derive(Debug)]
 pub(crate) struct UsersFileLock {
     #[allow(dead_code)]
@@ -40,20 +60,38 @@ impl UsersFileLock {
 
     pub(crate) fn acquire_with_timeout(users_path: &Path, timeout: Duration) -> Result<Self> {
         let lock_path = sibling_path(users_path, ".lock");
+        // Refuse a redirected sentinel instead of following it: the open
+        // below would otherwise create/lock whatever the link points at
+        // (checked before the open; std has no portable O_NOFOLLOW).
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(meta) if sentinel_is_redirected(&meta) => bail!(
+                "refusing symlinked lock sentinel {} — the lock must live \
+                 in a plain file, not behind a link",
+                lock_path.display()
+            ),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat {}", lock_path.display()));
+            }
+        }
         // Create, NOT create_new: all contenders share one file/inode so
         // their flock/LockFileEx calls actually contend with each other.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false) // sentinel is reused across acquirers; pid line is diagnostic-only
+            .truncate(false) // truncation happens only AFTER the lock is won
             .open(&lock_path)
             .with_context(|| format!("open {}", lock_path.display()))?;
         let deadline = Instant::now() + timeout;
         loop {
             match platform::try_exclusive_lock(&file) {
                 Ok(()) => {
-                    // PID is diagnostics-only.
+                    // The winner owns the sentinel: rewrite it with exactly
+                    // one diagnostic pid line instead of growing forever.
+                    file.set_len(0)
+                        .with_context(|| format!("truncate {}", lock_path.display()))?;
                     let mut f = &file;
                     let _ = writeln!(f, "{}", std::process::id());
                     return Ok(Self { lock_path, file });

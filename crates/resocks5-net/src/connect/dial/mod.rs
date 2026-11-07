@@ -3,14 +3,15 @@
 
 use std::time::Duration;
 
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::connect::connect_http_proxy::http_connect_on_tcp;
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::socks5_handshake;
+use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 use crate::connect::host_port::HostPort;
-use crate::connect::tcp_dial::tcp_dial;
+use crate::connect::tcp_dial::{apply_socket_options, tcp_dial};
 use crate::connect::{AnyUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::{ProxyConfig, ProxyProtocol};
@@ -23,9 +24,11 @@ mod chain_pool;
 #[cfg(feature = "pool")]
 pub use chain_pool::connect_chain;
 
-/// Time budgets for [`dial`].
+/// Time budgets and socket options for [`dial`].
 ///
-/// Defaults: 10 s TCP connect, 10 s protocol handshake, no total cap.
+/// Defaults: 10 s TCP connect, 10 s protocol handshake, no total cap; the
+/// socket to the proxy keeps the OS defaults (no `TCP_NODELAY`, no
+/// keepalive) unless set.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DialOptions {
@@ -36,6 +39,10 @@ pub struct DialOptions {
     pub handshake_timeout: Duration,
     /// Optional bound on the whole call, connect plus handshake.
     pub total_timeout: Option<Duration>,
+    /// Set `TCP_NODELAY` on the socket to the proxy.
+    pub nodelay: bool,
+    /// Enable TCP keepalive on the socket to the proxy with this idle time.
+    pub keepalive: Option<Duration>,
 }
 
 impl Default for DialOptions {
@@ -44,6 +51,8 @@ impl Default for DialOptions {
             connect_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(10),
             total_timeout: None,
+            nodelay: false,
+            keepalive: None,
         }
     }
 }
@@ -73,6 +82,21 @@ impl DialOptions {
     #[must_use]
     pub fn with_total_timeout(mut self, d: Duration) -> Self {
         self.total_timeout = Some(d);
+        self
+    }
+
+    /// Set or clear `TCP_NODELAY` on the socket to the proxy.
+    #[must_use]
+    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
+        self.nodelay = nodelay;
+        self
+    }
+
+    /// Enable TCP keepalive on the socket to the proxy, probing after
+    /// `idle` without traffic.
+    #[must_use]
+    pub fn with_keepalive(mut self, idle: Duration) -> Self {
+        self.keepalive = Some(idle);
         self
     }
 }
@@ -166,6 +190,48 @@ pub async fn dial_plain(
     dial(proxy, host, port, opts, None).await
 }
 
+/// Dial `host:port` through a SOCKS5 or HTTP CONNECT `proxy` and return the
+/// bare socket: the tunnel is then a plain [`TcpStream`] (no wrapper, no
+/// permit), ready for `into_split`, `peer_addr` and the like.
+///
+/// # Errors
+///
+/// As [`dial_plain`]. An HTTPS upstream is refused before any connect:
+/// `TlsFeatureMissing` without the `tls` feature, a `Tls` error with it (its
+/// tunnel is a TLS stream, use [`dial`]).
+pub async fn dial_tcp(
+    proxy: &ProxyConfig,
+    host: &str,
+    port: u16,
+    opts: &DialOptions,
+) -> Result<TcpStream, ConnectError> {
+    if proxy.protocol == ProxyProtocol::Https {
+        return Err(not_a_tcp_tunnel(proxy));
+    }
+    match dial(proxy, host, port, opts, None).await? {
+        AnyUpstream::Plain(stream) => Ok(stream.stream),
+        // `dial` yields `Plain` for SOCKS5 and HTTP CONNECT.
+        _ => Err(not_a_tcp_tunnel(proxy)),
+    }
+}
+
+fn not_a_tcp_tunnel(proxy: &ProxyConfig) -> ConnectError {
+    #[cfg(feature = "tls")]
+    {
+        let _ = proxy;
+        ConnectError::Tls {
+            message: "HTTPS upstream yields a TLS stream: use dial, not dial_tcp".to_string(),
+            source: None,
+        }
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        ConnectError::TlsFeatureMissing {
+            host: proxy.host.clone(),
+        }
+    }
+}
+
 async fn dial_inner(
     proxy: &ProxyConfig,
     host: &str,
@@ -174,6 +240,8 @@ async fn dial_inner(
     tls_connector: Option<&TlsConnector>,
     on_tcp: impl FnOnce(),
 ) -> Result<AnyUpstream, ConnectError> {
+    // Before the TCP connect: nothing reaches the upstream.
+    proxy.refuse_cleartext()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -198,6 +266,7 @@ async fn dial_inner(
     };
 
     let tcp = tcp_dial(proxy, opts.connect_timeout).await?;
+    apply_socket_options(&tcp, proxy, opts)?;
     let mut stream = UpstreamStream::from_tcp(tcp);
     on_tcp();
     let hs = opts.handshake_timeout;
@@ -210,11 +279,20 @@ async fn dial_inner(
 
     match proxy.protocol {
         ProxyProtocol::Socks5 => {
-            let auth = socks5_auth(proxy);
-            match timeout(hs, socks5_handshake(stream, host, port, auth)).await {
-                Ok(r) => Ok(AnyUpstream::Plain(r?)),
-                Err(_) => Err(hs_timeout(TimeoutKind::Socks5Handshake)),
-            }
+            // One deadline for both phases: a silent greeting implicates
+            // the upstream alone, a stalled CONNECT reply may still be the
+            // destination's fault.
+            let stream = socks5_handshake_bounded(
+                stream,
+                host,
+                port,
+                socks5_auth(proxy),
+                deadline_after(hs),
+                &format!("{}:{}", proxy.host, proxy.port),
+                hs,
+            )
+            .await?;
+            Ok(AnyUpstream::Plain(stream))
         }
         ProxyProtocol::Http => {
             let target = HostPort::format(host, port);

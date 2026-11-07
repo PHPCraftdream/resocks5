@@ -7,6 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `resocks5-net`: without `cleartext-server`, HTTP 407 now advertises
+  `Proxy-Authenticate: Resocks5-Secure`, not Basic, to avoid inviting a
+  clear-text password transmission. Status 407 and its challenge remain;
+  feature-enabled builds retain the previous Basic realm and charset.
+  This does not implement secure authentication over HTTP. Preemptive Basic
+  from a preconfigured client cannot be prevented; browser prompt behavior
+  for the unknown scheme has not been tested.
+
+### Changed
+
+- `resocks5-net`: fewer copies on the dial path, behavior unchanged.
+  `ChainKey::singleton(&Arc<ProxyConfig>)` keys one node without copying it
+  (a gate-less node is shared); `ChainPick::config_arc()` returns the pick's
+  linked configuration as a shared `Arc` (`config()` still returns an owned
+  copy); `ProxyRotator::link_proxy` takes `impl AsRef<str>` (source compatible:
+  `String`, `&String` and `&str` all work) and only allocates a key for a new
+  address; hedged attempts share one `Arc<str>` target. The application uses
+  these on its dial path and no longer clones the client and target for the
+  direct-cap log line.
+
+### Added
+
+- `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by
+  default), SOCKS5 private method 0x80: the password never crosses the wire. The
+  server stores a per-user Argon2id salt, parameters and the derived key `K`
+  (`UserSecret`, behind the `SecretStore` trait); a login is a mutual HMAC-SHA256
+  challenge-response over `K` with fresh nonces on both sides, so a recorded
+  exchange cannot be replayed and a server without `K` cannot pass. Unknown users
+  get a decoy (`DecoyKey`) indistinguishable from a wrong password; the client
+  refuses server parameters below its floor (`KdfParams::DEFAULT`, 19 MiB / t=2 /
+  p=1) and above hard limits.
+- `resocks5-net`: init enrollment for `secure_auth`: a user stored as "waiting"
+  (`StoredUser::Init`) is enrolled by its first client, which sends `K` sealed
+  with X25519 + HKDF-SHA256 + ChaCha20-Poly1305 bound to both nonces;
+  `SecretStore::claim` stores it atomically (one winner). A client enrolls only
+  with `SecureCredentials::allow_enrollment(true)`.
+- `resocks5-net`: `ProxyConfig::with_secure_auth(SecureCredentials)` — dial and
+  chain hops authenticate to a SOCKS5 upstream with secure auth;
+  `server::accept_secure(stream, options, store, decoy)` — inbound SOCKS5 with
+  method 0x80 (or 0x00), never username/password; any HTTP `Proxy-Authorization`
+  is answered 407.
+- `resocks5-net`: `ProxyConfig::from_uri` / `from_uri_with(ProxyUriOptions)` parse
+  `socks5://`, `http://`, `https://` URIs with percent-decoded credentials; the
+  typed `ProxyUriError` never carries the input.
+- `resocks5-net`: `ConnectError::suggested_reply()` maps a dial failure to the
+  `server::Reply` to send the client (SOCKS5 REP 2/3/4/5/6, HTTP 403/502/503/504).
+- `resocks5-net`: `connect::socks5_handshake_until` and
+  `http_connect_handshake_until` run a handshake under an absolute deadline and
+  fail with a typed `ConnectError::Timeout`.
+- `resocks5-net`: `server::Credentials::basic_payload()` — the whole decoded HTTP
+  Basic token, without splitting at `:`.
+- `resocks5-net`: `DialOptions::with_nodelay` / `with_keepalive` (fields `nodelay`,
+  `keepalive`) set `TCP_NODELAY` and TCP keepalive on the socket to the proxy
+  (`dial`, `dial_chain`); by default the OS defaults stay. `connect::dial_tcp`
+  returns the bare `TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (HTTPS is refused
+  before any connect).
+- `resocks5-net`: GSSAPI authentication for SOCKS5 (`gssapi` module, feature
+  `gssapi`, RFC 1961, method 0x01): the context exchange, abort, protection-level
+  negotiation and, optionally, protected SOCKS request/reply are implemented over the
+  `GssBackend` / `GssContext` traits; no password or credential crosses the wire.
+  `ProxyConfig::with_gssapi(GssCredentials)` on the client,
+  `server::accept_with(stream, options, &AuthMethods)` on the server, where
+  `IncomingRequest::auth_method()` tells how the client authenticated and
+  `username()` is the principal for GSSAPI. By default only the authentication is
+  protected (level 0, which `curl --socks5-gssapi` and Dante's `clear` speak: the
+  context is mutual, the SOCKS request and reply are not wrapped); levels 1 and 2
+  (`GssAcceptor::with_protection`, `GssCredentials::with_min_protection`) wrap
+  them. The tunnel data is never protected. Ships with a test-only
+  mock mechanism (`gssapi::mock`); the Kerberos backend is a separate feature.
+- `resocks5-net`: methods adapt on the fly, strongest first. A client with several
+  strong methods configured (GSSAPI, secure auth) offers them all in that order and
+  never anything weaker (no anonymous, no clear text, no downgrade if the server
+  answers another method); `accept_with` picks the strongest the server has enabled
+  and the client offers: GSSAPI, then secure auth, then anonymous (if allowed).
+- `resocks5-net`: `testing::MockUpstream` (feature `test-instrumentation`): a
+  scripted SOCKS5 / HTTP CONNECT upstream on `127.0.0.1:0` for tests — `Script`
+  (tunnel with echo, refuse with a REP/status, silent greeting, silent CONNECT,
+  hang-up), `MockAuth` (none, clear-text, secure auth), and the recorded CONNECT
+  targets.
+- `resocks5-net`: `ProxyConfig::wipe_credentials()` (feature `zeroize`) overwrites
+  and clears `user`/`password` at this node and every solely owned gate, and
+  reports a shared gate it left untouched. Opt-in: `ProxyConfig` has no `Drop`.
+
+### Changed
+
+- `resocks5-net` (**breaking**): clear-text credentials are off by default. A
+  client never sends a password in clear text (SOCKS5 username/password, HTTP
+  Basic) unless feature `cleartext-client` is on — otherwise the dial fails with
+  `ConnectError::CleartextCredentialsRefused` before any byte is sent; the server
+  (`server::accept`) never offers or accepts them unless feature
+  `cleartext-server` is on (SOCKS5 0x02 not chosen, HTTP Basic answered 407).
+- `resocks5` (**breaking**): inbound users authenticate with secure auth only.
+  SOCKS5 username/password and HTTP Basic are refused; standard clients
+  (browsers, curl) can connect only anonymously, a password needs a
+  `resocks5-net` client (`ProxyConfig::with_secure_auth`). HTTP CONNECT has no
+  password authentication. Upstream proxy credentials work as before.
+- `resocks5`: `users[].hash` keeps the Argon2id v19 PHC form; it is now read as
+  the secure-auth key. Hashes written by earlier versions are exactly that, so
+  existing accounts keep working with the same password. A stored value in
+  another format, or derived below m=19456,t=2,p=1 (default clients refuse it),
+  is reported at startup; reset it with `users set-password`.
+- `resocks5`: `hash: init` accounts are claimed by the first enrolling client
+  (only the sealed key travels); concurrent first logins have exactly one winner,
+  the others are denied. A user filtered by `allowed_clients` is answered like a
+  wrong password and cannot claim an init account.
+
+- `resocks5` (**breaking**): upstream credentials stay in
+  `resocks5.proxy_list.ktav` as written but are never sent in clear text. A SOCKS5
+  upstream with `user:pass` authenticates with secure auth (method 0x80), so it
+  must be an upstream that speaks it (another resocks5 or a `resocks5-net` client);
+  a username/password-only SOCKS5 server is refused without receiving the
+  password. HTTPS upstreams send Basic inside TLS as before; a plain HTTP upstream
+  with credentials is reported at startup and its dials are refused. The app no
+  longer enables `cleartext-client`.
+
+- `resocks5`: GSSAPI (Kerberos) for inbound clients and SOCKS5 upstreams, behind
+  the new features `gssapi` (protocol and mapping) and `gssapi-system` (the
+  system Kerberos backend; not in the release binaries). `auth.gssapi_service`
+  (and `auth.gssapi_protection`) enable it; `users add-gssapi <principal>`
+  creates a password-less account named like the principal (`hash: gssapi`) to
+  which that principal maps; a SOCKS5 upstream entry may end in
+  `;gssapi=<service@host>`. Methods adapt on the fly, strongest first: the server
+  picks GSSAPI, then secure auth, then anonymous; a client with several methods
+  offers them all and nothing weaker.
+- `resocks5-net`: `server::IncomingRequest::set_identity` replaces the
+  authenticated identity (a host mapping a principal to an account).
+- `resocks5-net`: feature `gssapi-system` and `gssapi::system::SystemBackend`,
+  Kerberos 5 through the system GSS-API (MIT Kerberos / Heimdal on Linux, Apple
+  GSS on macOS; not Windows), not default; its real-KDC tests run in a dedicated CI job against a throwaway MIT KDC, which also
+  checks interoperability with a third-party client (`curl --socks5-gssapi`) against the
+  `gssapi_interop_server` example.
+
+### Removed
+
+- `resocks5`: the server-side password verify path and its in-memory password
+  cache: the server neither receives nor holds passwords and never runs Argon2
+  for a login.
+
+## [0.5.0] - 2026-11-05
+
 ### Added
 
 - `resocks5-net`: `ProxyConfig::validate()`, `validate_node()` and
@@ -35,6 +177,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-probe reservation hook (`Fn(&ProxyConfig) -> Option<guard>`): `None` defers
   the probe (no connection, no health change, no event), `Some(guard)` holds the
   guard for the probe. `probe_due` / `probe_all` are unchanged.
+- `resocks5-net`: `chain::GateLevels::try_new` (duplicate ranks are an error in
+  release builds too, `GateLevelsError`), `types::MAX_CHAIN_NODES` (64) with
+  `ProxyConfigError::ChainTooLong`, `error::TimeoutKind::Socks5Greeting`, and
+  `ProxyRotator::{take_probe_claims, record_success_for, record_hard_failure_for,
+  quarantine_now_unless_tripped}` with `UpstreamProbeClaim`.
+- `resocks5-net`: feature `test-instrumentation` adds `progress::ProgressScopeProbe`,
+  an instance-scoped observer of confirmed write progress.
+- CI: a `feature-unification` job builds the `tests/feature_unification` fixture,
+  `release-behavior` runs a few release-mode suites on full runs, every job has a
+  `timeout-minutes`, and `changed-areas.sh --self-test` pins the classifier.
 
 ### Changed
 
@@ -73,6 +225,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory runs with health persistence disabled and one warning instead of
   deleting the running writer's temp; shutdown reports go through the log
   channel.
+- `resocks5-net`: a SOCKS5 greeting that gets no reply within the handshake budget
+  is `TimeoutKind::Socks5Greeting` and counts as upstream-down
+  (`is_upstream_down`); a stalled CONNECT reply is still `Socks5Handshake`.
+  `ProxyConfig` `Debug` renders the gate chain as a flat list (no recursion),
+  and `ProxyConfig::validate` rejects chains over 64 nodes.
+- `resocks5-net`: a chain probe outcome is bound to the claim that took the probe
+  (generation token): a result for a slot that was reset, re-tripped or leased
+  again meanwhile is dropped; only destination-unreachable replies (SOCKS5 REP
+  3-6, HTTP 502-504) of the final CONNECT quarantine the tested gate.
+- `resocks5`: new Argon2id hashes use m=19456 KiB, t=2, p=1 (OWASP minimum); stored
+  hashes keep verifying with their own parameters. A stored hash that is not
+  Argon2id v19 is rejected (it used to verify with the algorithm named in the
+  string). `verify_async` runs the same single comparison (against a dummy)
+  for unknown and disabled names, so the first step costs the same for every name.
+- `resocks5`: cached chains honour the direct fallback reserve of
+  `max_upstream_attempts` (a budget of 1 still serves the sticky cache first),
+  and `network.*` time budgets above one day and limits above 2^30 are rejected
+  at start-up.
+- `resocks5`: strict HTTP `Host` follows RFC 9110 (empty port and any digits are
+  valid, bracketed IPvFuture is accepted, no 1..65535 range); the app enables the
+  `zeroize` feature of `resocks5-net`.
 
 ### Fixed
 
@@ -113,6 +286,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5-net`: a quarantine whose deadline is not representable as an `Instant`
   (huge configured maximum) stays quarantined instead of dropping to probation at
   once.
+- `resocks5-net`: `connect_hedged` no longer launches a pending candidate on a hedge
+  tick after a win was published, catches a callback panic inside the detached
+  drain, and `HedgeError::source()` returns the last connection error.
+  `http_error` falls back to a 500 head for an unknown status instead of panicking.
+- `resocks5-net`: strict HTTP accepts an uppercase `V` in a bracketed IPvFuture
+  `Host` (`[V1.example]`), as the RFC 3986 ABNF string is case-insensitive.
+- `resocks5`: the verify-cache keeps the presented password in process memory
+  (wiped on drop, never persisted) instead of an HMAC of it, so a repeated login is
+  one constant-time comparison and nothing is recomputed; unknown and disabled
+  names run the same single comparison against a dummy. Anyone who can read the
+  process memory (dump, debugger) can read the cached passwords of users who
+  logged in since the start.
+- `resocks5`: the health writer compares quarantine deadlines with a two-second
+  tolerance (the whole-second truncation jitter) instead of one save interval, so a
+  re-trip with unchanged counters is saved whenever its expiry really moved.
+- `resocks5-net`: a `Duration::MAX` handshake budget no longer panics the dial
+  paths (SOCKS5 and TLS hops use a checked deadline); `same_upstream` documents
+  that `gate_level` is part of an upstream's identity and the `gate` link is not.
+- `resocks5-net`: SOCKS5 server credentials are not cloned in raw mode and a rejected
+  buffer is wiped before it is freed (feature `zeroize`).
+- `resocks5-net`: a probe lease too large for the `Instant` range still excludes a
+  second probe, and `probe_all_with` trips an upstream atomically.
+- `resocks5`: the health file lock now outlives a blocking write that the bounded
+  shutdown stopped waiting for; a failed save clears the baseline so the next
+  round rewrites; the quarantine deadline is part of the compared state;
+  duplicated or ambiguous records (same label, different secret) are not
+  restored and warn; the lock sentinel refuses symlinks and keeps one pid line.
+- `resocks5`: the tunnel's fragmentation prelude renews its idle window from every
+  accepted relay write, and a client that only half-closes after the early reply
+  keeps its session (the IP fallback is dialed, the FIN is propagated and the
+  greeting relayed).
+- `resocks5`: the log drain reports a failed log file through a bounded, awaited
+  stderr write instead of a blocking `eprintln!` on the worker.
+- CI: `release.yml` grants `contents: write` only to the release job, and the crate
+  is packaged and verified before the token-bearing step, which publishes with
+  `--no-verify`.
 
 ## [0.4.1] - 2026-11-02
 
@@ -937,7 +1146,8 @@ reusable networking toolkit) and `resocks5` (the CLI proxy server).
 - Direct-bypass users are documented as leaking the server's IP and DNS;
   opt-in only, never anonymous.
 
-[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/PHPCraftdream/resocks5/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/PHPCraftdream/resocks5/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/PHPCraftdream/resocks5/compare/v0.2.0...v0.3.0

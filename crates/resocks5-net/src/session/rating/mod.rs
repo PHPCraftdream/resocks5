@@ -43,6 +43,33 @@ pub struct Ratings {
     inner: Mutex<Inner>,
 }
 
+/// Opaque ownership token of one probation slot: what a probe outcome is
+/// bound to. [`Ratings::take_probe_claims`] issues one claim per granted
+/// probe lease; every success, trip, restore and newer lease changes the
+/// slot's generation, and [`Ratings::record_success_for`] /
+/// [`Ratings::record_hard_failure_for`] then drop outcomes whose claim no
+/// longer matches instead of rating a slot somebody else owns now.
+///
+/// The claim is about ownership, not about time: the lease only keeps a
+/// second probe away while it runs. An outcome that arrives after its lease
+/// ran out but before anybody claimed the slot again is still evidence about
+/// that upstream and is applied; once a newer claim (or any reset, trip or
+/// restore) exists, the old outcome is dropped. Bound a probe's own run time
+/// with its connect/handshake budget, not with the lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeClaim {
+    index: usize,
+    token: u64,
+}
+
+impl ProbeClaim {
+    /// The rated slot this claim belongs to.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+}
+
 impl Ratings {
     /// Create `n` fresh upstreams, all starting at weight 1.0.
     ///
@@ -150,6 +177,53 @@ impl Ratings {
         inner.quarantine[i].hard_failure(now, &self.quarantine)
     }
 
+    /// Apply a probe's success only while `claim` still owns the slot:
+    /// under one lock acquisition the claim's generation is checked
+    /// against the slot's; a reset, re-trip, restore or newer lease in
+    /// between makes the outcome stale and nothing is changed. Returns
+    /// `true` when the success was applied.
+    pub fn record_success_for(&self, claim: &ProbeClaim) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if claim.index >= inner.cells.len() {
+            return false;
+        }
+        if inner.quarantine[claim.index].generation() != claim.token {
+            return false;
+        }
+        let now = Instant::now();
+        if self.policy.enabled() {
+            inner.cells[claim.index].observe_success(now, &self.policy);
+        }
+        inner.quarantine[claim.index].success();
+        true
+    }
+
+    /// Apply a probe's hard failure only while `claim` still owns the
+    /// slot (same generation gate as [`Ratings::record_success_for`],
+    /// under the same lock). Returns the new quarantine length when the
+    /// applied failure (re-)tripped the quarantine; `None` when the claim
+    /// was stale (nothing changed) or the applied failure did not trip.
+    pub fn record_hard_failure_for(&self, claim: &ProbeClaim) -> Option<Duration> {
+        self.record_hard_failure_for_at(claim, Instant::now())
+    }
+
+    fn record_hard_failure_for_at(&self, claim: &ProbeClaim, now: Instant) -> Option<Duration> {
+        let mut inner = self.inner.lock().unwrap();
+        if claim.index >= inner.cells.len() {
+            return None;
+        }
+        if inner.quarantine[claim.index].generation() != claim.token {
+            return None;
+        }
+        if self.policy.enabled() {
+            inner.cells[claim.index].observe_failure(now, &self.policy);
+        }
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        inner.quarantine[claim.index].hard_failure(now, &self.quarantine)
+    }
+
     /// Quarantine upstream `i` right away, without waiting for the failure
     /// threshold: for an explicit health check that found it down (e.g. at
     /// startup). Returns the quarantine length; `None` without a quarantine
@@ -161,6 +235,26 @@ impl Ratings {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         let cell = inner.quarantine.get_mut(i)?;
+        Some(cell.trip_now(now, &self.quarantine))
+    }
+
+    /// [`Ratings::quarantine_now`] unless the upstream is already tripped
+    /// (quarantined or on probation) — one lock acquisition, so a
+    /// concurrent [`Ratings::on_hard_failure`] cannot slip between the
+    /// check and the trip and double the backoff on one piece of
+    /// evidence. Returns the quarantine length when THIS call did the
+    /// quarantining; `None` when the upstream was already tripped or the
+    /// index is unknown.
+    pub fn quarantine_now_unless_tripped(&self, i: usize) -> Option<Duration> {
+        if !self.quarantine.enabled() {
+            return None;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        let cell = inner.quarantine.get_mut(i)?;
+        if cell.is_tripped() {
+            return None;
+        }
         Some(cell.trip_now(now, &self.quarantine))
     }
 
@@ -245,34 +339,76 @@ impl Ratings {
         self.pick_order_at(Instant::now())
     }
 
-    fn pick_order_at(&self, now: Instant) -> Vec<usize> {
-        let (eligible, keyed) = {
-            let mut inner = self.inner.lock().unwrap();
-            let Inner {
-                cells,
-                quarantine,
-                rng,
-            } = &mut *inner;
-            let eligible: Vec<usize> = if self.quarantine.enabled()
-                && quarantine.iter().any(|c| c.state(now) == State::Healthy)
-            {
-                (0..cells.len())
-                    .filter(|&i| quarantine[i].state(now) == State::Healthy)
-                    .collect()
-            } else {
-                (0..cells.len()).collect()
-            };
-            let keyed = select::weighted_keys(
-                eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
-                rng,
-            );
-            (eligible, keyed)
+    /// Снапшот выбора: eligibility и все N ключей под одним взятием lock
+    /// (тот же объём работы и момент, что у полного pick_order); порядок
+    /// отдаётся лениво курсором вне lock.
+    fn eligible_and_keyed(&self, now: Instant) -> (Vec<usize>, Vec<(usize, f64)>) {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner {
+            cells,
+            quarantine,
+            rng,
+        } = &mut *inner;
+        let eligible: Vec<usize> = if self.quarantine.enabled()
+            && quarantine.iter().any(|c| c.state(now) == State::Healthy)
+        {
+            (0..cells.len())
+                .filter(|&i| quarantine[i].state(now) == State::Healthy)
+                .collect()
+        } else {
+            (0..cells.len()).collect()
         };
+        let keyed = select::weighted_keys(
+            eligible.iter().map(|&i| cells[i].weight(now, &self.policy)),
+            rng,
+        );
+        (eligible, keyed)
+    }
+
+    fn pick_order_at(&self, now: Instant) -> Vec<usize> {
+        let (eligible, keyed) = self.eligible_and_keyed(now);
         // The O(n log n) sort does not hold the ratings lock.
         select::order_keys(keyed)
             .into_iter()
             .map(|j| eligible[j])
             .collect()
+    }
+
+    /// Ленивый снапшот: тот же lock-объём, что pick_order_at, сортировка —
+    /// по мере потребления. Доступен при feature rotator.
+    #[cfg(feature = "rotator")]
+    pub(crate) fn pick_order_lazy_at(&self, now: Instant) -> OrderSnapshot {
+        let (eligible, keyed) = self.eligible_and_keyed(now);
+        OrderSnapshot {
+            eligible,
+            cursor: select::LazyOrder::from_keyed(keyed),
+        }
+    }
+
+    /// Текущий момент; см. pick_order_lazy_at.
+    #[cfg(feature = "rotator")]
+    pub(crate) fn pick_order_lazy(&self) -> OrderSnapshot {
+        self.pick_order_lazy_at(Instant::now())
+    }
+
+    /// Пересеять внутренний RNG (тестовый хук).
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn reseed(&self, seed: u64) {
+        self.inner.lock().unwrap().rng = SmallRng::from_seed(seed);
+    }
+
+    /// Тестовый хук: Ratings с фиксированным seed RNG.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn with_rng_seed(
+        n: usize,
+        policy: RatingPolicy,
+        quarantine: QuarantinePolicy,
+        seed: u64,
+    ) -> Ratings {
+        let ratings = Ratings::try_with_quarantine(n, policy, quarantine)
+            .expect("валидные параметры в тесте");
+        ratings.reseed(seed);
+        ratings
     }
 
     /// Claim the upstreams that are due for a probe: their quarantine has
@@ -286,7 +422,23 @@ impl Ratings {
         self.take_probes_at(Instant::now())
     }
 
+    /// [`Ratings::take_probes`] with ownership: each returned
+    /// [`ProbeClaim`] carries the generation of the slot at lease-grant
+    /// time. Report the outcome with [`Ratings::record_success_for`] /
+    /// [`Ratings::record_hard_failure_for`]; outcomes whose slot changed
+    /// hands meanwhile are dropped. Empty without a quarantine.
+    pub fn take_probe_claims(&self) -> Vec<ProbeClaim> {
+        self.take_probe_claims_at(Instant::now())
+    }
+
     fn take_probes_at(&self, now: Instant) -> Vec<usize> {
+        self.take_probe_claims_at(now)
+            .into_iter()
+            .map(|claim| claim.index)
+            .collect()
+    }
+
+    fn take_probe_claims_at(&self, now: Instant) -> Vec<ProbeClaim> {
         if !self.quarantine.enabled() {
             return Vec::new();
         }
@@ -295,120 +447,67 @@ impl Ratings {
             .quarantine
             .iter_mut()
             .enumerate()
-            .filter_map(|(i, c)| c.try_lease(now, &self.quarantine).then_some(i))
+            .filter_map(|(i, c)| {
+                c.try_lease(now, &self.quarantine)
+                    .map(|token| ProbeClaim { index: i, token })
+            })
             .collect()
     }
 }
 
+/// Снимок порядка выбора: eligibility и RNG зафиксированы в момент
+/// создания; порядок выдаётся лениво с ограниченной работой сравнения.
+/// Доступен при feature rotator (потребитель — rotator/chain).
+#[cfg(feature = "rotator")]
+pub(crate) struct OrderSnapshot {
+    eligible: Vec<usize>,
+    cursor: select::LazyOrder,
+}
+
+#[cfg(feature = "rotator")]
+impl OrderSnapshot {
+    /// Следующий индекс в точном порядке pick_order, или None после
+    /// исчерпания.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn next_index(&mut self) -> Option<usize> {
+        self.cursor.next().map(|j| self.eligible[j])
+    }
+
+    /// Число eligible-слотов в снапшоте.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn eligible_len(&self) -> usize {
+        self.eligible.len()
+    }
+
+    /// Разобрать снимок: eligible-индексы и курсор порядка, без копий.
+    pub(crate) fn into_parts(self) -> (Vec<usize>, select::LazyOrder) {
+        (self.eligible, self.cursor)
+    }
+
+    /// Полный дренаж в тот же Vec, что вернул бы pick_order.
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn into_indices(mut self) -> Vec<usize> {
+        std::iter::from_fn(|| self.next_index()).collect()
+    }
+}
+
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "../testing/rating_tests.rs"]
+mod tests;
 
-    #[test]
-    fn new_with_zero_n_works() {
-        let r = Ratings::new(0, RatingPolicy::default());
-        assert_eq!(r.len(), 0);
-        assert!(r.is_empty());
-        assert!(r.pick_order().is_empty());
-    }
-
-    #[test]
-    fn on_failure_increases_sand() {
-        let r = Ratings::new(2, RatingPolicy::default());
-        r.on_failure(0);
-        let w = r.weights();
-        assert!(
-            w[0] < 1.0,
-            "weight after failure should be < 1.0, got {}",
-            w[0]
-        );
-    }
-
-    #[test]
-    fn on_failure_disabled_when_penalty_zero() {
-        let p = RatingPolicy {
-            fail_penalty: 0.0,
-            ..Default::default()
-        };
-        let r = Ratings::new(2, p);
-        r.on_failure(0);
-        let w = r.weights();
-        assert!(
-            (w[0] - 1.0).abs() < 1e-9,
-            "weight should stay 1.0 when disabled, got {}",
-            w[0]
-        );
-    }
-
-    #[test]
-    fn pick_order_is_permutation_of_all_indices() {
-        let r = Ratings::new(5, RatingPolicy::default());
-        let order = r.pick_order();
-        assert_eq!(order.len(), 5);
-        let mut sorted = order.clone();
-        sorted.sort();
-        assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn weights_equal_at_start() {
-        let r = Ratings::new(4, RatingPolicy::default());
-        let w = r.weights();
-        for (i, &v) in w.iter().enumerate() {
-            assert!((v - 1.0).abs() < 1e-9, "weight[{i}] = {v}, expected 1.0");
-        }
-    }
-
-    #[test]
-    fn bad_upstream_picked_less_but_nonzero_over_many_pulls() {
-        let r = Ratings::new(4, RatingPolicy::default());
-        // Saturate cell 0.
-        for _ in 0..100 {
-            r.on_failure(0);
-        }
-        let n = 10_000;
-        let mut count0 = 0u32;
-        for _ in 0..n {
-            if r.pick() == 0 {
-                count0 += 1;
-            }
-        }
-        assert!(count0 >= 1, "index 0 should still be picked at least once");
-        let frac = count0 as f64 / n as f64;
-        assert!(
-            frac < 0.10,
-            "index 0 picked {frac}*100% of the time, expected <10%"
-        );
-    }
-
-    #[test]
-    fn converges_under_sustained_failure_rate() {
-        let r = Ratings::new(4, RatingPolicy::default());
-        // Simulate: index 0 fails roughly 50% of the time over many iterations.
-        // We use a deterministic pattern: fail on even iterations.
-        for i in 0..10_000 {
-            if i % 2 == 0 {
-                r.on_failure(0);
-            } else {
-                r.on_success(0);
-            }
-        }
-        let w = r.weights();
-        // With 50% failure rate the sand level stabilises around ~1.0
-        // (fail adds 1.0, success halves), giving a weight strictly below 1.0
-        // but well above min_weight.  This proves the model neither runs away
-        // nor collapses to zero.
-        assert!(
-            w[0] < 1.0,
-            "weight[0] should be below 1.0 under sustained failures, got {}",
-            w[0]
-        );
-        assert!(
-            w[0] > 0.05,
-            "weight[0] should stay above min_weight (0.05), got {}",
-            w[0]
-        );
-    }
+/// Тестовый хук: Ratings с карантином и фиксированным seed RNG.
+#[cfg(all(test, feature = "rotator"))]
+fn quarantined_ratings_with_seed(n: usize) -> Ratings {
+    Ratings::with_rng_seed(
+        n,
+        RatingPolicy::default(),
+        QuarantinePolicy::default()
+            .with_threshold(3)
+            .with_initial(Duration::from_secs(30))
+            .with_max(Duration::from_secs(600))
+            .with_probe_lease(Duration::from_secs(25)),
+        208,
+    )
 }
 
 #[cfg(test)]
@@ -614,5 +713,112 @@ mod quarantine_tests {
             Ratings::try_with_quarantine(2, RatingPolicy::default(), bad),
             Err(RatingError::InvalidPolicy(msg)) if msg.contains("initial")
         ));
+    }
+
+    // Finding E: a claim carries the slot's generation. An ordinary
+    // request success resets the slot, renewed failures re-quarantine it,
+    // a fresh probe claims it — and the old probe's late outcome must
+    // then change nothing, while the fresh claim still applies.
+    // Mutations: drop the generation comparison (the stale calls apply:
+    // P1's success clears P2's quarantine / P1's failure re-trips) or
+    // skip the generation bump in success() (the old claim stays valid).
+    #[test]
+    fn stale_probe_claims_change_nothing_after_reset_and_retrip() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        let old = r.take_probe_claims_at(t1).pop().unwrap();
+        // A normal (fail-open) request succeeds: the slot resets ...
+        r.on_success(0);
+        // ... and fresh hard failures quarantine it again.
+        for _ in 0..3 {
+            r.on_hard_failure_at(0, t1);
+        }
+        assert_eq!(r.health_at(t1)[0].trips, 1);
+        let t2 = t1 + Duration::from_secs(31);
+        let fresh = r.take_probe_claims_at(t2).pop().unwrap();
+        assert_ne!(old, fresh, "the new lease must own a new generation");
+        // The slot is leased to the fresh claim only.
+        assert!(r.take_probe_claims_at(t2).is_empty());
+
+        // P1's late success: stale — dropped, the new quarantine stands.
+        assert!(!r.record_success_for(&old));
+        // Re-quarantined at t1 for 30 s, so at t2 the slot is on probation
+        // (leased to the fresh claim) and still counts as tripped.
+        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Probation);
+        assert_eq!(r.health_at(t2)[0].trips, 1);
+        // P1's late hard failure: stale too — dropped.
+        assert_eq!(r.record_hard_failure_for(&old), None);
+        assert_eq!(r.health_at(t2)[0].trips, 1);
+        // P2's ownership is intact: its success applies.
+        assert!(r.record_success_for(&fresh));
+        assert_eq!(r.health_at(t2)[0].state, UpstreamState::Alive);
+        assert_eq!(r.health_at(t2)[0].trips, 0);
+    }
+
+    // Finding E, direct path: a fresh claim's hard failure still
+    // requarantines (doubled length), and soft failures never invalidate
+    // a claim. Mutations: gating the claim path off entirely (returns
+    // None) or bumping the generation on soft failures (claim stale).
+    #[test]
+    fn fresh_claim_failure_requarantines_and_soft_failures_do_not_invalidate() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        trip(&r, 0, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        let claim = r.take_probe_claims_at(t1).pop().unwrap();
+        r.on_failure(0);
+        r.on_failure(0);
+        // Evaluated at the probe's own instant, like the rest of this table.
+        assert_eq!(
+            r.record_hard_failure_for_at(&claim, t1),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    // Finding H3, deterministic half: quarantining an already-tripped
+    // upstream must be a no-op — one piece of evidence, one trip.
+    // Mutation: unconditional trip_now (check dropped): the second
+    // call returns Some and trips becomes 2.
+    #[test]
+    fn quarantine_now_unless_tripped_is_a_noop_for_a_tripped_upstream() {
+        let r = ratings(2);
+        let t0 = Instant::now();
+        assert_eq!(
+            r.quarantine_now_unless_tripped(0),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(r.quarantine_now_unless_tripped(0), None);
+        assert_eq!(r.quarantine_now_unless_tripped(9), None);
+        assert_eq!(r.health_at(t0)[0].trips, 1);
+        assert_eq!(r.health_at(t0)[1].trips, 0);
+    }
+
+    // Finding H3, race half: with the check and the trip in ONE lock
+    // acquisition, exactly one of many concurrent callers quarantines
+    // and trips == 1. Mutation: splitting it back into is_quarantined +
+    // quarantine_now (two acquisitions) lets several callers trip under
+    // contention.
+    #[test]
+    fn concurrent_quarantine_trips_only_once() {
+        let r = std::sync::Arc::new(ratings(1));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let r = std::sync::Arc::clone(&r);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                r.quarantine_now_unless_tripped(0)
+            }));
+        }
+        let applied = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|result| result.is_some())
+            .count();
+        assert_eq!(applied, 1, "exactly one caller does the quarantining");
+        assert_eq!(r.health()[0].trips, 1);
     }
 }

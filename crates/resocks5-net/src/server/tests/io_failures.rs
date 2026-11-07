@@ -244,6 +244,9 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
             for protocol in [Protocol::Socks5, Protocol::Http] {
                 for reply in [Reply::Established, Reply::Forbidden, Reply::UpstreamUnavailable, Reply::ConnectionRefused, Reply::NetworkUnreachable, Reply::TimedOut, Reply::GeneralFailure, Reply::Overloaded] {
                     let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
                     username_raw: None,
                     credentials: None,
                         protocol, target: "h:1".into(), username: None, pipeline: Vec::new(),
@@ -329,6 +332,9 @@ async fn host_budget_cancels_final_flush_without_replay() {
     timeout(Duration::from_secs(10), async {
         for protocol in [Protocol::Socks5, Protocol::Http] {
             let req = IncomingRequest {
+                auth: crate::server::AuthMethod::Anonymous,
+                #[cfg(feature = "gssapi")]
+                gss: None,
                 username_raw: None,
                 credentials: None,
                 protocol,

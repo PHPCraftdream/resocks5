@@ -23,6 +23,10 @@ fn http_proxy_config(host: &str, port: u16) -> ProxyConfig {
         port,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
+        #[cfg(feature = "gssapi")]
+        gssapi: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -37,6 +41,10 @@ fn socks5_proxy_config(host: &str, port: u16) -> ProxyConfig {
         port,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
+        #[cfg(feature = "gssapi")]
+        gssapi: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -143,10 +151,15 @@ async fn pool_connect_timeout_yields_typed_timeout() {
 
 #[cfg(feature = "pool")]
 #[tokio::test]
-async fn socks5_handshake_timeout_yields_typed_timeout() {
+async fn socks5_silent_greeting_yields_greeting_timeout_and_upstream_down() {
+    // Regression for the silent-upstream decision: a TCP-alive upstream
+    // that never answers the greeting must be classified as down.
+    // Mutations caught: (a) reverting the producer wiring back to one
+    // whole-handshake timeout (the kind becomes Socks5Handshake),
+    // (b) removing Socks5Greeting from is_upstream_down in classify.rs.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // Accept and stay silent — the handshake budget must expire.
+    // Accept and stay silent — the greeting budget must expire.
     tokio::spawn(async move {
         // Hold the accepted socket open — dropping it would reset
         // the client's read before its handshake budget expires.
@@ -168,18 +181,68 @@ async fn socks5_handshake_timeout_yields_typed_timeout() {
             &err,
             ConnectError::Timeout {
                 stage: Stage::Handshake,
-                kind: TimeoutKind::Socks5Handshake,
+                kind: TimeoutKind::Socks5Greeting,
                 ..
             }
         ),
         "got: {err:?}"
     );
+    assert!(err.is_upstream_down());
+    assert!(err.counts_against_upstream());
     assert!(
         err.to_string()
             .starts_with("[SOCKS5] handshake timeout (0s) to "),
         "legacy text lost: {}",
         err
     );
+}
+
+#[cfg(feature = "pool")]
+#[tokio::test]
+async fn socks5_silent_connect_reply_stays_handshake_timeout_not_upstream_down() {
+    // The other half of the silent-upstream decision: after the greeting
+    // and method selection succeeded, a stalled CONNECT reply may still
+    // be the destination's fault and must NOT count the upstream as down.
+    // Mutation caught: blanket-classifying the whole handshake (including
+    // the CONNECT-reply phase) as upstream-down fails the last assertion.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut greeting = [0u8; 3];
+        let _ = sock.read_exact(&mut greeting).await;
+        let _ = sock.write_all(&[0x05, 0x00]).await;
+        // Read the CONNECT request (10 bytes for the IPv4 targets these
+        // tests use), then stay silent: closing with the request unread
+        // would RST the socket instead of leaving the client's read
+        // pending for its budget.
+        let mut request = [0u8; 10];
+        let _ = sock.read_exact(&mut request).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(sock);
+    });
+    let proxy = socks5_proxy_config(&addr.ip().to_string(), addr.port());
+    let err = crate::connect::connect_socks5_proxy(
+        "1.2.3.4:443",
+        &proxy,
+        &ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1),
+        Duration::from_millis(300),
+    )
+    .await
+    .expect_err("silent CONNECT reply must time out");
+    assert!(
+        matches!(
+            &err,
+            ConnectError::Timeout {
+                stage: Stage::Handshake,
+                kind: TimeoutKind::Socks5Handshake,
+                ..
+            }
+        ),
+        "got: {err:?}"
+    );
+    assert!(!err.is_upstream_down());
+    assert!(err.counts_against_upstream());
 }
 
 #[cfg(feature = "pool")]
@@ -609,6 +672,10 @@ async fn https_without_connector_yields_tls_variant_with_legacy_text() {
         port: 443,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
+        #[cfg(feature = "gssapi")]
+        gssapi: None,
         is_gate: false,
         gate_level: 0,
         gate: None,
@@ -638,6 +705,10 @@ async fn https_in_lean_build_yields_tls_feature_missing() {
         port: 443,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
+        #[cfg(feature = "gssapi")]
+        gssapi: None,
         is_gate: false,
         gate_level: 0,
         gate: None,

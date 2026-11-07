@@ -3,6 +3,12 @@
 Thanks for considering a contribution. This document is short on purpose —
 the rules are mostly the rules of any small Rust project.
 
+## Repository language
+
+Use English for repository content: source code, comments, documentation,
+configuration explanations, CI labels, commit messages, and pull requests.
+Keep translations separate from unrelated changes and preserve existing meaning.
+
 ## Before you open a PR
 
 1. **Open an issue first** for anything bigger than a typo or a one-file
@@ -35,8 +41,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI also runs structure, MSRV, documentation, feature-matrix, and lean-library
-checks. The workflow's `RUSTFLAGS=-D warnings` treats compiler warnings as
+CI also runs structure (with the classifier self-test), MSRV, documentation,
+feature-matrix, feature-unification fixture, and lean-library checks. The workflow's `RUSTFLAGS=-D warnings` treats compiler warnings as
 errors; this does not prohibit particular constructs such as `unwrap()`,
 `dbg!`, or `TODO` by itself.
 
@@ -48,11 +54,12 @@ runs only that, on ubuntu. Nothing needs to be written in the commit message.
 
 | Changed files | What runs |
 |---------------|-----------|
-| SDK core: `crates/resocks5-net/src/{lib.rs,connect,error,types}`, `session/{pool,progress.rs}`, `tests/` | all SDK tests in every feature-matrix row, lean clippy/doc, and all app tests |
+| SDK core: `crates/resocks5-net/src/{lib.rs,connect,error,types}`, `session/{pool,progress.rs}`, `tests/` | all SDK tests in every feature-matrix row, lean clippy/doc, all app tests, and the feature-unification fixture build |
 | `crates/resocks5-net/src/session/rating`, `rotator` | SDK tests of `rating::` / `rotator::` in every matrix row; app `server::` tests |
 | `crates/resocks5-net/src/session/chain` | SDK tests of `chain::` in every matrix row; app `server::` tests |
 | `crates/resocks5-net/src/server` | SDK `server::` tests; app `server::` and `http_proxy::` tests |
 | SDK examples, fixtures | test builds of every matrix row (`--no-run`) |
+| `tests/feature_unification/**` | the feature-unification job: the fixture workspace's lean build and the combined (tls-unified) build, both `--locked` |
 | `crates/resocks5/src/{main.rs,config}` | all app tests |
 | `crates/resocks5/src/{auth,cli,server,http_proxy,logger}` | app tests of that module (`auth` also `server::`, `http_proxy::`) |
 | `README.md`, `docs/REFERENCE.md`, `docs/ARCHITECTURE.md` (embedded and tested by the app) | app `print_config_docs` tests |
@@ -68,6 +75,19 @@ unit test and doctest under that module. Limits of this mapping: a change is
 tested in its own module (and the modules known to depend on it), so
 cross-module behaviour changes and Windows/macOS-only breakage can slip past a
 targeted run. The full run exists for exactly that.
+
+This mapping is executable-checked: the `structure` job runs
+`sh .github/scripts/changed-areas.sh --self-test`, a table-driven test that
+feeds each row's changed paths through the classifier and pins the resulting
+flags and filters. Deleting a mapping case — or the script drifting from this
+table — fails CI. The cases cover: `session/chain` → `chain::` SDK tests plus
+app `server::` tests; `rating` / `rotator` / SDK `server` filters (the app
+`server` case filters `http_proxy:: server::`); a generic net path
+(`--no-run`, no app tests); the fixture and SDK-core triggers of the
+feature-unification job; a `Cargo.lock` change (both crates, license jobs);
+the `[ci: full]` override (full run including the fixture job and the
+release-behavior lane); and docs-only (nothing but the always-on `structure`
+job).
 
 **The full run** (every segment, the whole workspace, Linux, macOS and
 Windows, no filters) is started explicitly, at the end of a sprint and before a
@@ -86,6 +106,12 @@ release:
   (`workflow_dispatch`, always a full run);
 - it also runs for every `v*` tag, and when `.github/workflows/ci.yml` or the
   classifier script changes (to prove the change).
+
+The full run also includes the release-mode behavioral lane: the
+`release-behavior` job runs a handful of fast, hermetic budget/stage/parser
+suites (`handle_client::`, `allowed_clients::`, `print_config_docs::` filters)
+under `cargo test --release -p resocks5`, exercising the optimized release
+profile (fat LTO) that the ordinary test job never builds.
 
 Require the single **`ci result`** check in branch protection: segments that
 were skipped count as passing, a failed or cancelled one fails it.
@@ -174,8 +200,10 @@ need to see what changed, why, and how you verified it.
 
 ### crates.io credentials
 
-The `publish-crates` job in `release.yml` (`resocks5-net` only) always runs
-a packaging dry-run and uploads only when credentials exist. The mode is
+The `publish-crates` job in `release.yml` (`resocks5-net` only) packages and
+verifies the crate once without any secret in the environment — build scripts
+and proc macros never see the upload token — then uploads the already
+verified package (`--no-verify`) only when credentials exist. The mode is
 chosen by the repository variable `CRATES_IO_AUTH`:
 
 - **API token (default; unset variable).** Create a token at

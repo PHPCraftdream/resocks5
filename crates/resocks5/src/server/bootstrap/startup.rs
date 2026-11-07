@@ -57,6 +57,45 @@ fn parse_proxy_list(list_name: &str, list: &[String], proto: ProxyProtocol) -> V
         println!("{}", skipped_line_message(list_name, *line_no));
     }
     parsed
+        .into_iter()
+        .map(|config| {
+            if cleartext_upstream_credentials(&config) {
+                println!("{}", cleartext_upstream_message(list_name, &config));
+            }
+            secure_upstream_auth(config)
+        })
+        .collect()
+}
+
+/// Credentials are stored as written, but never sent in clear text: a SOCKS5
+/// upstream with a user and password authenticates with secure auth (method
+/// 0x80), so the password stays in this process. HTTPS upstreams send Basic
+/// inside TLS and are left as they are.
+pub(super) fn secure_upstream_auth(config: ProxyConfig) -> ProxyConfig {
+    let credentials = match (&config.user, &config.password) {
+        (Some(user), Some(password)) if config.protocol == ProxyProtocol::Socks5 => Some(
+            resocks5_net::secure_auth::SecureCredentials::new(user.as_str(), password.as_str()),
+        ),
+        _ => None,
+    };
+    match credentials {
+        Some(credentials) => config.with_secure_auth(credentials),
+        None => config,
+    }
+}
+
+/// Plain HTTP upstream with credentials: Basic would cross the network in
+/// clear text, so the dial refuses it. Use an `https` upstream or SOCKS5.
+pub(super) fn cleartext_upstream_credentials(config: &ProxyConfig) -> bool {
+    config.protocol == ProxyProtocol::Http && config.user.is_some() && config.password.is_some()
+}
+
+/// Names the list and host only, never the credentials.
+pub(super) fn cleartext_upstream_message(list_name: &str, config: &ProxyConfig) -> String {
+    format!(
+        "warning: {list_name}: http upstream {}:{} has credentials but would send them in clear          text — its dials are refused; use an https or socks5 upstream",
+        config.host, config.port
+    )
 }
 
 /// Pure part of [`parse_proxy_list`]: parsed configs plus the 1-based
@@ -72,12 +111,61 @@ pub(super) fn parse_proxy_list_checked(
         if line.starts_with('#') {
             continue;
         }
-        match parse_proxy_str(line, proto) {
-            Ok(config) => parsed.push(config),
+        let (entry, service) = split_gssapi_option(line);
+        match parse_proxy_str(entry, proto) {
+            Ok(config) => match attach_gssapi(config, service) {
+                Some(config) => parsed.push(config),
+                None => failed.push(idx + 1),
+            },
             Err(_) => failed.push(idx + 1),
         }
     }
     (parsed, failed)
+}
+
+/// An entry may end in `;gssapi=<service@host>`: the SOCKS5 upstream is then
+/// authenticated with GSSAPI (Kerberos) as that host-based service, strongest
+/// method first, falling back to secure auth when the entry also has
+/// credentials and the upstream prefers it. Splits the option off the entry.
+pub(super) fn split_gssapi_option(line: &str) -> (&str, Option<&str>) {
+    match line.rsplit_once(";gssapi=") {
+        // A service name is `service@host`: never empty, no `:` (a credential
+        // or a port after the marker means it was not the option).
+        Some((entry, service)) if !service.is_empty() && !service.contains(':') => {
+            (entry, Some(service))
+        }
+        _ => (line, None),
+    }
+}
+
+/// Apply the `;gssapi=` option to a parsed entry; `None` drops the entry (with
+/// a warning that names no credentials): GSSAPI needs a SOCKS5 upstream and a
+/// build with the `gssapi-system` backend.
+fn attach_gssapi(config: ProxyConfig, service: Option<&str>) -> Option<ProxyConfig> {
+    let Some(service) = service else {
+        return Some(config);
+    };
+    if config.protocol != ProxyProtocol::Socks5 {
+        println!(
+            "warning: upstream {}:{}: `;gssapi=` applies to SOCKS5 upstreams only — entry skipped",
+            config.host, config.port
+        );
+        return None;
+    }
+    #[cfg(feature = "gssapi-system")]
+    {
+        let backend = resocks5_net::gssapi::system::SystemBackend::new().shared();
+        Some(config.with_gssapi(resocks5_net::gssapi::GssCredentials::new(backend, service)))
+    }
+    #[cfg(not(feature = "gssapi-system"))]
+    {
+        let _ = service;
+        println!(
+            "warning: upstream {}:{}: `;gssapi=` needs a build with the `gssapi-system` feature — entry skipped",
+            config.host, config.port
+        );
+        None
+    }
 }
 
 /// Diagnostic for one dropped line. Deliberately receives only the list
@@ -382,12 +470,19 @@ pub(super) async fn run_server_inner() -> Result<()> {
         None
     };
 
-    let gate_levels = Arc::new(GateLevels::new(
-        gate_groups
-            .into_iter()
-            .map(|(rank, proxies)| Ok((rank, Arc::new(new_rotator(proxies).map_err(map_cfg_err)?))))
-            .collect::<Result<Vec<_>>>()?,
-    ));
+    // Ranks come from a map (unique by construction); `try_new` enforces the
+    // invariant in release builds too.
+    let gate_levels = Arc::new(
+        GateLevels::try_new(
+            gate_groups
+                .into_iter()
+                .map(|(rank, proxies)| {
+                    Ok((rank, Arc::new(new_rotator(proxies).map_err(map_cfg_err)?)))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid gate levels: {e}"))?,
+    );
 
     let v4_rotator = if !v4_proxies.is_empty() {
         Some(Arc::new(new_rotator(v4_proxies).map_err(map_cfg_err)?))

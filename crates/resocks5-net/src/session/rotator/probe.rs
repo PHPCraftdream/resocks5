@@ -55,36 +55,35 @@ type CheckResult = Result<(), String>;
 /// no task, no connection, nothing to report — while `Some(future)` runs
 /// as its own task; every task is started before the first one is
 /// awaited.
-fn spawn_checks<F, Fut>(
-    proxies: Vec<Arc<ProxyConfig>>,
-    check: F,
-) -> JoinSet<(Arc<ProxyConfig>, CheckResult)>
+fn spawn_checks<P, F, Fut>(payloads: Vec<P>, check: F) -> JoinSet<(P, CheckResult)>
 where
-    F: Fn(Arc<ProxyConfig>) -> Option<Fut> + Send + Sync + 'static,
+    P: Clone + Send + 'static,
+    F: Fn(P) -> Option<Fut> + Send + Sync + 'static,
     Fut: Future<Output = CheckResult> + Send + 'static,
 {
     let check = Arc::new(check);
     let mut tasks = JoinSet::new();
-    for proxy in proxies {
+    for payload in payloads {
         let check = Arc::clone(&check);
-        let Some(future) = check(Arc::clone(&proxy)) else {
+        let Some(future) = check(payload.clone()) else {
             continue;
         };
         tasks.spawn(async move {
             let result = future.await;
-            (proxy, result)
+            (payload, result)
         });
     }
     tasks
 }
 
-async fn drain_checks<F>(mut tasks: JoinSet<(Arc<ProxyConfig>, CheckResult)>, mut report: F)
+async fn drain_checks<P, F>(mut tasks: JoinSet<(P, CheckResult)>, mut report: F)
 where
-    F: FnMut(Arc<ProxyConfig>, CheckResult),
+    P: 'static,
+    F: FnMut(P, CheckResult),
 {
     while let Some(result) = tasks.join_next().await {
-        if let Ok((proxy, ok)) = result {
-            report(proxy, ok);
+        if let Ok((payload, ok)) = result {
+            report(payload, ok);
         }
     }
 }
@@ -105,6 +104,10 @@ impl ProxyRotator {
     /// Returning `Some(guard)` pins `guard` (e.g. a pool permit) for the
     /// probe's whole duration; it drops once the connect attempt
     /// settles.
+    ///
+    /// The outcome applies only through the claim taken at the start; a
+    /// stale outcome — the slot changed hands while the probe ran — is
+    /// dropped silently.
     pub async fn probe_due_with<G, R>(
         &self,
         connect_timeout: Duration,
@@ -114,10 +117,14 @@ impl ProxyRotator {
         G: Send + 'static,
         R: Fn(&ProxyConfig) -> Option<G> + Send + Sync + 'static,
     {
-        let tasks = spawn_checks(self.take_probes(), move |proxy| {
-            let guard = reserve(&proxy)?;
+        // Claims are taken before any reserve or spawn (finding E): the
+        // outcome is bound to the slot's generation at claim time, so a
+        // health change that happens while the probe runs cannot be
+        // overwritten by a stale result.
+        let tasks = spawn_checks(self.take_probe_claims(), move |claim| {
+            let guard = reserve(&claim.proxy)?;
             Some(async move {
-                let result = reachable(&proxy, connect_timeout).await;
+                let result = reachable(&claim.proxy, connect_timeout).await;
                 // `_guard` holds the cap slot until the attempt settles.
                 let _guard = guard;
                 result
@@ -125,19 +132,22 @@ impl ProxyRotator {
         });
 
         let mut events = Vec::new();
-        drain_checks(tasks, |proxy, result| match result {
+        drain_checks(tasks, |claim, result| match result {
             Ok(()) => {
-                self.record_success(&proxy);
-                events.push(ProbeEvent::Recovered { proxy });
+                if self.record_success_for(&claim) {
+                    events.push(ProbeEvent::Recovered { proxy: claim.proxy });
+                }
+                // A stale success changes nothing and reports nothing.
             }
             Err(reason) => {
-                if let Some(quarantined_for) = self.record_hard_failure(&proxy) {
+                if let Some(quarantined_for) = self.record_hard_failure_for(&claim) {
                     events.push(ProbeEvent::StillDown {
-                        proxy,
+                        proxy: claim.proxy,
                         quarantined_for,
                         reason,
                     });
                 }
+                // A stale failure changes nothing and reports nothing.
             }
         })
         .await;
@@ -173,14 +183,14 @@ impl ProxyRotator {
         let mut events = Vec::new();
         drain_checks(tasks, |proxy, result| {
             if let Err(reason) = result {
-                if !self.is_quarantined(&proxy) {
-                    if let Some(quarantined_for) = self.quarantine_now(&proxy) {
-                        events.push(ProbeEvent::QuarantinedAtStart {
-                            proxy,
-                            quarantined_for,
-                            reason,
-                        });
-                    }
+                // One atomic check-and-trip (finding H3): a concurrent
+                // hard failure can no longer double the backoff.
+                if let Some(quarantined_for) = self.quarantine_now_unless_tripped(&proxy) {
+                    events.push(ProbeEvent::QuarantinedAtStart {
+                        proxy,
+                        quarantined_for,
+                        reason,
+                    });
                 }
             }
         })

@@ -16,7 +16,7 @@ use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 use tokio::net::TcpListener;
 
-fn test_logger() -> Arc<crate::logger::Logger> {
+pub(super) fn test_logger() -> Arc<crate::logger::Logger> {
     let (tx, _rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
     Arc::new(crate::logger::Logger::new(
         tx,
@@ -27,7 +27,9 @@ fn test_logger() -> Arc<crate::logger::Logger> {
 /// Minimal no-auth SOCKS5 stub. After CONNECT succeeds it writes
 /// `banner` to the tunnel (if non-empty), then records everything the
 /// client sends. The log starts with the requested target ("host:port").
-async fn spawn_socks5_stub(banner: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+pub(super) async fn spawn_socks5_stub(
+    banner: &'static [u8],
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -94,7 +96,7 @@ async fn serve_stub_client(
     Some(())
 }
 
-fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
+pub(super) fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
     resocks5_net::types::ProxyConfig::socks5("127.0.0.1", addr.port())
 }
 
@@ -570,6 +572,7 @@ async fn handle_client_hands_partial_http_pipeline_to_recovery_losslessly() {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig { users: Vec::new() },
                 "unused-handoff",
@@ -707,6 +710,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
         AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &crate::config::UsersConfig {
                 users: vec![crate::config::User {
@@ -809,7 +813,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
 }
 
 /// Parse a real request to obtain the recovery reply capability.
-async fn recovery_request() -> IncomingRequest {
+pub(super) async fn recovery_request() -> IncomingRequest {
     let (mut peer, mut stream) = tokio::io::duplex(128);
     peer.write_all(b"CONNECT 203.0.113.9:443 HTTP/1.1\r\n\r\n")
         .await
@@ -825,4 +829,84 @@ async fn recovery_request() -> IncomingRequest {
     )
     .await
     .unwrap()
+}
+
+/// A direct account at its direct-connection cap gets 503 and one log line
+/// that names the client and the target (built from borrowed values).
+/// Mutation: dropping or reordering a value in the line, or answering
+/// something other than Overloaded, fails here.
+#[tokio::test]
+async fn direct_cap_overload_replies_503_and_logs_client_and_target() {
+    let auth = Arc::new(
+        AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous: true,
+                ..Default::default()
+            },
+            &crate::config::UsersConfig {
+                users: vec![crate::config::User {
+                    name: "alice".into(),
+                    hash: "init".into(),
+                    is_enabled: true,
+                    direct: true,
+                    allowed_clients: None,
+                }],
+            },
+            "unused-direct-cap",
+        )
+        .unwrap(),
+    );
+    let mut request = recovery_request().await;
+    request.set_identity("alice".to_owned());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (log_tx, mut logs) = tokio::sync::mpsc::channel(8);
+    let logger = Arc::new(crate::logger::Logger::new(
+        log_tx,
+        crate::logger::LogConfig::default(),
+    ));
+    let network = Arc::new(NetworkConfig::default());
+    handle_http_client(
+        socket,
+        request,
+        &auth,
+        &Arc::new(GateLevels::default()),
+        &None,
+        &None,
+        &logger,
+        &Arc::new(RegexSet::empty()),
+        &Arc::new(ProxyPool::new(
+            Default::default(),
+            Duration::from_secs(1),
+            1,
+        )),
+        &Arc::new(TlsFragmentConfig::default()),
+        &network,
+        None,
+        &Arc::new(Semaphore::new(0)),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    peer.read_to_end(&mut response).await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 503 "),
+        "{:?}",
+        String::from_utf8_lossy(&response)
+    );
+    match logs.try_recv().unwrap() {
+        crate::logger::ELog::Error(line) => assert_eq!(
+            line,
+            format!(
+                "Direct cap reached ({}) — dropping client=alice target=203.0.113.9:443",
+                network.max_concurrent_direct
+            )
+        ),
+        crate::logger::ELog::Log(line) => panic!("unexpected plain log entry: {line}"),
+    }
+    assert!(logs.try_recv().is_err(), "exactly one line");
 }

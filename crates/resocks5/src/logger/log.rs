@@ -96,6 +96,14 @@ impl Logger {
         }
     }
 
+    pub(crate) fn tunnels_enabled(&self) -> bool {
+        self.cfg.tunnels
+    }
+
+    pub(crate) fn proxy_failures_enabled(&self) -> bool {
+        self.cfg.proxy_failures
+    }
+
     pub fn tunnel(&self, msg: impl FnOnce() -> String) {
         if self.cfg.tunnels {
             self.send(msg, ELog::Log);
@@ -140,6 +148,23 @@ mod tests {
             attempts: true,
             tunnels: true,
         }
+    }
+
+    #[cfg(feature = "test-instrumentation")]
+    #[test]
+    fn perf208_disabled_logger_control() {
+        let (tx, _rx) = mpsc::channel(4);
+        let logger = Logger::new(tx, all_off());
+        let called = Cell::new(false);
+        let (_, counts) = crate::perf::measure(|| {
+            logger.tunnel(|| {
+                called.set(true);
+                format!("target={}", std::hint::black_box("target.invalid:443"))
+            })
+        });
+        assert!(!called.get());
+        assert_eq!(counts, crate::perf::Counts::default());
+        crate::perf::report("logger/tunnel/logging=off/control", counts);
     }
 
     #[test]

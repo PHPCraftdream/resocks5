@@ -1,21 +1,24 @@
 //! Direct-аккаунт передаёт данные без upstream; остальные политики сохраняются.
+//! Пароль — только secure auth (SOCKS5 0x80): HTTP с паролем всегда 407,
+//! поэтому HTTP проверяется только анонимно.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Instant};
 
 use super::handle_client::handle_client;
+use crate::auth::test_support::creds;
 use crate::auth::AuthState;
 use crate::config::{AuthConfig, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
 use crate::logger::{LogConfig, Logger};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
+use resocks5_net::secure_auth::{client_authenticate, METHOD};
+use resocks5_net::SecureAuthError;
 
 const PAYLOAD: &[u8] = b"direct request\x00\xff";
 const RESPONSE: &[u8] = b"direct response\xff\x00";
@@ -63,22 +66,18 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
     };
     match protocol {
         Protocol::Socks5 => {
-            let method = if anonymous { 0 } else { 2 };
+            let method = if anonymous { 0 } else { METHOD };
             stream.write_all(&[5, 1, method]).await.unwrap();
             let mut selected = [0; 2];
             stream.read_exact(&mut selected).await.unwrap();
             assert_eq!(selected, [5, method]);
             if !anonymous {
-                let mut auth = vec![1, 5, b'a', b'l', b'i', b'c', b'e'];
-                auth.push(u8::try_from(password.len()).unwrap());
-                auth.extend_from_slice(password.as_bytes());
-                stream.write_all(&auth).await.unwrap();
-                let mut verdict = [0; 2];
-                stream.read_exact(&mut verdict).await.unwrap();
-                assert_eq!(verdict, [1, u8::from(case.auth_failure())]);
+                let verdict = client_authenticate(&mut stream, &creds("alice", password)).await;
                 if case.auth_failure() {
+                    assert_eq!(verdict, Err(SecureAuthError::Denied));
                     return;
                 }
+                verdict.unwrap();
             }
             let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
             request.extend_from_slice(&port.to_be_bytes());
@@ -98,11 +97,8 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
             assert_eq!(&reply[..2], &[5, expected]);
         }
         Protocol::Http => {
+            assert!(anonymous, "HTTP не аутентифицирует пароль");
             let mut request = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n");
-            if !anonymous {
-                let credentials = STANDARD.encode(format!("alice:{password}"));
-                request.push_str(&format!("Proxy-Authorization: Basic {credentials}\r\n"));
-            }
             request.push_str("\r\n");
             let mut bytes = request.into_bytes();
             if case == Case::Direct {
@@ -140,6 +136,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             AuthState::build(
                 &AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &UsersConfig {
                     users: vec![User {
@@ -169,7 +166,7 @@ async fn exercise(protocol: Protocol, case: Case) {
         let address = listener.local_addr().unwrap();
         let no_rotator = None;
         let no_gates = Arc::new(GateLevels::default());
-        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         let logger = Arc::new(Logger::new(sender, LogConfig::default()));
         let banned = Arc::new(if case == Case::Banned {
             regex::RegexSet::new([format!("^127[.]0[.]0[.]1:{port}$")]).unwrap()
@@ -243,6 +240,26 @@ async fn exercise(protocol: Protocol, case: Case) {
             );
         }
         assert_eq!(direct_limiter.available_permits(), slots);
+        let cap_lines: Vec<String> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter_map(|entry| match entry {
+                crate::logger::ELog::Error(line) if line.starts_with("Direct cap reached") => {
+                    Some(line)
+                }
+                _ => None,
+            })
+            .collect();
+        if case == Case::AtCapacity {
+            // The line is built from borrowed values: its text must match.
+            assert_eq!(
+                cap_lines,
+                [format!(
+                    "Direct cap reached ({}) — dropping client=alice target=127.0.0.1:{port}",
+                    network.max_concurrent_direct
+                )]
+            );
+        } else {
+            assert!(cap_lines.is_empty(), "{cap_lines:?}");
+        }
     })
     .await
     .expect("обмен обязан завершиться в общем бюджете");
@@ -250,30 +267,25 @@ async fn exercise(protocol: Protocol, case: Case) {
 
 #[tokio::test]
 async fn direct_account_relays_bytes_without_any_upstream() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        exercise(protocol, Case::Direct).await;
-    }
+    exercise(Protocol::Socks5, Case::Direct).await;
 }
 
 #[tokio::test]
 async fn direct_is_not_a_fallback_for_pool_or_anonymous_clients() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        for case in [Case::Pool, Case::Anonymous] {
-            exercise(protocol, case).await;
-        }
+    for case in [Case::Pool, Case::Anonymous] {
+        exercise(Protocol::Socks5, case).await;
     }
+    exercise(Protocol::Http, Case::Anonymous).await;
 }
 
 #[tokio::test]
 async fn direct_preserves_auth_bans_and_concurrency_limits() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        for case in [
-            Case::Disabled,
-            Case::WrongPassword,
-            Case::Banned,
-            Case::AtCapacity,
-        ] {
-            exercise(protocol, case).await;
-        }
+    for case in [
+        Case::Disabled,
+        Case::WrongPassword,
+        Case::Banned,
+        Case::AtCapacity,
+    ] {
+        exercise(Protocol::Socks5, case).await;
     }
 }

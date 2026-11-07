@@ -459,6 +459,9 @@ async fn raw_failed_auth_errors_and_debugs_stay_secret_free() {
         );
 
         let req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:1".into(),
             username: Some("leak-raw-1\u{fffd}".to_owned()),
@@ -542,6 +545,9 @@ async fn raw_zeroize_wipes_raw_byte_vectors() {
         assert!(password_raw.is_none() || password_raw.expect("present").is_empty());
 
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:2".into(),
             username: Some("raw-u".to_owned()),
@@ -600,4 +606,79 @@ fn take_username_zeroizes_raw_bytes_before_free() {
     discard_wiped(&mut slot);
     assert!(slot.is_none());
     assert_eq!(observed.borrow().0, 1, "an empty slot must drop nothing");
+}
+
+/// The extracted decode helper returns the exact pair for valid and invalid
+/// UTF-8: text-only for a valid field, lossy text plus the exact submitted
+/// bytes for a non-UTF-8 field. Mutation: any regression that drops or
+/// corrupts the raw bytes (or mangles the lossy text) fails these assertions.
+#[test]
+fn decode_raw_field_returns_exact_pairs() {
+    assert_eq!(
+        decode_raw_field(b"plain".to_vec()),
+        ("plain".to_owned(), None)
+    );
+    let (text, raw) = decode_raw_field(b"ab\xff".to_vec());
+    assert_eq!(text, "ab\u{fffd}");
+    assert_eq!(raw.as_deref(), Some(b"ab\xff".as_slice()));
+}
+
+/// The helper consumes the buffer: a valid field becomes the text in place and
+/// an invalid one comes back as the very same allocation, neither is copied.
+/// Mutation: going back to `String::from_utf8(raw.clone())` / cloning the
+/// bytes changes the data pointer and fails both assertions.
+#[test]
+fn decode_raw_field_does_not_copy_the_buffer() {
+    let raw = b"plain-field".to_vec();
+    let ptr = raw.as_ptr();
+    let (text, kept) = decode_raw_field(raw);
+    assert_eq!(text.as_ptr(), ptr, "valid UTF-8 must convert in place");
+    assert!(kept.is_none());
+
+    let raw = b"ab\xffcd".to_vec();
+    let ptr = raw.as_ptr();
+    let (_, kept) = decode_raw_field(raw);
+    let kept = kept.expect("invalid UTF-8 keeps the bytes");
+    assert_eq!(
+        kept.as_ptr(),
+        ptr,
+        "the exact bytes must come back without a clone"
+    );
+}
+
+/// `drop_secret` must wipe rejected credential bytes before they are freed:
+/// the witness records what its `Drop` sees, so the assertion reads live
+/// memory only. Mutation: dropping without the in-place wipe lets the buffer
+/// arrive at `Drop` unwiped and fails the all-zero assertion.
+#[cfg(feature = "zeroize")]
+#[test]
+fn drop_secret_zeroizes_rejected_bytes_before_free() {
+    struct Witness {
+        bytes: Vec<u8>,
+        observed: std::rc::Rc<std::cell::RefCell<(usize, Vec<u8>)>>,
+    }
+    impl zeroize::Zeroize for Witness {
+        // Overwrite in place and keep the length: a wholesale `Vec::zeroize`
+        // would also clear the length, leaving nothing to observe.
+        fn zeroize(&mut self) {
+            self.bytes.iter_mut().for_each(|b| *b = 0);
+        }
+    }
+    impl Drop for Witness {
+        fn drop(&mut self) {
+            let mut seen = self.observed.borrow_mut();
+            seen.0 += 1;
+            seen.1 = self.bytes.clone();
+        }
+    }
+
+    let observed = std::rc::Rc::new(std::cell::RefCell::new((0usize, Vec::new())));
+    drop_secret(Witness {
+        bytes: b"rejected-secret".to_vec(),
+        observed: std::rc::Rc::clone(&observed),
+    });
+    let seen = observed.borrow().clone();
+    assert_eq!(seen.0, 1, "the witness must drop exactly once");
+    assert_eq!(seen.1.len(), 15, "the witness must capture the buffer");
+    assert!(seen.1.iter().all(|&b| b == 0), "bytes must arrive zeroized");
 }

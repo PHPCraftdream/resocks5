@@ -3,23 +3,45 @@
 #[cfg(feature = "pool")]
 use std::time::Duration;
 
+use crate::connect::handshake_over_stream::Socks5Auth;
 #[cfg(feature = "pool")]
-use tokio::time::timeout;
-
+use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 #[cfg(feature = "pool")]
-use crate::connect::handshake_over_stream;
+use crate::connect::host_port::HostPort;
 #[cfg(feature = "pool")]
 use crate::connect::tcp_dial::upstream_endpoint;
 #[cfg(feature = "pool")]
 use crate::connect::UpstreamStream;
 #[cfg(feature = "pool")]
-use crate::error::{ConnectError, Stage, TimeoutKind};
+use crate::error::ConnectError;
 #[cfg(feature = "pool")]
 use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
 
-/// Credentials of `proxy` for the SOCKS5 sub-negotiation, if both are set.
-pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Option<(&str, &str)> {
+/// How the SOCKS5 greeting to `proxy` authenticates: secure auth when
+/// configured, else the clear-text pair when both parts are set, else none.
+pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Socks5Auth<'_> {
+    #[cfg(feature = "secure-auth")]
+    {
+        let secure = proxy.secure_auth.as_deref();
+        #[cfg(feature = "gssapi")]
+        let gssapi = proxy.gssapi.as_deref();
+        #[cfg(feature = "gssapi")]
+        let any = secure.is_some() || gssapi.is_some();
+        #[cfg(not(feature = "gssapi"))]
+        let any = secure.is_some();
+        if any {
+            return Socks5Auth::Strong(crate::connect::handshake_over_stream::Strong {
+                #[cfg(feature = "gssapi")]
+                gssapi,
+                secure,
+            });
+        }
+    }
+    Socks5Auth::from_pair(socks5_pair(proxy))
+}
+
+fn socks5_pair(proxy: &ProxyConfig) -> Option<(&str, &str)> {
     match (&proxy.user, &proxy.password) {
         (Some(user), Some(password)) => Some((user.as_str(), password.as_str())),
         _ => None,
@@ -36,7 +58,10 @@ pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Option<(&str, &str)> {
 ///
 /// Returns [`ConnectError`] when acquiring a socket or running the
 /// SOCKS5 handshake fails, or when the handshake budget expires
-/// (`TimeoutKind::Socks5Handshake`).
+/// ([`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind::Socks5Greeting) while the upstream has not answered
+/// the greeting yet — it never spoke its own protocol;
+/// [`TimeoutKind::Socks5Handshake`](crate::error::TimeoutKind::Socks5Handshake) once the CONNECT reply may be the
+/// destination's fault).
 #[cfg(feature = "pool")]
 pub async fn connect_socks5_proxy(
     target_addr: &str,
@@ -49,7 +74,10 @@ pub async fn connect_socks5_proxy(
 }
 
 /// The SOCKS5 half of [`connect_socks5_proxy`] on a socket already taken
-/// from the pool, bounded by `handshake_timeout`.
+/// from the pool, bounded by `handshake_timeout`. One deadline covers
+/// both phases: a greeting stall reports [`TimeoutKind::Socks5Greeting`](crate::error::TimeoutKind::Socks5Greeting)
+/// (the upstream never spoke its own protocol), a stalled CONNECT reply
+/// stays [`TimeoutKind::Socks5Handshake`](crate::error::TimeoutKind::Socks5Handshake).
 #[cfg(feature = "pool")]
 pub(crate) async fn socks5_on_acquired(
     stream: UpstreamStream,
@@ -57,19 +85,17 @@ pub(crate) async fn socks5_on_acquired(
     proxy: &ProxyConfig,
     handshake_timeout: Duration,
 ) -> Result<UpstreamStream, ConnectError> {
-    match timeout(
+    let parsed = HostPort::parse(target_addr)
+        .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
+    // Target checks run before any byte is written (inside the helper).
+    socks5_handshake_bounded(
+        stream,
+        parsed.host,
+        parsed.port,
+        socks5_auth(proxy),
+        deadline_after(handshake_timeout),
+        &upstream_endpoint(proxy),
         handshake_timeout,
-        handshake_over_stream(stream, target_addr, socks5_auth(proxy)),
     )
     .await
-    {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(ConnectError::Timeout {
-            stage: Stage::Handshake,
-            kind: TimeoutKind::Socks5Handshake,
-            endpoint: upstream_endpoint(proxy),
-            after: handshake_timeout,
-        }),
-    }
 }

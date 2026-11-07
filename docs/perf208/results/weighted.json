@@ -1,0 +1,3682 @@
+{
+  "stage": "weighted",
+  "issue": 208,
+  "base_revision": "4fc5968",
+  "uncommitted_working_tree": true,
+  "compiler": "rustc 1.97.0 (2d8144b78 2026-07-07), host x86_64-pc-windows-msvc",
+  "target": "x86_64-pc-windows-msvc",
+  "allocator": "std::alloc::System",
+  "builds": {
+    "sdk": {
+      "features": [
+        "default",
+        "pool",
+        "rating",
+        "rotator",
+        "secure-auth",
+        "serde",
+        "test-instrumentation",
+        "tls",
+        "zeroize"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "test": true
+      }
+    },
+    "app": {
+      "features": [
+        "test-instrumentation"
+      ],
+      "profile": {
+        "opt_level": "0",
+        "test": true
+      }
+    }
+  },
+  "lock_sha256": "dc3acbef3693ce42b520478640cacde26cced2ee45dc714b10ef3f51003bd4f0",
+  "parent_review_round2_and_3_fixes": {
+    "r2_1_feature_gating": "cfg(feature=rotator) на LazyOrder/OrderSnapshot/pick_order_lazy*; cfg(all(test, feature=rotator)) на test-only методы/тесты; без allow(dead_code)/pub-подъёмов/изменения фич; check-формы rating/rotator/rating,rotator + test-only rating build — exit 0",
+    "r2_2_app_oracles": "dial.rs: pub(super) PlanBuildTrace; establish_connection_traced; 4 негативных + 1 позитивный контрол; pick_order_calls semantics прежняя",
+    "r2_3_total_cost": "test-only дословный LegacyChainPlan (Vec<Hop>/Layer/немедленный advance); 14 строк chain_plan_legacy/*",
+    "r2_4_lookahead": "отложенный advance (need_advance): потребление k → материализация k",
+    "r3_1_production_observer": "PlanBuildRecorder trait (generic, не dyn) + ZST NoopPlanBuildRecorder: production-обёртка не создаёт Vec/записей — гарантия конструктивная; тест noop_plan_build_recorder_is_zero_sized; PlanBuildTrace=Vec — только тестовый impl трейта",
+    "r3_2_clippy": "allow(clippy::too_many_arguments) возвращён на 10-аргументный pub establish_connection; попутный box_collection на Option<Box<HashSet>> устранён (Option<HashSet>)",
+    "r3_3_faithful_legacy_v2": "после замечания о не-дословности: LegacyChainPlan с Vec<Layer>/Layer{candidates,live,index}, current_pick с Vec<Hop> и клоном ОБЕИХ Arc на каждый pick, немедленным advance, холостыми dead/seen.contains; прежние legacy-числа superseded",
+    "r3_3b_singleton_regression": "измеренная регрессия singleton-планов (N=1: new 22/1510 vs legacy 15/778) устранена: (a) OrderSnapshot::into_parts — без to_vec-копий; (b) Layer без копии eligibles (mark_dead читает cursor.eligible()); (в) live без HashMap-прохода для single-rotator слоёв (инвариант уникальности ротатора); (г) eager fast path вырожденных слоёв (все ротаторы ≤1 eligible): курсоры не создаются, кандидаты материализованы при construction, dedup сканом same_upstream, mark_dead сканом ключей (взвешенного порядка нет — сортировать нечего); singleton_key_arc заимствует Arc при gate=None",
+    "r3_4_comparability": "legacy gates2x16 на тех же рангах 2/1/0; пары new/legacy N=1/8/64/256 × consumed=1/3/full + gates2x16 + singleton_gates; строки superseded помечены",
+    "r3_comments": "новые комментарии dial/unit/quarantine/chain (включая need_advance) — по-русски"
+  },
+  "runs": {
+    "baseline": {
+      "accepted": true,
+      "elapsed_seconds": 0.047,
+      "rows": {
+        "sdk": 44,
+        "app": 24
+      },
+      "note": "до правок этапа; контроль weighted_order/n=256 = 256/2112 совпал с gate-formatter.json"
+    },
+    "fix": {
+      "accepted": true,
+      "elapsed_seconds": 7.672,
+      "rows": {
+        "sdk": 90,
+        "app": 24
+      },
+      "run_dir": "fix-counters-6",
+      "checks": {
+        "sdk:chain::": {
+          "tests": 52,
+          "failed": 0
+        },
+        "sdk:lazy": {
+          "tests": 16,
+          "failed": 0
+        },
+        "app:budget_exhausted_by_cache_failure": {
+          "tests": 1,
+          "failed": 0
+        },
+        "app:healthy_cached_chain": {
+          "tests": 1,
+          "failed": 0
+        },
+        "app:quarantined_foreign_exit_copy": {
+          "tests": 2,
+          "failed": 0
+        },
+        "app:owning_exit_copy": {
+          "tests": 1,
+          "failed": 0
+        }
+      },
+      "not_selected_checks": [
+        "sdk:rating:: (94)",
+        "sdk:rotator:: (68)",
+        "app:tests_chain_failures (2)",
+        "остальные тесты tests_unit/tests_quarantine",
+        "полный suite вне perf208-набора"
+      ]
+    },
+    "superseded_accepted_runs": [
+      {
+        "run_dir": "fix-counters-4",
+        "elapsed_seconds": 7.703,
+        "rows": {
+          "sdk": 82
+        },
+        "reason": "не-дословная legacy-реплика, look-ahead не устранён"
+      },
+      {
+        "run_dir": "fix-counters-5",
+        "elapsed_seconds": 7.718,
+        "rows": {
+          "sdk": 90
+        },
+        "reason": "дословный legacy, но без устранения machinery-overhead — singleton-регрессия измерена (N=1: new 22/1510 vs legacy 15/778)"
+      }
+    ],
+    "rejected_attempts": [
+      {
+        "run_dir": "fix-counters-2",
+        "elapsed_seconds": 15.015
+      },
+      {
+        "run_dir": "fix-counters-3",
+        "elapsed_seconds": 15.016
+      }
+    ]
+  },
+  "ab_comparison": {
+    "identical_rows": 68,
+    "changed_rows": [],
+    "new_rows": 46,
+    "missing_rows": 0,
+    "source": "Полная личная сверка родителя после singleton fast path и ограничения cursor-count."
+  },
+  "key_rows_after": {
+    "chain_plan/n=1/consumed=1": {
+      "alloc": 11,
+      "requested_bytes": 599,
+      "config_clones": 1,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "weighted_keys": 1
+    },
+    "chain_plan_legacy/n=1/consumed=1": {
+      "alloc": 15,
+      "requested_bytes": 778,
+      "config_clones": 2,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 1,
+      "weighted_keys": 1
+    },
+    "chain_plan/singleton_gates/consumed=1": {
+      "alloc": 27,
+      "requested_bytes": 1573,
+      "config_clones": 3,
+      "chain_builds": 1,
+      "chain_nodes": 3,
+      "weighted_keys": 3
+    },
+    "chain_plan_legacy/singleton_gates/consumed=1": {
+      "alloc": 39,
+      "realloc": 1,
+      "requested_bytes": 1870,
+      "config_clones": 6,
+      "chain_builds": 1,
+      "chain_nodes": 3,
+      "hash_nodes": 3,
+      "weighted_keys": 3
+    },
+    "chain_plan/n=8/consumed=1": {
+      "alloc": 12,
+      "requested_bytes": 819,
+      "config_clones": 1,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 1,
+      "weighted_keys": 8,
+      "sort_comparisons": 19
+    },
+    "chain_plan_legacy/n=8/consumed=1": {
+      "alloc": 45,
+      "realloc": 1,
+      "requested_bytes": 2499,
+      "config_clones": 9,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 18,
+      "weighted_keys": 8,
+      "sort_comparisons": 19
+    },
+    "chain_plan/n=8/consumed=full": {
+      "alloc": 56,
+      "realloc": 1,
+      "requested_bytes": 3268,
+      "config_clones": 8,
+      "chain_builds": 8,
+      "chain_nodes": 8,
+      "hash_nodes": 18,
+      "weighted_keys": 8,
+      "sort_comparisons": 19
+    },
+    "chain_plan_legacy/n=8/consumed=full": {
+      "alloc": 87,
+      "realloc": 1,
+      "requested_bytes": 4508,
+      "config_clones": 16,
+      "chain_builds": 8,
+      "chain_nodes": 8,
+      "hash_nodes": 18,
+      "weighted_keys": 8,
+      "sort_comparisons": 19
+    },
+    "chain_plan/n=64/consumed=1": {
+      "alloc": 12,
+      "requested_bytes": 2164,
+      "config_clones": 1,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 1,
+      "weighted_keys": 64,
+      "sort_comparisons": 63
+    },
+    "chain_plan_legacy/n=64/consumed=1": {
+      "alloc": 272,
+      "realloc": 4,
+      "requested_bytes": 17554,
+      "config_clones": 65,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 172,
+      "weighted_keys": 64,
+      "sort_comparisons": 387
+    },
+    "chain_plan/n=64/consumed=full": {
+      "alloc": 395,
+      "realloc": 4,
+      "requested_bytes": 25490,
+      "config_clones": 64,
+      "chain_builds": 64,
+      "chain_nodes": 64,
+      "hash_nodes": 172,
+      "weighted_keys": 64,
+      "sort_comparisons": 686
+    },
+    "chain_plan_legacy/n=64/consumed=full": {
+      "alloc": 650,
+      "realloc": 4,
+      "requested_bytes": 35688,
+      "config_clones": 128,
+      "chain_builds": 64,
+      "chain_nodes": 64,
+      "hash_nodes": 172,
+      "weighted_keys": 64,
+      "sort_comparisons": 387
+    },
+    "chain_plan/n=256/consumed=1": {
+      "alloc": 12,
+      "requested_bytes": 6773,
+      "config_clones": 1,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 1,
+      "weighted_keys": 256,
+      "sort_comparisons": 255
+    },
+    "chain_plan_legacy/n=256/consumed=1": {
+      "alloc": 1042,
+      "realloc": 6,
+      "requested_bytes": 69199,
+      "config_clones": 257,
+      "chain_builds": 1,
+      "chain_nodes": 1,
+      "hash_nodes": 700,
+      "weighted_keys": 256,
+      "sort_comparisons": 2138
+    },
+    "chain_plan/n=256/consumed=full": {
+      "alloc": 1549,
+      "realloc": 6,
+      "requested_bytes": 101710,
+      "config_clones": 256,
+      "chain_builds": 256,
+      "chain_nodes": 256,
+      "hash_nodes": 700,
+      "weighted_keys": 256,
+      "sort_comparisons": 5018
+    },
+    "chain_plan_legacy/n=256/consumed=full": {
+      "alloc": 2572,
+      "realloc": 6,
+      "requested_bytes": 142784,
+      "config_clones": 512,
+      "chain_builds": 256,
+      "chain_nodes": 256,
+      "hash_nodes": 700,
+      "weighted_keys": 256,
+      "sort_comparisons": 2138
+    },
+    "chain_plan/gates2x16/consumed=1": {
+      "alloc": 30,
+      "requested_bytes": 2809,
+      "config_clones": 3,
+      "chain_builds": 1,
+      "chain_nodes": 3,
+      "hash_nodes": 3,
+      "weighted_keys": 48,
+      "sort_comparisons": 45
+    },
+    "chain_plan_legacy/gates2x16/consumed=1": {
+      "alloc": 228,
+      "realloc": 7,
+      "requested_bytes": 13507,
+      "config_clones": 51,
+      "chain_builds": 1,
+      "chain_nodes": 3,
+      "hash_nodes": 120,
+      "weighted_keys": 48,
+      "sort_comparisons": 187
+    },
+    "chain_plan/gates2x16/consumed=full": {
+      "alloc": 57369,
+      "realloc": 6,
+      "requested_bytes": 2619316,
+      "config_clones": 12288,
+      "chain_builds": 4096,
+      "chain_nodes": 12288,
+      "hash_nodes": 120,
+      "weighted_keys": 48,
+      "sort_comparisons": 237
+    },
+    "chain_plan_legacy/gates2x16/consumed=full": {
+      "alloc": 57558,
+      "realloc": 7,
+      "requested_bytes": 2626630,
+      "config_clones": 12336,
+      "chain_builds": 4096,
+      "chain_nodes": 12288,
+      "hash_nodes": 120,
+      "weighted_keys": 48,
+      "sort_comparisons": 187
+    }
+  },
+  "net_tradeoff_per_case": {
+    "n1_any_consumption": "legacy 15/0/778 B/2 clones → new 11/0/599 B/1 clone — new не хуже (меньше) по alloc/realloc/bytes; НЕ позиционируется как throughput-оптимизация",
+    "singleton_gates_2_1_0_c1": "legacy 39/1/1870 B/6 clones → new 27/0/1573 B/3 clones — new лучше по всем полям",
+    "n8_c1": "legacy 45/1/2499 B/9/19 → new 12/0/819 B/1/19 — new лучше",
+    "n8_full": "legacy 87/1/4508 B/16/19 → new 56/1/3268 B/8/19 — new лучше по alloc/bytes/клонам, cmp равны",
+    "n64_c1": "legacy 272/4/17554 B/65/387 → new 12/0/2164 B/1/63 — new лучше",
+    "n64_full": "legacy 650/4/35688 B/128/387 → new 395/4/25490 B/64/686 — alloc/байты/клоны лучше, cmp больше",
+    "n256_c1": "legacy 1042/6/69199 B/257/2138 → new 12/0/6773 B/1/255 — new лучше по всем полям",
+    "n256_c3": "legacy 1054/6/69775 B/259/2138 → new 304/0/54410 B/6/1433 — new лучше",
+    "n256_full": "legacy 2572/6/142784 B/512/2138 → new 1549/6/101710 B/256/5018 — alloc/байты/клоны лучше, cmp больше (O(N log N), не O(N²))",
+    "gates2x16_c1": "legacy 228/7/13507 B/51/187 → new 30/0/2809 B/3/45 — new лучше",
+    "gates2x16_full": "legacy 57558/7/2626630 B/12336/187 → new 57369/6/2619316 B/12288/237 — ≈паритет",
+    "statement": "по alloc/realloc/requested_bytes/config_clones new <= legacy во ВСЕХ измеренных парах; единственная плата — сравнения при полном исчерпании (константа O(N log N)); черезpuт/latency не заявляются"
+  },
+  "parent_verification": {
+    "accepted": true,
+    "budget_seconds": 15.0,
+    "elapsed_seconds": 7.671999999962281,
+    "passed_tests": {
+      "app.txt": 8,
+      "check-0.txt": 52,
+      "check-1.txt": 16,
+      "check-10.txt": 8,
+      "check-11.txt": 6,
+      "check-2.txt": 9,
+      "check-3.txt": 1,
+      "check-4.txt": 1,
+      "check-5.txt": 2,
+      "check-6.txt": 1,
+      "check-7.txt": 1,
+      "check-8.txt": 4,
+      "check-9.txt": 1,
+      "sdk.txt": 18
+    },
+    "total_test_executions": 128,
+    "rating_only_check": true,
+    "rotator_only_check": true,
+    "rating_only_test_build": true,
+    "app_clippy": true,
+    "fast_path_cursor_bound": 2,
+    "many_singleton_groups_regression_task": 81,
+    "common_unchanged": 68,
+    "common_changed": [],
+    "new_rows": 46
+  },
+  "parent_dependency_artifacts_matched": {
+    "sdk": {
+      "count": 89,
+      "sha256": "322709c354fb0eb6945918920fa39c508cb27c67672416769cd89244ec90c428"
+    },
+    "app": {
+      "count": 129,
+      "sha256": "cd9ee83072c1dd7dffdcf8f1e1771310ad5e70d5050473ae648936816f9fe381"
+    }
+  },
+  "parent_measurements": [
+    {
+      "scenario": "chain_hash/depth=1",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_hash/depth=16",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 16,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 16,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_hash/depth=4",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 4,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 4,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_hash/depth=64",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 64,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 64,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan/gates2x16/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 30,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 30,
+        "requested_bytes": 2809,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 3,
+        "resolve_comparisons": 0,
+        "weighted_keys": 48,
+        "sort_comparisons": 45
+      }
+    },
+    {
+      "scenario": "chain_plan/gates2x16/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 57369,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 57369,
+        "requested_bytes": 2619316,
+        "config_clones": 12288,
+        "chain_builds": 4096,
+        "gate_formats": 0,
+        "chain_nodes": 12288,
+        "hash_nodes": 120,
+        "resolve_comparisons": 0,
+        "weighted_keys": 48,
+        "sort_comparisons": 237
+      }
+    },
+    {
+      "scenario": "chain_plan/n=1/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 11,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 11,
+        "requested_bytes": 599,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan/n=1/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 11,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 11,
+        "requested_bytes": 599,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan/n=1/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 11,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 11,
+        "requested_bytes": 599,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan/n=256/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 12,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 12,
+        "requested_bytes": 6773,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 255
+      }
+    },
+    {
+      "scenario": "chain_plan/n=256/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 24,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 24,
+        "requested_bytes": 7349,
+        "config_clones": 3,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 3,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 1433
+      }
+    },
+    {
+      "scenario": "chain_plan/n=256/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 1549,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 1549,
+        "requested_bytes": 101710,
+        "config_clones": 256,
+        "chain_builds": 256,
+        "gate_formats": 0,
+        "chain_nodes": 256,
+        "hash_nodes": 700,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 5018
+      }
+    },
+    {
+      "scenario": "chain_plan/n=64/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 12,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 12,
+        "requested_bytes": 2164,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 63
+      }
+    },
+    {
+      "scenario": "chain_plan/n=64/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 24,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 24,
+        "requested_bytes": 2740,
+        "config_clones": 3,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 3,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 273
+      }
+    },
+    {
+      "scenario": "chain_plan/n=64/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 395,
+        "alloc_zeroed": 0,
+        "realloc": 4,
+        "dealloc": 395,
+        "requested_bytes": 25490,
+        "config_clones": 64,
+        "chain_builds": 64,
+        "gate_formats": 0,
+        "chain_nodes": 64,
+        "hash_nodes": 172,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 686
+      }
+    },
+    {
+      "scenario": "chain_plan/n=8/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 12,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 12,
+        "requested_bytes": 819,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan/n=8/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 24,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 24,
+        "requested_bytes": 1393,
+        "config_clones": 3,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 3,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan/n=8/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 56,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 56,
+        "requested_bytes": 3268,
+        "config_clones": 8,
+        "chain_builds": 8,
+        "gate_formats": 0,
+        "chain_nodes": 8,
+        "hash_nodes": 18,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan/singleton_gates/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 27,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 27,
+        "requested_bytes": 1573,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 3,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/gates2x16/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 228,
+        "alloc_zeroed": 0,
+        "realloc": 7,
+        "dealloc": 228,
+        "requested_bytes": 13507,
+        "config_clones": 51,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 120,
+        "resolve_comparisons": 0,
+        "weighted_keys": 48,
+        "sort_comparisons": 187
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/gates2x16/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 57558,
+        "alloc_zeroed": 0,
+        "realloc": 7,
+        "dealloc": 57558,
+        "requested_bytes": 2626630,
+        "config_clones": 12336,
+        "chain_builds": 4096,
+        "gate_formats": 0,
+        "chain_nodes": 12288,
+        "hash_nodes": 120,
+        "resolve_comparisons": 0,
+        "weighted_keys": 48,
+        "sort_comparisons": 187
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=1/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 15,
+        "requested_bytes": 778,
+        "config_clones": 2,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=1/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 15,
+        "requested_bytes": 778,
+        "config_clones": 2,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=1/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 15,
+        "requested_bytes": 778,
+        "config_clones": 2,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=256/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 1042,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 1042,
+        "requested_bytes": 69199,
+        "config_clones": 257,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 700,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2138
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=256/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 1054,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 1054,
+        "requested_bytes": 69775,
+        "config_clones": 259,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 700,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2138
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=256/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 2572,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 2572,
+        "requested_bytes": 142784,
+        "config_clones": 512,
+        "chain_builds": 256,
+        "gate_formats": 0,
+        "chain_nodes": 256,
+        "hash_nodes": 700,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2138
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=64/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 272,
+        "alloc_zeroed": 0,
+        "realloc": 4,
+        "dealloc": 272,
+        "requested_bytes": 17554,
+        "config_clones": 65,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 172,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 387
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=64/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 284,
+        "alloc_zeroed": 0,
+        "realloc": 4,
+        "dealloc": 284,
+        "requested_bytes": 18130,
+        "config_clones": 67,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 172,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 387
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=64/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 650,
+        "alloc_zeroed": 0,
+        "realloc": 4,
+        "dealloc": 650,
+        "requested_bytes": 35688,
+        "config_clones": 128,
+        "chain_builds": 64,
+        "gate_formats": 0,
+        "chain_nodes": 64,
+        "hash_nodes": 172,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 387
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=8/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 45,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 45,
+        "requested_bytes": 2499,
+        "config_clones": 9,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 18,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=8/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 57,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 57,
+        "requested_bytes": 3073,
+        "config_clones": 11,
+        "chain_builds": 3,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 18,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/n=8/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 87,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 87,
+        "requested_bytes": 4508,
+        "config_clones": 16,
+        "chain_builds": 8,
+        "gate_formats": 0,
+        "chain_nodes": 8,
+        "hash_nodes": 18,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "chain_plan_legacy/singleton_gates/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 39,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 39,
+        "requested_bytes": 1870,
+        "config_clones": 6,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 3,
+        "resolve_comparisons": 0,
+        "weighted_keys": 3,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "credentials/duplicate/basic",
+      "before": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 27,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 27,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "credentials/duplicate/raw",
+      "before": {
+        "alloc": 4,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 12,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 4,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 12,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "credentials/duplicate/utf8",
+      "before": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 12,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 12,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "gate_label/depth=0",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "gate_label/depth=1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 37,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 37,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "gate_label/depth=16",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 659,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 659,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "gate_label/depth=4",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 160,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 160,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 1,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "logger/tunnel/logging=off/control",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "mark_dead/duplicate",
+      "before": {
+        "alloc": 4,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 4,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 4,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 4,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "mark_dead/first",
+      "before": {
+        "alloc": 5,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 211,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 5,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 211,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 1,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick/depth=1",
+      "before": {
+        "alloc": 6,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 287,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 6,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 287,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick/depth=16",
+      "before": {
+        "alloc": 66,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 2918,
+        "config_clones": 16,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 16,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 66,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 2918,
+        "config_clones": 16,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 16,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick/depth=4",
+      "before": {
+        "alloc": 18,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 812,
+        "config_clones": 4,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 4,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 18,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 812,
+        "config_clones": 4,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 4,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick_config/depth=1",
+      "before": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick_config/depth=16",
+      "before": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pick_config/depth=4",
+      "before": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 47,
+        "config_clones": 1,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pool/checkout/empty",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pool/checkout_then_reserve/warm",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pool/reserve/capacity",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 15,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 15,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pool/reserve/cold",
+      "before": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 251,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 251,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "pool/reserve/warm",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/http_ipv6",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/http_port1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/https_domain",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/socks5_empty",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/socks5_ipv4",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/socks5_ipv6_brackets",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/socks5_long300_maxport",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 2,
+        "dealloc": 0,
+        "requested_bytes": 971,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 2,
+        "dealloc": 0,
+        "requested_bytes": 971,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/current/socks5_utf8",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/http_ipv6",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/http_port1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/https_domain",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/socks5_empty",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/socks5_ipv4",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/socks5_ipv6_brackets",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/socks5_long300_maxport",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 2,
+        "dealloc": 0,
+        "requested_bytes": 971,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 2,
+        "dealloc": 0,
+        "requested_bytes": 971,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "print_cfg/legacy/socks5_utf8",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 0,
+        "requested_bytes": 60,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/collision/bucket=2",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 2,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 2,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/exit/cached_gate_composite",
+      "before": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/first/n=1",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/first/n=256",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/first/n=64",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/first/n=8",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/gates2_owner=first",
+      "before": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/gates2_owner=second",
+      "before": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 15,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 669,
+        "config_clones": 3,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 3,
+        "hash_nodes": 0,
+        "resolve_comparisons": 3,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/last/n=1",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/last/n=256",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 321,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 321,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/last/n=64",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 320,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 320,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/last/n=8",
+      "before": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 7,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 319,
+        "config_clones": 1,
+        "chain_builds": 1,
+        "gate_formats": 0,
+        "chain_nodes": 1,
+        "hash_nodes": 0,
+        "resolve_comparisons": 1,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/miss/n=1",
+      "before": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/miss/n=256",
+      "before": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/miss/n=64",
+      "before": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "resolve/miss/n=8",
+      "before": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 48,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "tunnel/counters/clone",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "tunnel/counters/create",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 40,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 40,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "tunnel/report/logging=off",
+      "before": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_full/n=1/full_sort_control",
+      "before": null,
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 24,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_full/n=256/full_sort_control",
+      "before": null,
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 6144,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2138
+      }
+    },
+    {
+      "scenario": "weighted_full/n=64/full_sort_control",
+      "before": null,
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 1536,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 387
+      }
+    },
+    {
+      "scenario": "weighted_full/n=8/full_sort_control",
+      "before": null,
+      "after": {
+        "alloc": 2,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 1,
+        "requested_bytes": 192,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=1/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 56,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=1/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 56,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=1/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 56,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=256/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 6176,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 255
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=256/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 6176,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 1433
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=256/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 6,
+        "dealloc": 2,
+        "requested_bytes": 10208,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 5018
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=64/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 1568,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 63
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=64/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 1568,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 273
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=64/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 4,
+        "dealloc": 2,
+        "requested_bytes": 2528,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 686
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=8/consumed=1",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 224,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=8/consumed=3",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 2,
+        "requested_bytes": 224,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "weighted_lazy/n=8/consumed=full",
+      "before": null,
+      "after": {
+        "alloc": 3,
+        "alloc_zeroed": 0,
+        "realloc": 1,
+        "dealloc": 2,
+        "requested_bytes": 288,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "weighted_order/n=1/consumed=1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 16,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 16,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_order/n=1/consumed=3",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 16,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 16,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "scenario": "weighted_order/n=256/consumed=1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 4096,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2112
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 4096,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2112
+      }
+    },
+    {
+      "scenario": "weighted_order/n=256/consumed=3",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 4096,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2112
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 4096,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 256,
+        "sort_comparisons": 2112
+      }
+    },
+    {
+      "scenario": "weighted_order/n=64/consumed=1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 1024,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 381
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 1024,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 381
+      }
+    },
+    {
+      "scenario": "weighted_order/n=64/consumed=3",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 1024,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 381
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 1024,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 64,
+        "sort_comparisons": 381
+      }
+    },
+    {
+      "scenario": "weighted_order/n=8/consumed=1",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 128,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 128,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    },
+    {
+      "scenario": "weighted_order/n=8/consumed=3",
+      "before": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 128,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      },
+      "after": {
+        "alloc": 1,
+        "alloc_zeroed": 0,
+        "realloc": 0,
+        "dealloc": 0,
+        "requested_bytes": 128,
+        "config_clones": 0,
+        "chain_builds": 0,
+        "gate_formats": 0,
+        "chain_nodes": 0,
+        "hash_nodes": 0,
+        "resolve_comparisons": 0,
+        "weighted_keys": 8,
+        "sort_comparisons": 19
+      }
+    }
+  ],
+  "superseded_reported_ab_comparison": {
+    "identical_rows": 65,
+    "changed_rows": [
+      {
+        "scenario": "sdk:pick/depth=1",
+        "before": {
+          "alloc": 6,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 287,
+          "config_clones": 1,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 1,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "after": {
+          "alloc": 6,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 287,
+          "config_clones": 1,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 1,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "mechanism": "materialization перенесена из construction в next(): singleton_key-клон и emitted-вставка на слой в scope измерения; construction больше не строит N dedup-ключей"
+      },
+      {
+        "scenario": "sdk:pick/depth=4",
+        "before": {
+          "alloc": 18,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 812,
+          "config_clones": 4,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 4,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "after": {
+          "alloc": 18,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 812,
+          "config_clones": 4,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 4,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "mechanism": "materialization перенесена из construction в next(): singleton_key-клон и emitted-вставка на слой в scope измерения; construction больше не строит N dedup-ключей"
+      },
+      {
+        "scenario": "sdk:pick/depth=16",
+        "before": {
+          "alloc": 66,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 2918,
+          "config_clones": 16,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 16,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "after": {
+          "alloc": 66,
+          "alloc_zeroed": 0,
+          "realloc": 0,
+          "dealloc": 1,
+          "requested_bytes": 2918,
+          "config_clones": 16,
+          "chain_builds": 1,
+          "gate_formats": 0,
+          "chain_nodes": 16,
+          "hash_nodes": 0,
+          "resolve_comparisons": 0,
+          "weighted_keys": 0,
+          "sort_comparisons": 0
+        },
+        "mechanism": "materialization перенесена из construction в next(): singleton_key-клон и emitted-вставка на слой в scope измерения; construction больше не строит N dedup-ключей"
+      }
+    ],
+    "other_changed": 0,
+    "new_rows": {
+      "count": 46,
+      "scenarios": [
+        "sdk:chain_plan/n=1/consumed=1",
+        "sdk:chain_plan/n=1/consumed=3",
+        "sdk:chain_plan/n=1/consumed=full",
+        "sdk:chain_plan/n=8/consumed=1",
+        "sdk:chain_plan/n=8/consumed=3",
+        "sdk:chain_plan/n=8/consumed=full",
+        "sdk:chain_plan/n=64/consumed=1",
+        "sdk:chain_plan/n=64/consumed=3",
+        "sdk:chain_plan/n=64/consumed=full",
+        "sdk:chain_plan/n=256/consumed=1",
+        "sdk:chain_plan/n=256/consumed=3",
+        "sdk:chain_plan/n=256/consumed=full",
+        "sdk:chain_plan/gates2x16/consumed=1",
+        "sdk:chain_plan/gates2x16/consumed=full",
+        "sdk:chain_plan_legacy/n=1/consumed=1",
+        "sdk:chain_plan_legacy/n=1/consumed=3",
+        "sdk:chain_plan_legacy/n=1/consumed=full",
+        "sdk:chain_plan_legacy/n=8/consumed=1",
+        "sdk:chain_plan_legacy/n=8/consumed=3",
+        "sdk:chain_plan_legacy/n=8/consumed=full",
+        "sdk:chain_plan_legacy/n=64/consumed=1",
+        "sdk:chain_plan_legacy/n=64/consumed=3",
+        "sdk:chain_plan_legacy/n=64/consumed=full",
+        "sdk:chain_plan_legacy/n=256/consumed=1",
+        "sdk:chain_plan_legacy/n=256/consumed=3",
+        "sdk:chain_plan_legacy/n=256/consumed=full",
+        "sdk:chain_plan_legacy/gates2x16/consumed=1",
+        "sdk:chain_plan_legacy/gates2x16/consumed=full",
+        "sdk:weighted_full/n=1/full_sort_control",
+        "sdk:weighted_full/n=8/full_sort_control",
+        "sdk:weighted_full/n=64/full_sort_control",
+        "sdk:weighted_full/n=256/full_sort_control",
+        "sdk:weighted_lazy/n=1/consumed=1",
+        "sdk:weighted_lazy/n=1/consumed=3",
+        "sdk:weighted_lazy/n=1/consumed=full",
+        "sdk:weighted_lazy/n=8/consumed=1",
+        "sdk:weighted_lazy/n=8/consumed=3",
+        "sdk:weighted_lazy/n=8/consumed=full",
+        "sdk:weighted_lazy/n=64/consumed=1",
+        "sdk:weighted_lazy/n=64/consumed=3",
+        "sdk:weighted_lazy/n=64/consumed=full",
+        "sdk:weighted_lazy/n=256/consumed=1",
+        "sdk:weighted_lazy/n=256/consumed=3",
+        "sdk:weighted_lazy/n=256/consumed=full"
+      ]
+    },
+    "missing_rows": 0,
+    "note": "контрольные строки побайтово идентичны (weighted_order/n=256 = 256/2112; mark_dead config_clones==1); fixtures 2112/2138 различены; legacy n=256 = 2138 == rotator-контроль"
+  },
+  "task": 79
+}

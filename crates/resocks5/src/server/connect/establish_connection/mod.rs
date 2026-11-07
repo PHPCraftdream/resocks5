@@ -1,5 +1,9 @@
+#[cfg(test)]
+mod budget_tests;
 mod dial;
 mod probes;
+#[cfg(test)]
+mod probes_tests;
 mod route;
 #[cfg(test)]
 #[path = "tests/chain_failures.rs"]

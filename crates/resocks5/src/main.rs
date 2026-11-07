@@ -5,6 +5,10 @@ mod http_proxy;
 mod logger;
 mod server;
 
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "../../resocks5-net/src/session/testing/perf.rs"]
+mod perf;
+
 use anyhow::Result;
 use clap::Parser;
 

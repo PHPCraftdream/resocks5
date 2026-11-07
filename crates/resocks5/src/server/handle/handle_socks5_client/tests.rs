@@ -27,31 +27,29 @@ async fn recovery_limit_preserves_the_unread_tail() {
 // Claim tests check credentials and persistence, not wall-clock KDF throughput.
 const CLAIM_TEST_BUDGET: Duration = Duration::from_secs(30);
 
-/// Exercise real application claim/persistence through the library auth closure.
+/// Exercise real application enrollment/persistence through `accept_secure`.
 async fn serve_one(
     listener: TcpListener,
     auth: Arc<crate::auth::AuthState>,
 ) -> anyhow::Result<(String, Option<String>)> {
-    let (mut stream, _) = listener.accept().await?;
+    let (mut stream, peer) = listener.accept().await?;
     let options = resocks5_net::server::ServerOptions::new(
         tokio::time::Instant::now() + CLAIM_TEST_BUDGET,
         auth.allow_anonymous,
         !auth.is_empty(),
     );
-    let req = resocks5_net::server::accept(&mut stream, &options, move |credentials| async move {
-        auth.verify_async(credentials.username(), credentials.password())
-            .await
-    })
-    .await?;
+    let store = auth.peer_store(Some(peer.ip()));
+    let req =
+        resocks5_net::server::accept_secure(&mut stream, &options, &store, auth.decoy()).await?;
     Ok((req.target().to_owned(), req.username().map(str::to_owned)))
 }
 
-// ── RFC 1929 zero-length-field tests (R5-07) ────────────────────
+// ── secure-auth enrollment through the SOCKS5 front door ────────
 
 fn init_user(name: &str) -> crate::config::User {
     crate::config::User {
         name: name.to_string(),
-        // Mirrors state.rs's INIT_HASH ("init") first-login sentinel.
+        // Mirrors claim.rs's INIT_HASH ("init") first-login sentinel.
         hash: "init".to_string(),
         is_enabled: true,
         direct: false,
@@ -83,6 +81,7 @@ fn auth_state_with_users(
         crate::auth::AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &crate::config::UsersConfig { users },
             path,
@@ -91,145 +90,118 @@ fn auth_state_with_users(
     )
 }
 
-async fn zero_length_field_rejected_then_valid_claim(auth_frame: &[u8]) {
+/// Greet with method 0x80 and check the server chose it.
+async fn secure_greeting(client: &mut TcpStream) {
+    let method = resocks5_net::secure_auth::METHOD;
+    client.write_all(&[0x05, 0x01, method]).await.unwrap();
+    let mut chosen = [0u8; 2];
+    client.read_exact(&mut chosen).await.unwrap();
+    assert_eq!(chosen, [0x05, method]);
+}
+
+/// Enroll `bob` with `password` over a real socket, CONNECT, and return
+/// the users file as persisted.
+async fn enroll_via_socks5(auth: Arc<crate::auth::AuthState>, password: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(serve_one(listener, auth));
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    secure_greeting(&mut client).await;
+    let enrolled = resocks5_net::secure_auth::client_authenticate(
+        &mut client,
+        &crate::auth::test_support::enrolling("bob", password),
+    )
+    .await;
+    if let Err(error) = enrolled {
+        let outcome = server.await.expect("claim server task panicked");
+        panic!("enrollment failed: {error}; claim server returned {outcome:?}");
+    }
+    client
+        .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
+        .await
+        .unwrap();
+    let (target_addr, authed_user) =
+        tokio::time::timeout(CLAIM_TEST_BUDGET, async { server.await.unwrap().unwrap() })
+            .await
+            .expect("timed out");
+    assert_eq!(target_addr, "1.2.3.4:443");
+    assert_eq!(authed_user.as_deref(), Some("bob"));
+}
+
+/// A malformed secure hello (zero-length user name) fails the handshake
+/// without touching the claim machinery; a valid enrollment afterwards
+/// still succeeds and persists. Mutation: a server that reads a zero-length
+/// name as a user could claim an account named "".
+#[tokio::test]
+async fn a_malformed_hello_is_rejected_and_init_stays_unclaimed() {
     let path = unique_users_path();
     let auth = auth_state_with_users(vec![init_user("bob")], &path);
 
-    // First connection: the malformed auth frame must fail the
-    // handshake without touching the claim machinery.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(serve_one(listener, auth.clone()));
-
     let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x02]);
-    client.write_all(auth_frame).await.unwrap();
-
-    let mut reply = [0u8; 2];
-    client.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply, [0x01, 0x01]);
-    drop(client);
-
+    secure_greeting(&mut client).await;
+    client.write_all(&[0x01, 0x00]).await.unwrap();
     let result = tokio::time::timeout(CLAIM_TEST_BUDGET, server)
         .await
         .expect("timed out")
         .unwrap();
-    assert!(
-        result.is_err(),
-        "malformed frame must fail the handshake: {result:?}"
-    );
+    assert!(result.is_err(), "malformed hello must fail: {result:?}");
+    drop(client);
     assert!(!std::path::Path::new(&path).exists());
 
-    // Second connection: a valid claim still succeeds and persists.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x02]);
-
-    let mut frame = vec![0x01, 0x03, b'b', b'o', b'b', 0x07];
-    frame.extend_from_slice(b"real-pw");
-    client.write_all(&frame).await.unwrap();
-    let mut reply = [0u8; 2];
-    client.read_exact(&mut reply).await.unwrap();
-    assert_eq!(reply, [0x01, 0x00]);
-
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
-        .await
-        .unwrap();
-    let (target_addr, authed_user) =
-        tokio::time::timeout(CLAIM_TEST_BUDGET, async { server.await.unwrap().unwrap() })
-            .await
-            .expect("timed out");
-    assert_eq!(target_addr, "1.2.3.4:443");
-    assert_eq!(authed_user.as_deref(), Some("bob"));
-
+    enroll_via_socks5(auth, "real-pw").await;
     let loaded: crate::config::UsersConfig = ktav::from_file(&path).unwrap();
-    let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
-    assert_ne!(bob.hash, "init");
-    assert!(bob.hash.starts_with("$argon2id$"));
+    assert_ne!(loaded.users[0].hash, "init");
     let _ = std::fs::remove_file(&path);
 }
 
+/// Any password length enrolls (the password never travels, so the RFC
+/// 1929 255-byte field limit is gone), the file holds no password, and a
+/// server restarted on the file logs the same password in and denies
+/// another. Mutation: persisting a key the password does not derive fails
+/// the restarted login.
 #[tokio::test]
-async fn zero_length_username_frame_rejected_and_init_stays_unclaimed() {
-    zero_length_field_rejected_then_valid_claim(&[0x01, 0x00]).await;
-}
+async fn passwords_of_any_length_enroll_and_survive_a_restart() {
+    for password in ["x".to_owned(), "a".repeat(255), "b".repeat(1000)] {
+        let path = unique_users_path();
+        let auth = auth_state_with_users(vec![init_user("bob")], &path);
+        enroll_via_socks5(auth, &password).await;
 
-#[tokio::test]
-async fn zero_length_password_frame_rejected_and_init_stays_unclaimed() {
-    zero_length_field_rejected_then_valid_claim(&[0x01, 0x03, b'b', b'o', b'b', 0x00]).await;
-}
+        let text = std::fs::read_to_string(&path).unwrap();
+        if password.len() > 1 {
+            assert!(!text.contains(&password), "the password reached the file");
+        }
+        let loaded: crate::config::UsersConfig = ktav::from_file(&path).unwrap();
+        let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
+        assert!(crate::auth::secret::parse_secret(&bob.hash).is_ok());
 
-async fn short_password_claims_via_socks5(password: &[u8]) {
-    let path = unique_users_path();
-    let auth = auth_state_with_users(vec![init_user("bob")], &path);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(serve_one(listener, auth));
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-    let mut method = [0u8; 2];
-    client.read_exact(&mut method).await.unwrap();
-    assert_eq!(method, [0x05, 0x02]);
-
-    let mut frame = vec![0x01, 0x03, b'b', b'o', b'b', password.len() as u8];
-    frame.extend_from_slice(password);
-    client.write_all(&frame).await.unwrap();
-    let mut reply = [0u8; 2];
-    if let Err(error) = client.read_exact(&mut reply).await {
-        let outcome = server.await.expect("claim server task panicked");
-        panic!("authentication reply failed: {error}; claim server returned {outcome:?}");
+        let fresh = Arc::new(
+            crate::auth::AuthState::build(
+                &crate::config::AuthConfig {
+                    allow_anonymous: false,
+                    ..Default::default()
+                },
+                &loaded,
+                path.clone(),
+            )
+            .unwrap(),
+        );
+        for (attempt, ok) in [(password.as_str(), true), ("y", false)] {
+            let store = fresh.peer_store(Some([127, 0, 0, 1].into()));
+            let credentials = crate::auth::test_support::creds("bob", attempt);
+            let (mut c, mut s) = tokio::io::duplex(4096);
+            let (client, server) = tokio::join!(
+                resocks5_net::secure_auth::client_authenticate(&mut c, &credentials),
+                resocks5_net::secure_auth::server_authenticate(&mut s, &store, fresh.decoy()),
+            );
+            assert_eq!(client.is_ok(), ok, "len {}", password.len());
+            assert_eq!(server.is_ok(), ok, "len {}", password.len());
+        }
+        let _ = std::fs::remove_file(&path);
     }
-    assert_eq!(reply, [0x01, 0x00]);
-
-    client
-        .write_all(&[0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x01, 0xBB])
-        .await
-        .unwrap();
-    let (target_addr, authed_user) =
-        tokio::time::timeout(CLAIM_TEST_BUDGET, async { server.await.unwrap().unwrap() })
-            .await
-            .expect("timed out");
-    assert_eq!(target_addr, "1.2.3.4:443");
-    assert_eq!(authed_user.as_deref(), Some("bob"));
-
-    let loaded: crate::config::UsersConfig = ktav::from_file(&path).unwrap();
-    let bob = loaded.users.iter().find(|u| u.name == "bob").unwrap();
-    assert_ne!(bob.hash, "init");
-    assert!(bob.hash.starts_with("$argon2id$"));
-
-    let fresh = crate::auth::AuthState::build(
-        &crate::config::AuthConfig {
-            allow_anonymous: false,
-        },
-        &loaded,
-        path.clone(),
-    )
-    .unwrap();
-    assert!(fresh.verify("bob", std::str::from_utf8(password).unwrap()));
-    assert!(!fresh.verify("bob", "y"));
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn one_byte_password_claims_via_socks5_and_persists() {
-    short_password_claims_via_socks5(b"x").await;
-}
-
-#[tokio::test]
-async fn password_255_bytes_claims_via_socks5_and_persists() {
-    short_password_claims_via_socks5(&vec![b'a'; 255]).await;
 }
 
 // ── Recovery-path tests ─────────────────────────────────────────
@@ -247,7 +219,7 @@ use crate::config::{NetworkConfig, TlsFragmentConfig};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::rotator::ProxyRotator;
 
-fn test_logger() -> Arc<crate::logger::Logger> {
+pub(super) fn test_logger() -> Arc<crate::logger::Logger> {
     let (tx, _rx) = tokio::sync::mpsc::channel::<crate::logger::ELog>(64);
     Arc::new(crate::logger::Logger::new(
         tx,
@@ -258,7 +230,9 @@ fn test_logger() -> Arc<crate::logger::Logger> {
 /// Minimal no-auth SOCKS5 stub. After CONNECT succeeds it writes
 /// `banner` to the tunnel (if non-empty), then records everything the
 /// client sends. The log starts with the requested target ("host:port").
-async fn spawn_socks5_stub(banner: &'static [u8]) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+pub(super) async fn spawn_socks5_stub(
+    banner: &'static [u8],
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -325,7 +299,7 @@ async fn serve_stub_client(
     Some(())
 }
 
-fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
+pub(super) fn socks5_upstream_config(addr: SocketAddr) -> resocks5_net::types::ProxyConfig {
     resocks5_net::types::ProxyConfig::socks5("127.0.0.1", addr.port())
 }
 
@@ -675,9 +649,11 @@ async fn client_closed_before_payload_ends_cleanly() {
 
     let mut success = [0u8; 10];
     client.read_exact(&mut success).await.unwrap();
-    // The EOF lands during the grace read, so no upstream is ever
-    // dialed; the observable contract is a clean Ok(()) and an
-    // untouched stub.
+    // The EOF lands during the grace read. R3-I: a client EOF no
+    // longer aborts the session — the IP fallback is dialed, the FIN
+    // is propagated upstream, and the (silent, banner-less) stub then
+    // closes it: the observable contract is a clean Ok(()) with
+    // exactly one dial of the CONNECT target.
     drop(client);
 
     let result = tokio::time::timeout(Duration::from_secs(8), task)
@@ -686,9 +662,15 @@ async fn client_closed_before_payload_ends_cleanly() {
         .unwrap();
     assert!(result.is_ok(), "expected Ok(()), got: {result:?}");
     let targets = up_log.lock().unwrap().clone();
-    assert!(
-        targets.is_empty(),
-        "no upstream may be dialed when the client closed first, targets: {targets:?}"
+    assert_eq!(
+        targets.first().map(String::as_str),
+        Some("203.0.113.9:443"),
+        "the IP fallback must be dialed for a half-closed client, targets: {targets:?}"
+    );
+    assert_eq!(
+        targets.len(),
+        1,
+        "only the CONNECT target may be dialed, targets: {targets:?}"
     );
 }
 
@@ -791,7 +773,7 @@ async fn expired_deadline_with_buffered_payload_never_starts_recovery() {
     );
 }
 
-async fn recovery_request() -> resocks5_net::server::IncomingRequest {
+pub(super) async fn recovery_request() -> resocks5_net::server::IncomingRequest {
     let (mut peer, mut stream) = tokio::io::duplex(128);
     peer.write_all(&[5, 1, 0, 5, 1, 0, 1, 203, 0, 113, 9, 1, 187])
         .await

@@ -31,6 +31,11 @@ impl<'a> HostPort<'a> {
     /// Anything else — no colon, empty host, non-numeric or out-of-range
     /// port, brackets around a non-IPv6 host, a host containing `:` that is
     /// not a valid IPv6 literal — returns `None`.
+    ///
+    /// The host bytes themselves are not grammar-checked: any non-empty host
+    /// without an interior `:` passes, including `@`, `/`, and `%` — SOCKS5
+    /// DOMAINNAME and the permissive HTTP CONNECT path rely on this; strict
+    /// HTTP mode applies the stricter RFC grammar on top.
     pub fn parse(s: &'a str) -> Option<Self> {
         if let Some(rest) = s.strip_prefix('[') {
             let (host, after) = rest.split_once(']')?;
@@ -117,6 +122,24 @@ mod tests {
         ] {
             assert!(HostPort::parse(s).is_none(), "expected None for {s:?}");
         }
+    }
+
+    /// Host bytes are not grammar-checked: `@`, `/`, `%` pass through.
+    /// Mutation: adding an authority-host byte allowlist to `parse` fails this.
+    #[test]
+    fn permissive_host_bytes_pass_through() {
+        for s in [
+            "a@b:443",
+            "a/b:443",
+            "a%41b:443",
+            "user@example.com:443",
+            "ex%zz.com:443",
+        ] {
+            let hp = HostPort::parse(s).unwrap_or_else(|| panic!("rejected {s:?}"));
+            assert_eq!(hp.port, 443);
+        }
+        let hp = HostPort::parse("a@b:443").unwrap();
+        assert_eq!(hp.host, "a@b");
     }
 
     #[test]

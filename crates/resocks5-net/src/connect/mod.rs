@@ -47,7 +47,7 @@ pub use util::tcp_keepalive;
 
 #[cfg(feature = "pool")]
 pub use connect_http_proxy::connect_http_proxy;
-pub use connect_http_proxy::http_connect_handshake;
+pub use connect_http_proxy::{http_connect_handshake, http_connect_handshake_until};
 #[cfg(feature = "pool")]
 pub use connect_proxy::connect_proxy;
 #[cfg(feature = "pool")]
@@ -58,11 +58,13 @@ pub use connect_socks5_proxy::connect_socks5_proxy;
 #[cfg(feature = "pool")]
 pub use dial::connect_chain;
 pub use dial::{
-    dial, dial_chain, dial_chain_over, dial_plain, ChainError, ChainStage, DialOptions,
+    dial, dial_chain, dial_chain_over, dial_plain, dial_tcp, ChainError, ChainStage, DialOptions,
 };
-pub use handshake_over_stream::{handshake_over_stream, socks5_handshake};
+pub use handshake_over_stream::{handshake_over_stream, socks5_handshake, socks5_handshake_until};
 pub use host_port::HostPort;
-pub use parse_proxy_str::{parse_proxy_str, ParseProxyError};
+pub use parse_proxy_str::{
+    parse_proxy_str, parse_proxy_uri, ParseProxyError, ProxyUriError, ProxyUriOptions,
+};
 #[cfg(feature = "pool")]
 pub use proxy_connect::hedged::{
     connect_hedged, AttemptOutcome, AttemptReport, HedgeError, HedgeOptions, Hedged,

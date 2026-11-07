@@ -2,7 +2,17 @@
 
 use super::Protocol;
 
-const RESP_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const RESP_407: &[u8] = if crate::CLEARTEXT_SERVER {
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+} else {
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+};
+
+/// Fallback for a status no caller sends today: a well-formed 500 head.
+/// Callers use private fixed statuses, so this arm is unreachable now — a
+/// new status must degrade to this, never panic on the network path.
+const RESP_500: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// Host-selected final tunnel response; parsing itself never sends success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +50,7 @@ pub(super) fn http_error(status: u16) -> &'static [u8] {
         503 => b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         504 => b"HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         505 => b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        _ => unreachable!("private HTTP response status"),
+        _ => RESP_500,
     }
 }
 

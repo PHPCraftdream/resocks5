@@ -138,6 +138,7 @@ fn default_main(port: u16, banned_patterns: Vec<String>) -> MainConfig {
         banned_patterns,
         auth: AuthConfig {
             allow_anonymous: true,
+            ..Default::default()
         },
         log: LogConfig::default(),
         pool: PoolConfig::default(),

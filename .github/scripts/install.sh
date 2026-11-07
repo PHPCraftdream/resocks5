@@ -42,7 +42,7 @@ esac
 repo=https://github.com/PHPCraftdream/resocks5
 # Фиксируем тег, чтобы архив и checksums не попали из разных релизов.
 release_url=$(curl --fail --silent --show-error --location --head \
-    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --retry-delay 2 \
     --connect-timeout 20 --max-time 120 --output /dev/null \
     --write-out '%{url_effective}' "$repo/releases/latest") || fail 'Не удалось определить последний релиз.'
 case "$release_url" in
@@ -66,7 +66,7 @@ mkdir "$scratch/archive" "$scratch/checksums" "$scratch/extracted"
 base="$repo/releases/download/$tag"
 fetch() {
     curl --fail --silent --show-error --location \
-        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --retry-delay 2 \
         --connect-timeout 20 --max-time 300 --output "$2" "$1"
 }
 fetch "$base/sha256sums.txt" "$scratch/checksums/sha256sums.txt" || fail 'Не удалось скачать SHA-256.'

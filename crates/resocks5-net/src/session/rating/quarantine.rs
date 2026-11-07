@@ -165,6 +165,10 @@ pub(super) struct Cell {
     trips: u32,
     until: Option<Instant>,
     lease_until: Option<Instant>,
+    /// Bumped on every ownership-relevant change (lease grant, success,
+    /// trip, restore): outstanding probe claims carry the value read at
+    /// grant time and go stale once it differs.
+    generation: u64,
 }
 
 impl Cell {
@@ -179,6 +183,12 @@ impl Cell {
     /// `true` once tripped and not yet cleared by a success.
     pub(super) fn is_tripped(&self) -> bool {
         self.until.is_some()
+    }
+
+    /// Generation of the slot's state: what an outstanding probe claim
+    /// must still match for its outcome to be applied.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Count a hard failure. Returns the new quarantine length when this
@@ -199,6 +209,7 @@ impl Cell {
             return None;
         }
         self.trips = self.trips.saturating_add(1);
+        self.generation = self.generation.wrapping_add(1);
         let length = policy.duration_for(self.trips);
         self.until = Some(deadline(now, length));
         Some(length)
@@ -211,6 +222,7 @@ impl Cell {
         self.lease_until = None;
         self.consecutive = self.consecutive.max(policy.threshold);
         self.trips = self.trips.saturating_add(1);
+        self.generation = self.generation.wrapping_add(1);
         let length = policy.duration_for(self.trips);
         self.until = Some(deadline(now, length));
         length
@@ -237,6 +249,7 @@ impl Cell {
         now: Instant,
         policy: &QuarantinePolicy,
     ) {
+        self.generation = self.generation.wrapping_add(1);
         let left = if quarantined {
             left.min(policy.max)
         } else {
@@ -248,22 +261,31 @@ impl Cell {
         self.until = Some(deadline(now, left));
     }
 
-    /// A success proves the upstream alive: forget everything.
+    /// A success proves the upstream alive: forget everything. Bumps the
+    /// generation so outcomes of older probes cannot clear newer state.
     pub(super) fn success(&mut self) {
-        *self = Cell::default();
+        self.generation = self.generation.wrapping_add(1);
+        self.consecutive = 0;
+        self.trips = 0;
+        self.until = None;
+        self.lease_until = None;
     }
 
-    /// Claim the probation slot. `true` only for an upstream on probation
-    /// whose previous lease (if any) has run out.
-    pub(super) fn try_lease(&mut self, now: Instant, policy: &QuarantinePolicy) -> bool {
+    /// Claim the probation slot. Returns the slot's new generation for the
+    /// granted lease (the claim's ownership token), `None` for an upstream
+    /// that is not on probation or whose previous lease still holds. Every
+    /// grant bumps the generation, so a claim from an expired earlier
+    /// lease goes stale as soon as a new probe claims the slot.
+    pub(super) fn try_lease(&mut self, now: Instant, policy: &QuarantinePolicy) -> Option<u64> {
         if self.state(now) != State::Probation {
-            return false;
+            return None;
         }
         if self.lease_until.is_some_and(|lease| now < lease) {
-            return false;
+            return None;
         }
-        self.lease_until = Some(now.checked_add(policy.probe_lease).unwrap_or(now));
-        true
+        self.generation = self.generation.wrapping_add(1);
+        self.lease_until = Some(deadline(now, policy.probe_lease));
+        Some(self.generation)
     }
 }
 
@@ -378,7 +400,7 @@ mod tests {
         }
         let t1 = t0 + Duration::from_secs(31);
         assert_eq!(c.state(t1), State::Probation);
-        assert!(c.try_lease(t1, &p));
+        assert!(c.try_lease(t1, &p).is_some());
         assert_eq!(c.hard_failure(t1, &p), Some(Duration::from_secs(60)));
         assert_eq!(c.state(t1 + Duration::from_secs(59)), State::Quarantined);
         assert_eq!(c.state(t1 + Duration::from_secs(60)), State::Probation);
@@ -393,7 +415,7 @@ mod tests {
             c.hard_failure(t0, &p);
         }
         let t1 = t0 + Duration::from_secs(31);
-        assert!(c.try_lease(t1, &p));
+        assert!(c.try_lease(t1, &p).is_some());
         c.success();
         assert_eq!(c.state(t1), State::Healthy);
         assert!(!c.is_tripped());
@@ -408,9 +430,9 @@ mod tests {
             c.hard_failure(t0, &p);
         }
         let t1 = t0 + Duration::from_secs(31);
-        assert!(c.try_lease(t1, &p));
-        assert!(!c.try_lease(t1 + Duration::from_secs(9), &p));
-        assert!(c.try_lease(t1 + Duration::from_secs(10), &p));
+        assert!(c.try_lease(t1, &p).is_some());
+        assert!(c.try_lease(t1 + Duration::from_secs(9), &p).is_none());
+        assert!(c.try_lease(t1 + Duration::from_secs(10), &p).is_some());
     }
 
     #[test]
@@ -418,11 +440,11 @@ mod tests {
         let p = policy();
         let t0 = Instant::now();
         let mut c = Cell::default();
-        assert!(!c.try_lease(t0, &p));
+        assert!(c.try_lease(t0, &p).is_none());
         for _ in 0..3 {
             c.hard_failure(t0, &p);
         }
-        assert!(!c.try_lease(t0 + Duration::from_secs(1), &p));
+        assert!(c.try_lease(t0 + Duration::from_secs(1), &p).is_none());
     }
 
     #[test]
@@ -515,6 +537,29 @@ mod tests {
         assert_eq!(
             q.snapshot(t0),
             (State::Quarantined, Duration::from_secs(30), 1, 3)
+        );
+    }
+
+    // Finding F-SDK: an unrepresentable probe lease used to store
+    // `lease_until = now` (checked_add fallback), handing the slot to a
+    // second probe at the same instant. Mutation: restore
+    // `.unwrap_or(now)` in try_lease.
+    #[test]
+    fn probe_lease_with_unrepresentable_length_still_excludes() {
+        let p = QuarantinePolicy::default()
+            .with_threshold(1)
+            .with_initial(Duration::from_millis(20))
+            .with_max(Duration::from_millis(20))
+            .with_probe_lease(Duration::MAX);
+        let t0 = Instant::now();
+        let mut c = Cell::default();
+        assert_eq!(c.hard_failure(t0, &p), Some(Duration::from_millis(20)));
+        let t1 = t0 + Duration::from_millis(21);
+        assert_eq!(c.state(t1), State::Probation);
+        assert!(c.try_lease(t1, &p).is_some());
+        assert!(
+            c.try_lease(t1, &p).is_none(),
+            "same instant: the lease must still be held"
         );
     }
 }

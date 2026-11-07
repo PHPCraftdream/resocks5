@@ -12,25 +12,32 @@ categories = ["network-programming", "command-line-utilities"]
 # The binary ships via the GitHub Release and the container image only.
 publish = false
 
+[features]
+# Счётчики #208 включаются только в unit tests; production API не меняется.
+test-instrumentation = ["resocks5-net/test-instrumentation"]
+# GSSAPI (Kerberos) authentication of inbound clients and of SOCKS5 upstreams:
+# the protocol and the account mapping. Without a backend (below) a server
+# configured for GSSAPI refuses to start.
+gssapi = ["resocks5-net/gssapi"]
+# The system Kerberos backend (MIT Kerberos / Heimdal through libgssapi); needs
+# the platform GSS-API library and its headers to build. Not in the release
+# binaries.
+gssapi-system = ["gssapi", "resocks5-net/gssapi-system"]
+
 [dependencies]
 # `version` is what a registry build would resolve from crates.io (`path` is
 # only for the local workspace build); the crate is `publish = false`, so
 # it is kept in step with `[workspace.package].version` in case publishing
 # is ever re-enabled. Not covered by workspace inheritance.
-resocks5-net = { path = "../resocks5-net", version = "0.4.1", features = ["pool", "tls", "serde", "rating", "rotator"] }
+resocks5-net = { path = "../resocks5-net", version = "0.5.0", features = ["pool", "tls", "serde", "rating", "rotator", "zeroize"] }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync", "fs", "signal"] }
 anyhow.workspace = true
 serde.workspace = true
 base64.workspace = true
 tokio-rustls.workspace = true
-dashmap.workspace = true
 chrono.workspace = true
 regex.workspace = true
-getrandom.workspace = true
-sha2.workspace = true
-subtle.workspace = true
 argon2.workspace = true
-hmac.workspace = true
 clap.workspace = true
 rpassword.workspace = true
 ktav.workspace = true
