@@ -339,9 +339,9 @@ impl Ratings {
         self.pick_order_at(Instant::now())
     }
 
-    /// Снапшот выбора: eligibility и все N ключей под одним взятием lock
-    /// (тот же объём работы и момент, что у полного pick_order); порядок
-    /// отдаётся лениво курсором вне lock.
+    /// Selection snapshot: eligibility and all N keys under a single
+    /// lock acquisition (same work and moment as a full pick_order);
+    /// the order is handed out lazily by a cursor outside the lock.
     fn eligible_and_keyed(&self, now: Instant) -> (Vec<usize>, Vec<(usize, f64)>) {
         let mut inner = self.inner.lock().unwrap();
         let Inner {
@@ -374,8 +374,8 @@ impl Ratings {
             .collect()
     }
 
-    /// Ленивый снапшот: тот же lock-объём, что pick_order_at, сортировка —
-    /// по мере потребления. Доступен при feature rotator.
+    /// Lazy snapshot: same lock scope as pick_order_at, sorting happens
+    /// on demand. Available under the rotator feature.
     #[cfg(feature = "rotator")]
     pub(crate) fn pick_order_lazy_at(&self, now: Instant) -> OrderSnapshot {
         let (eligible, keyed) = self.eligible_and_keyed(now);
@@ -385,19 +385,19 @@ impl Ratings {
         }
     }
 
-    /// Текущий момент; см. pick_order_lazy_at.
+    /// Current instant; see pick_order_lazy_at.
     #[cfg(feature = "rotator")]
     pub(crate) fn pick_order_lazy(&self) -> OrderSnapshot {
         self.pick_order_lazy_at(Instant::now())
     }
 
-    /// Пересеять внутренний RNG (тестовый хук).
+    /// Reseed the internal RNG (test hook).
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn reseed(&self, seed: u64) {
         self.inner.lock().unwrap().rng = SmallRng::from_seed(seed);
     }
 
-    /// Тестовый хук: Ratings с фиксированным seed RNG.
+    /// Test hook: Ratings with a fixed-seed RNG.
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn with_rng_seed(
         n: usize,
@@ -455,9 +455,9 @@ impl Ratings {
     }
 }
 
-/// Снимок порядка выбора: eligibility и RNG зафиксированы в момент
-/// создания; порядок выдаётся лениво с ограниченной работой сравнения.
-/// Доступен при feature rotator (потребитель — rotator/chain).
+/// Order-selection snapshot: eligibility and RNG are fixed at creation
+/// time; the order is handed out lazily with bounded comparison work.
+/// Available under the rotator feature (consumer: rotator/chain).
 #[cfg(feature = "rotator")]
 pub(crate) struct OrderSnapshot {
     eligible: Vec<usize>,
@@ -466,25 +466,26 @@ pub(crate) struct OrderSnapshot {
 
 #[cfg(feature = "rotator")]
 impl OrderSnapshot {
-    /// Следующий индекс в точном порядке pick_order, или None после
-    /// исчерпания.
+    /// Next index in the exact pick_order order, or None once
+    /// exhausted.
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn next_index(&mut self) -> Option<usize> {
         self.cursor.next().map(|j| self.eligible[j])
     }
 
-    /// Число eligible-слотов в снапшоте.
+    /// Number of eligible slots in the snapshot.
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn eligible_len(&self) -> usize {
         self.eligible.len()
     }
 
-    /// Разобрать снимок: eligible-индексы и курсор порядка, без копий.
+    /// Decompose the snapshot: eligible indices and the order cursor,
+    /// no copies.
     pub(crate) fn into_parts(self) -> (Vec<usize>, select::LazyOrder) {
         (self.eligible, self.cursor)
     }
 
-    /// Полный дренаж в тот же Vec, что вернул бы pick_order.
+    /// Full drain into the same Vec pick_order would return.
     #[cfg(all(test, feature = "rotator"))]
     pub(crate) fn into_indices(mut self) -> Vec<usize> {
         std::iter::from_fn(|| self.next_index()).collect()
@@ -495,7 +496,7 @@ impl OrderSnapshot {
 #[path = "../testing/rating_tests.rs"]
 mod tests;
 
-/// Тестовый хук: Ratings с карантином и фиксированным seed RNG.
+/// Test hook: Ratings with quarantine and a fixed-seed RNG.
 #[cfg(all(test, feature = "rotator"))]
 fn quarantined_ratings_with_seed(n: usize) -> Ratings {
     Ratings::with_rng_seed(

@@ -168,9 +168,9 @@ pub async fn run_server(
                     }
                 };
 
-                // Глобальный фильтр: сразу после accept, ДО spawn,
-                // nodelay/keepalive и permit'а. Peer — только TCP;
-                // fail-closed, если адрес недоступен.
+                // Global filter: right after accept, BEFORE spawn,
+                // nodelay/keepalive and the permit. Peer is TCP only;
+                // fail-closed if the address is unavailable.
                 if let Some(rule) = &allowed_clients {
                     let peer = client_stream.peer_addr().ok().map(|a| a.ip());
                     if peer.is_none_or(|ip| !rule.matches(ip)) {

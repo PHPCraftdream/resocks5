@@ -302,13 +302,13 @@ fn warn_obsolete_cb_keys() {
     }
 }
 
-/// Единая точка валидации allowed_clients на старте: компиляция
-/// глобального правила и AuthState::build (включая правила каждого
-/// пользователя). Вызывается в `run_server_inner` ДО route-bailout и
-/// до spawn_log_drain, чтобы невалидная строка давала контекстную
-/// allowed_clients-ошибку даже при отсутствии upstreams и не скрывалась
-/// сообщением «no upstream proxies». Выделена pub(crate) как seam для
-/// focused-теста пути валидации.
+/// Single validation point for allowed_clients at startup: compiling
+/// the global rule and AuthState::build (including each user's rules).
+/// Called in `run_server_inner` BEFORE the route-bailout and
+/// spawn_log_drain, so an invalid string yields a contextual
+/// allowed_clients error even with no upstreams and is not masked by
+/// the "no upstream proxies" message. Made pub(crate) as a seam for
+/// a focused test of the validation path.
 pub(crate) fn validate_allowed_clients(
     cfg_main: &crate::config::MainConfig,
     users: &crate::config::UsersConfig,
@@ -332,9 +332,9 @@ pub(super) async fn run_server_inner() -> Result<()> {
     let configs = config::load_or_init()?;
     let cfg_main = &configs.main;
 
-    // Глобальное правило + правила пользователей — ОДНА точка валидации
-    // на старте, до route-bailout и до spawn_log_drain (все `?`-return'ы
-    // выше спавна).
+    // Global rule + user rules — ONE validation point at startup,
+    // before the route-bailout and before spawn_log_drain (all
+    // `?`-returns above the spawns).
     let (allowed_clients, auth) = validate_allowed_clients(cfg_main, &configs.users)?;
 
     warn_obsolete_cb_keys();

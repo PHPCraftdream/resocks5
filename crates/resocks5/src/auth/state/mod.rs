@@ -24,9 +24,8 @@ struct UserEntry {
     index: usize,
     enabled: bool,
     direct: bool,
-    /// Скомпилированное при старте пользовательское правило
-    /// `allowed_clients` (`None` = не ограничивает). Снапшот запуска:
-    /// пере-компиляции в рантайме нет.
+    /// User `allowed_clients` rule compiled at startup (`None` = no
+    /// restriction). Startup snapshot: no recompilation at runtime.
     allowed: Option<crate::config::AllowedClients>,
 }
 
@@ -90,11 +89,11 @@ impl AuthState {
         let users_path = users_path.into();
         let mut entries = HashMap::with_capacity(users.users.len());
         for (index, user) in users.users.iter().enumerate() {
-            // Компилируем правило КАЖДОГО пользователя — включая disabled
-            // и дубликаты имён: невалидная строка обязана валить старт с
-            // понятной ошибкой, а не притворяться отсутствием правила.
-            // Для дубликатов имени в `entries` попадает первая (first
-            // wins) — как и раньше.
+            // Compile EVERY user's rule — including disabled users and
+            // duplicate names: an invalid string must fail startup with a
+            // clear error, not pretend the rule is absent. For duplicate
+            // names, the first entry lands in `entries` (first wins) —
+            // as before.
             let allowed = match &user.allowed_clients {
                 Some(spec) => Some(crate::config::compile_allowed_clients(spec).map_err(|e| {
                     anyhow!(
@@ -151,13 +150,13 @@ impl AuthState {
         &self.decoy
     }
 
-    /// Пользовательский фильтр IP. `None` у пользователя не ограничивает;
-    /// неизвестное или выключенное имя → `false` (клиент получает обычный
-    /// отказ аутентификации). Анонимный клиент (без credentials) сюда не
-    /// попадает и подчиняется только глобальному правилу.
+    /// Per-user IP filter. `None` on a user does not restrict; an
+    /// unknown or disabled name → `false` (the client gets the usual
+    /// auth failure). An anonymous client (no credentials) never
+    /// reaches here and obeys only the global rule.
     pub(crate) fn client_ip_allowed(&self, name: &str, ip: Option<IpAddr>) -> bool {
         let Some(ip) = ip else {
-            // Адрес недоступен — fail-closed.
+            // No address available — fail-closed.
             return false;
         };
         self.entries

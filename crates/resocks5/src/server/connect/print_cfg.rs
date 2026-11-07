@@ -24,9 +24,9 @@ pub fn print_cfg(cfg: &ProxyConfig) -> String {
     )
 }
 
-/// Дописывает в готовый буфер ровно тот же текст, что [`print_cfg`] —
-/// `ip V4/V6 - DebugProtocol://host:port`, без user/password. Закрытый
-/// helper для gate_label: без промежуточного String на каждый gate.
+/// Appends to a ready buffer exactly the same text as [`print_cfg`] —
+/// `ip V4/V6 - DebugProtocol://host:port`, without user/password. Private
+/// helper for gate_label: no intermediate String per gate.
 pub(crate) fn push_cfg(out: &mut String, cfg: &ProxyConfig) {
     let _ = write!(
         out,

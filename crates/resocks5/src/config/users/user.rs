@@ -17,10 +17,10 @@ pub struct User {
     /// and goes directly from this server's IP.
     #[serde(default)]
     pub direct: bool,
-    /// Правило допуска клиентов для этого пользователя (`None` = не
-    /// ограничивает, не сериализуется). Итоговое правило = глобальное
-    /// ∩ пользовательское; `None` у пользователя не расширяет
-    /// глобальное. См. `config::allowed_clients`.
+    /// Client admission rule for this user (`None` = no restriction,
+    /// not serialized). The effective rule is global ∩ per-user;
+    /// `None` on the user does not widen the global one. See
+    /// `config::allowed_clients`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_clients: Option<String>,
 }
@@ -76,7 +76,7 @@ hash: init
         user.allowed_clients = None;
         let serialized = ktav::to_string(&user).unwrap();
         assert!(!serialized.contains("allowed_clients"));
-        // Отсутствие ключа при десериализации даёт None.
+        // A missing key deserializes to None.
         let parsed: User = ktav::from_str(&serialized).unwrap();
         assert_eq!(parsed.allowed_clients, None);
     }

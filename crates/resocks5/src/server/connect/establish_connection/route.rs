@@ -27,10 +27,10 @@ pub(super) fn log_chain_attempt(
     logger.attempt(|| message(gate_label(pick)));
 }
 
-/// Верхняя граница на один gate без host: `ip V6 - Socks5://` + `:` +
-/// порт до 5 цифр = 23 байта (самый длинный Debug протокола — `Socks5`).
-/// Более длинный вариант протокола даст realloc — это поймает assertion
-/// в perf208_gate_label_component.
+/// Upper bound for one gate without host: `ip V6 - Socks5://` + `:` +
+/// port up to 5 digits = 23 bytes (longest protocol Debug is `Socks5`).
+/// A longer protocol variant would realloc — the assertion in
+/// perf208_gate_label_component will catch that.
 const GATE_OVERHEAD: usize = "ip V6 - Socks5://:65535".len();
 const HOP_SEPARATOR: &str = " -> ";
 
@@ -39,7 +39,7 @@ fn gate_label(pick: &resocks5_net::chain::ChainPick) -> String {
     crate::perf::operation(|c| c.gate_formats += 1);
     let hops = pick.hops();
     let gates = hops.len().saturating_sub(1);
-    // Единый буфер по верхней границе: без String/Vec на каждый gate.
+    // Single buffer sized by the upper bound: no String/Vec per gate.
     let capacity = hops[..gates]
         .iter()
         .map(|hop| hop.proxy.host.len())

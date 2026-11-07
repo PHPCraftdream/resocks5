@@ -38,10 +38,10 @@ pub struct MainConfig {
     /// `enabled: false` by default, so existing configs are unaffected.
     #[serde(default)]
     pub file_log: FileLogConfig,
-    /// Глобальное правило допуска клиентов (список IP/масок через
-    /// запятую, `"*"` = любой). См. `config::allowed_clients`.
-    /// Итоговое правило = глобальное ∩ пользовательское; отсутствие
-    /// пользовательского (`None`) НЕ расширяет глобальное.
+    /// Global client admission rule (comma-separated IP/CIDR list,
+    /// `"*"` = any). See `config::allowed_clients`. The effective rule is
+    /// global ∩ per-user; a missing per-user rule (`None`) does NOT
+    /// widen the global one.
     #[serde(default = "default_allowed_clients")]
     pub allowed_clients: String,
 }

@@ -116,7 +116,7 @@ impl Hash for ChainKey {
         let mut current = Some(self.0.as_ref());
         while let Some(node) = current {
             if len == nodes.len() {
-                // Не прошедшие validate длинные цепочки тоже остаются допустимыми ключами.
+                // Over-long chains that failed validate are still valid keys.
                 let nodes = self.0.nodes();
                 nodes.len().hash(state);
                 for node in nodes {
