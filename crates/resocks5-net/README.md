@@ -403,11 +403,14 @@ async fn main() -> anyhow::Result<()> {
 CONNECT upstreams `dial_plain` is the simpler entry point; `dial`
 returns an `AnyUpstream` through an extra `tls_connector` argument and
 is the one to use when the upstream is HTTPS (pass a `TlsConnector`).
-Cap accounting is then up to the caller. `DialOptions::with_nodelay(bool)` /
-`with_keepalive(Duration)` set `TCP_NODELAY` and TCP keepalive on the socket
-to the proxy (fields `nodelay`, `keepalive`; by default the OS defaults
-stay). `connect::dial_tcp(proxy, host, port, opts)` returns the bare
-`TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (no wrapper, no permit) and
+Cap accounting is then up to the caller. `DialOptions::with_nodelay(bool)` / `with_keepalive(Duration)` set
+`TCP_NODELAY` and TCP keepalive on the socket to the proxy (fields `nodelay`,
+`keepalive`; by default the OS defaults stay).
+`with_keepalive_interval(Duration)` sets the probe interval only when
+`with_keepalive(idle)` is also configured; it is best-effort and ignored on
+platforms where `socket2` lacks `with_interval`.
+`connect::dial_tcp(proxy, host, port, opts)` returns the bare `TcpStream` of
+a SOCKS5 / HTTP CONNECT tunnel (no wrapper, no permit) and
 refuses an HTTPS upstream before any connect.
 
 ```text
@@ -475,15 +478,17 @@ non-SOCKS5 version byte is `Protocol(Socks5BadVersion { got })`, not
 `MethodUnsupported`. For `ProxyRejected { code, .. }` on SOCKS5,
 `resocks5_net::socks5_rep_description(code)` gives the RFC 1928 reply
 meaning. `ConnectError::suggested_reply()` maps an error to the reply a
-gateway should send its own client: any `Timeout` → `Reply::TimedOut`;
-SOCKS5 `ProxyRejected` REP 2/3/4/5/6 →
+gateway should send its own client: TCP-connect, SOCKS5-greeting and HTTPS-TLS-handshake
+timeouts → `UpstreamUnavailable`; SOCKS5/HTTP/HTTPS CONNECT-handshake and total
+timeouts → `TimedOut`; I/O timeouts → `TimedOut` regardless of stage; other
+connect-stage I/O → `UpstreamUnavailable`, other I/O → `GeneralFailure`; TLS
+failures → `UpstreamUnavailable`. SOCKS5 `ProxyRejected` REP 2/3/4/5/6 →
 `Forbidden`/`NetworkUnreachable`/`UpstreamUnavailable`/`ConnectionRefused`/
 `TimedOut`; HTTP(S) 403/504/502+503 →
 `Forbidden`/`TimedOut`/`UpstreamUnavailable`; other refusals, auth/method
 failures, `Protocol`, `InvalidTarget`, `CleartextCredentialsRefused`,
 secure-auth/GSSAPI exchange errors and a missing TLS feature →
-`GeneralFailure`; I/O at the connect stage and TLS failures →
-`UpstreamUnavailable`; with `pool`, `AtCapacity` → `Overloaded`. Only the
+`GeneralFailure`; with `pool`, `AtCapacity` → `Overloaded`. Only the
 destination's own verdict selects a specific reply; hop failures never
 answer "connection refused".
 
