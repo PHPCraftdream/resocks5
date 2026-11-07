@@ -1,0 +1,224 @@
+{
+  "stage": "cow",
+  "environment": "ubuntu-24.04, rustc 1.88.0, x86_64-unknown-linux-gnu, std::alloc::System, profile test, RUSTFLAGS=-D warnings",
+  "revision": "ac7eace",
+  "fields": [
+    "alloc",
+    "realloc",
+    "requested_bytes",
+    "config_clones",
+    "sort_comparisons"
+  ],
+  "rows": [
+    {
+      "id": "singleton_gateless",
+      "source": "sdk",
+      "title": "singleton route key, gate-less node",
+      "before_row": "singleton_key/gateless_legacy",
+      "after_row": "singleton_key/gateless",
+      "before": {
+        "alloc": 5,
+        "realloc": 0,
+        "requested_bytes": 271,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "singleton_gated",
+      "source": "sdk",
+      "title": "singleton route key, gated node",
+      "before_row": "singleton_key/gated_legacy",
+      "after_row": "singleton_key/gated",
+      "before": {
+        "alloc": 5,
+        "realloc": 0,
+        "requested_bytes": 271,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 4,
+        "realloc": 0,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "config_arc_1",
+      "source": "sdk",
+      "title": "ChainPick::config_arc, 1 hop",
+      "before_row": "config_arc_legacy/depth=1",
+      "after_row": "config_arc/depth=1",
+      "before": {
+        "alloc": 4,
+        "realloc": 0,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "config_arc_4",
+      "source": "sdk",
+      "title": "ChainPick::config_arc, 4 hops",
+      "before_row": "config_arc_legacy/depth=4",
+      "after_row": "config_arc/depth=4",
+      "before": {
+        "alloc": 4,
+        "realloc": 0,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "config_arc_16",
+      "source": "sdk",
+      "title": "ChainPick::config_arc, 16 hops",
+      "before_row": "config_arc_legacy/depth=16",
+      "after_row": "config_arc/depth=16",
+      "before": {
+        "alloc": 4,
+        "realloc": 0,
+        "requested_bytes": 159,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "link_proxy_update",
+      "source": "sdk",
+      "title": "link_proxy, known address",
+      "before_row": "link_proxy/update/legacy",
+      "after_row": "link_proxy/update",
+      "before": {
+        "alloc": 1,
+        "realloc": 0,
+        "requested_bytes": 18,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "link_proxy_new",
+      "source": "sdk",
+      "title": "link_proxy, new address",
+      "before_row": "link_proxy/new_addr/legacy",
+      "after_row": "link_proxy/new_addr",
+      "before": {
+        "alloc": 5,
+        "realloc": 0,
+        "requested_bytes": 1157,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 4,
+        "realloc": 0,
+        "requested_bytes": 1140,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "chain_arc_1",
+      "source": "sdk",
+      "title": "ProxyConfig::chain_arc, 1 node",
+      "before_row": "chain_arc_legacy/nodes=1",
+      "after_row": "chain_arc/nodes=1",
+      "before": {
+        "alloc": 6,
+        "realloc": 0,
+        "requested_bytes": 279,
+        "config_clones": 1,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 0,
+        "realloc": 0,
+        "requested_bytes": 0,
+        "config_clones": 0,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "chain_arc_4",
+      "source": "sdk",
+      "title": "ProxyConfig::chain_arc, 4 nodes",
+      "before_row": "chain_arc_legacy/nodes=4",
+      "after_row": "chain_arc/nodes=4",
+      "before": {
+        "alloc": 18,
+        "realloc": 0,
+        "requested_bytes": 780,
+        "config_clones": 4,
+        "sort_comparisons": 0
+      },
+      "after": {
+        "alloc": 12,
+        "realloc": 0,
+        "requested_bytes": 477,
+        "config_clones": 3,
+        "sort_comparisons": 0
+      }
+    },
+    {
+      "id": "pick_iter_256",
+      "source": "sdk",
+      "title": "direct order, 1 of 256 consumed",
+      "before_row": "rotator/pick_order/n=256/full_sort_control",
+      "after_row": "rotator/pick_iter/n=256/consumed=1",
+      "before": {
+        "alloc": 1032,
+        "realloc": 0,
+        "requested_bytes": 131650,
+        "config_clones": 0,
+        "sort_comparisons": 2138
+      },
+      "after": {
+        "alloc": 1032,
+        "realloc": 0,
+        "requested_bytes": 131650,
+        "config_clones": 0,
+        "sort_comparisons": 255
+      }
+    }
+  ]
+}

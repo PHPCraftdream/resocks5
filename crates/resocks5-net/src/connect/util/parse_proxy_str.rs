@@ -1,6 +1,7 @@
 //! Parser for upstream-list lines: `host:port`, `user:pass@host:port`, or
 //! those forms with 0–255 leading `*` markers specifying gate level.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use super::HostPort;
@@ -264,7 +265,7 @@ pub fn parse_proxy_uri(uri: &str, options: &ProxyUriOptions) -> Result<ProxyConf
     }
     let mut config = ProxyConfig::new(protocol, host, port);
     if let Some((user, password)) = credentials {
-        config = config.with_auth(user, password);
+        config = config.with_auth(user.into_owned(), password.into_owned());
     }
     Ok(config)
 }
@@ -319,10 +320,14 @@ fn is_host_name(host: &str) -> bool {
         })
 }
 
-fn percent_decode(text: &str) -> Result<String, ProxyUriError> {
+fn percent_decode(text: &str) -> Result<Cow<'_, str>, ProxyUriError> {
+    let Some(percent) = text.find('%') else {
+        return Ok(Cow::Borrowed(text));
+    };
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
+    out.extend_from_slice(&bytes[..percent]);
+    let mut i = percent;
     while i < bytes.len() {
         if bytes[i] == b'%' {
             let hex = bytes
@@ -340,7 +345,9 @@ fn percent_decode(text: &str) -> Result<String, ProxyUriError> {
             i += 1;
         }
     }
-    String::from_utf8(out).map_err(|_| ProxyUriError::NotUtf8)
+    String::from_utf8(out)
+        .map(Cow::Owned)
+        .map_err(|_| ProxyUriError::NotUtf8)
 }
 
 #[cfg(test)]
@@ -817,5 +824,44 @@ mod uri_tests {
         let built = ProxyConfig::socks5("::1", 1080).with_auth("u", "p");
         assert_eq!(parsed.host, built.host);
         assert_eq!(parsed.protocol, built.protocol);
+    }
+
+    /// `percent_decode` borrows the input when there is no `%` to decode.
+    #[test]
+    fn percent_decode_borrows_text_without_percent() {
+        let text = "plain-user:pa:ss";
+        match percent_decode(text) {
+            Ok(Cow::Borrowed(decoded)) => assert!(std::ptr::eq(decoded, text)),
+            other => panic!("expected a borrowed decode, got {other:?}"),
+        }
+        match percent_decode("") {
+            Ok(Cow::Borrowed(decoded)) => assert!(std::ptr::eq(decoded, "")),
+            other => panic!("expected a borrowed decode, got {other:?}"),
+        }
+    }
+
+    /// Any `%` forces the owned path; the decoded forms are unchanged.
+    #[test]
+    fn percent_decode_owns_escaped_sequences() {
+        let decoded = percent_decode("%41").unwrap();
+        assert!(matches!(decoded, Cow::Owned(_)));
+        assert_eq!(decoded, "A");
+        let mixed = percent_decode("a%20b").unwrap();
+        assert!(matches!(mixed, Cow::Owned(_)));
+        assert_eq!(mixed, "a b");
+    }
+
+    /// Error variants are unchanged by the `Cow` return type.
+    #[test]
+    fn percent_decode_keeps_error_variants() {
+        assert_eq!(
+            percent_decode("trailing%").unwrap_err(),
+            ProxyUriError::InvalidPercentEncoding
+        );
+        assert_eq!(
+            percent_decode("%zz").unwrap_err(),
+            ProxyUriError::InvalidPercentEncoding
+        );
+        assert_eq!(percent_decode("%ff").unwrap_err(), ProxyUriError::NotUtf8);
     }
 }

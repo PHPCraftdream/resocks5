@@ -10,7 +10,7 @@ import time
 
 
 BUDGET_SECONDS = 15.0
-EXPECTED_ROWS = {"sdk": 189, "app": 24}
+EXPECTED_ROWS = {"sdk": 209, "app": 24}
 
 
 def executable(manifest):

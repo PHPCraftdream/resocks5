@@ -1,13 +1,13 @@
-//! Регрессионные тесты AND-каскада allowed_clients через общий
-//! `handle_client`: реальные TCP-обмены, без вызова `client_ip_allowed`
-//! напрямую и без мока matcher'а.
+//! Regression tests of the allowed_clients AND-cascade via the shared
+//! `handle_client`: real TCP exchanges, without calling `client_ip_allowed`
+//! directly and without mocking the matcher.
 //!
-//! Observable boundary без внешнего upstream: rotators = None, target
-//! `blocked.invalid:443` запрещён banned-regex'ом → допущенный клиент
-//! получает 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); недопущенный —
-//! обычный auth failure (secure auth `Denied` / 407) или закрытие без
-//! единого байта. Пароли — только secure auth (SOCKS5 0x80); HTTP Basic и
-//! SOCKS5 UNAME/PASSWD отклоняются всегда.
+//! Observable boundary with no external upstream: rotators = None, target
+//! `blocked.invalid:443` banned by the banned-regex → an allowed client
+//! gets 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); a disallowed one —
+//! a plain auth failure (secure auth `Denied` / 407) or a close without
+//! a single byte. Passwords — secure auth only (SOCKS5 0x80); HTTP Basic and
+//! SOCKS5 UNAME/PASSWD are always rejected.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,7 @@ const BANNED: &str = "^blocked[.]invalid:443$";
 const TARGET_HOST: &str = "blocked.invalid";
 const TARGET_PORT: u16 = 443;
 
-/// SOCKS5 reply `Forbidden` — ровно то, что шлёт negotiate.rs.
+/// SOCKS5 reply `Forbidden` — exactly what negotiate.rs sends.
 const SOCKS_FORBIDDEN: [u8; 10] = [5, 2, 0, 1, 0, 0, 0, 0, 0, 0];
 
 #[derive(Clone, Copy)]
@@ -41,14 +41,14 @@ enum Protocol {
     Http,
 }
 
-/// Ожидаемый исход всего каскада.
+/// Expected outcome of the ENTIRE cascade.
 #[derive(Clone, Copy)]
 enum Expect {
-    /// Глобальный фильтр: закрытие без единого байта ответа.
+    /// Global filter: close without a single response byte.
     GlobalDeny,
-    /// Обычный отказ аутентификации: secure auth `Denied` / 407.
+    /// Plain auth failure: secure auth `Denied` / 407.
     AuthFail,
-    /// Фильтры пройдены, дошли до routing: 403 / reply Forbidden.
+    /// Filters passed, reached routing: 403 / Forbidden reply.
     RouteBanned,
 }
 
@@ -89,7 +89,7 @@ fn test_logger() -> Arc<crate::logger::Logger> {
     ))
 }
 
-/// Собрать AuthState и прогнать один обмен. Сетевая часть выполняется в
+/// Build AuthState and run one exchange. The network part runs in
 /// [`run_case_with_auth`].
 async fn run_case(c: Case) -> Arc<AuthState> {
     let Case {
@@ -123,7 +123,7 @@ async fn run_case(c: Case) -> Arc<AuthState> {
     auth
 }
 
-/// То же с уже собранным AuthState (персистентный users-файл).
+/// Same with an already built AuthState (persistent users file).
 async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
@@ -144,14 +144,14 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
         )
     });
 
-    // Общий таймаут на ВЕСЬ обмен: connect/accept, handler и клиентская
-    // нога в одном блоке. handler — будущий Future (не spawn): при панике
-    // или таймауте клиентской ноги join паникует/дропается, и handler
-    // вместе со stream уничтожается — задач не оставляем.
+    // One timeout for the ENTIRE exchange: connect/accept, handler and the
+    // client leg in one block. handler is a Future (not spawned): on panic
+    // or client-leg timeout the join panics/drops, and the handler
+    // is destroyed along with the stream — no tasks left behind.
     let result = timeout(Duration::from_secs(8), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        // connect до accept — хватает backlog'а слушателя.
+        // connect before accept — listener backlog suffices.
         let mut client = TcpStream::connect(address).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
 
@@ -172,7 +172,7 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
             &allowed,
             deadline,
         );
-        // Клиентская нога паникует — падает весь блок, тест завершён.
+        // Client leg panics — the whole block fails, test is done.
         let (handler_res, ()) = tokio::join!(handler, client_leg(&mut client, c));
         handler_res
     })
@@ -199,11 +199,11 @@ async fn run_case_with_auth(c: &Case, auth: Arc<AuthState>) {
     }
 }
 
-/// Клиентская нога: обмен байтами по протоколу кейса, с проверками
-/// ровно тех ответов, которые отличают три исхода.
+/// Client leg: byte exchange per the case protocol, with checks
+/// of exactly the responses distinguishing the three outcomes.
 async fn client_leg(client: &mut TcpStream, c: &Case) {
     match (c.protocol, c.expect) {
-        // Глобальный отказ: ничего не пишем, ждём EOF/RST.
+        // Global deny: write nothing, wait for EOF/RST.
         (_, Expect::GlobalDeny) => {
             let mut reply = [0u8; 2];
             match client.read(&mut reply).await {
@@ -228,8 +228,8 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
                 SecureAuthError::Denied,
                 "аутентификация обязана отказать"
             );
-            // Сервер закрывает соединение после отказа: принимаем только
-            // EOF-класс исходы, любую другую Err не глотаем.
+            // Server closes the connection after rejection: accept only
+            // EOF-class outcomes, swallow no other Err.
             let mut rest = [0u8; 1];
             match client.read(&mut rest).await {
                 Ok(0) => {}
@@ -290,7 +290,7 @@ async fn client_leg(client: &mut TcpStream, c: &Case) {
     }
 }
 
-/// SOCKS5 greeting предлагает только secure auth (0x80).
+/// SOCKS5 greeting offers only secure auth (0x80).
 async fn secure_greeting(client: &mut TcpStream) {
     client.write_all(&[0x05, 0x01, METHOD]).await.unwrap();
     let mut method = [0u8; 2];
@@ -316,14 +316,14 @@ fn http_connect(b64_creds: Option<&str>) -> Vec<u8> {
 
 const BOTH: [Protocol; 2] = [Protocol::Socks5, Protocol::Http];
 
-/// Кейсы с паролем: HTTP отвечает 407 на любые credentials, фильтр там
-/// ничего не различает — проверяем SOCKS5 (secure auth).
+/// Password cases: HTTP replies 407 to any credentials, the filter
+/// distinguishes nothing there — we check SOCKS5 (secure auth).
 const WITH_PASSWORD: [Protocol; 1] = [Protocol::Socks5];
 
-/// Кейс 1a: глобальный deny сильнее разрешающего пользователя.
-/// Клиент ничего не шлёт; при удалении global-фильтра 403/407 не будет —
-/// handler повиснет до protocol timeout, тест упадёт на общем таймауте
-/// или другом error-исходе.
+/// Case 1a: global deny is stronger than a permissive user.
+/// The client sends nothing; with the global filter removed there would be
+/// no 403/407 — the handler would hang until the protocol timeout, and the
+/// test would fail on the shared timeout or another error outcome.
 #[tokio::test]
 async fn global_deny_beats_permissive_user() {
     for protocol in BOTH {
@@ -339,8 +339,8 @@ async fn global_deny_beats_permissive_user() {
     }
 }
 
-/// Кейс 1b: user-deny при глобальном `*` — обычный auth failure.
-/// Без user-фильтра secure auth пройдёт вместо `Denied`.
+/// Case 1b: user-deny with a global `*` — plain auth failure.
+/// Without the user filter secure auth would pass instead of `Denied`.
 #[tokio::test]
 async fn user_deny_beats_global_star() {
     for protocol in WITH_PASSWORD {
@@ -356,10 +356,10 @@ async fn user_deny_beats_global_star() {
     }
 }
 
-/// Кейсы 1c и 3: global allow + user None → доходим до routing
-/// boundary (banned target → 403/Forbidden); None не ограничивает.
-/// Counterfactual: фильтр ложно запрещает loopback — будет `Denied`
-/// или закрытие.
+/// Cases 1c and 3: global allow + user None → reach the routing
+/// boundary (banned target → 403/Forbidden); None does not restrict.
+/// Counterfactual: a filter falsely banning loopback — would be `Denied`
+/// or a close.
 #[tokio::test]
 async fn global_allow_and_user_none_reach_routing_boundary() {
     for protocol in WITH_PASSWORD {
@@ -375,14 +375,14 @@ async fn global_allow_and_user_none_reach_routing_boundary() {
     }
 }
 
-/// Кейс 4: anonymous подчиняется ТОЛЬКО глобальному правилу (SOCKS5
-/// метод 0x00 и HTTP без Authorization не проходят user-фильтр).
-/// Counterfactual: anonymous через user-фильтр — будет отказ вместо
-/// 403.
+/// Case 4: anonymous obeys ONLY the global rule (SOCKS5
+/// method 0x00 and HTTP without Authorization do not pass the user filter).
+/// Counterfactual: anonymous through the user filter — would be a rejection
+/// instead of 403.
 #[tokio::test]
 async fn anonymous_obeys_only_global_rule() {
     for protocol in BOTH {
-        // Global allow → проходит до boundary, несмотря на restrictive alice.
+        // Global allow → passes to the boundary, despite restrictive alice.
         run_case(Case {
             protocol,
             expect: Expect::RouteBanned,
@@ -392,9 +392,9 @@ async fn anonymous_obeys_only_global_rule() {
             creds: None,
         })
         .await;
-        // Global deny → отклонение до auth/routing. При удалении
-        // global-фильтра handler ждёт protocol timeout — тест падает
-        // на общем таймауте, а не на 403.
+        // Global deny → rejection before auth/routing. With the
+        // global filter removed the handler waits for the protocol timeout — the test fails
+        // on the shared timeout, not on 403.
         run_case(Case {
             protocol,
             expect: Expect::GlobalDeny,
@@ -407,9 +407,9 @@ async fn anonymous_obeys_only_global_rule() {
     }
 }
 
-/// Кейс 5: открытый пароль не принимается даже верный и с разрешённого
-/// peer: SOCKS5 UNAME/PASSWD не выбирается ([5,0xFF]), HTTP Basic — 407.
-/// Counterfactual: приложение на clear-text `accept` пропустило бы оба.
+/// Case 5: a cleartext password is never accepted even if correct and from an allowed
+/// peer: SOCKS5 UNAME/PASSWD is not selected ([5,0xFF]), HTTP Basic — 407.
+/// Counterfactual: an app on a clear-text `accept` would let both through.
 #[tokio::test]
 async fn a_cleartext_password_is_never_accepted() {
     for protocol in BOTH {
@@ -442,7 +442,7 @@ async fn a_cleartext_password_is_never_accepted() {
     }
 }
 
-/// Один обмен: клиент пишет `request` и читает всё до закрытия.
+/// One exchange: the client writes `request` and reads everything until close.
 async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
@@ -492,9 +492,9 @@ async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
     .expect("общий таймаут 8с на обмен")
 }
 
-/// Кейс 6: direct-пользователь подчиняется фильтру; запрещённый IP
-/// получает auth failure ДО direct-путей.
-/// Counterfactual: убрать user-фильтр — запрос ушёл бы в direct-ветку.
+/// Case 6: a direct user obeys the filter; a banned IP
+/// gets an auth failure BEFORE the direct paths.
+/// Counterfactual: remove the user filter — the request would go to the direct branch.
 #[tokio::test]
 async fn direct_user_denied_before_direct_paths() {
     for protocol in WITH_PASSWORD {
@@ -510,11 +510,11 @@ async fn direct_user_denied_before_direct_paths() {
     }
 }
 
-/// Кейс 7: user с hash='init' и фильтром, исключающим peer: регистрация
-/// даёт обычный auth failure; init-claim НЕ происходит — users-файл на
-/// диске байт-в-байт не меняется.
-/// Counterfactual: убрать user-фильтр — claim прошёл бы, файл изменился бы,
-/// тест упал бы на сравнении байтов и на исходе.
+/// Case 7: a user with hash='init' and a filter excluding the peer: enrollment
+/// yields a plain auth failure; init-claim does NOT happen — the users file on
+/// disk is unchanged byte-for-byte.
+/// Counterfactual: remove the user filter — the claim would pass, the file would change,
+/// the test would fail on the byte comparison and on the outcome.
 #[tokio::test]
 async fn user_filter_blocks_init_claim() {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -530,7 +530,7 @@ async fn user_filter_blocks_init_claim() {
     let _ = std::fs::remove_file(&path);
 
     let users = vec![init_user("bob", Some("203.0.113.9"))];
-    // Базлайн на диске — как в auth-тестах с персистентным файлом.
+    // Baseline on disk — as in the auth tests with a persistent file.
     crate::config::users_file::write_atomic(
         std::path::Path::new(&path),
         &UsersConfig {
@@ -557,7 +557,7 @@ async fn user_filter_blocks_init_claim() {
                 protocol,
                 expect: Expect::AuthFail,
                 global_rule: Some("*"),
-                users: Vec::new(), // auth собран отдельно
+                users: Vec::new(), // auth is built separately
                 allow_anonymous: false,
                 creds: Some(("bob", "first-password")),
             },
@@ -565,7 +565,7 @@ async fn user_filter_blocks_init_claim() {
         )
         .await;
 
-        // Мутации нет: файл байт-в-байт неизменен после КАЖДОГО прогона.
+        // No mutation: the file is byte-for-byte unchanged after EVERY run.
         let after = std::fs::read(&path).unwrap();
         assert_eq!(
             before, after,

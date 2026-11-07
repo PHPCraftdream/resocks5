@@ -71,11 +71,11 @@ fn rating_index_checks_identity_on_hash_collision() {
     assert_eq!(rotator.index_of(&first), None);
 }
 
-/// Принудительные коллизии для индексного resolve: совпадение hash не
-/// доказывает identity — путь сканирует bucket до первого совпадения полей
-/// и возвращает свой слот. Позиции target в bucket: начало, середина,
-/// конец; плюс miss при непустом bucket. Mutation: доверять hash — вернётся
-/// чужой слот; скан без раннего выхода — счётчик превысит позицию.
+/// Forced collisions for the index resolve: a hash match does not
+/// prove identity — the path scans the bucket to the first field match
+/// and returns its own slot. Target positions in the bucket: start, middle,
+/// end; plus a miss on a non-empty bucket. Mutation: trusting the hash — a
+/// foreign slot is returned; a scan without early exit — the counter exceeds the position.
 #[test]
 fn perf208_resolve_identity_scans_forced_collision_bucket() {
     let target = make_proxy("target", 1000);
@@ -85,7 +85,7 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
     rotator.by_identity.insert(hash, vec![1, 0]);
     let resolved = rotator.resolve_identity(&target).unwrap();
     assert!(Arc::ptr_eq(resolved, &rotator.proxies[0]));
-    // Bucket из чужих слотов: ни одно сравнение identity не подтверждает.
+    // Bucket of foreign slots: no identity comparison confirms.
     rotator.by_identity.insert(hash, vec![1]);
     assert!(rotator.resolve_identity(&target).is_none());
     #[cfg(all(test, feature = "test-instrumentation"))]
@@ -96,8 +96,8 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
         crate::perf::report("resolve/collision/bucket=2", counts);
     }
 
-    // Матрица позиций на bucket из трёх слотов: результат — свой слот,
-    // счётчик равен позиции совпадения (1/2/3) или длине bucket для miss.
+    // Position matrix on a three-slot bucket: the result is the own slot,
+    // the counter equals the match position (1/2/3) or the bucket length for a miss.
     let extra = make_proxy("extra", 1002);
     let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone(), extra.clone()]);
     let hash = upstream_hash(&rotator.identity_hasher, &target);
@@ -120,7 +120,7 @@ fn perf208_resolve_identity_scans_forced_collision_bucket() {
     assert!(rotator.resolve_identity(&target).is_none());
     #[cfg(all(test, feature = "test-instrumentation"))]
     {
-        // Счётчик: 1 (начало), 2 (середина), 3 (конец), 2 (miss = длина bucket [1,2]).
+        // Counter: 1 (start), 2 (middle), 3 (end), 2 (miss = bucket length [1,2]).
         for (bucket, expected) in [
             (vec![0usize, 1, 2], 1u64),
             (vec![1, 0, 2], 2),
@@ -547,8 +547,8 @@ fn gate_composite_maps_to_original_rating_slot() {
     );
 }
 
-/// Ленивые кандидаты обязаны совпадать с полным pick_order: префиксы 1 и 3
-/// на свежих снапшотах того же seed и полный дренаж.
+/// Lazy candidates must match the full pick_order: prefixes 1 and 3
+/// on fresh snapshots of the same seed, and a full drain.
 #[test]
 fn lazy_candidates_match_pick_order_exactly() {
     fn fresh() -> std::sync::Arc<ProxyRotator> {
@@ -568,17 +568,17 @@ fn lazy_candidates_match_pick_order_exactly() {
     }
     let addr = |p: &Arc<ProxyConfig>| (p.host.clone(), p.port);
     let expected: Vec<_> = fresh().pick_order().iter().map(&addr).collect();
-    // Префикс 1.
+    // Prefix 1.
     let mut c1 = fresh().pick_order_lazy();
     assert_eq!(c1.next_proxy().map(|p| addr(&p)).as_ref(), expected.first());
-    // Префикс 3 на свежем снапшоте.
+    // Prefix 3 on a fresh snapshot.
     let mut c3 = fresh().pick_order_lazy();
     let got3: Vec<_> = (0..3)
         .filter_map(|_| c3.next_proxy())
         .map(|p| addr(&p))
         .collect();
     assert_eq!(got3, expected[..3], "prefix 3");
-    // Полный дренаж на свежем снапшоте.
+    // Full drain on a fresh snapshot.
     let full: Vec<_> = fresh()
         .pick_order_lazy()
         .into_proxies()
@@ -586,7 +586,7 @@ fn lazy_candidates_match_pick_order_exactly() {
         .map(addr)
         .collect();
     assert_eq!(full, expected, "full");
-    // Длина eligible = длине полного порядка.
+    // Eligible length = full order length.
     let c = fresh().pick_order_lazy();
     assert_eq!(c.eligible().len(), expected.len());
 }
@@ -676,4 +676,179 @@ fn link_proxy_accepts_owned_and_borrowed_addresses() {
         Some(1002)
     );
     assert_eq!(rotator.sticky.lock().unwrap().map.len(), 2);
+}
+
+/// `pick_iter` must equal `pick_order` element-wise (same slots, same order) for identically built,
+/// identically seeded rotators: full drain (same `Arc`s), prefixes
+/// `take(1)`/`take(3)`, and exhaustion keeps returning `None`. Mutation:
+/// a different snapshot (eligibility, RNG, quarantine) or a different
+/// key comparison breaks the element-wise equality.
+#[test]
+fn pick_iter_matches_pick_order_across_seeds_and_sizes() {
+    fn make_rotator(n: usize, seed: u64) -> std::sync::Arc<ProxyRotator> {
+        std::sync::Arc::new(
+            ProxyRotator::with_rng_seed(
+                (0..n)
+                    .map(|i| make_proxy(&format!("host{i}"), 1000 + i as u16))
+                    .collect(),
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+                DEFAULT_STICKY_CACHE_TTL,
+                seed,
+            )
+            .expect("valid parameters in test"),
+        )
+    }
+    for n in [1usize, 2, 7, 64] {
+        for seed in [0u64, 1, 7, 208] {
+            let expected = make_rotator(n, seed).pick_order();
+            // Each rotator owns its own proxies, so identity is compared by
+            // host and port (unique per slot here), not by `Arc::ptr_eq`.
+            let same = |a: &ProxyConfig, b: &ProxyConfig| a.host == b.host && a.port == b.port;
+            // Full drain: the same slots in the same order as pick_order.
+            let drained: Vec<_> = make_rotator(n, seed).pick_iter().collect();
+            assert_eq!(drained.len(), expected.len(), "n {n}, seed {seed}");
+            for (got, want) in drained.iter().zip(&expected) {
+                assert!(same(got, want), "n {n}, seed {seed}");
+            }
+            // Prefixes 1 and 3 on fresh snapshots.
+            for take in [1usize, 3] {
+                let prefix: Vec<_> = make_rotator(n, seed).pick_iter().take(take).collect();
+                assert_eq!(prefix.len(), take.min(n), "n {n}, seed {seed}, take {take}");
+                for (got, want) in prefix.iter().zip(&expected) {
+                    assert!(same(got, want), "n {n}, seed {seed}, take {take}");
+                }
+            }
+            // Exhaustion keeps returning None.
+            let mut exhausted = make_rotator(n, seed).pick_iter();
+            for _ in 0..n {
+                assert!(exhausted.next().is_some(), "n {n}, seed {seed}");
+            }
+            assert!(exhausted.next().is_none(), "n {n}, seed {seed}");
+            assert!(exhausted.next().is_none(), "fused after exhaustion");
+        }
+    }
+}
+
+/// The iterator may be moved across threads or await points by
+/// consumers: pin `Send` at compile time.
+#[test]
+fn pick_order_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<PickOrder>();
+}
+
+/// A quarantined upstream is absent from the lazy order exactly as from
+/// `pick_order`, while a healthy upstream exists.
+#[test]
+fn pick_iter_skips_a_quarantined_upstream_like_pick_order() {
+    fn make_rotator() -> std::sync::Arc<ProxyRotator> {
+        std::sync::Arc::new(
+            ProxyRotator::with_rng_seed(
+                vec![
+                    make_proxy("a", 1080),
+                    make_proxy("b", 1081),
+                    make_proxy("c", 1082),
+                ],
+                RatingPolicy::default(),
+                QuarantinePolicy::default().with_threshold(3),
+                DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+                DEFAULT_STICKY_CACHE_TTL,
+                208,
+            )
+            .expect("valid parameters in test"),
+        )
+    }
+    let rotator = make_rotator();
+    let dead = make_proxy("a", 1080);
+    let mut tripped = None;
+    for _ in 0..3 {
+        tripped = rotator.record_hard_failure(&dead);
+    }
+    assert!(tripped.is_some(), "the quarantine must trip");
+    let eager = rotator.pick_order();
+    assert_eq!(eager.len(), 2);
+    assert!(eager.iter().all(|p| p.host != "a"));
+    let lazy: Vec<_> = rotator.pick_iter().collect();
+    assert_eq!(lazy.len(), 2);
+    assert!(lazy.iter().all(|p| p.host != "a"));
+    // A success lifts the quarantine on both paths.
+    rotator.record_success(&dead);
+    assert_eq!(rotator.pick_iter().count(), 3);
+}
+
+/// Consumption-proportional work behind the public iterator: taking one
+/// element of an N=256 snapshot performs strictly fewer
+/// `sort_comparisons` than a full `pick_order`, while key generation
+/// stays N on both paths (same snapshot). Mutation: sorting the whole
+/// snapshot eagerly in `pick_iter` raises the one-element cost to the
+/// full sort.
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[test]
+fn perf208_pick_iter_one_element_costs_less_than_full_pick_order() {
+    fn make_rotator(seed: u64) -> std::sync::Arc<ProxyRotator> {
+        std::sync::Arc::new(
+            ProxyRotator::with_rng_seed(
+                (0..256usize)
+                    .map(|i| make_proxy(&format!("host{i}"), 1000 + i as u16))
+                    .collect(),
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+                DEFAULT_STICKY_CACHE_TTL,
+                seed,
+            )
+            .expect("valid parameters in test"),
+        )
+    }
+    // Rebuilding reseeds the RNG, so identical seeds produce identical
+    // keys and the counters are deterministic.
+    let run_first = |seed| {
+        crate::perf::measure(move || {
+            let mut iter = make_rotator(seed).pick_iter();
+            std::hint::black_box(iter.next());
+            std::hint::black_box(&iter);
+        })
+    };
+    let (_, lazy) = run_first(208u64);
+    let (_, repeated) = run_first(208u64);
+    assert_eq!(lazy, repeated, "same seed must reproduce the same counters");
+    let (_, full) = crate::perf::measure(|| make_rotator(208).pick_order());
+    // Same snapshot: all N weighted keys on both paths.
+    assert_eq!(lazy.weighted_keys, 256);
+    assert_eq!(full.weighted_keys, 256);
+    // One element sorts a fraction of the snapshot, the full order all of it.
+    assert!(
+        lazy.sort_comparisons < full.sort_comparisons,
+        "one element: {} comparisons, full pick_order: {}",
+        lazy.sort_comparisons,
+        full.sort_comparisons
+    );
+    crate::perf::report("rotator/pick_iter/n=256/consumed=1", lazy);
+    crate::perf::report("rotator/pick_order/n=256/full_sort_control", full);
+}
+
+/// `pick_iter` counts as one order build, like `pick_order`: the dependent
+/// crates' budget-exhaustion oracles read this counter and must keep seeing
+/// the direct path. Mutation: a `pick_iter` that does not count turns those
+/// "no order was built" assertions vacuous.
+#[cfg(feature = "test-instrumentation")]
+#[test]
+fn pick_iter_and_pick_order_both_count_as_order_builds() {
+    let rotator = std::sync::Arc::new(ProxyRotator::new(vec![
+        make_proxy("a", 1),
+        make_proxy("b", 2),
+    ]));
+    assert_eq!(rotator.pick_order_calls(), 0);
+    let _ = rotator.pick_order();
+    assert_eq!(rotator.pick_order_calls(), 1);
+    let mut iter = rotator.pick_iter();
+    assert_eq!(rotator.pick_order_calls(), 2, "counted when built");
+    while iter.next().is_some() {}
+    assert_eq!(
+        rotator.pick_order_calls(),
+        2,
+        "consuming the iterator is not another build"
+    );
 }

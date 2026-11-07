@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(loaded.users[0].allowed_clients, None);
     }
 
-    /// Старый конфиг без поля `allowed_clients` получает default `"*"`.
+    /// An old config without the `allowed_clients` field gets the default `"*"`.
     #[test]
     fn old_main_without_allowed_clients_defaults_to_star() {
         let src = "\
@@ -232,7 +232,7 @@ auth: { allow_anonymous: true }
         assert_eq!(cfg.allowed_clients, "*");
     }
 
-    /// Round-trip значения allowed_clients через ktav.
+    /// Round-trip of the allowed_clients value through ktav.
     #[test]
     fn main_allowed_clients_round_trips() {
         let mut cfg = default_main(20082, Vec::new());

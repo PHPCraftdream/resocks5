@@ -1,4 +1,4 @@
-//! Компонентные baseline-сценарии #208, без сокетов и таймеров.
+//! Component-level baseline scenarios #208, no sockets or timers.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -11,7 +11,7 @@ use crate::rating::{select::weighted_order, QuarantinePolicy, RatingPolicy, Smal
 use crate::rotator::ProxyRotator;
 use crate::types::{ChainKey, ProxyConfig};
 
-/// Ротатор с детерминированным RNG рейтингов (seed задаёт порядок взвешенного выбора).
+/// Rotator with deterministic ratings RNG (seed defines the weighted pick order).
 fn seeded_rotator(size: usize, seed: u64) -> Arc<ProxyRotator> {
     Arc::new(
         ProxyRotator::with_rng_seed(
@@ -26,7 +26,7 @@ fn seeded_rotator(size: usize, seed: u64) -> Arc<ProxyRotator> {
     )
 }
 
-/// Ротатор с детерминированным RNG и реальным ранком gate-уровня у всех узлов.
+/// Rotator with deterministic RNG and a real gate-level rank on all nodes.
 fn seeded_ranked_rotator(size: usize, seed: u64, rank: u8) -> Arc<ProxyRotator> {
     Arc::new(
         ProxyRotator::with_rng_seed(
@@ -41,7 +41,7 @@ fn seeded_ranked_rotator(size: usize, seed: u64, rank: u8) -> Arc<ProxyRotator> 
     )
 }
 
-/// Метка бюджета для report: 1, 3 или `full` (полное исчерпание).
+/// Budget label for report: 1, 3, or `full` (full exhaustion).
 fn budget_label(budget: usize) -> String {
     if budget == usize::MAX {
         "full".to_owned()
@@ -72,7 +72,7 @@ fn perf208_mark_dead_first_and_duplicate() {
     let (_, duplicate) = measure(|| plan.mark_dead(&dead));
     report("mark_dead/first", first);
     report("mark_dead/duplicate", duplicate);
-    // После baseline убрана временная owned-конфигурация перед singleton_key.
+    // After baseline, the temporary owned config was removed before singleton_key.
     assert_eq!(first.config_clones, 1);
     assert_eq!(duplicate.config_clones, 1);
     assert!(plan.all(|pick| pick.exit().proxy.host != dead.host));
@@ -123,10 +123,10 @@ fn perf208_pick_then_config_materialization() {
     }
 }
 
-/// Оракул — identity_scan_expectation: позиция совпавшего слота в bucket
-/// (hit) или длина bucket (miss); корректен для произвольных коллизий и
-/// раннего совпадения. resolve_comparisons обязан равняться оракулу: так
-/// ловятся и возврат линейного скана, и обход счётчика.
+/// Oracle — identity_scan_expectation: position of the matched slot in bucket
+/// (hit) or bucket length (miss); correct for arbitrary collisions and
+/// early match. resolve_comparisons must equal the oracle: this catches
+/// both a linear-scan fallback and a counter walk-through.
 #[test]
 fn perf208_cached_resolve_first_last_and_miss() {
     for size in [1, 8, 64, 256] {
@@ -176,7 +176,7 @@ fn perf208_resolve_gate_levels_exit_owner_and_cached_composite() {
         .unwrap()
     };
 
-    // Owner — первый exit-rotator среза, содержащий identity узла.
+    // Owner — first exit-rotator slice containing the node's identity.
     let config = chain_with(proxy(3));
     let expected = (outer_rot.identity_scan_expectation(&outer)
         + inner_rot.identity_scan_expectation(&inner)
@@ -186,7 +186,7 @@ fn perf208_resolve_gate_levels_exit_owner_and_cached_composite() {
     assert_eq!(counts.resolve_comparisons, expected);
     report("resolve/gates2_owner=first", counts);
 
-    // Владелец — второй: первый не содержит узла (bucket пуст, 0 сравнений).
+    // Owner — the second one: the first does not contain the node (empty bucket, 0 comparisons).
     let config = chain_with(proxy(4));
     let expected = (outer_rot.identity_scan_expectation(&outer)
         + inner_rot.identity_scan_expectation(&inner)
@@ -197,8 +197,8 @@ fn perf208_resolve_gate_levels_exit_owner_and_cached_composite() {
     assert_eq!(counts.resolve_comparisons, expected);
     report("resolve/gates2_owner=second", counts);
 
-    // Реальная форма cached-цепочки: exit-узел несёт gate-ссылку (LINK),
-    // identity её игнорирует — узел матчится с plain-прокси ротатора.
+    // Real cached-chain shape: exit node carries the gate ref (LINK),
+    // identity ignores it — the node matches the rotator's plain proxy.
     let config = chain_with(proxy(3).with_gate(proxy(9)));
     let expected = (outer_rot.identity_scan_expectation(&outer)
         + inner_rot.identity_scan_expectation(&inner)
@@ -209,7 +209,7 @@ fn perf208_resolve_gate_levels_exit_owner_and_cached_composite() {
     assert_eq!(counts.resolve_comparisons, expected);
     report("resolve/exit/cached_gate_composite", counts);
 
-    // Неверный gate rank отсекается до lookup: ноль сравнений.
+    // Wrong gate rank is cut off before lookup: zero comparisons.
     let mut wrong_rank = outer.clone();
     wrong_rank.gate_level = 5;
     let config = ProxyConfig::chain([
@@ -222,7 +222,7 @@ fn perf208_resolve_gate_levels_exit_owner_and_cached_composite() {
     assert!(pick.is_none());
     assert_eq!(counts.resolve_comparisons, 0);
 
-    // Неверный пароль exit-узла: gate-уровни просмотрены, exit-hash bucket'и пусты.
+    // Wrong exit-node password: gate levels scanned, exit-hash buckets empty.
     let mut wrong_pass = proxy(3);
     wrong_pass.password = Some("wrong".to_owned());
     let config = chain_with(wrong_pass.clone());
@@ -393,14 +393,14 @@ fn perf208_credentials_retention_valid_raw_and_basic() {
     }
 }
 
-/// Ленивый взвешенный порядок: снапшот потребляет ровно N ключей,
-/// материализация Arc-конфигураций — по потреблению.
+/// Lazy weighted order: snapshot consumes exactly N keys,
+/// Arc configs materialize on consumption.
 #[test]
 fn perf208_lazy_weighted_order_end_to_end() {
     for size in [1usize, 8, 64, 256] {
         for budget in [1usize, 3, usize::MAX] {
-            // Пересоздание ротатора сбрасывает RNG (reseed есть только при
-            // конструировании) — детерминизм между прогонами.
+            // Recreating the rotator resets the RNG (reseed happens only at
+            // construction) — determinism across runs.
             let run = || {
                 let rotator = seeded_rotator(size, 208);
                 measure(|| {
@@ -418,18 +418,18 @@ fn perf208_lazy_weighted_order_end_to_end() {
             };
             let (order, counts) = run();
             let (again, repeated) = run();
-            // ProxyConfig без PartialEq — сравниваем детерминизм по хостам.
+            // ProxyConfig lacks PartialEq — compare determinism by hosts.
             assert_eq!(
                 order.iter().map(|p| p.host.clone()).collect::<Vec<_>>(),
                 again.iter().map(|p| p.host.clone()).collect::<Vec<_>>()
             );
             assert_eq!(counts, repeated);
-            // Снапшот потребил все N ключей рейтингов независимо от бюджета.
+            // Snapshot consumed all N rating keys regardless of budget.
             assert_eq!(counts.weighted_keys, size as u64);
             assert_eq!(order.len(), size.min(budget));
             if budget == 1 && size == 256 {
-                // Относительный контроль: полный путь на том же входе тратит
-                // больше сравнений компаратора, чем ленивое потребление 1 элемента.
+                // Relative control: full path on the same input spends
+                // more comparator comparisons than lazy consumption of 1 element.
                 let rotator = seeded_rotator(size, 208);
                 let (_, full) = measure(|| rotator.pick_order());
                 assert!(counts.sort_comparisons < full.sort_comparisons);
@@ -442,11 +442,11 @@ fn perf208_lazy_weighted_order_end_to_end() {
     }
 }
 
-/// Ротатор-уровневый полный контроль (полная сортировка pick_order).
+/// Rotator-level full control (full pick_order sort).
 #[test]
 fn perf208_full_pick_order_rotator_control() {
     for size in [1usize, 8, 64, 256] {
-        // Пересоздание ротатора сбрасывает RNG — детерминизм между прогонами.
+        // Recreating the rotator resets the RNG — determinism across runs.
         let run = || {
             let rotator = seeded_rotator(size, 208);
             measure(|| rotator.pick_order())
@@ -463,14 +463,14 @@ fn perf208_full_pick_order_rotator_control() {
     }
 }
 
-/// Тестовый эталон прежнего eager-пути #208 для честного total-cost A/B.
-/// Дословная реплика baseline `ChainPlan` (структуры/аллокационные шаги/
-/// lifetime returned picks); production-путь — `ChainPlan`. Только для
-/// total-cost измерений; этот код в production не используется.
+/// Test reference of the old eager path #208 for a fair total-cost A/B.
+/// Verbatim replica of baseline `ChainPlan` (structures/allocation steps/
+/// lifetime of returned picks); production path is `ChainPlan`. Only for
+/// total-cost measurements; this code is not used in production.
 #[derive(Clone)]
 struct LegacyHop {
-    // Читается в baseline через pick.record_success (не измеряется) и клон
-    // Hop.clone в current_pick; derive(Clone) не гасит dead_code-анализ.
+    // Read in baseline via pick.record_success (not measured) and the
+    // Hop.clone in current_pick; derive(Clone) does not silence dead_code analysis.
     #[allow(dead_code)]
     rotator: Arc<ProxyRotator>,
     proxy: Arc<ProxyConfig>,
@@ -482,14 +482,14 @@ struct LegacyCandidate {
 }
 struct LegacyLayer {
     candidates: Vec<LegacyCandidate>,
-    // Реплика поля baseline (читался в mark_dead, который не измеряется).
+    // Replica of a baseline field (read in mark_dead, which is not measured).
     #[allow(dead_code)]
     live: usize,
     index: usize,
 }
 struct LegacyChainPick {
-    // Реплика поля baseline (читался в hops()/exit(); возвращённый pick
-    // создаётся и уничтожается на каждой итерации — dealloc в замере).
+    // Replica of a baseline field (read in hops()/exit(); the returned pick
+    // is created and dropped on every iteration — dealloc in the measurement).
     #[allow(dead_code)]
     hops: Vec<LegacyHop>,
     key: ChainKey,
@@ -503,7 +503,7 @@ struct LegacyChainPlan {
 }
 
 impl LegacyChainPlan {
-    /// Дословная реплика baseline `ChainPlan::new`.
+    /// Verbatim replica of baseline `ChainPlan::new`.
     fn legacy_new(gates: &GateLevels, exits: &[Arc<ProxyRotator>]) -> Self {
         let mut layers: Vec<_> = gates
             .iter()
@@ -553,8 +553,8 @@ impl LegacyChainPlan {
         }
     }
 
-    /// Дословная реплика baseline `ChainPlan::next_pick`: базовый НЕМЕДЛЕННЫЙ
-    /// advance после `current_pick` (старое поведение, не новое need_advance).
+    /// Verbatim replica of baseline `ChainPlan::next_pick`: the basic IMMEDIATE
+    /// advance after `current_pick` (old behavior, not the new need_advance).
     fn legacy_next_pick(&mut self) -> Option<LegacyChainPick> {
         while !self.done {
             self.legacy_count_step();
@@ -579,8 +579,8 @@ impl LegacyChainPlan {
         self.steps += 1;
     }
 
-    /// Дословная реплика baseline `current_pick`: клонирование ОБЕИХ Arc
-    /// (`rotator` и `proxy`) каждого `Hop` в свежий Vec на каждый pick.
+    /// Verbatim replica of baseline `current_pick`: cloning BOTH Arc
+    /// (`rotator` and `proxy`) of every `Hop` into a fresh Vec on each pick.
     fn legacy_current_pick(&self) -> LegacyChainPick {
         let hops: Vec<_> = self
             .layers
@@ -594,7 +594,7 @@ impl LegacyChainPlan {
         LegacyChainPick { hops, key }
     }
 
-    /// Дословная реплика baseline `advance`.
+    /// Verbatim replica of baseline `advance`.
     fn legacy_advance(&mut self) {
         for layer in self.layers.iter_mut().rev() {
             layer.index += 1;
@@ -606,8 +606,8 @@ impl LegacyChainPlan {
         self.done = true;
     }
 
-    /// Дословная реплика baseline `jump_subtree` (в замерах dead пуст — не
-    /// срабатывает; перенесён для полноты).
+    /// Verbatim replica of baseline `jump_subtree` (no-op in dead measurements —
+    /// never fires; carried over for completeness).
     fn legacy_jump_subtree(&mut self, index: usize) {
         for layer in self.layers.iter_mut().skip(index + 1) {
             layer.index = 0;
@@ -628,7 +628,7 @@ impl LegacyChainPlan {
     }
 }
 
-/// Дословная реплика baseline `deduplicate`.
+/// Verbatim replica of baseline `deduplicate`.
 fn legacy_deduplicate(
     candidates: impl IntoIterator<Item = (Arc<ProxyRotator>, Arc<ProxyConfig>)>,
 ) -> Vec<LegacyCandidate> {
@@ -645,7 +645,7 @@ fn legacy_deduplicate(
         .collect()
 }
 
-/// Дословная реплика прежнего singleton_key из baseline (та же instrumentation
+/// Verbatim replica of the old singleton_key from baseline (same instrumentation
 /// config_clones).
 fn legacy_singleton_key(proxy: &ProxyConfig) -> ChainKey {
     crate::perf::operation(|c| c.config_clones += 1);
@@ -654,15 +654,15 @@ fn legacy_singleton_key(proxy: &ProxyConfig) -> ChainKey {
     ChainKey::new(Arc::new(plain))
 }
 
-/// Честный total-cost A/B: legacy eager-путь против ленивого ChainPlan на тех
-/// же входах. Числа сводит оркестратор отчёта; cross-test сравнений нет.
+/// Fair total-cost A/B: legacy eager path vs lazy ChainPlan on the same
+/// inputs. The report orchestrator aggregates the numbers; no cross-test comparisons.
 #[test]
 fn perf208_chain_plan_legacy_total_cost() {
     let gates_default = GateLevels::default();
-    // А) exits-only: один слой, полная матрица размеров.
+    // (A) exits-only: one layer, full size matrix.
     for size in [1usize, 8, 64, 256] {
         for budget in [1usize, 3, usize::MAX] {
-            // Пересоздание ротатора сбрасывает RNG — детерминизм между прогонами.
+            // Recreating the rotator resets the RNG — determinism across runs.
             let run = || {
                 let exits = [seeded_rotator(size, 208)];
                 measure(|| {
@@ -685,7 +685,7 @@ fn perf208_chain_plan_legacy_total_cost() {
             let (again, repeated) = run();
             assert_eq!(picks, again);
             assert_eq!(counts, repeated);
-            // Полный pick_order у legacy потребляет все ключи всегда.
+            // Legacy's full pick_order always consumes all keys.
             assert_eq!(counts.weighted_keys, size as u64);
             report(
                 &format!(
@@ -697,9 +697,9 @@ fn perf208_chain_plan_legacy_total_cost() {
         }
     }
 
-    // Б) Многослойный: 2 gate-уровня по 16 + exit 16, произведение 4096.
+    // (B) Multilayer: 2 gate levels of 16 + exit 16, product 4096.
     for budget in [1usize, usize::MAX] {
-        // Пересоздание ротаторов сбрасывает RNG — детерминизм.
+        // Recreating the rotators resets the RNG — determinism.
         let run = || {
             let gates = GateLevels::new(vec![
                 (2, seeded_ranked_rotator(16, 209, 2)),
@@ -739,15 +739,15 @@ fn perf208_chain_plan_legacy_total_cost() {
     }
 }
 
-/// Цепочки на ленивом пути: candidates материализуются по мере прохождения
-/// одометра, а не все сразу при построении плана.
+/// Chains on the lazy path: candidates materialize as the odometer
+/// advances, not all at once at plan construction.
 #[test]
 fn perf208_chain_plan_lazy_small_consumption_end_to_end() {
-    // А) exits-only: один слой, полная матрица размеров.
+    // (A) exits-only: one layer, full size matrix.
     for size in [1usize, 8, 64, 256] {
         for budget in [1usize, 3, usize::MAX] {
             let gates = GateLevels::default();
-            // Пересоздание ротаторов сбрасывает RNG — детерминизм.
+            // Recreating the rotators resets the RNG — determinism.
             let run = || {
                 let exits = [seeded_rotator(size, 208)];
                 measure(|| {
@@ -767,15 +767,15 @@ fn perf208_chain_plan_lazy_small_consumption_end_to_end() {
             let (again, repeated) = run();
             assert_eq!(picks, again);
             assert_eq!(counts, repeated);
-            // Каждый pick строил цепочку; в 1-слойном плане ровно по одной.
+            // Each pick built a chain; a 1-layer plan has exactly one per pick.
             assert_eq!(counts.chain_builds, picks as u64);
             if budget == 1 && size == 256 {
-                // Eager-путь материализовал все 257 конфигураций сразу;
-                // ленивый строит цепочку только для одного pick.
+                // The eager path materialized all 257 configs at once;
+                // the lazy one builds a chain only for a single pick.
                 assert!(counts.config_clones <= 4);
             }
             if budget == usize::MAX {
-                // Полное исчерпание: без дубликатов все candidate уникальны.
+                // Full exhaustion: without duplicates all candidates are unique.
                 assert_eq!(picks, size);
             }
             report(
@@ -785,9 +785,9 @@ fn perf208_chain_plan_lazy_small_consumption_end_to_end() {
         }
     }
 
-    // Б) Многослойный: 2 gate-уровня по 16 + exit 16, произведение 4096.
+    // (B) Multilayer: 2 gate levels of 16 + exit 16, product 4096.
     for budget in [1usize, usize::MAX] {
-        // Пересоздание ротаторов сбрасывает RNG — детерминизм.
+        // Recreating the rotators resets the RNG — determinism.
         let run = || {
             let gates = GateLevels::new(vec![
                 (2, seeded_ranked_rotator(16, 209, 2)),
@@ -811,8 +811,8 @@ fn perf208_chain_plan_lazy_small_consumption_end_to_end() {
         let (again, repeated) = run();
         assert_eq!(picks, again);
         assert_eq!(counts, repeated);
-        // Каждый pick строил цепочку; при полном исчерпании — всё произведение
-        // 16*16*16 без дубликатов.
+        // Each pick built a chain; at full exhaustion the whole product
+        // 16*16*16 without duplicates.
         assert!(counts.chain_builds >= picks as u64);
         if budget == usize::MAX {
             assert_eq!(picks, 16 * 16 * 16);
@@ -824,14 +824,14 @@ fn perf208_chain_plan_lazy_small_consumption_end_to_end() {
     }
 }
 
-/// Singleton-gates: контроль отсутствия регрессии ленивого ChainPlan
-/// относительно faithful legacy на вырожденных входах (по 1 узлу на слой).
-/// Цель — singleton-план без регрессии относительно faithful legacy
-/// (после устранения overhead singleton-планов в chain/mod.rs).
+/// Singleton-gates: control against lazy-ChainPlan regression
+/// relative to faithful legacy on degenerate inputs (1 node per layer).
+/// Goal — a singleton plan with no regression vs faithful legacy
+/// (after removing singleton-plan overhead in chain/mod.rs).
 #[test]
 fn perf208_chain_plan_singleton_gates_no_regression() {
-    // A) App-style singleton gates: ранги 2/1/0, по одному узлу на слой.
-    //    Свежие ротаторы на каждый замер — детерминизм (RNG сбрасывается).
+    // (A) App-style singleton gates: ranks 2/1/0, one node per layer.
+    //    Fresh rotators per measurement — determinism (RNG resets).
     let mut first = (Counts::default(), Counts::default());
     for run_case in 0..2 {
         let gates = GateLevels::new(vec![
@@ -839,14 +839,14 @@ fn perf208_chain_plan_singleton_gates_no_regression() {
             (1, seeded_ranked_rotator(1, 210, 1)),
         ]);
         let exits = [seeded_rotator(1, 211)];
-        // new: construction + один pick, как в существующих chain_plan-строках.
+        // new: construction + one pick, as in existing chain_plan rows.
         let (picked_new, new) = measure(|| {
             let mut plan = ChainPlan::new(&gates, &exits);
             let got = plan.next().is_some();
             std::hint::black_box(got);
             got
         });
-        // legacy: construction + один pick на дословной реплике baseline.
+        // legacy: construction + one pick on the verbatim baseline replica.
         let (picked_legacy, legacy) = measure(|| {
             let mut plan = LegacyChainPlan::legacy_new(&gates, &exits);
             let got = plan.legacy_next_pick().is_some();
@@ -858,7 +858,7 @@ fn perf208_chain_plan_singleton_gates_no_regression() {
             picked_legacy,
             "run={run_case}: legacy path must yield 1 pick"
         );
-        // Направление сравнения — «не хуже legacy»: строки не ослабляем.
+        // Comparison direction — "no worse than legacy": we do not weaken rows.
         assert!(
             new.alloc <= legacy.alloc,
             "run={run_case} {new:?} vs {legacy:?}"
@@ -885,14 +885,14 @@ fn perf208_chain_plan_singleton_gates_no_regression() {
             report("chain_plan/singleton_gates/consumed=1", new);
             report("chain_plan_legacy/singleton_gates/consumed=1", legacy);
         } else {
-            // Детерминизм: двойной прогон каждой стороны, равенство Counts.
+            // Determinism: double run of each side, equal Counts.
             assert_eq!(new, first.0);
             assert_eq!(legacy, first.1);
         }
     }
 
-    // B) Exits-only N=1: единственный exit-ротатор без gate-слоёв (ранг 0).
-    //    Для блока B строки не репортим: ровно 2 новые строки — singleton_gates.
+    // (B) Exits-only N=1: a single exit-rotator without gate layers (rank 0).
+    //    No rows reported for block B: exactly 2 new rows — singleton_gates.
     let mut first_b = (Counts::default(), Counts::default());
     for run_case in 0..2 {
         let gates = GateLevels::default();
@@ -938,7 +938,7 @@ fn perf208_chain_plan_singleton_gates_no_regression() {
         if run_case == 0 {
             first_b = (new, legacy);
         } else {
-            // Детерминизм: двойной прогон каждой стороны, равенство Counts.
+            // Determinism: double run of each side, equal Counts.
             assert_eq!(new, first_b.0);
             assert_eq!(legacy, first_b.1);
         }

@@ -508,14 +508,14 @@ impl ProxyRotator {
             .find(|index| same_upstream(p, &self.proxies[*index]))
     }
 
-    /// Разрешение identity узла cached-цепочки через construction-time индекс:
-    /// его использует `GateLevels::resolve` вместо линейного скана
-    /// `all_proxies`. Bucket хранится в порядке слотов, поэтому возвращается
-    /// тот же слот, что нашёл бы линейный поиск. Совпадение hash только
-    /// отбирает кандидатов — identity доказывается сравнением полей
-    /// `same_upstream`, поэтому коллизии разрешаются корректно. С
-    /// `test-instrumentation` каждое сравнение bucket учитывается в
-    /// `resolve_comparisons` (счётчик пути resolve, не `index_of`).
+    /// Resolution of a cached-chain node's identity via a construction-time index:
+    /// used by `GateLevels::resolve` instead of a linear scan of
+    /// `all_proxies`. The bucket is stored in slot order, so the
+    /// same slot as a linear search is returned. A hash match only
+    /// selects candidates — identity is proven by comparing the
+    /// `same_upstream` fields, so collisions resolve correctly. With
+    /// `test-instrumentation`, every bucket comparison counts toward
+    /// `resolve_comparisons` (the resolve-path counter, not `index_of`).
     pub(crate) fn resolve_identity(&self, node: &ProxyConfig) -> Option<&Arc<ProxyConfig>> {
         let bucket = self
             .by_identity
@@ -530,10 +530,10 @@ impl ProxyRotator {
         None
     }
 
-    /// Тестовый оракул: ожидаемое число сравнений индексного пути для
-    /// `node` — позиция совпавшего слота в bucket (hit, скан до первого
-    /// совпадения) или длина bucket (miss, bucket исчерпан). Корректно
-    /// для произвольных коллизий, раннего совпадения и пустого bucket.
+    /// Test oracle: the expected comparison count of the index path for
+    /// `node` — the matched slot's position in the bucket (hit, scan to
+    /// first match) or the bucket length (miss, bucket exhausted). Correct
+    /// for arbitrary collisions, early matches, and an empty bucket.
     #[cfg(all(test, feature = "test-instrumentation"))]
     pub(crate) fn identity_scan_expectation(&self, node: &ProxyConfig) -> usize {
         let Some(bucket) = self
@@ -548,8 +548,8 @@ impl ProxyRotator {
             .map_or(bucket.len(), |position| position + 1)
     }
 
-    /// Снапшотный прокси по индексу ratings (только для внутренних планов;
-    /// идентичность — same_upstream).
+    /// Snapshot proxy by ratings index (for internal plans only;
+    /// identity is same_upstream).
     pub(crate) fn proxy_at(&self, index: usize) -> &ProxyConfig {
         &self.proxies[index]
     }
@@ -699,7 +699,8 @@ impl ProxyRotator {
     }
 
     /// Diagnostic/test-only reader: how many times
-    /// [`ProxyRotator::pick_order`] has been called on this rotator.
+    /// [`ProxyRotator::pick_order`] or [`ProxyRotator::pick_iter`] has been
+    /// called on this rotator.
     /// Hidden from docs; nothing in production consumes it — it exists
     /// so tests in dependent crates can assert that budget
     /// exhaustion skips order building. Compiled only with the
@@ -710,8 +711,8 @@ impl ProxyRotator {
         self.pick_order_calls.load(Ordering::Relaxed)
     }
 
-    /// Ленивый аналог pick_order: тот же снапшот (момент, quarantine,
-    /// RNG-потребление), порядок и материализация по мере потребления.
+    /// Lazy pick_order: same snapshot (moment, quarantine,
+    /// RNG consumption), order, and materialization on demand.
     pub(crate) fn pick_order_lazy(self: &Arc<Self>) -> LazyCandidates {
         let (eligible, cursor) = self.ratings.pick_order_lazy().into_parts();
         LazyCandidates {
@@ -721,7 +722,22 @@ impl ProxyRotator {
         }
     }
 
-    /// Тестовый хук: ротатор с фиксированным seed RNG рейтингов.
+    /// Public lazy twin of [`ProxyRotator::pick_order`]: the same snapshot
+    /// (eligibility, quarantine screening and RNG consumption at call
+    /// time) yielding the same order, but the weighted keys are sorted
+    /// and the `Arc<ProxyConfig>` candidates materialised only as the
+    /// iterator is consumed, so the cost is proportional to consumption
+    /// instead of the pool size. Draining it produces exactly
+    /// [`ProxyRotator::pick_order`] for the same RNG state.
+    pub fn pick_iter(self: &Arc<Self>) -> PickOrder {
+        #[cfg(feature = "test-instrumentation")]
+        self.pick_order_calls.fetch_add(1, Ordering::Relaxed);
+        PickOrder {
+            inner: self.pick_order_lazy(),
+        }
+    }
+
+    /// Test hook: rotator with a fixed-seed ratings RNG.
     #[cfg(test)]
     pub(crate) fn with_rng_seed(
         proxies: Vec<ProxyConfig>,
@@ -737,8 +753,8 @@ impl ProxyRotator {
     }
 }
 
-/// Ленивая выдача pick_order: тот же снапшот рейтингов, proxies
-/// материализуются Arc-клоном только по мере потребления.
+/// Lazy pick_order: same ratings snapshot, proxies
+/// Arc-cloned only as consumed.
 pub(crate) struct LazyCandidates {
     rotator: Arc<ProxyRotator>,
     eligible: Vec<usize>,
@@ -746,29 +762,48 @@ pub(crate) struct LazyCandidates {
 }
 
 impl LazyCandidates {
-    /// Индексы eligible-слотов снапшота (для точного mark_dead без ключей).
+    /// Indices of the snapshot's eligible slots (for exact mark_dead without keys).
     pub(crate) fn eligible(&self) -> &[usize] {
         &self.eligible
     }
 
-    /// Владелец снапшота (используется ленивыми слоями ChainPlan).
+    /// Snapshot owner (used by the lazy ChainPlan layers).
     pub(crate) fn rotator(&self) -> &Arc<ProxyRotator> {
         &self.rotator
     }
 
-    /// Следующий прокси в точном порядке pick_order.
+    /// Next proxy in the exact pick_order order.
     pub(crate) fn next_proxy(&mut self) -> Option<Arc<ProxyConfig>> {
         self.cursor
             .next()
             .map(|j| self.rotator.proxies[self.eligible[j]].clone())
     }
 
-    /// Полный дренаж; эквивалентен pick_order().
+    /// Full drain; equivalent to pick_order().
     #[cfg(test)]
     pub(crate) fn into_proxies(mut self) -> Vec<Arc<ProxyConfig>> {
         std::iter::from_fn(|| self.next_proxy()).collect()
     }
 }
+
+/// Lazy candidate iterator returned by [`ProxyRotator::pick_iter`].
+/// See that method for the snapshot, ordering and cost contract: the
+/// order equals [`ProxyRotator::pick_order`] for the same RNG state, and
+/// sorting/materialisation happen only as items are pulled. After
+/// exhaustion it keeps returning `None`.
+pub struct PickOrder {
+    inner: LazyCandidates,
+}
+
+impl Iterator for PickOrder {
+    type Item = Arc<ProxyConfig>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next_proxy()
+    }
+}
+
+impl std::iter::FusedIterator for PickOrder {}
 
 #[cfg(test)]
 mod construction_tests;

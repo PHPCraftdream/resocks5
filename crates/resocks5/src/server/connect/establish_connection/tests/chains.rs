@@ -784,10 +784,19 @@ async fn failing_dial(
     v6: Option<Arc<ProxyRotator>>,
     v4: Option<Arc<ProxyRotator>>,
 ) -> anyhow::Error {
+    failing_dial_with_budget(v6, v4, 4).await
+}
+
+/// [`failing_dial`] with an explicit `max_upstream_attempts` budget.
+async fn failing_dial_with_budget(
+    v6: Option<Arc<ProxyRotator>>,
+    v4: Option<Arc<ProxyRotator>>,
+    max_upstream_attempts: usize,
+) -> anyhow::Error {
     let (log_tx, _logs) = mpsc::channel(8);
     let logger = Arc::new(Logger::new(log_tx, LogConfig::default()));
     let network = Arc::new(crate::config::NetworkConfig {
-        max_upstream_attempts: 4,
+        max_upstream_attempts,
         handshake_timeout_sec: 2,
         connect_timeout_sec: 1,
         ..Default::default()
@@ -855,4 +864,86 @@ async fn distinct_proxies_are_both_attempted() {
     failing_dial(Some(v6), Some(v4)).await;
     assert_eq!(first_accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(second_accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// `n` distinct counting refusers behind one rotator: the stubs (kept
+/// alive by the binding), the rotator and one accept counter per
+/// upstream.
+async fn refusing_pool(
+    n: usize,
+) -> (
+    Vec<Stub>,
+    Arc<ProxyRotator>,
+    Vec<Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    let mut stubs = Vec::new();
+    let mut proxies = Vec::new();
+    let mut accepts = Vec::new();
+    for _ in 0..n {
+        let (stub, counter) = counting_refuser().await;
+        proxies.push(config(stub.addr, 0));
+        stubs.push(stub);
+        accepts.push(counter);
+    }
+    (stubs, Arc::new(ProxyRotator::new(proxies)), accepts)
+}
+
+/// Sum of contacts equals `expected_total` and no upstream was contacted
+/// twice.
+fn assert_pool_contacted(accepts: &[Arc<std::sync::atomic::AtomicUsize>], expected_total: usize) {
+    let counts: Vec<usize> = accepts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        .collect();
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        expected_total,
+        "total contacts: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|&c| c <= 1),
+        "an upstream was contacted twice: {counts:?}"
+    );
+}
+
+/// Budget 4 over 8 distinct refusing upstreams: the direct path stops
+/// asking the rotator once the budget is full, so exactly 4 distinct
+/// refusers are contacted, none of them twice. Mutation: materialising
+/// more candidates than the budget (or losing route dedup) contacts
+/// more upstreams or dials one twice.
+#[tokio::test]
+async fn direct_budget_contacts_exactly_budget_distinct_refusers() {
+    let (_stubs, rotator, accepts) = refusing_pool(8).await;
+    let rotator_handle = rotator.clone();
+    let error = failing_dial_with_budget(None, Some(rotator), 4).await;
+    assert!(
+        error.to_string().contains("All 4 upstream attempts"),
+        "expected the 4-attempt exhaustion error, got: {error}"
+    );
+    assert_pool_contacted(&accepts, 4);
+    assert_eq!(
+        rotator_handle.pick_order_calls(),
+        1,
+        "one order build, on the direct path"
+    );
+}
+
+/// Budget larger than the pool: every upstream is contacted, exactly
+/// once. Mutation: an off-by-one in the candidate loop drops the last
+/// upstream or double-dials one.
+#[tokio::test]
+async fn direct_budget_larger_than_pool_contacts_every_upstream_once() {
+    let (_stubs, rotator, accepts) = refusing_pool(8).await;
+    let rotator_handle = rotator.clone();
+    let error = failing_dial_with_budget(None, Some(rotator), 12).await;
+    assert!(
+        error.to_string().contains("All 8 upstream attempts"),
+        "expected the 8-attempt exhaustion error, got: {error}"
+    );
+    assert_pool_contacted(&accepts, 8);
+    assert_eq!(
+        rotator_handle.pick_order_calls(),
+        1,
+        "one order build, on the direct path"
+    );
 }

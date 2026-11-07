@@ -72,8 +72,8 @@ where
     }
 }
 
-/// Глобальная проверка IP до любого handshake: только TCP peer-адрес,
-/// fail-closed, если адрес недоступен.
+/// Global IP check before any handshake: TCP peer address only,
+/// fail-closed if the address is unavailable.
 fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> anyhow::Result<()> {
     let Some(rule) = rule else {
         return Ok(());
@@ -110,9 +110,9 @@ pub async fn handle_client(
     allowed_clients: &Option<Arc<AllowedClients>>,
     client_deadline: Instant,
 ) -> anyhow::Result<()> {
-    // Глобальный фильтр — ДО протокольного peek/handshake. Правило
-    // приходит уже скомпилированным (одна компиляция на старте), здесь
-    // только проверка.
+    // Global filter — BEFORE protocol peek/handshake. The rule arrives
+    // already compiled (compiled once at startup); here it is
+    // only checked.
     global_allowed(&client_stream, allowed_clients)?;
     let peer_ip = client_stream.peer_addr().ok().map(|a| a.ip());
     #[cfg(test)]
@@ -791,9 +791,9 @@ mod tests {
         .unwrap();
     }
 
-    /// Глобальный фильтр в handle_client: peer вне правила отвергается
-    /// ДО любого протокольного ввода-вывода. Клиент коннектится без
-    /// данных — handler обязан отказать, не прочитав ни байта.
+    /// The global filter in handle_client: a peer outside the rule is
+    /// rejected BEFORE any protocol I/O. The client connects without
+    /// data — the handler must reject it without reading a single byte.
     #[tokio::test]
     async fn global_allowed_clients_denies_before_handshake() {
         let auth = test_auth();
@@ -809,8 +809,8 @@ mod tests {
         let direct_limiter = Arc::new(Semaphore::new(8));
         let no_gates = Arc::new(GateLevels::default());
         let no_rotator = None;
-        // loopback не входит в правило — peer 127.0.0.1 обязан быть
-        // отвергнут ещё до чтения первого байта.
+        // loopback is NOT included in the rule — peer 127.0.0.1 must
+        // be rejected even before reading the first byte.
         let allowed = Arc::new(crate::config::compile_allowed_clients("203.0.113.7").unwrap());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -843,9 +843,9 @@ mod tests {
         };
         let peer = async {
             let mut socket = TcpStream::connect(address).await.unwrap();
-            // Ничего не пишем: фильтр обязан отказать до любого ввода.
-            // Ждём закрытия соединения: EOF (0 байт) или RST — иные
-            // ошибки не проглатываем.
+            // We write nothing: the filter must reject before any I/O.
+            // Wait for connection close: EOF (0 bytes) or RST — other
+            // errors are not swallowed.
             let mut reply = [0u8; 2];
             match socket.read(&mut reply).await {
                 Ok(0) => {}
@@ -858,8 +858,8 @@ mod tests {
                 },
             }
         };
-        // Общий таймаут на обе стороны — детерминированная защита от
-        // взаимного зависания без sleep/yield-поллинга.
+        // One overall timeout for both sides — a deterministic guard
+        // against mutual hang without sleep/yield polling.
         timeout(Duration::from_secs(8), async {
             tokio::join!(host, peer);
         })
@@ -867,8 +867,8 @@ mod tests {
         .unwrap();
     }
 
-    /// Пользовательский фильтр в secure-auth store: верный пароль с
-    /// запрещённого IP даёт ОБЫЧНЫЙ отказ (decoy, Denied) — как неверный.
+    /// The user filter in the secure-auth store: a correct password from
+    /// a forbidden IP yields an ORDINARY failure (decoy, Denied) — same as a wrong one.
     #[tokio::test]
     async fn user_allowed_clients_denies_like_a_wrong_password() {
         let auth = Arc::new(
@@ -883,7 +883,7 @@ mod tests {
                         hash: crate::auth::compute_hash("pw").unwrap(),
                         is_enabled: true,
                         direct: false,
-                        // loopback НЕ входит — peer 127.0.0.1 запрещён.
+                        // loopback is NOT included — peer 127.0.0.1 is forbidden.
                         allowed_clients: Some("203.0.113.9".into()),
                     }],
                 },
@@ -945,7 +945,7 @@ mod tests {
             let mut method = [0u8; 2];
             socket.read_exact(&mut method).await.unwrap();
             assert_eq!(method, [0x05, resocks5_net::secure_auth::METHOD]);
-            // alice / pw — валидные credentials, но IP вне правила.
+            // alice / pw — valid credentials, but the IP is outside the rule.
             let error = resocks5_net::secure_auth::client_authenticate(
                 &mut socket,
                 &crate::auth::test_support::creds("alice", "pw"),
