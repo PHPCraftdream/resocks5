@@ -578,6 +578,9 @@ async fn into_prefixed_streams_pipeline_and_payload_end_to_end() {
 fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
     // `tests/framing.rs` still covers accept-level pipeline regression (unchanged).
     let mut req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username_raw: None,
         credentials: None,
         protocol: Protocol::Http,
@@ -592,6 +595,9 @@ fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
     let (peer, server) = duplex(64);
     drop(peer);
     let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username_raw: None,
         credentials: None,
         protocol: Protocol::Http,

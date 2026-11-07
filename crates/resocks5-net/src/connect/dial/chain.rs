@@ -9,17 +9,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::time::{timeout, timeout_at};
+use tokio::time::timeout;
 
 use super::{dial_inner, DialOptions};
 use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
-use crate::connect::handshake_over_stream::{
-    deadline_after, socks5_connect_request, socks5_greeting,
-};
+use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 use crate::connect::host_port::HostPort;
 use crate::connect::http_connect_handshake;
-use crate::connect::tcp_dial::tcp_dial;
+use crate::connect::tcp_dial::{apply_socket_options, tcp_dial};
 use crate::connect::{AnyUpstream, BoxedUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::progress::ProgressReportingWriter;
@@ -341,6 +339,8 @@ async fn chain_inner(
     let tcp = tcp_dial(nodes[0], opts.connect_timeout)
         .await
         .map_err(|e| ChainError::new(ChainStage::Connect, e))?;
+    apply_socket_options(&tcp, nodes[0], opts)
+        .map_err(|e| ChainError::new(ChainStage::Connect, e))?;
     // The one real socket sits under every tunnel: wrapping it here (and
     // only here) lets confirmed ciphertext writes below the first TLS hop
     // count as progress while nested plaintext cannot fake it.
@@ -420,33 +420,22 @@ async fn hop(
         endpoint: format!("{}:{}", node.host, node.port),
         after: hs,
     };
+    node.refuse_cleartext()?;
     match node.protocol {
         ProxyProtocol::Socks5 => {
             let parsed = HostPort::parse(target)
                 .ok_or_else(|| ConnectError::InvalidTarget(target.to_string()))?;
-            // Rejected before any byte is written, like `socks5_handshake`.
-            if parsed.host.is_empty() || parsed.port == 0 {
-                return Err(ConnectError::InvalidTarget(HostPort::format(
-                    parsed.host,
-                    parsed.port,
-                )));
-            }
-            let deadline = deadline_after(hs);
-            let stream =
-                match timeout_at(deadline, socks5_greeting(stream, socks5_auth(node))).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err(timed_out(TimeoutKind::Socks5Greeting)),
-                };
-            match timeout_at(
-                deadline,
-                socks5_connect_request(stream, parsed.host, parsed.port),
+            // Target checks run before any byte is written (inside the helper).
+            socks5_handshake_bounded(
+                stream,
+                parsed.host,
+                parsed.port,
+                socks5_auth(node),
+                deadline_after(hs),
+                &format!("{}:{}", node.host, node.port),
+                hs,
             )
             .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(timed_out(TimeoutKind::Socks5Handshake)),
-            }
         }
         ProxyProtocol::Http => {
             match timeout(hs, http_connect_handshake(&mut stream, target, node)).await {

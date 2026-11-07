@@ -54,6 +54,8 @@
 //! for the inner proxy (see `reserve_permit`), so direct traffic and
 //! gate-routed traffic draw on the same cap.
 
+use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,6 +76,8 @@ mod error;
 pub use crate::connect::UpstreamStream;
 pub use error::AtCapacity;
 
+#[cfg(test)]
+mod key_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -105,6 +109,60 @@ struct ProxySpares {
 /// and don't affect socket reuse, and the per-account/per-IP quota
 /// that the semaphore defends is keyed the same way.
 type ProxyKey = (String, u16);
+
+/// Borrowed-форма [`ProxyKey`] для lookup'ов без аллокаций. `std`
+/// даёт `Borrow<str> for String`, но borrowed-формы кортежа нет, и
+/// поиск по `(&str, u16)` требовал owning-ключ. `ProxyKey:
+/// Borrow<dyn ProxyEndpoint>` принимает в `get` ссылку, собранную
+/// на стеке из `&str`/`u16`; вставки сохраняют owning-ключ.
+trait ProxyEndpoint {
+    fn endpoint_host(&self) -> &str;
+    fn endpoint_port(&self) -> u16;
+}
+
+impl ProxyEndpoint for ProxyKey {
+    fn endpoint_host(&self) -> &str {
+        &self.0
+    }
+
+    fn endpoint_port(&self) -> u16 {
+        self.1
+    }
+}
+
+impl ProxyEndpoint for (&str, u16) {
+    fn endpoint_host(&self) -> &str {
+        self.0
+    }
+
+    fn endpoint_port(&self) -> u16 {
+        self.1
+    }
+}
+
+// Hash и eq читают те же поля в том же порядке, что и производные
+// impls кортежа — контракт Borrow для ручных impls.
+impl Hash for dyn ProxyEndpoint + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.endpoint_host().hash(state);
+        self.endpoint_port().hash(state);
+    }
+}
+
+impl PartialEq for dyn ProxyEndpoint + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint_host() == other.endpoint_host()
+            && self.endpoint_port() == other.endpoint_port()
+    }
+}
+
+impl Eq for dyn ProxyEndpoint + '_ {}
+
+impl<'a> Borrow<dyn ProxyEndpoint + 'a> for ProxyKey {
+    fn borrow(&self) -> &(dyn ProxyEndpoint + 'a) {
+        self
+    }
+}
 
 /// Non-blocking liveness probe for a queued spare.
 ///
@@ -216,16 +274,20 @@ impl ProxyPool {
     /// connections to this `(host, port)`. First-acquire for a new
     /// upstream allocates the Semaphore inline.
     fn upstream_semaphore(&self, host: &str, port: u16) -> Arc<Semaphore> {
-        let key = (host.to_string(), port);
-        if let Some(s) = self.upstream_caps.get(&key) {
+        // Borrowed-lookup: owning-ключ на тёплом пути не строится.
+        // Явная аннотация задаёт unsized coercion: без неё вывод
+        // выберет Q = (&str, u16) и не найдёт Borrow impl.
+        let key: &dyn ProxyEndpoint = &(host, port);
+        if let Some(s) = self.upstream_caps.get(key) {
             return s.value().clone();
         }
-        // Race-safe insert: another caller may have populated the
-        // entry between our get() and entry().or_insert_with(). DashMap
-        // serialises the entry, so whichever lands first wins and the
-        // other reads it back.
+        // Холодный путь: owning-ключ строится здесь, где запись может
+        // создаваться. Race-safe insert без изменений: другой
+        // вызывающий мог заполнить запись между нашим get() и
+        // entry().or_insert_with(); DashMap сериализует entry,
+        // побеждает записавший первым.
         self.upstream_caps
-            .entry(key)
+            .entry((host.to_string(), port))
             .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_upstream)))
             .value()
             .clone()
@@ -261,7 +323,8 @@ impl ProxyPool {
         if let Ok(permit) = sem.clone().try_acquire_owned() {
             return Ok(permit);
         }
-        if let Some(spares) = self.pools.get(&(proxy.host.clone(), proxy.port)) {
+        let key: &dyn ProxyEndpoint = &(proxy.host.as_str(), proxy.port);
+        if let Some(spares) = self.pools.get(key) {
             if let Some(spare) = spares.queue.pop() {
                 let PreWarmed { stream, permit, .. } = spare;
                 drop(stream);
@@ -329,8 +392,8 @@ impl ProxyPool {
         if !self.config.enabled {
             return None;
         }
-        let key = (proxy.host.clone(), proxy.port);
-        let spares = self.pools.get(&key)?.value().clone();
+        let key: &dyn ProxyEndpoint = &(proxy.host.as_str(), proxy.port);
+        let spares = self.pools.get(key)?.value().clone();
         let max_age = Duration::from_secs(self.config.max_session_age_sec);
         let now = Instant::now();
         // Drop stale or already-dead entries lazily on checkout. Each

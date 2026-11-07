@@ -62,6 +62,8 @@ pub(super) fn weighted_keys(
         .into_iter()
         .enumerate()
         .map(|(i, w)| {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| c.weighted_keys += 1);
             let u = rng.next_f64();
             let key = if w > 0.0 && w.is_finite() {
                 (-u.ln()).ln() - w.ln()
@@ -74,8 +76,86 @@ pub(super) fn weighted_keys(
 }
 
 pub(super) fn order_keys(mut keyed: Vec<(usize, f64)>) -> Vec<usize> {
-    keyed.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    keyed.sort_unstable_by(compare_keyed);
     keyed.into_iter().map(|(i, _)| i).collect()
+}
+
+/// Компаратор ключей: total_cmp по ключу, затем по индексу. Все вызовы
+/// обоих путей (full-sort и ленивого) инструментируются в `sort_comparisons`.
+fn compare_keyed(a: &(usize, f64), b: &(usize, f64)) -> std::cmp::Ordering {
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    crate::perf::operation(|c| c.sort_comparisons += 1);
+    a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
+}
+
+/// Ленивый курсор точного порядка `order_keys` над готовым снимком ключей.
+/// Конструкция O(1) без сравнений; каждый следующий элемент расширяет
+/// отсортированный префикс геометрически: select_nth_unstable_by выделяет
+/// следующую порцию рангов из необработанного пула, затем sort_unstable_by
+/// упорядочивает только её. Когда остаток пула мал по сравнению с шагом,
+/// пул один раз досортировывается целиком — полное исчерпание остаётся
+/// O(N log N), ни один путь не квадратичен. Все вызовы компаратора обоих
+/// алгоритмов инструментированы в `sort_comparisons`, поэтому счётчик
+/// отражает реальные сравнения нового пути, включая перестройку.
+/// Доступен при feature rotator (потребитель — rotator/chain).
+#[cfg(feature = "rotator")]
+pub(crate) struct LazyOrder {
+    keyed: Vec<(usize, f64)>,
+    sorted: usize,
+    served: usize,
+}
+
+#[cfg(feature = "rotator")]
+impl LazyOrder {
+    /// O(1): без сортировок и сравнений.
+    pub(crate) fn from_keyed(keyed: Vec<(usize, f64)>) -> Self {
+        Self {
+            keyed,
+            sorted: 0,
+            served: 0,
+        }
+    }
+
+    /// Следующий индекс в точном порядке `order_keys`, или `None` после
+    /// исчерпания.
+    pub(crate) fn next(&mut self) -> Option<usize> {
+        if self.served == self.sorted && self.sorted < self.keyed.len() {
+            self.extend();
+        }
+        if self.served == self.keyed.len() {
+            return None;
+        }
+        let i = self.keyed[self.served].0;
+        self.served += 1;
+        Some(i)
+    }
+
+    /// Полный дренаж (для тестов/оракулов).
+    #[cfg(all(test, feature = "rotator"))]
+    pub(crate) fn into_vec(mut self) -> Vec<usize> {
+        std::iter::from_fn(|| self.next()).collect()
+    }
+
+    /// Расширить отсортированный префикс геометрически; инвариант:
+    /// `keyed[0..sorted]` — точные первые `sorted` элементы полного
+    /// порядка, весь пул `keyed[sorted..]` >= префикса.
+    fn extend(&mut self) {
+        let len = self.keyed.len();
+        debug_assert_eq!(self.sorted, self.served);
+        if self.sorted == len {
+            return;
+        }
+        let step = self.sorted.max(1);
+        if len - self.sorted <= step * 8 {
+            self.keyed[self.sorted..].sort_unstable_by(compare_keyed);
+            self.sorted = len;
+            return;
+        }
+        let pool = &mut self.keyed[self.sorted..];
+        pool.select_nth_unstable_by(step - 1, compare_keyed);
+        pool[..step].sort_unstable_by(compare_keyed);
+        self.sorted += step;
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +405,96 @@ mod tests {
         assert_eq!(weighted_index(&[f64::NAN], &mut rng), 0);
         assert_eq!(weighted_index(&[0.0, f64::NEG_INFINITY], &mut rng), 0);
         assert_eq!(weighted_index(&[], &mut rng), 0);
+    }
+
+    /// Матрица длины × паттерны весов × seed: ленивый курсор обязан
+    /// выдавать побайтово тот же порядок, что full-sort `order_keys` —
+    /// префиксно (1 и 3 на свежих курсорах) и при полном дренаже.
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_order_matches_order_keys_exactly() {
+        let pattern_sets: &[&[f64]] = &[
+            &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            &[1e-300, 1e300, f64::MAX, 1e-300, 1e300, f64::MAX],
+            &[f64::NAN, -1.0, f64::INFINITY, f64::NEG_INFINITY, 1.0, 2.0],
+            &[0.0, 5.0, 0.0, 5.0],
+        ];
+        for n in [1, 2, 7, 64, 257] {
+            for pattern in pattern_sets {
+                for seed in 0..16u64 {
+                    let weights: Vec<f64> = (0..n).map(|i| pattern[i % pattern.len()]).collect();
+                    let expected = order_keys(weighted_keys(
+                        weights.iter().copied(),
+                        &mut SmallRng::from_seed(seed),
+                    ));
+                    // Префикс 1.
+                    let mut c1 = LazyOrder::from_keyed(weighted_keys(
+                        weights.iter().copied(),
+                        &mut SmallRng::from_seed(seed),
+                    ));
+                    assert_eq!(
+                        c1.next().unwrap(),
+                        expected[0],
+                        "n {n}, seed {seed}, prefix 1"
+                    );
+                    // Префикс 3 на свежем курсоре.
+                    let mut c3 = LazyOrder::from_keyed(weighted_keys(
+                        weights.iter().copied(),
+                        &mut SmallRng::from_seed(seed),
+                    ));
+                    let got3: Vec<usize> = (0..3).filter_map(|_| c3.next()).collect();
+                    assert_eq!(
+                        got3,
+                        expected[..3.min(expected.len())],
+                        "n {n}, seed {seed}, prefix 3"
+                    );
+                    // Полный дренаж на третьем свежем курсоре.
+                    let full = LazyOrder::from_keyed(weighted_keys(
+                        weights.iter().copied(),
+                        &mut SmallRng::from_seed(seed),
+                    ))
+                    .into_vec();
+                    assert_eq!(full, expected, "n {n}, seed {seed}, full");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_order_empty_is_exhausted() {
+        let mut c = LazyOrder::from_keyed(vec![]);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.next(), None);
+        assert!(c.into_vec().is_empty());
+    }
+
+    /// Один курсор: частичный дренаж, затем полный — сумма префиксов
+    /// равна полному порядку без повторов.
+    #[cfg(all(test, feature = "rotator"))]
+    #[test]
+    fn lazy_order_serves_from_a_single_keyed_snapshot() {
+        let weights = [1.0, 0.5, 2.0, 0.0, 1.5, 3.0, 0.25];
+        for seed in 0..16u64 {
+            let keyed = weighted_keys(weights, &mut SmallRng::from_seed(seed));
+            let expected = order_keys(weighted_keys(weights, &mut SmallRng::from_seed(seed)));
+            let mut cursor = LazyOrder::from_keyed(keyed);
+            let mut got: Vec<usize> = Vec::new();
+            for _ in 0..4 {
+                if let Some(i) = cursor.next() {
+                    got.push(i);
+                }
+            }
+            assert_eq!(&expected[..4], &got[..], "seed {seed}, partial");
+            while let Some(i) = cursor.next() {
+                got.push(i);
+            }
+            let mut sorted = got.clone();
+            sorted.sort();
+            let n = weights.len();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>(), "seed {seed}");
+            assert_eq!(got, expected, "seed {seed}, full");
+        }
     }
 }

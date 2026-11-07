@@ -3,6 +3,12 @@
 Thanks for considering a contribution. This document is short on purpose —
 the rules are mostly the rules of any small Rust project.
 
+## Repository language
+
+Use English for repository content: source code, comments, documentation,
+configuration explanations, CI labels, commit messages, and pull requests.
+Keep translations separate from unrelated changes and preserve existing meaning.
+
 ## Before you open a PR
 
 1. **Open an issue first** for anything bigger than a typo or a one-file

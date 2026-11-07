@@ -97,7 +97,7 @@ impl From<RatingError> for RotatorError {
 /// borrowed fields only: no `host`/`user`/`password` clones on the
 /// per-event `record_failure`/`record_success` path. Cheap scalars
 /// are compared first so mismatching candidates exit early.
-fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
+pub(crate) fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
     a.port == b.port
         && a.protocol == b.protocol
         && a.gate_level == b.gate_level
@@ -106,7 +106,7 @@ fn same_upstream(a: &ProxyConfig, b: &ProxyConfig) -> bool {
         && a.password == b.password
 }
 
-fn upstream_hash(state: &RandomState, proxy: &ProxyConfig) -> u64 {
+pub(crate) fn upstream_hash(state: &RandomState, proxy: &ProxyConfig) -> u64 {
     state.hash_one((
         proxy.host.as_str(),
         proxy.port,
@@ -169,11 +169,14 @@ impl StickyCache {
         Some(entry.proxy.clone())
     }
 
-    fn insert(&mut self, addr: String, proxy: Arc<ProxyConfig>, now: Instant) {
+    fn insert(&mut self, addr: impl AsRef<str>, proxy: Arc<ProxyConfig>, now: Instant) {
+        let addr = addr.as_ref();
         if self.max_entries == 0 {
             return;
         }
-        let key = self.remove(&addr);
+        // A replaced entry hands its key back, so only a new address
+        // allocates one.
+        let key = self.remove(addr);
         if self.map.len() >= self.max_entries {
             // Reclaim one expired entry before evicting any live entry.
             let victim = self
@@ -431,11 +434,12 @@ impl ProxyRotator {
 
     /// Insert (or replace) the cache entry for `addr`. Takes ownership
     /// of `Arc<ProxyConfig>` so the caller can hand off the only clone
-    /// it had — refcount stays the same.
+    /// it had — refcount stays the same. `addr` is only borrowed: pass a
+    /// `&str` and nothing is allocated when the entry already exists.
     ///
     /// A full cache reclaims an expired entry first, otherwise evicting
     /// the least-recently-used entry.
-    pub fn link_proxy(&self, addr: String, proxy: Arc<ProxyConfig>) {
+    pub fn link_proxy(&self, addr: impl AsRef<str>, proxy: Arc<ProxyConfig>) {
         self.sticky
             .lock()
             .unwrap()
@@ -496,12 +500,58 @@ impl ProxyRotator {
     /// Expected O(1), with no lock or allocation. Identities are unique
     /// in the rotator (duplicates collapsed at construction); the
     /// per-slot comparison still guards against hash collisions.
-    fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
+    pub(crate) fn index_of(&self, p: &ProxyConfig) -> Option<usize> {
         self.by_identity
             .get(&upstream_hash(&self.identity_hasher, p))?
             .iter()
             .copied()
             .find(|index| same_upstream(p, &self.proxies[*index]))
+    }
+
+    /// Разрешение identity узла cached-цепочки через construction-time индекс:
+    /// его использует `GateLevels::resolve` вместо линейного скана
+    /// `all_proxies`. Bucket хранится в порядке слотов, поэтому возвращается
+    /// тот же слот, что нашёл бы линейный поиск. Совпадение hash только
+    /// отбирает кандидатов — identity доказывается сравнением полей
+    /// `same_upstream`, поэтому коллизии разрешаются корректно. С
+    /// `test-instrumentation` каждое сравнение bucket учитывается в
+    /// `resolve_comparisons` (счётчик пути resolve, не `index_of`).
+    pub(crate) fn resolve_identity(&self, node: &ProxyConfig) -> Option<&Arc<ProxyConfig>> {
+        let bucket = self
+            .by_identity
+            .get(&upstream_hash(&self.identity_hasher, node))?;
+        for slot in bucket {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| c.resolve_comparisons += 1);
+            if same_upstream(node, &self.proxies[*slot]) {
+                return Some(&self.proxies[*slot]);
+            }
+        }
+        None
+    }
+
+    /// Тестовый оракул: ожидаемое число сравнений индексного пути для
+    /// `node` — позиция совпавшего слота в bucket (hit, скан до первого
+    /// совпадения) или длина bucket (miss, bucket исчерпан). Корректно
+    /// для произвольных коллизий, раннего совпадения и пустого bucket.
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    pub(crate) fn identity_scan_expectation(&self, node: &ProxyConfig) -> usize {
+        let Some(bucket) = self
+            .by_identity
+            .get(&upstream_hash(&self.identity_hasher, node))
+        else {
+            return 0;
+        };
+        bucket
+            .iter()
+            .position(|slot| same_upstream(node, &self.proxies[*slot]))
+            .map_or(bucket.len(), |position| position + 1)
+    }
+
+    /// Снапшотный прокси по индексу ratings (только для внутренних планов;
+    /// идентичность — same_upstream).
+    pub(crate) fn proxy_at(&self, index: usize) -> &ProxyConfig {
+        &self.proxies[index]
     }
 
     /// Record a failure for the given proxy in the sand model.
@@ -658,6 +708,65 @@ impl ProxyRotator {
     #[cfg(feature = "test-instrumentation")]
     pub fn pick_order_calls(&self) -> u64 {
         self.pick_order_calls.load(Ordering::Relaxed)
+    }
+
+    /// Ленивый аналог pick_order: тот же снапшот (момент, quarantine,
+    /// RNG-потребление), порядок и материализация по мере потребления.
+    pub(crate) fn pick_order_lazy(self: &Arc<Self>) -> LazyCandidates {
+        let (eligible, cursor) = self.ratings.pick_order_lazy().into_parts();
+        LazyCandidates {
+            rotator: Arc::clone(self),
+            eligible,
+            cursor,
+        }
+    }
+
+    /// Тестовый хук: ротатор с фиксированным seed RNG рейтингов.
+    #[cfg(test)]
+    pub(crate) fn with_rng_seed(
+        proxies: Vec<ProxyConfig>,
+        policy: RatingPolicy,
+        quarantine: QuarantinePolicy,
+        max_entries: usize,
+        ttl: Duration,
+        seed: u64,
+    ) -> Result<Self, RotatorError> {
+        let rotator = Self::try_with_quarantine(proxies, policy, quarantine, max_entries, ttl)?;
+        rotator.ratings.reseed(seed);
+        Ok(rotator)
+    }
+}
+
+/// Ленивая выдача pick_order: тот же снапшот рейтингов, proxies
+/// материализуются Arc-клоном только по мере потребления.
+pub(crate) struct LazyCandidates {
+    rotator: Arc<ProxyRotator>,
+    eligible: Vec<usize>,
+    cursor: crate::rating::select::LazyOrder,
+}
+
+impl LazyCandidates {
+    /// Индексы eligible-слотов снапшота (для точного mark_dead без ключей).
+    pub(crate) fn eligible(&self) -> &[usize] {
+        &self.eligible
+    }
+
+    /// Владелец снапшота (используется ленивыми слоями ChainPlan).
+    pub(crate) fn rotator(&self) -> &Arc<ProxyRotator> {
+        &self.rotator
+    }
+
+    /// Следующий прокси в точном порядке pick_order.
+    pub(crate) fn next_proxy(&mut self) -> Option<Arc<ProxyConfig>> {
+        self.cursor
+            .next()
+            .map(|j| self.rotator.proxies[self.eligible[j]].clone())
+    }
+
+    /// Полный дренаж; эквивалентен pick_order().
+    #[cfg(test)]
+    pub(crate) fn into_proxies(mut self) -> Vec<Arc<ProxyConfig>> {
+        std::iter::from_fn(|| self.next_proxy()).collect()
     }
 }
 

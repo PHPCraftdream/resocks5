@@ -290,7 +290,7 @@ where
     }
     let race = Arc::new(RaceState::default());
     let callback: Arc<dyn Fn(&AttemptReport) + Send + Sync> = Arc::new(on_attempt);
-    let target = target_addr.to_owned();
+    let target: Arc<str> = Arc::from(target_addr);
     let pool = Arc::clone(pool);
     #[cfg(feature = "tls")]
     let tls = tls_connector.cloned().map(Arc::new);
@@ -376,7 +376,7 @@ fn launch(
     index: usize,
     proxy: Arc<ProxyConfig>,
     race: Arc<RaceState>,
-    target: String,
+    target: Arc<str>,
     pool: Arc<ProxyPool>,
     timeout: Duration,
     tls: Option<Arc<TlsConnector>>,

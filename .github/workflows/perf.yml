@@ -1,0 +1,79 @@
+name: Perf counters 208
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/perf.yml'
+      - 'tests/perf208/**'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  counters:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Зафиксировать окружение и графы фич
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p perf-results
+          {
+            rustc -Vv
+            cargo -V
+            uname -a
+            ldd --version
+            printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+            printf 'target=x86_64-unknown-linux-gnu\nallocator=std::alloc::System\nprofile=test\n'
+            printf 'RUSTFLAGS=%s\nCARGO_INCREMENTAL=%s\n' "$RUSTFLAGS" "$CARGO_INCREMENTAL"
+            git rev-parse HEAD
+            git hash-object Cargo.lock
+            sha256sum Cargo.lock
+          } > perf-results/environment.txt
+          cp Cargo.lock perf-results/Cargo.lock
+          cargo tree --locked -p resocks5-net --features zeroize,test-instrumentation -e features > perf-results/sdk-features.txt
+          cargo tree --locked -p resocks5 --features test-instrumentation -e features > perf-results/app-features.txt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Проверить deadline runner без задержек
+        run: python -I -B tests/perf208/test_run.py
+      - name: Компиляция отдельно от бюджета измерений
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p resocks5-net --lib --target x86_64-unknown-linux-gnu --features zeroize,test-instrumentation --no-run --message-format=json > perf-results/sdk-build.json
+          cargo test --locked -p resocks5 --bin resocks5 --target x86_64-unknown-linux-gnu --features test-instrumentation --no-run --message-format=json > perf-results/app-build.json
+      - name: Измерения SDK и приложения, общий лимит 15 секунд
+        run: >-
+          python -I tests/perf208/run.py
+          --sdk perf-results/sdk-build.json
+          --app perf-results/app-build.json
+          --output perf-results/counters
+          --check sdk:types::chain_tests::
+          --check sdk:chain::selection_tests::
+          --check sdk:chain::accounting_tests::
+          --check app:server::tunnel::tunnel_log::tests::
+          --check app:logger::log::tests::
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf208-counters
+          path: perf-results/
+          if-no-files-found: error

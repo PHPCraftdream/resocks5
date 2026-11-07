@@ -45,13 +45,27 @@
 // isn't noisy — only `cargo doc` surfaces it.
 #![warn(missing_docs)]
 
-pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
+pub use error::{
+    socks5_rep_description, ConnectError, GssapiError, ProtocolViolation, SecureAuthError, Stage,
+    TimeoutKind,
+};
+
+/// May this build send credentials in clear text (feature `cleartext-client`)?
+/// The crate's own unit tests always may; integration tests link the library
+/// without `cfg(test)` and so exercise the default (refusing) build.
+pub(crate) const CLEARTEXT_CLIENT: bool = cfg!(any(test, feature = "cleartext-client"));
+/// May this build offer and accept clear-text credentials (feature
+/// `cleartext-server`)? Same test rule as [`CLEARTEXT_CLIENT`].
+pub(crate) const CLEARTEXT_SERVER: bool = cfg!(any(test, feature = "cleartext-server"));
 
 #[cfg(feature = "rotator")]
 #[path = "session/chain/mod.rs"]
 pub mod chain;
 pub mod connect;
 pub mod error;
+#[cfg(feature = "gssapi")]
+#[path = "session/auth/gssapi/mod.rs"]
+pub mod gssapi;
 #[cfg(feature = "pool")]
 #[path = "session/pool/mod.rs"]
 pub mod pool;
@@ -63,5 +77,21 @@ pub mod rating;
 #[cfg(feature = "rotator")]
 #[path = "session/rotator/mod.rs"]
 pub mod rotator;
+#[cfg(feature = "secure-auth")]
+#[path = "session/auth/secure_auth/mod.rs"]
+pub mod secure_auth;
 pub mod server;
+#[cfg(feature = "test-instrumentation")]
+#[path = "session/testing/mod.rs"]
+pub mod testing;
 pub mod types;
+
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf.rs"]
+mod perf;
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf_cases.rs"]
+mod perf_cases;
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "session/testing/perf_credentials.rs"]
+mod perf_credentials;

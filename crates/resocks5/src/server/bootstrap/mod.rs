@@ -3,6 +3,8 @@ mod runtime;
 mod startup;
 
 #[cfg(test)]
+mod gssapi_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use runtime::run_server;

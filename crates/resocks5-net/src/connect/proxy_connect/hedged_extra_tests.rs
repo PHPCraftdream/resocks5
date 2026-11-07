@@ -154,7 +154,7 @@ async fn drain_catches_callback_panic_and_still_delivers_remaining_reports() {
         0,
         proxy(dead_addr.ip().to_string(), dead_addr.port()),
         race.clone(),
-        "example.com:80".to_owned(),
+        "example.com:80".into(),
         pool(Duration::from_millis(300)),
         Duration::from_secs(1),
         None,
@@ -165,7 +165,7 @@ async fn drain_catches_callback_panic_and_still_delivers_remaining_reports() {
         1,
         live,
         race,
-        "example.com:80".to_owned(),
+        "example.com:80".into(),
         pool(Duration::from_secs(1)),
         Duration::from_secs(1),
         None,
@@ -275,4 +275,81 @@ fn a_hedge_tick_launches_only_when_idle_and_not_won() {
     assert!(!tick_may_launch(true, false), "a handshake is running");
     assert!(!tick_may_launch(false, true), "a win was published");
     assert!(!tick_may_launch(true, true));
+}
+
+/// SOCKS5 upstream that records the domain target of the CONNECT it receives
+/// and then either refuses it or accepts it.
+async fn recording_upstream(
+    listener: TcpListener,
+    accept: bool,
+    seen: mpsc::UnboundedSender<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut greeting = [0; 3];
+    stream.read_exact(&mut greeting).await.unwrap();
+    stream.write_all(&[5, 0]).await.unwrap();
+    let mut head = [0; 4];
+    stream.read_exact(&mut head).await.unwrap();
+    assert_eq!(head[3], 3, "a domain target stays a domain");
+    let mut host = vec![0; usize::from(stream.read_u8().await.unwrap())];
+    stream.read_exact(&mut host).await.unwrap();
+    let port = stream.read_u16().await.unwrap();
+    let target = format!("{}:{port}", String::from_utf8(host).unwrap());
+    seen.send(target).unwrap();
+    let rep = if accept { 0 } else { 5 };
+    stream
+        .write_all(&[5, rep, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let _ = stream.read_u8().await;
+}
+
+/// The one target string is shared by every launched attempt: each upstream
+/// sees the same CONNECT target, in launch order, whether it refuses or
+/// accepts it. Mutation: an attempt that gets a truncated or different target
+/// shows up as a different recorded string.
+#[tokio::test]
+async fn every_launched_attempt_requests_the_same_target() {
+    let (seen_tx, mut seen) = mpsc::unbounded_channel();
+    let mut candidates = Vec::new();
+    let mut servers = Vec::new();
+    for accept in [false, false, true] {
+        let (listener, candidate) = loopback().await;
+        candidates.push(candidate);
+        servers.push(tokio::spawn(recording_upstream(
+            listener,
+            accept,
+            seen_tx.clone(),
+        )));
+    }
+    drop(seen_tx);
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        connect_hedged(
+            &candidates,
+            "example.com:443",
+            &pool(Duration::from_secs(1)),
+            None,
+            &opts(Duration::ZERO),
+            |_| {},
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.winner, 2);
+    let mut targets = Vec::new();
+    for _ in 0..3 {
+        let target = tokio::time::timeout(Duration::from_secs(1), seen.recv())
+            .await
+            .expect("every launched attempt reports its target")
+            .expect("the channel stays open while attempts run");
+        targets.push(target);
+    }
+    assert_eq!(targets, ["example.com:443"; 3]);
+    drop(result);
+    for server in servers {
+        server.abort();
+    }
 }

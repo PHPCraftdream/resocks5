@@ -15,6 +15,32 @@ use resocks5_net::connect::{connect_hedged, AttemptOutcome, AttemptReport, Hedge
 use resocks5_net::pool::{AnyUpstream, ProxyPool};
 use resocks5_net::rotator::ProxyRotator;
 use resocks5_net::types::{ChainKey, ProxyConfig};
+
+/// Наблюдатель построений gate-плана для dial-маршрута.
+/// Production использует `NoopPlanBuildRecorder` (ZST без состояния):
+/// пустое тело `record` не может аллоцировать — отсутствие стоимости
+/// гарантировано конструкцией, а не оптимизатором.
+pub(super) trait PlanBuildRecorder {
+    /// Зафиксировать построение плана: (число gate-уровней, число exit-ротаторов); пустой план — (0, 0).
+    fn record(&mut self, gate_levels: usize, exit_rotators: usize);
+}
+
+/// Production-наблюдатель: zero-sized type без состояния и аллокаций.
+pub(super) struct NoopPlanBuildRecorder;
+
+impl PlanBuildRecorder for NoopPlanBuildRecorder {
+    fn record(&mut self, _gate_levels: usize, _exit_rotators: usize) {}
+}
+
+/// Тестовый наблюдатель: журнал `(gate_levels, exit_rotators)` каждого построения плана; пустой план — `(0, 0)`.
+pub(super) type PlanBuildTrace = Vec<(usize, usize)>;
+
+impl PlanBuildRecorder for PlanBuildTrace {
+    fn record(&mut self, gate_levels: usize, exit_rotators: usize) {
+        self.push((gate_levels, exit_rotators));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn establish_connection(
     target_addr: &str,
@@ -27,6 +53,37 @@ pub async fn establish_connection(
     network: &Arc<NetworkConfig>,
     client_user: Option<&str>,
     tls_connector: Option<&TlsConnector>,
+) -> anyhow::Result<AnyUpstream> {
+    let mut recorder = NoopPlanBuildRecorder;
+    establish_connection_traced(
+        target_addr,
+        gates,
+        v6_rotator,
+        v4_rotator,
+        logger,
+        banned,
+        pool,
+        network,
+        client_user,
+        tls_connector,
+        &mut recorder,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
+    target_addr: &str,
+    gates: &Arc<GateLevels>,
+    v6_rotator: &Option<Arc<ProxyRotator>>,
+    v4_rotator: &Option<Arc<ProxyRotator>>,
+    logger: &Arc<Logger>,
+    banned: &Arc<RegexSet>,
+    pool: &Arc<ProxyPool>,
+    network: &Arc<NetworkConfig>,
+    client_user: Option<&str>,
+    tls_connector: Option<&TlsConnector>,
+    recorder: &mut R,
 ) -> anyhow::Result<AnyUpstream> {
     let handshake_timeout = Duration::from_secs(network.handshake_timeout_sec);
     let max_attempts = network.max_upstream_attempts;
@@ -75,9 +132,7 @@ pub async fn establish_connection(
     for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         if let Some(cached_proxy) = rotator.get_linked(target_addr) {
             if cached_proxy.gate.is_none() {
-                let route = ChainKey::new(Arc::new(
-                    ProxyConfig::chain([cached_proxy.clone()]).expect("singleton chain"),
-                ));
+                let route = ChainKey::singleton(&cached_proxy);
                 if tried_routes.insert(route) {
                     candidates.push(Candidate {
                         rotator: rotator.clone(),
@@ -130,14 +185,7 @@ pub async fn establish_connection(
             logger.cache_attempt(|| {
                 format!("Attempting to use cached proxy for {}{}", target_addr, ctag)
             });
-            let config = pick.config();
-            let gate = pick
-                .hops()
-                .iter()
-                .take(pick.hops().len().saturating_sub(1))
-                .map(|hop| print_cfg(&hop.proxy))
-                .collect::<Vec<_>>()
-                .join(" -> ");
+            let config = pick.config_arc();
             let t0 = Instant::now();
             match resocks5_net::connect::connect_chain(
                 &config,
@@ -150,7 +198,7 @@ pub async fn establish_connection(
             {
                 Ok(stream) => {
                     pick.record_success();
-                    logger.attempt(|| {
+                    log_chain_attempt(logger, &pick, |gate| {
                         format!(
                             "attempt target={} via={} gate={} path=cache outcome=ok dur={}ms{}",
                             target_addr,
@@ -164,14 +212,9 @@ pub async fn establish_connection(
                     return Ok(stream);
                 }
                 Err(error) => {
-                    let gate = pick
-                        .hops()
-                        .iter()
-                        .take(pick.hops().len().saturating_sub(1))
-                        .map(|hop| print_cfg(&hop.proxy))
-                        .collect::<Vec<_>>()
-                        .join(" -> ");
-                    logger.attempt(|| format!("attempt target={} via={} gate={} path=cache outcome=fail dur={}ms err={}{}", target_addr, print_cfg(pick.exit().proxy.as_ref()), gate, t0.elapsed().as_millis(), error, ctag));
+                    log_chain_attempt(logger, &pick, |gate| {
+                        format!("attempt target={} via={} gate={} path=cache outcome=fail dur={}ms err={}{}", target_addr, print_cfg(pick.exit().proxy.as_ref()), gate, t0.elapsed().as_millis(), error, ctag)
+                    });
                     logger.proxy_failure(|| {
                         format!(
                             "Cached proxy failed: {} - {}{}",
@@ -186,8 +229,10 @@ pub async fn establish_connection(
                     for q in plan
                         .get_or_insert_with(|| {
                             if attempts + direct_reserve < max_attempts {
+                                recorder.record(gates.len(), exits.len());
                                 ChainPlan::new(gates, &exits)
                             } else {
+                                recorder.record(0, 0);
                                 ChainPlan::new(&GateLevels::default(), &[])
                             }
                         })
@@ -209,6 +254,7 @@ pub async fn establish_connection(
     }
 
     if !gates.is_empty() && attempts + direct_reserve < max_attempts && plan.is_none() {
+        recorder.record(gates.len(), exits.len());
         plan = Some(ChainPlan::new(gates, &exits));
     }
     while !gates.is_empty() && attempts + direct_reserve < max_attempts {
@@ -220,14 +266,7 @@ pub async fn establish_connection(
             continue;
         }
         attempts += 1;
-        let config = pick.config();
-        let gate = pick
-            .hops()
-            .iter()
-            .take(pick.hops().len().saturating_sub(1))
-            .map(|hop| print_cfg(&hop.proxy))
-            .collect::<Vec<_>>()
-            .join(" -> ");
+        let config = pick.config_arc();
         let t0 = Instant::now();
         match resocks5_net::connect::connect_chain(
             &config,
@@ -240,7 +279,7 @@ pub async fn establish_connection(
         {
             Ok(stream) => {
                 pick.record_success();
-                logger.attempt(|| {
+                log_chain_attempt(logger, &pick, |gate| {
                     format!(
                         "attempt target={} via={} gate={} path=gate outcome=ok dur={}ms{}",
                         target_addr,
@@ -250,15 +289,13 @@ pub async fn establish_connection(
                         ctag
                     )
                 });
-                pick.exit()
-                    .rotator
-                    .link_proxy(target_addr.to_string(), Arc::new(config));
+                pick.exit().rotator.link_proxy(target_addr, config);
                 logger
                     .cache_write(|| format!("Cache written for {} with gate{}", target_addr, ctag));
                 return Ok(stream);
             }
             Err(error) => {
-                logger.attempt(|| {
+                log_chain_attempt(logger, &pick, |gate| {
                     format!(
                         "attempt target={} via={} gate={} path=gate outcome=fail dur={}ms err={}{}",
                         target_addr,
@@ -303,9 +340,7 @@ pub async fn establish_connection(
             break;
         }
         for proxy_config in rotator.pick_order() {
-            let route = ChainKey::new(Arc::new(
-                ProxyConfig::chain([proxy_config.clone()]).expect("singleton chain"),
-            ));
+            let route = ChainKey::singleton(&proxy_config);
             if tried_routes.contains(&route) {
                 continue;
             }
@@ -394,7 +429,7 @@ fn report_attempt(
             if !report.after_win && *cached {
                 logger.cache_hit(|| format!("Cache used for {}{}", target_addr, ctag));
             } else if !report.after_win {
-                rotator.link_proxy(target_addr.to_string(), proxy.clone());
+                rotator.link_proxy(target_addr, proxy.clone());
                 logger
                     .cache_write(|| format!("Cache written for {} directly{}", target_addr, ctag));
             }

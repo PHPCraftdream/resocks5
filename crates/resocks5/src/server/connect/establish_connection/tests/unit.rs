@@ -538,7 +538,7 @@ async fn dead_cache_route_is_skipped_and_direct_fallback_survives() {
     composite.gate = Some(Arc::new(dead_gate.clone()));
 
     let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
-    v4.link_proxy(target.to_string(), Arc::new(composite));
+    v4.link_proxy(target, Arc::new(composite));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![dead_gate.clone()])),
@@ -648,7 +648,7 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
     composite.gate = Some(Arc::new(dead_gate.clone()));
 
     let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
-    v4.link_proxy(target.to_string(), Arc::new(composite));
+    v4.link_proxy(target, Arc::new(composite));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![dead_gate.clone()])),
@@ -657,7 +657,8 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
     let gate_orders_before = gate_rotator.pick_order_calls();
     let v4_orders_before = v4.pick_order_calls();
 
-    let result = establish_connection(
+    let mut plan_trace = PlanBuildTrace::new();
+    let result = establish_connection_traced(
         target,
         &gates,
         &None,
@@ -668,6 +669,7 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         &network,
         None,
         None,
+        &mut plan_trace,
     )
     .await;
 
@@ -698,6 +700,19 @@ async fn budget_exhausted_by_cache_failure_makes_no_further_attempts() {
         v4_orders_before,
         "budget exhaustion must skip building the direct order"
     );
+    // Счётчики `pick_order_calls` выше сохранены для прямого пути; gate-план
+    // строится из ленивых курсоров, поэтому авторитетный негативный оракул
+    // gate-фазы — trace построений: полный gate-план строиться не может.
+    assert!(
+        plan_trace.iter().all(|(gates, _)| *gates == 0),
+        "budget exhaustion must skip building the gate plan, trace: {plan_trace:?}"
+    );
+}
+
+/// Production-наблюдатель должен быть zero-sized: никаких полей и аллокаций.
+#[test]
+fn noop_plan_build_recorder_is_zero_sized() {
+    assert_eq!(std::mem::size_of::<NoopPlanBuildRecorder>(), 0);
 }
 
 /// SOCKS5 stub that answers every handshake round on a socket with
@@ -805,8 +820,8 @@ async fn queued_sticky_routes_stay_within_one_launch_budget() {
     let fast = socks5_config(fast_addr, false);
     let v6 = Arc::new(ProxyRotator::new(vec![slow.clone()]));
     let v4 = Arc::new(ProxyRotator::new(vec![fast.clone()]));
-    v6.link_proxy(target.to_string(), Arc::new(slow.clone()));
-    v4.link_proxy(target.to_string(), Arc::new(fast.clone()));
+    v6.link_proxy(target, Arc::new(slow.clone()));
+    v4.link_proxy(target, Arc::new(fast.clone()));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![
@@ -891,8 +906,8 @@ async fn spent_budget_truncates_the_queued_sticky_slice() {
     composite.gate = Some(Arc::new(gate.clone()));
     let v6 = Arc::new(ProxyRotator::new(vec![sticky.clone()]));
     let v4 = Arc::new(ProxyRotator::new(vec![inner.clone()]));
-    v6.link_proxy(target.to_string(), Arc::new(sticky.clone()));
-    v4.link_proxy(target.to_string(), Arc::new(composite));
+    v6.link_proxy(target, Arc::new(sticky.clone()));
+    v4.link_proxy(target, Arc::new(composite));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![gate.clone()])),

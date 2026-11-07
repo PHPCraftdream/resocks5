@@ -13,8 +13,15 @@ impl ProxyConfig {
     where
         I: IntoIterator<Item = Arc<ProxyConfig>>,
     {
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.chain_builds += 1);
         let mut chain: Option<Arc<ProxyConfig>> = None;
         for node in nodes {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| {
+                c.chain_nodes += 1;
+                c.config_clones += 1;
+            });
             let mut linked = (*node).clone();
             linked.gate = chain;
             chain = Some(Arc::new(linked));
@@ -50,6 +57,22 @@ impl ChainKey {
     /// Create a key rooted at the exit configuration.
     pub fn new(exit: Arc<ProxyConfig>) -> Self {
         Self(exit)
+    }
+
+    /// Key of one node on its own, without its gate link.
+    ///
+    /// A gate-less node is shared as is (refcount only); a node with a gate
+    /// is copied once with the link dropped. Equal to the key of
+    /// `ProxyConfig::chain([node])`, without that call's copies.
+    pub fn singleton(node: &Arc<ProxyConfig>) -> Self {
+        if node.gate.is_none() {
+            return Self(Arc::clone(node));
+        }
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.config_clones += 1);
+        let mut plain = (**node).clone();
+        plain.gate = None;
+        Self(Arc::new(plain))
     }
 
     /// Return the exit configuration.
@@ -88,18 +111,40 @@ impl Eq for ChainKey {}
 
 impl Hash for ChainKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let nodes = self.0.nodes();
-        nodes.len().hash(state);
-        for node in nodes {
-            (
-                std::mem::discriminant(&node.protocol),
-                &node.host,
-                node.port,
-                &node.user,
-                &node.password,
-                node.gate_level,
-            )
-                .hash(state);
+        let mut nodes = [None; super::MAX_CHAIN_NODES];
+        let mut len = 0;
+        let mut current = Some(self.0.as_ref());
+        while let Some(node) = current {
+            if len == nodes.len() {
+                // Не прошедшие validate длинные цепочки тоже остаются допустимыми ключами.
+                let nodes = self.0.nodes();
+                nodes.len().hash(state);
+                for node in nodes {
+                    hash_node(node, state);
+                }
+                return;
+            }
+            nodes[len] = Some(node);
+            len += 1;
+            current = node.gate.as_deref();
+        }
+        len.hash(state);
+        for node in nodes[..len].iter().rev().flatten() {
+            hash_node(node, state);
         }
     }
+}
+
+fn hash_node<H: Hasher>(node: &ProxyConfig, state: &mut H) {
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    crate::perf::operation(|c| c.hash_nodes += 1);
+    (
+        std::mem::discriminant(&node.protocol),
+        &node.host,
+        node.port,
+        &node.user,
+        &node.password,
+        node.gate_level,
+    )
+        .hash(state);
 }

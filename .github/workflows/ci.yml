@@ -252,6 +252,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p resocks5-net ${{ matrix.args }} --locked ${{ needs.changes.outputs.net_test_args }}
+      - name: HTTP challenge policy without unit-test cleartext override
+        if: (matrix.name == 'default' || matrix.name == 'cleartext-server') && needs.changes.outputs.net_test_args != ''
+        run: cargo test -p resocks5-net ${{ matrix.args }} --locked --test no_cleartext
 
   # Lean clippy for the library: dead-code and unused-import lints surface
   # only in feature-off builds, and the workspace `lint` job always sees
@@ -319,6 +322,34 @@ jobs:
         env:
           RESOCKS5NET_PROVIDER_CONTRACT_EXPECT_PANIC: "1"
         run: cargo test -p resocks5-net --features "tls,rustls/custom-provider" --test crypto_provider_contract --locked
+
+  # The Kerberos backend links the platform GSS-API (libkrb5) and needs its
+  # headers and libclang, so it is outside the `--all-features`-style rows above;
+  # this job builds it, lints it, and runs the real-Kerberos tests against a
+  # throwaway MIT KDC (.github/checks/kdc-test.sh).
+  gssapi-system:
+    name: gssapi (real Kerberos)
+    needs: changes
+    if: needs.changes.outputs.run_net == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gssapi-system
+      - name: install Kerberos
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libkrb5-dev krb5-user krb5-kdc krb5-admin-server clang libclang-dev libssl-dev
+      - run: cargo clippy -p resocks5-net --features gssapi-system --all-targets --locked -- -D warnings
+      - run: cargo clippy -p resocks5 --features gssapi-system --all-targets --locked -- -D warnings
+      # The app's GSSAPI account mapping, on the mock mechanism.
+      - run: cargo test -p resocks5 --features gssapi --locked gssapi
+      - run: sh .github/checks/kdc-test.sh
 
   # tests/feature_unification is its own workspace (excluded from the root
   # one), so no job above ever compiles it. There cargo unifies `tls` and
@@ -474,6 +505,7 @@ jobs:
       - clippy-net-lean
       - doc-net-lean
       - crypto-provider-contract
+      - gssapi-system
       - feature-unification
       - portable-builds
       - deny

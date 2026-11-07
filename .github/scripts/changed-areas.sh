@@ -28,7 +28,7 @@
 # the self-test uses it to feed cases without a git history.
 set -eu
 
-ALL_ROWS="lean pool tls pool-tls serde rating rotator zeroize test-instrumentation default all"
+ALL_ROWS="lean pool tls pool-tls serde rating rotator zeroize test-instrumentation cleartext-client cleartext-server secure-auth gssapi default all"
 
 row_args() {
   case "$1" in
@@ -40,9 +40,15 @@ row_args() {
     rating) echo "--no-default-features --features rating" ;;
     rotator) echo "--no-default-features --features rotator" ;;
     zeroize) echo "--no-default-features --features zeroize" ;;
+    cleartext-client) echo "--no-default-features --features cleartext-client" ;;
+    cleartext-server) echo "--no-default-features --features cleartext-server" ;;
+    secure-auth) echo "--no-default-features --features secure-auth" ;;
+    gssapi) echo "--no-default-features --features gssapi" ;;
     test-instrumentation) echo "--no-default-features --features test-instrumentation" ;;
     default) echo "" ;;
-    all) echo "--all-features" ;;
+    # Every feature except `gssapi-system`, which needs the system Kerberos
+    # library and is covered by its own job (`gssapi-system` in ci.yml).
+    all) echo "--features pool,tls,serde,rating,rotator,zeroize,test-instrumentation,cleartext-client,cleartext-server,secure-auth,gssapi" ;;
     *) return 1 ;;
   esac
 }

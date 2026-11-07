@@ -360,6 +360,7 @@ fn main_cfg_with_allowed(rule: &str) -> crate::config::MainConfig {
         banned_patterns: Vec::new(),
         auth: crate::config::AuthConfig {
             allow_anonymous: false,
+            ..Default::default()
         },
         log: crate::logger::LogConfig::default(),
         pool: Default::default(),
@@ -645,4 +646,131 @@ fn all_rotators_lists_every_gate_level_then_exits() {
         .collect::<Vec<_>>();
     assert_eq!(hosts, vec!["gate-high", "gate-low", "exit-v6", "exit-v4"]);
     assert!(super::startup::all_rotators(&GateLevels::default(), &[None, None]).is_empty());
+}
+
+// ── upstream credentials: stored as written, never sent in clear ──
+
+mod upstream_auth {
+    use std::time::Duration;
+
+    use resocks5_net::connect::{dial_tcp, DialOptions};
+    use resocks5_net::secure_auth::{KdfParams, UserSecret};
+    use resocks5_net::testing::{MockAuth, MockUpstream};
+    use resocks5_net::types::{ProxyConfig, ProxyProtocol};
+    use resocks5_net::ConnectError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::super::startup::{
+        cleartext_upstream_credentials, cleartext_upstream_message, secure_upstream_auth,
+    };
+
+    async fn dial(proxy: &ProxyConfig) -> Result<tokio::net::TcpStream, ConnectError> {
+        let opts = DialOptions::new().with_handshake_timeout(Duration::from_secs(10));
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            dial_tcp(proxy, "example.test", 443, &opts),
+        )
+        .await
+        .expect("test guard")
+    }
+
+    /// A SOCKS5 entry with credentials becomes secure auth: the user stays,
+    /// the clear-text password leaves the config. Anything else is untouched.
+    /// Mutation: converting HTTP/HTTPS or credential-less entries fails a row.
+    #[test]
+    fn only_socks5_entries_with_credentials_are_converted() {
+        let socks = secure_upstream_auth(ProxyConfig::socks5("h", 1).with_auth("u", "p"));
+        assert!(socks.secure_auth.is_some());
+        assert_eq!(socks.user.as_deref(), Some("u"));
+        assert_eq!(socks.password, None);
+        for other in [
+            ProxyConfig::socks5("h", 1),
+            ProxyConfig::http("h", 1).with_auth("u", "p"),
+            ProxyConfig::https("h", 1).with_auth("u", "p"),
+        ] {
+            let before = (other.user.clone(), other.password.clone());
+            let after = secure_upstream_auth(other);
+            assert!(after.secure_auth.is_none());
+            assert_eq!((after.user, after.password), before);
+        }
+    }
+
+    /// The converted entry logs in to a secure-auth upstream and tunnels.
+    /// Mutation: leaving the entry as parsed would refuse the dial.
+    #[tokio::test]
+    async fn a_converted_entry_authenticates_with_secure_auth() {
+        let secret = UserSecret::from_password("pw", KdfParams::DEFAULT).unwrap();
+        let mock = MockUpstream::socks5()
+            .auth(MockAuth::Secure {
+                user: "alice".into(),
+                secret,
+            })
+            .spawn()
+            .await
+            .unwrap();
+        let proxy = secure_upstream_auth(mock.proxy().with_auth("alice", "pw"));
+        let mut tunnel = dial(&proxy).await.unwrap();
+        tunnel.write_all(b"ping").await.unwrap();
+        let mut back = [0u8; 4];
+        tunnel.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ping");
+        assert_eq!(mock.targets(), ["example.test:443"]);
+    }
+
+    /// The password is never sent in clear text: an upstream that only takes
+    /// username/password gets no password from the converted entry (method
+    /// 0x02 is not even offered), and the unconverted entry is refused before
+    /// any connect. Mutation: enabling `cleartext-client` in the app makes
+    /// the second dial reach the mock and send the password.
+    #[tokio::test]
+    async fn a_cleartext_only_upstream_never_receives_the_password() {
+        let mock = MockUpstream::socks5()
+            .auth(MockAuth::Cleartext {
+                user: "alice".into(),
+                password: "pw".into(),
+            })
+            .spawn()
+            .await
+            .unwrap();
+        let converted = secure_upstream_auth(mock.proxy().with_auth("alice", "pw"));
+        let error = dial(&converted).await.unwrap_err();
+        assert!(
+            matches!(error, ConnectError::MethodUnsupported { .. }),
+            "{error:?}"
+        );
+        let raw = mock.proxy().with_auth("alice", "pw");
+        let error = dial(&raw).await.unwrap_err();
+        assert!(
+            matches!(error, ConnectError::CleartextCredentialsRefused),
+            "{error:?}"
+        );
+        assert!(mock.targets().is_empty());
+        assert_eq!(
+            mock.connections(),
+            1,
+            "the unconverted dial never connected"
+        );
+    }
+
+    /// Plain HTTP with credentials is flagged and refused; the notice names
+    /// the host and never the credentials.
+    #[tokio::test]
+    async fn plain_http_with_credentials_is_flagged_and_refused() {
+        let mock = MockUpstream::http().spawn().await.unwrap();
+        let proxy = mock.proxy().with_auth("alice", "very-secret");
+        assert!(cleartext_upstream_credentials(&proxy));
+        assert!(!cleartext_upstream_credentials(&mock.proxy()));
+        assert!(!cleartext_upstream_credentials(
+            &ProxyConfig::new(ProxyProtocol::Https, "h", 1).with_auth("u", "p")
+        ));
+        let message = cleartext_upstream_message("http_v4", &proxy);
+        assert!(message.contains("127.0.0.1"));
+        assert!(!message.contains("alice") && !message.contains("very-secret"));
+        let error = dial(&proxy).await.unwrap_err();
+        assert!(
+            matches!(error, ConnectError::CleartextCredentialsRefused),
+            "{error:?}"
+        );
+        assert_eq!(mock.connections(), 0);
+    }
 }

@@ -9,6 +9,7 @@ pub struct Credentials {
     password: String,
     username_raw: Option<Vec<u8>>, // present only when UNAME was not valid UTF-8
     password_raw: Option<Vec<u8>>,
+    basic_payload: Option<String>, // HTTP Basic only: the whole decoded token
 }
 
 impl Credentials {
@@ -19,7 +20,16 @@ impl Credentials {
             password,
             username_raw: None,
             password_raw: None,
+            basic_payload: None,
         }
+    }
+
+    /// Build from an HTTP Basic token: the pair split at the first `:` plus the
+    /// whole decoded token (`payload`), kept verbatim.
+    pub(crate) fn with_basic_payload(username: String, password: String, payload: String) -> Self {
+        let mut credentials = Self::new(username, password);
+        credentials.basic_payload = Some(payload);
+        credentials
     }
 
     /// Build credentials carrying the raw submitted bytes of any field that was
@@ -35,6 +45,7 @@ impl Credentials {
             password,
             username_raw,
             password_raw,
+            basic_payload: None,
         }
     }
 
@@ -59,7 +70,19 @@ impl Credentials {
             password: self.password.clone(),
             username_raw: self.username_raw.clone(),
             password_raw: self.password_raw.clone(),
+            basic_payload: self.basic_payload.clone(),
         }
+    }
+
+    /// The whole decoded HTTP Basic token, exactly as the client sent it
+    /// (`user:pass`, split nowhere): `Some` for an HTTP Basic request, `None`
+    /// for SOCKS5. Unlike `username()` / `password()` it never loses
+    /// information: `"u:"` (empty password) and `"u:p:q"` (colon inside the
+    /// password) stay unambiguous, and a gateway that forwards the token
+    /// upstream needs no re-joining. The text is valid UTF-8 (a token that is
+    /// not is refused with 407 before this point).
+    pub fn basic_payload(&self) -> Option<&str> {
+        self.basic_payload.as_deref()
     }
 
     /// Exact submitted UNAME bytes (the lossy `username()` text must not be
@@ -99,6 +122,7 @@ impl Credentials {
         self.password.zeroize();
         self.username_raw.zeroize();
         self.password_raw.zeroize();
+        self.basic_payload.zeroize();
     }
 }
 
@@ -112,6 +136,41 @@ impl fmt::Debug for Credentials {
 impl Drop for Credentials {
     fn drop(&mut self) {
         self.wipe();
+        #[cfg(test)]
+        drop_observer::notify(self);
+    }
+}
+
+#[cfg(all(test, feature = "zeroize"))]
+pub(super) mod drop_observer {
+    use super::Credentials;
+    use std::cell::Cell;
+
+    thread_local! {
+        static OBSERVER: Cell<Option<fn(&Credentials)>> = const { Cell::new(None) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| slot.set(None));
+        }
+    }
+
+    pub(crate) fn install(observer: fn(&Credentials)) -> Guard {
+        OBSERVER.with(|slot| {
+            assert!(slot.get().is_none(), "nested credentials drop observer");
+            slot.set(Some(observer));
+        });
+        Guard
+    }
+
+    pub(super) fn notify(credentials: &Credentials) {
+        let observer = OBSERVER.try_with(Cell::get).ok().flatten();
+        if let Some(observer) = observer {
+            observer(credentials);
+        }
     }
 }
 

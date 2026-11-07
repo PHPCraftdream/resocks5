@@ -11,12 +11,18 @@
 //! HTTP proxy; we aim to expose the same upstream-rotator pipeline
 //! through whichever proxy protocol the client speaks.
 //!
-//! Authentication uses RFC 7617 `Proxy-Authorization: Basic` with the
-//! shared `AuthState` — the same users and the same `allow_anonymous`
-//! policy as on the SOCKS5 side. Failed/missing credentials yield
-//! `407 Proxy Authentication Required` with `Proxy-Authenticate: Basic
-//! realm="resocks5"`. Upstream connect failures yield `502 Bad Gateway`;
-//! banned targets yield `403 Forbidden`.
+//! HTTP has no password authentication: Basic would put the password on
+//! the wire. With `allow_anonymous` a request without `Proxy-Authorization`
+//! is served anonymously; any request carrying credentials, and any request
+//! when anonymous access is off, gets `407 Proxy Authentication Required`.
+//! Without SDK feature `cleartext-server`, the challenge is `Resocks5-Secure`,
+//! not Basic; enabling the feature preserves the previous Basic challenge.
+//! This is not HTTP secure auth. RFC 9110 §15.5.8 requires the 407 challenge;
+//! 403 denotes an access denial. A client may send Basic preemptively, which
+//! the server cannot prevent. Browser prompt behavior has not been tested.
+//! Users authenticate over SOCKS5 (secure auth, method 0x80). Upstream
+//! connect failures yield `502 Bad Gateway`; banned targets yield
+//! `403 Forbidden`.
 
 pub mod handle_http_client;
 

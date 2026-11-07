@@ -481,6 +481,9 @@ async fn retain_credentials_builder_defaults_chain_and_copies() {
     .expect("bounded retain_credentials_builder_defaults_chain_and_copies");
 }
 
+#[cfg(feature = "zeroize")]
+mod drop_lifecycle;
+
 /// Wiping clears credential and request secrets; the pipeline is preserved.
 #[cfg(feature = "zeroize")]
 #[tokio::test]
@@ -494,6 +497,9 @@ async fn zeroize_wipes_credentials_and_requests() {
 
         // (b) Request wipe clears identity, keeps the pipeline.
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:1".into(),
             username: Some("wipe-user-1".to_owned()),
@@ -514,6 +520,9 @@ async fn zeroize_wipes_credentials_and_requests() {
 
         // (c) A partially drained request still drops without panicking.
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:2".into(),
             username: Some("wipe-user-1".to_owned()),
@@ -541,6 +550,9 @@ const _: () = {
 /// Drain one host reply from a duplex, after a clean flush and writer drop.
 async fn reply_wire(protocol: Protocol, reply: Reply) -> Vec<u8> {
     let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
         username_raw: None,
         credentials: None,
         protocol,
@@ -629,6 +641,9 @@ async fn reply_flush_delivers_the_whole_message_for_every_pair() {
                 (Protocol::Http, http_bytes),
             ] {
                 let req = IncomingRequest {
+                    auth: crate::server::AuthMethod::Anonymous,
+                    #[cfg(feature = "gssapi")]
+                    gss: None,
                     username_raw: None,
                     credentials: None,
                     protocol,
@@ -757,6 +772,9 @@ async fn reply_writes_drain_through_a_four_byte_duplex_with_a_concurrent_reader(
             (Protocol::Http, Reply::TimedOut, EXPECT_HTTP_504),
         ] {
             let req = IncomingRequest {
+                auth: crate::server::AuthMethod::Anonymous,
+                #[cfg(feature = "gssapi")]
+                gss: None,
                 username_raw: None,
                 credentials: None,
                 protocol,
@@ -795,6 +813,9 @@ async fn reply_to_closed_peer_fails_with_io_error() {
                 Reply::Overloaded,
             ] {
                 let req = IncomingRequest {
+        auth: crate::server::AuthMethod::Anonymous,
+        #[cfg(feature = "gssapi")]
+        gss: None,
                     username_raw: None,
                     credentials: None,
                     protocol,
@@ -864,4 +885,19 @@ async fn accept_then_error_replies_reach_the_scripted_client() {
     })
     .await
     .expect("bounded handshake-level error replies");
+}
+
+/// The retained Basic payload (the whole `user:pass` text) is wiped with the
+/// rest of the credentials. Mutation: leaving it out of `wipe` keeps the text.
+#[cfg(feature = "zeroize")]
+#[test]
+fn zeroize_wipes_the_basic_payload() {
+    let mut c = Credentials::with_basic_payload(
+        "wipe-user".to_owned(),
+        "wipe-pass".to_owned(),
+        "wipe-user:wipe-pass".to_owned(),
+    );
+    assert_eq!(c.basic_payload(), Some("wipe-user:wipe-pass"));
+    c.wipe();
+    assert_eq!(c.basic_payload(), None);
 }

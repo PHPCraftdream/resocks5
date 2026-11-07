@@ -8,13 +8,14 @@
 //! exit. A layer whose candidates are all marked dead ends the plan at once.
 //! Only explicit complete-chain exclusions are retained.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::RandomState;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::connect::{ChainError, ChainStage};
 use crate::error::ConnectError;
-use crate::rotator::ProxyRotator;
+use crate::rotator::{same_upstream, upstream_hash, LazyCandidates, ProxyRotator};
 use crate::types::{ChainKey, ProxyConfig};
 
 /// Ranked proxy rotators used as chain gates.
@@ -101,11 +102,7 @@ impl GateLevels {
             if node.gate_level != *rank {
                 return None;
             }
-            let proxy = rotator
-                .all_proxies()
-                .iter()
-                .find(|candidate| same_node(candidate, node))?
-                .clone();
+            let proxy = rotator.resolve_identity(node)?.clone();
             hops.push(Hop {
                 rotator: rotator.clone(),
                 proxy,
@@ -113,12 +110,7 @@ impl GateLevels {
         }
         let exit_node = nodes.last()?;
         for rotator in exits {
-            if let Some(proxy) = rotator
-                .all_proxies()
-                .iter()
-                .find(|candidate| same_node(candidate, exit_node))
-                .cloned()
-            {
+            if let Some(proxy) = rotator.resolve_identity(exit_node).cloned() {
                 hops.push(Hop {
                     rotator: rotator.clone(),
                     proxy,
@@ -141,15 +133,6 @@ impl std::fmt::Debug for GateLevels {
     }
 }
 
-fn same_node(a: &ProxyConfig, b: &ProxyConfig) -> bool {
-    a.protocol == b.protocol
-        && a.host == b.host
-        && a.port == b.port
-        && a.user == b.user
-        && a.password == b.password
-        && a.gate_level == b.gate_level
-}
-
 /// One selected node and its source rotator.
 #[derive(Clone)]
 pub struct Hop {
@@ -165,10 +148,20 @@ struct Candidate {
     key: ChainKey,
 }
 struct Layer {
-    candidates: Vec<Candidate>,
-    /// Candidates not yet marked dead; zero means no chain can exist.
+    /// Ленивые курсоры: gate-слой — 1; exit-слой — N, потребляются по порядку.
+    cursors: Vec<LazyCandidates>,
+    /// Различных singleton-идентичностей в объединении eligible.
     live: usize,
+    /// Идентичности уже выданных кандидатов (first-owner dedup).
+    /// Лениво выделенная таблица: у lazy-слоёв аллоцируется при первом pull;
+    /// eager-слой (cursors пуст) dedup'ирует сканом candidates — таблица
+    /// не создаётся вовсе и не аллоцирует.
+    emitted: Option<HashSet<ChainKey>>,
+    /// Материализованный префикс в точном взвешенном порядке.
+    candidates: Vec<Candidate>,
     index: usize,
+    /// Какой курсор активен.
+    cursor_index: usize,
 }
 
 /// One complete chain candidate, gates outermost and exit last.
@@ -187,10 +180,17 @@ impl ChainPick {
     pub fn key(&self) -> ChainKey {
         self.key.clone()
     }
-    /// Build the linked configuration for this chain.
+    /// The linked configuration for this chain, shared with the pick's key:
+    /// a refcount bump, no copy. Prefer it over [`config`](Self::config)
+    /// unless an owned, mutable value is needed.
+    pub fn config_arc(&self) -> Arc<ProxyConfig> {
+        Arc::clone(self.key.exit())
+    }
+    /// Build the linked configuration for this chain (an owned copy).
     pub fn config(&self) -> ProxyConfig {
-        ProxyConfig::chain(self.hops.iter().map(|hop| hop.proxy.clone()))
-            .expect("a chain pick always has an exit")
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.config_clones += 1);
+        self.key.exit().as_ref().clone()
     }
     /// Record a success on every hop; needs no plan, so a cached chain can use it.
     pub fn record_success(&self) {
@@ -219,6 +219,9 @@ pub struct ChainPlan {
     seen: HashSet<ChainKey>,
     dead: HashSet<ChainKey>,
     done: bool,
+    /// Отложенный advance одометра: выполняется в начале следующего `next_pick`,
+    /// чтобы материализовать кандидатов строго по фактическому потреблению.
+    need_advance: bool,
     /// Test-only count of `next_pick` loop iterations for work-bound oracles.
     #[cfg(test)]
     steps: u64,
@@ -227,50 +230,23 @@ pub struct ChainPlan {
 impl ChainPlan {
     /// Snapshot weighted-random gate orders and concatenate exit candidates into one layer.
     pub fn new(gates: &GateLevels, exits: &[Arc<ProxyRotator>]) -> Self {
-        let mut layers: Vec<_> = gates
-            .iter()
-            .map(|(_, rotator)| {
-                let candidates = deduplicate(
-                    rotator
-                        .pick_order()
-                        .into_iter()
-                        .map(|proxy| (rotator.clone(), proxy)),
-                );
-                Layer {
-                    live: candidates.len(),
-                    candidates,
-                    index: 0,
-                }
-            })
-            .collect();
-        let mut candidates = Vec::new();
-        let mut keys = HashSet::new();
-        for rotator in exits {
-            for proxy in rotator.pick_order() {
-                let key = singleton_key(&proxy);
-                if keys.insert(key.clone()) {
-                    candidates.push(Candidate {
-                        hop: Hop {
-                            rotator: rotator.clone(),
-                            proxy,
-                        },
-                        key,
-                    });
-                }
-            }
-        }
-        let live = candidates.len();
-        layers.push(Layer {
-            live,
-            candidates,
-            index: 0,
-        });
-        let done = layers.iter().any(|layer| layer.candidates.is_empty());
+        // Точная ёмкость: один аллокат под все слои без роста и без
+        // минимального запаса RawVec (для вырожденных планов это вся
+        // разница с baseline по памяти).
+        let mut layers: Vec<Layer> = Vec::with_capacity(gates.len() + 1);
+        layers.extend(
+            gates
+                .iter()
+                .map(|(_, rotator)| lazy_layer(std::slice::from_ref(rotator))),
+        );
+        layers.push(lazy_layer(exits));
+        let done = layers.iter().any(|layer| layer.live == 0);
         Self {
             layers,
             seen: HashSet::new(),
             dead: HashSet::new(),
             done,
+            need_advance: false,
             #[cfg(test)]
             steps: 0,
         }
@@ -280,6 +256,17 @@ impl ChainPlan {
     fn next_pick(&mut self) -> Option<ChainPick> {
         while !self.done {
             self.count_step();
+            if self.need_advance {
+                self.advance();
+                self.need_advance = false;
+                if self.done {
+                    return None;
+                }
+            }
+            for layer in &mut self.layers {
+                let index = layer.index;
+                layer.ensure_upto(index);
+            }
             let dead_layer = self
                 .layers
                 .iter()
@@ -289,7 +276,7 @@ impl ChainPlan {
                 continue;
             }
             let pick = self.current_pick();
-            self.advance();
+            self.need_advance = true;
             if !self.seen.contains(&pick.key) {
                 return Some(pick);
             }
@@ -301,6 +288,8 @@ impl ChainPlan {
     #[cfg(test)]
     fn count_step(&mut self) {
         self.steps += 1;
+        #[cfg(feature = "test-instrumentation")]
+        crate::perf::operation(|c| c.chain_plan_steps += 1);
     }
     #[cfg(not(test))]
     fn count_step(&mut self) {}
@@ -310,16 +299,49 @@ impl ChainPlan {
     /// When the last live candidate of any layer dies, the plan is exhausted:
     /// every remaining combination would contain a dead node.
     pub fn mark_dead(&mut self, proxy: &ProxyConfig) {
-        let key = singleton_key(&Arc::new(proxy.clone()));
+        #[cfg(all(test, feature = "test-instrumentation"))]
+        crate::perf::operation(|c| c.mark_dead_calls += 1);
+        let key = singleton_key(proxy);
         if !self.dead.insert(key.clone()) {
             return;
         }
         for layer in &mut self.layers {
-            if layer
-                .candidates
-                .iter()
-                .any(|candidate| candidate.key == key)
-            {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| c.mark_dead_layer_visits += 1);
+            let present = if layer.cursors.is_empty() {
+                // Eager-слой: все кандидаты материализованы при construction —
+                // прежний скан по ключам (стоимость/семантика как в baseline).
+                // Кандидаты уникальны по идентичности (dedup при материализации),
+                // значит `any` даёт один decrement на слой.
+                let is_present = layer.candidates.iter().any(|candidate| {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.mark_dead_membership_checks += 1);
+                    candidate.key == key
+                });
+                is_present
+            } else {
+                // Ленивый слой: снапшот eligible + индексная проверка.
+                layer.cursors.iter().any(|cursor| {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.mark_dead_cursor_visits += 1);
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.mark_dead_index_lookups += 1);
+                    cursor.rotator().index_of(proxy).is_some_and(|i| {
+                        #[cfg(all(test, feature = "test-instrumentation"))]
+                        {
+                            cursor.eligible().iter().any(|eligible| {
+                                crate::perf::operation(|c| c.mark_dead_eligible_checks += 1);
+                                *eligible == i
+                            })
+                        }
+                        #[cfg(not(all(test, feature = "test-instrumentation")))]
+                        {
+                            cursor.eligible().contains(&i)
+                        }
+                    })
+                })
+            };
+            if present {
                 layer.live -= 1;
                 if layer.live == 0 {
                     self.done = true;
@@ -347,7 +369,7 @@ impl ChainPlan {
     fn advance(&mut self) {
         for layer in self.layers.iter_mut().rev() {
             layer.index += 1;
-            if layer.index < layer.candidates.len() {
+            if layer.index < layer.candidates.len() || layer.pull().is_ok() {
                 return;
             }
             layer.index = 0;
@@ -361,7 +383,9 @@ impl ChainPlan {
         let mut i = index;
         loop {
             self.layers[i].index += 1;
-            if self.layers[i].index < self.layers[i].candidates.len() {
+            if self.layers[i].index < self.layers[i].candidates.len()
+                || self.layers[i].pull().is_ok()
+            {
                 return;
             }
             self.layers[i].index = 0;
@@ -374,24 +398,164 @@ impl ChainPlan {
     }
 }
 
-fn deduplicate(
-    candidates: impl IntoIterator<Item = (Arc<ProxyRotator>, Arc<ProxyConfig>)>,
-) -> Vec<Candidate> {
-    let mut seen = HashSet::new();
-    candidates
-        .into_iter()
-        .filter_map(|(rotator, proxy)| {
-            let key = singleton_key(&proxy);
-            seen.insert(key.clone()).then_some(Candidate {
-                hop: Hop { rotator, proxy },
-                key,
-            })
-        })
-        .collect()
+/// Слой из ленивых курсоров: только снапшоты eligible, ничего не
+/// материализуется до первого прохода одометра.
+fn lazy_layer(rotators: &[Arc<ProxyRotator>]) -> Layer {
+    let cursors: Vec<_> = rotators.iter().map(|r| r.pick_order_lazy()).collect();
+    // Вырожденный слой: у каждого ротатора ≤1 eligible-кандидата — упорядочивать
+    // нечего, курсоры не нужны (курсор освобождается после единственной выдачи).
+    // Материализация — сразу, в порядке ротаторов; dedup — линейным сканом по уже
+    // материализованным (меж-ротаторные дубликаты идентичностей возможны и здесь).
+    // RNG уже потреблён при construction курсоров; next_proxy лишь выдаёт из
+    // снятого снимка, повторного потребления нет.
+    // Ограничение fast path не даёт линейному dedup выродиться в O(R²).
+    if cursors.len() <= 2 && cursors.iter().all(|cursor| cursor.eligible().len() <= 1) {
+        // Вырожденный слой: у каждого ротатора ≤1 eligible-кандидата —
+        // упорядочивать нечего, курсоры не нужны (курсор освобождается после
+        // единственной выдачи). Материализация — при construction, как в
+        // прежнем пути; RNG уже потреблён при construction курсоров.
+        // Dedup — линейным сканом same_upstream по уже снятым прокси
+        // (меж-ротаторные дубликаты идентичностей возможны и здесь),
+        // поэтому emitted остаётся пустым и не аллоцирует.
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for mut cursor in cursors {
+            if let Some(proxy) = cursor.next_proxy() {
+                let duplicate = candidates.iter().any(|candidate| {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| {
+                        c.singleton_dedup_comparisons += 1;
+                        c.singleton_cursor_comparisons += 1;
+                    });
+                    same_upstream(&candidate.hop.proxy, &proxy)
+                });
+                if !duplicate {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.singleton_candidates_inserted += 1);
+                    let key = ChainKey::singleton(&proxy);
+                    candidates.push(Candidate {
+                        hop: Hop {
+                            rotator: cursor.rotator().clone(),
+                            proxy,
+                        },
+                        key,
+                    });
+                } else {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.singleton_candidates_skipped += 1);
+                }
+            }
+        }
+        let live = candidates.len();
+        return Layer {
+            cursors: Vec::new(),
+            live,
+            emitted: None,
+            candidates,
+            index: 0,
+            cursor_index: 0,
+        };
+    }
+    // Инвариант ротатора: дедупликация прокси при construction по
+    // same_upstream («One rating slot per unique identity»), поэтому внутри
+    // одного ротатора курсор выдаёт уникальные идентичности — для
+    // single-rotator слоя distinct_identities не нужен. Дубликаты возможны
+    // только МЕЖДУ ротаторами (exit-слой из N > 1).
+    let live = if cursors.len() == 1 {
+        cursors[0].eligible().len()
+    } else {
+        distinct_identities(
+            &cursors
+                .iter()
+                .map(|cursor| (cursor.rotator(), cursor.eligible()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    Layer {
+        cursors,
+        live,
+        emitted: None,
+        candidates: Vec::new(),
+        index: 0,
+        cursor_index: 0,
+    }
 }
 
-fn singleton_key(proxy: &Arc<ProxyConfig>) -> ChainKey {
-    let mut plain = (**proxy).clone();
+/// Число различных singleton-идентичностей в объединении eligible срезов.
+/// Идентичность = те же 6 полей, что у singleton_key/ChainKey-node
+/// (gate-ссылка и is_gate игнорируются); бакеты по upstream_hash со
+/// случайным ключом, коллизии разрешаются same_upstream — точность без
+/// клонов ключей.
+fn distinct_identities(pairs: &[(&Arc<ProxyRotator>, &[usize])]) -> usize {
+    let state = RandomState::new();
+    let mut buckets: HashMap<u64, Vec<&ProxyConfig>> = HashMap::new();
+    let mut count = 0;
+    for (rotator, eligible) in pairs {
+        for &i in eligible.iter() {
+            #[cfg(all(test, feature = "test-instrumentation"))]
+            crate::perf::operation(|c| c.singleton_cursor_candidates += 1);
+            let proxy = rotator.proxy_at(i);
+            let hash = upstream_hash(&state, proxy);
+            let bucket = buckets.entry(hash).or_default();
+            let duplicate = bucket.iter().any(|seen| {
+                #[cfg(all(test, feature = "test-instrumentation"))]
+                crate::perf::operation(|c| {
+                    c.singleton_dedup_comparisons += 1;
+                    c.singleton_cursor_comparisons += 1;
+                });
+                same_upstream(seen, proxy)
+            });
+            if !duplicate {
+                bucket.push(proxy);
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+impl Layer {
+    /// Догнать материализованный префикс до `upto` включительно.
+    fn ensure_upto(&mut self, upto: usize) {
+        while self.candidates.len() <= upto && self.pull().is_ok() {}
+    }
+
+    /// Выдать следующую уникальную кандидатуру: Ok — добавлена,
+    /// Err — курсоры исчерпаны.
+    fn pull(&mut self) -> Result<(), ()> {
+        while self.cursor_index < self.cursors.len() {
+            if let Some(proxy) = self.cursors[self.cursor_index].next_proxy() {
+                let key = ChainKey::singleton(&proxy);
+                if self
+                    .emitted
+                    .get_or_insert_with(Default::default)
+                    .insert(key.clone())
+                {
+                    #[cfg(all(test, feature = "test-instrumentation"))]
+                    crate::perf::operation(|c| c.singleton_emitted_inserts += 1);
+                    self.candidates.push(Candidate {
+                        hop: Hop {
+                            rotator: self.cursors[self.cursor_index].rotator().clone(),
+                            proxy,
+                        },
+                        key,
+                    });
+                    return Ok(());
+                }
+                #[cfg(all(test, feature = "test-instrumentation"))]
+                crate::perf::operation(|c| c.singleton_emitted_duplicates += 1);
+                // Дубликат идентичности: first-owner уже выдан.
+                continue;
+            }
+            self.cursor_index += 1;
+        }
+        Err(())
+    }
+}
+
+fn singleton_key(proxy: &ProxyConfig) -> ChainKey {
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    crate::perf::operation(|c| c.config_clones += 1);
+    let mut plain = proxy.clone();
     plain.gate = None;
     ChainKey::new(Arc::new(plain))
 }
@@ -466,6 +630,11 @@ impl Iterator for ChainPlan {
 
 #[cfg(test)]
 mod accounting_tests;
+#[cfg(test)]
+mod lazy_oracle_tests;
+#[cfg(all(test, feature = "test-instrumentation"))]
+#[path = "mark_dead_perf_tests.rs"]
+mod mark_dead_perf_tests;
 #[cfg(test)]
 mod selection_tests;
 

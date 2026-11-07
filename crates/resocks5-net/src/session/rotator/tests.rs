@@ -71,6 +71,69 @@ fn rating_index_checks_identity_on_hash_collision() {
     assert_eq!(rotator.index_of(&first), None);
 }
 
+/// Принудительные коллизии для индексного resolve: совпадение hash не
+/// доказывает identity — путь сканирует bucket до первого совпадения полей
+/// и возвращает свой слот. Позиции target в bucket: начало, середина,
+/// конец; плюс miss при непустом bucket. Mutation: доверять hash — вернётся
+/// чужой слот; скан без раннего выхода — счётчик превысит позицию.
+#[test]
+fn perf208_resolve_identity_scans_forced_collision_bucket() {
+    let target = make_proxy("target", 1000);
+    let other = make_proxy("other", 1001);
+    let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone()]);
+    let hash = upstream_hash(&rotator.identity_hasher, &target);
+    rotator.by_identity.insert(hash, vec![1, 0]);
+    let resolved = rotator.resolve_identity(&target).unwrap();
+    assert!(Arc::ptr_eq(resolved, &rotator.proxies[0]));
+    // Bucket из чужих слотов: ни одно сравнение identity не подтверждает.
+    rotator.by_identity.insert(hash, vec![1]);
+    assert!(rotator.resolve_identity(&target).is_none());
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    {
+        rotator.by_identity.insert(hash, vec![1, 0]);
+        let (_, counts) = crate::perf::measure(|| rotator.resolve_identity(&target));
+        assert_eq!(counts.resolve_comparisons, 2);
+        crate::perf::report("resolve/collision/bucket=2", counts);
+    }
+
+    // Матрица позиций на bucket из трёх слотов: результат — свой слот,
+    // счётчик равен позиции совпадения (1/2/3) или длине bucket для miss.
+    let extra = make_proxy("extra", 1002);
+    let mut rotator = ProxyRotator::new(vec![target.clone(), other.clone(), extra.clone()]);
+    let hash = upstream_hash(&rotator.identity_hasher, &target);
+    rotator.by_identity.insert(hash, vec![0, 1, 2]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 0, 2]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 2, 0]);
+    assert!(Arc::ptr_eq(
+        rotator.resolve_identity(&target).unwrap(),
+        &rotator.proxies[0]
+    ));
+    rotator.by_identity.insert(hash, vec![1, 2]);
+    assert!(rotator.resolve_identity(&target).is_none());
+    #[cfg(all(test, feature = "test-instrumentation"))]
+    {
+        // Счётчик: 1 (начало), 2 (середина), 3 (конец), 2 (miss = длина bucket [1,2]).
+        for (bucket, expected) in [
+            (vec![0usize, 1, 2], 1u64),
+            (vec![1, 0, 2], 2),
+            (vec![1, 2, 0], 3),
+            (vec![1, 2], 2),
+        ] {
+            rotator.by_identity.insert(hash, bucket);
+            let (_, counts) = crate::perf::measure(|| rotator.resolve_identity(&target));
+            assert_eq!(counts.resolve_comparisons, expected);
+        }
+    }
+}
+
 #[test]
 fn duplicate_identity_collapses_onto_the_first_slot() {
     let proxy = make_proxy("one", 1000);
@@ -189,7 +252,7 @@ fn sticky_link_get_roundtrip() {
         Duration::from_secs(600),
     );
     let a = Arc::new(make_proxy("h", 1000));
-    r.link_proxy("target".to_string(), a.clone());
+    r.link_proxy("target", a.clone());
     assert_eq!(r.get_linked("target").map(|p| p.port), Some(1000));
     assert!(Arc::ptr_eq(&r.get_linked("target").unwrap(), &a));
     r.unlink_proxy("target");
@@ -205,8 +268,8 @@ fn sticky_relink_replaces_entry() {
         8,
         Duration::from_secs(600),
     );
-    r.link_proxy("target".to_string(), Arc::new(make_proxy("h", 1000)));
-    r.link_proxy("target".to_string(), Arc::new(make_proxy("h", 1001)));
+    r.link_proxy("target", Arc::new(make_proxy("h", 1000)));
+    r.link_proxy("target", Arc::new(make_proxy("h", 1001)));
     assert_eq!(r.get_linked("target").map(|p| p.port), Some(1001));
 }
 
@@ -262,7 +325,7 @@ fn bounded_concurrent_hammer_stays_within_cap() {
         }
     });
     assert!(r.sticky.lock().unwrap().map.len() <= 8);
-    r.link_proxy("sentinel".to_string(), Arc::new(make_proxy("h", 1001)));
+    r.link_proxy("sentinel", Arc::new(make_proxy("h", 1001)));
     assert_eq!(r.get_linked("sentinel").map(|p| p.port), Some(1001));
 }
 
@@ -275,10 +338,10 @@ fn lru_touch_prevents_eviction() {
         2,
         Duration::from_secs(600),
     );
-    r.link_proxy("A".to_string(), Arc::new(make_proxy("h", 1000)));
-    r.link_proxy("B".to_string(), Arc::new(make_proxy("h", 1001)));
+    r.link_proxy("A", Arc::new(make_proxy("h", 1000)));
+    r.link_proxy("B", Arc::new(make_proxy("h", 1001)));
     assert_eq!(r.get_linked("A").map(|p| p.port), Some(1000)); // touch
-    r.link_proxy("C".to_string(), Arc::new(make_proxy("h", 1002)));
+    r.link_proxy("C", Arc::new(make_proxy("h", 1002)));
     assert!(r.get_linked("B").is_none(), "B should be LRU-evicted");
     assert!(r.get_linked("A").is_some());
     assert_eq!(r.get_linked("C").map(|p| p.port), Some(1002));
@@ -288,7 +351,7 @@ fn lru_touch_prevents_eviction() {
 fn ttl_expires_entries() {
     let mut cache = StickyCache::new(8, Duration::from_secs(10));
     let t0 = Instant::now();
-    cache.insert("a".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+    cache.insert("a", Arc::new(make_proxy("h", 1000)), t0);
     assert!(cache.get("a", t0 + Duration::from_secs(5)).is_some());
     assert!(cache.get("a", t0 + Duration::from_secs(10)).is_none());
     assert!(cache.map.is_empty());
@@ -299,8 +362,8 @@ fn sticky_metadata_stays_bounded_behind_a_cold_entry() {
     let mut cache = StickyCache::new(2, Duration::from_secs(60));
     let t0 = Instant::now();
     let proxy = Arc::new(make_proxy("h", 1000));
-    cache.insert("cold".to_string(), proxy.clone(), t0);
-    cache.insert("hot".to_string(), proxy, t0);
+    cache.insert("cold", proxy.clone(), t0);
+    cache.insert("hot", proxy, t0);
     for second in 1..=8 {
         assert!(cache.get("hot", t0 + Duration::from_secs(second)).is_some());
     }
@@ -315,15 +378,15 @@ fn sticky_metadata_stays_bounded_behind_a_cold_entry() {
 fn sticky_expiry_takes_precedence_over_recency() {
     let mut cache = StickyCache::new(2, Duration::from_secs(10));
     let t0 = Instant::now();
-    cache.insert("expired".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+    cache.insert("expired", Arc::new(make_proxy("h", 1000)), t0);
     cache.insert(
-        "live".to_string(),
+        "live",
         Arc::new(make_proxy("h", 1001)),
         t0 + Duration::from_secs(5),
     );
     assert!(cache.get("expired", t0 + Duration::from_secs(9)).is_some());
     let now = t0 + Duration::from_secs(11);
-    cache.insert("new".to_string(), Arc::new(make_proxy("h", 1002)), now);
+    cache.insert("new", Arc::new(make_proxy("h", 1002)), now);
     assert_eq!(cache.get("live", now).map(|p| p.port), Some(1001));
     assert_eq!(cache.get("new", now).map(|p| p.port), Some(1002));
     assert!(cache.get("expired", now).is_none());
@@ -333,20 +396,20 @@ fn sticky_expiry_takes_precedence_over_recency() {
 fn sticky_replacement_refreshes_expiry_and_removal_releases_metadata() {
     let mut cache = StickyCache::new(2, Duration::from_secs(10));
     let t0 = Instant::now();
-    cache.insert("A".to_string(), Arc::new(make_proxy("h", 1000)), t0);
+    cache.insert("A", Arc::new(make_proxy("h", 1000)), t0);
     cache.insert(
-        "B".to_string(),
+        "B",
         Arc::new(make_proxy("h", 1001)),
         t0 + Duration::from_secs(1),
     );
     cache.insert(
-        "A".to_string(),
+        "A",
         Arc::new(make_proxy("h", 1002)),
         t0 + Duration::from_secs(8),
     );
     assert!(cache.get("B", t0 + Duration::from_secs(9)).is_some());
     let now = t0 + Duration::from_secs(11);
-    cache.insert("C".to_string(), Arc::new(make_proxy("h", 1003)), now);
+    cache.insert("C", Arc::new(make_proxy("h", 1003)), now);
     assert_eq!(cache.get("A", now).map(|p| p.port), Some(1002));
     assert!(cache.get("B", now).is_none());
     cache.remove("A");
@@ -361,10 +424,10 @@ fn sticky_recency_orders_operations_with_equal_timestamps() {
     let mut cache = StickyCache::new(2, Duration::from_secs(10));
     let now = Instant::now();
     let proxy = Arc::new(make_proxy("h", 1000));
-    cache.insert("A".to_string(), proxy.clone(), now);
-    cache.insert("B".to_string(), proxy.clone(), now);
+    cache.insert("A", proxy.clone(), now);
+    cache.insert("B", proxy.clone(), now);
     assert!(cache.get("A", now).is_some());
-    cache.insert("C".to_string(), proxy, now);
+    cache.insert("C", proxy, now);
     assert!(cache.get("A", now).is_some());
     assert!(cache.get("C", now).is_some());
     assert!(cache.get("B", now).is_none());
@@ -374,11 +437,11 @@ fn sticky_recency_orders_operations_with_equal_timestamps() {
 fn ttl_purge_frees_room_without_evicting_live_entries() {
     let mut cache = StickyCache::new(2, Duration::from_secs(10));
     let t0 = Instant::now();
-    cache.insert("A".to_string(), Arc::new(make_proxy("h", 1000)), t0);
-    cache.insert("B".to_string(), Arc::new(make_proxy("h", 1001)), t0);
+    cache.insert("A", Arc::new(make_proxy("h", 1000)), t0);
+    cache.insert("B", Arc::new(make_proxy("h", 1001)), t0);
     let t1 = t0 + Duration::from_secs(11);
-    cache.insert("C".to_string(), Arc::new(make_proxy("h", 1002)), t1);
-    cache.insert("D".to_string(), Arc::new(make_proxy("h", 1003)), t1);
+    cache.insert("C", Arc::new(make_proxy("h", 1002)), t1);
+    cache.insert("D", Arc::new(make_proxy("h", 1003)), t1);
     assert_eq!(cache.get("C", t1).map(|p| p.port), Some(1002));
     assert_eq!(cache.get("D", t1).map(|p| p.port), Some(1003));
     assert_eq!(cache.map.len(), 2);
@@ -393,7 +456,7 @@ fn cap_zero_disables_cache() {
         0,
         Duration::from_secs(600),
     );
-    r.link_proxy("a".to_string(), Arc::new(make_proxy("h", 1000)));
+    r.link_proxy("a", Arc::new(make_proxy("h", 1000)));
     assert!(r.get_linked("a").is_none());
     assert_eq!(r.sticky.lock().unwrap().map.len(), 0);
 }
@@ -482,4 +545,135 @@ fn gate_composite_maps_to_original_rating_slot() {
         "unrelated upstream must be untouched, got {}",
         w[1]
     );
+}
+
+/// Ленивые кандидаты обязаны совпадать с полным pick_order: префиксы 1 и 3
+/// на свежих снапшотах того же seed и полный дренаж.
+#[test]
+fn lazy_candidates_match_pick_order_exactly() {
+    fn fresh() -> std::sync::Arc<ProxyRotator> {
+        std::sync::Arc::new(
+            ProxyRotator::with_rng_seed(
+                (0..40)
+                    .map(|i| make_proxy(&format!("host{i}"), 1000 + i as u16))
+                    .collect(),
+                RatingPolicy::default(),
+                QuarantinePolicy::disabled(),
+                DEFAULT_STICKY_CACHE_MAX_ENTRIES,
+                DEFAULT_STICKY_CACHE_TTL,
+                208,
+            )
+            .expect("валидные параметры в тесте"),
+        )
+    }
+    let addr = |p: &Arc<ProxyConfig>| (p.host.clone(), p.port);
+    let expected: Vec<_> = fresh().pick_order().iter().map(&addr).collect();
+    // Префикс 1.
+    let mut c1 = fresh().pick_order_lazy();
+    assert_eq!(c1.next_proxy().map(|p| addr(&p)).as_ref(), expected.first());
+    // Префикс 3 на свежем снапшоте.
+    let mut c3 = fresh().pick_order_lazy();
+    let got3: Vec<_> = (0..3)
+        .filter_map(|_| c3.next_proxy())
+        .map(|p| addr(&p))
+        .collect();
+    assert_eq!(got3, expected[..3], "prefix 3");
+    // Полный дренаж на свежем снапшоте.
+    let full: Vec<_> = fresh()
+        .pick_order_lazy()
+        .into_proxies()
+        .iter()
+        .map(addr)
+        .collect();
+    assert_eq!(full, expected, "full");
+    // Длина eligible = длине полного порядка.
+    let c = fresh().pick_order_lazy();
+    assert_eq!(c.eligible().len(), expected.len());
+}
+
+/// Replacing an entry keeps its key allocation: the map, the recency set, the
+/// expiry set and this test hold the one `Arc<str>`. Mutation: building a new
+/// key on every insert breaks `ptr_eq` and leaves the old key alive in the
+/// sets until it is removed.
+#[test]
+fn sticky_replacement_reuses_the_key_allocation() {
+    let mut cache = StickyCache::new(4, Duration::from_secs(10));
+    let t0 = Instant::now();
+    cache.insert("A", Arc::new(make_proxy("h", 1000)), t0);
+    let first = Arc::clone(cache.map.get_key_value("A").unwrap().0);
+    assert_eq!(Arc::strong_count(&first), 4);
+    cache.insert(
+        "A",
+        Arc::new(make_proxy("h", 1001)),
+        t0 + Duration::from_secs(1),
+    );
+    let second = cache.map.get_key_value("A").unwrap().0;
+    assert!(Arc::ptr_eq(&first, second));
+    assert_eq!(Arc::strong_count(&first), 4);
+    assert_eq!(cache.map.len(), 1);
+    assert_eq!(cache.recency.len(), 1);
+    assert_eq!(cache.expiry.len(), 1);
+    assert_eq!(
+        cache.get("A", t0 + Duration::from_secs(2)).map(|p| p.port),
+        Some(1001)
+    );
+}
+
+/// A borrowed address is copied once, for a new entry only, and the stored key
+/// reads back equal to it.
+#[test]
+fn sticky_insert_from_a_borrowed_address_stores_an_equal_key() {
+    let mut cache = StickyCache::new(4, Duration::from_secs(10));
+    let t0 = Instant::now();
+    let address = String::from("example.com:443");
+    cache.insert(address.as_str(), Arc::new(make_proxy("h", 1000)), t0);
+    drop(address);
+    let (key, _) = cache.map.get_key_value("example.com:443").unwrap();
+    assert_eq!(&**key, "example.com:443");
+    assert_eq!(cache.get("example.com:443", t0).map(|p| p.port), Some(1000));
+}
+
+/// Eviction still picks the least recently used entry when keys arrive as
+/// borrowed addresses.
+#[test]
+fn sticky_borrowed_inserts_evict_the_least_recently_used_entry() {
+    let mut cache = StickyCache::new(2, Duration::from_secs(60));
+    let t0 = Instant::now();
+    cache.insert("A", Arc::new(make_proxy("h", 1000)), t0);
+    cache.insert(
+        "B",
+        Arc::new(make_proxy("h", 1001)),
+        t0 + Duration::from_secs(1),
+    );
+    cache.insert(
+        "C",
+        Arc::new(make_proxy("h", 1002)),
+        t0 + Duration::from_secs(2),
+    );
+    let now = t0 + Duration::from_secs(3);
+    assert!(cache.get("A", now).is_none());
+    assert!(cache.get("B", now).is_some());
+    assert!(cache.get("C", now).is_some());
+    assert_eq!(cache.recency.len(), 2);
+    assert_eq!(cache.expiry.len(), 2);
+}
+
+/// `link_proxy` takes `String`, `&String` and `&str` alike and keeps one entry
+/// per address.
+#[test]
+fn link_proxy_accepts_owned_and_borrowed_addresses() {
+    let rotator = ProxyRotator::new(vec![make_proxy("h", 1000)]);
+    let owned = String::from("owned.example:443");
+    rotator.link_proxy(owned.clone(), Arc::new(make_proxy("h", 1001)));
+    rotator.link_proxy("borrowed.example:443", Arc::new(make_proxy("h", 1002)));
+    rotator.link_proxy(&owned, Arc::new(make_proxy("h", 1003)));
+    assert_eq!(
+        rotator.get_linked("owned.example:443").map(|p| p.port),
+        Some(1003)
+    );
+    assert_eq!(
+        rotator.get_linked("borrowed.example:443").map(|p| p.port),
+        Some(1002)
+    );
+    assert_eq!(rotator.sticky.lock().unwrap().map.len(), 2);
 }

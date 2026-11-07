@@ -459,6 +459,9 @@ async fn raw_failed_auth_errors_and_debugs_stay_secret_free() {
         );
 
         let req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:1".into(),
             username: Some("leak-raw-1\u{fffd}".to_owned()),
@@ -542,6 +545,9 @@ async fn raw_zeroize_wipes_raw_byte_vectors() {
         assert!(password_raw.is_none() || password_raw.expect("present").is_empty());
 
         let mut req = IncomingRequest {
+            auth: crate::server::AuthMethod::Anonymous,
+            #[cfg(feature = "gssapi")]
+            gss: None,
             protocol: Protocol::Http,
             target: "h:2".into(),
             username: Some("raw-u".to_owned()),
