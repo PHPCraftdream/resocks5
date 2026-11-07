@@ -10,7 +10,7 @@ on:
       - '.github/workflows/perf.yml'
       - 'tests/perf208/**'
       - 'docs/PERF208.md'
-      - 'docs/perf208/results/**'
+      - 'docs/perf208/baseline/**'
 
 permissions:
   contents: read
