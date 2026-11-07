@@ -361,10 +361,10 @@ impl ChainPlan {
             .iter()
             .map(|layer| layer.candidates[layer.index].hop.clone())
             .collect();
-        let key = ChainKey::new(Arc::new(
-            ProxyConfig::chain(hops.iter().map(|hop| hop.proxy.clone()))
+        let key = ChainKey::new(
+            ProxyConfig::chain_arc(hops.iter().map(|hop| hop.proxy.clone()))
                 .expect("layers are non-empty"),
-        ));
+        );
         ChainPick { hops, key }
     }
     fn advance(&mut self) {

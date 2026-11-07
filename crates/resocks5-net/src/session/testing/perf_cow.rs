@@ -215,3 +215,41 @@ fn perf208_link_proxy_borrowed_address_saves_the_legacy_string() {
         }
     }
 }
+
+/// `ProxyConfig::chain_arc` vs the legacy replica
+/// `Arc::new(ProxyConfig::chain(nodes.clone()).unwrap())`: the first node is
+/// shared, later nodes are copied once, and the `Arc` is returned directly.
+#[test]
+fn perf208_chain_arc_shares_first_node_and_skips_the_unwrap_round_trip() {
+    for size in [1usize, 4] {
+        let nodes: Vec<_> = (0..size).map(|index| Arc::new(proxy(index))).collect();
+        let (built, new) = measure(|| ProxyConfig::chain_arc(nodes.iter().cloned()));
+        let (legacy_key, legacy) =
+            measure(|| ChainKey::new(Arc::new(ProxyConfig::chain(nodes.clone()).unwrap())));
+        let built = built.expect("chain_arc of a non-empty iterator");
+        assert_eq!(ChainKey::new(Arc::clone(&built)), legacy_key);
+        assert_eq!(new.chain_builds, 1);
+        assert_eq!(legacy.chain_builds, 1);
+        assert_eq!(new.chain_nodes, size as u64);
+        assert_eq!(legacy.chain_nodes, size as u64);
+        assert_eq!(new.config_clones, size as u64 - 1);
+        assert_eq!(legacy.config_clones, size as u64);
+        assert!(
+            allocator_calls(&new) < allocator_calls(&legacy),
+            "nodes={size}: {new:?} vs {legacy:?}"
+        );
+        if size == 1 {
+            assert!(Arc::ptr_eq(&built, &nodes[0]));
+            assert_eq!(allocator_calls(&new), 0, "nodes=1: {new:?}");
+        } else {
+            let mut outermost = Arc::clone(&built);
+            while let Some(gate) = outermost.gate.clone() {
+                outermost = gate;
+            }
+            assert!(Arc::ptr_eq(&outermost, &nodes[0]), "first node shared");
+            assert!(!Arc::ptr_eq(&built, &nodes[size - 1]), "exit is a copy");
+        }
+        report(&format!("chain_arc/nodes={size}"), new);
+        report(&format!("chain_arc_legacy/nodes={size}"), legacy);
+    }
+}

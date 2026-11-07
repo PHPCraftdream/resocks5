@@ -520,3 +520,31 @@ fn config_arc_orders_hops_outermost_first() {
         .collect();
     assert_eq!(hosts, ["outer", "inner", "exit"]);
 }
+
+/// `current_pick` keys stay identical to the legacy construction
+/// `ChainKey::new(Arc::new(ProxyConfig::chain(hops)))` for gated and
+/// gate-less plans, and the pick still shares the gate-less outermost hop.
+#[test]
+fn pick_key_equals_the_legacy_chain_construction() {
+    let gates = GateLevels::new(vec![(2, r(&["outer"])), (1, r(&["inner"]))]);
+    let exits = [r(&["exit-a"]), r(&["exit-b"])];
+    for pick in ChainPlan::new(&gates, &exits) {
+        let legacy = ChainKey::new(Arc::new(
+            ProxyConfig::chain(pick.hops().iter().map(|hop| Arc::clone(&hop.proxy))).unwrap(),
+        ));
+        assert_eq!(pick.key(), legacy);
+        let mut outermost = pick.config_arc();
+        while let Some(gate) = outermost.gate.clone() {
+            outermost = gate;
+        }
+        assert!(Arc::ptr_eq(&outermost, &pick.hops()[0].proxy));
+    }
+
+    let exits = [r(&["solo"])];
+    for pick in ChainPlan::new(&GateLevels::default(), &exits) {
+        let legacy = ChainKey::new(Arc::new(
+            ProxyConfig::chain(pick.hops().iter().map(|hop| Arc::clone(&hop.proxy))).unwrap(),
+        ));
+        assert_eq!(pick.key(), legacy);
+    }
+}

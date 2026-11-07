@@ -378,3 +378,96 @@ fn singleton_keys_differ_by_identity_fields() {
         );
     }
 }
+
+/// `chain_arc` builds the same key, node order and gate levels as `chain`
+/// for every length, discarding stray input gates.
+#[test]
+fn chain_arc_matches_chain_for_lengths_up_to_sixteen() {
+    for len in [0usize, 1, 2, 3, 16] {
+        let inputs: Vec<_> = (0..len)
+            .map(|index| {
+                Arc::new(
+                    node(&format!("node-{index}"), index as u16, (index as u8) % 8)
+                        .as_ref()
+                        .clone()
+                        .with_gate(ProxyConfig::http("discard", 9)),
+                )
+            })
+            .collect();
+        let via_arc = ProxyConfig::chain_arc(inputs.clone());
+        let owned = ProxyConfig::chain(inputs).map(Arc::new);
+        assert_eq!(via_arc.is_none(), len == 0);
+        assert_eq!(owned.is_none(), len == 0);
+        let Some(via_arc) = via_arc else {
+            continue;
+        };
+        let owned = owned.unwrap();
+        assert_eq!(
+            ChainKey::new(Arc::clone(&via_arc)),
+            ChainKey::new(Arc::clone(&owned))
+        );
+        assert_eq!(
+            hash(&ChainKey::new(Arc::clone(&via_arc))),
+            hash(&ChainKey::new(Arc::clone(&owned)))
+        );
+        assert_eq!(via_arc.chain_nodes().len(), owned.chain_nodes().len());
+        assert!(via_arc
+            .chain_nodes()
+            .iter()
+            .zip(owned.chain_nodes())
+            .all(|(a, b)| a.host == b.host && a.port == b.port && a.gate_level == b.gate_level));
+    }
+}
+
+/// A gate-less singleton comes back as the same `Arc`; a gated one is
+/// copied once with the gate dropped and the input left untouched.
+#[test]
+fn chain_arc_shares_gateless_and_copies_gated_singletons() {
+    let plain = node("plain", 1, 0);
+    let shared = ProxyConfig::chain_arc([Arc::clone(&plain)]).unwrap();
+    assert!(Arc::ptr_eq(&shared, &plain));
+    assert_eq!(Arc::strong_count(&plain), 2);
+
+    let gated =
+        Arc::new(ProxyConfig::socks5("exit", 9).with_gate(node("gate", 2, 1).as_ref().clone()));
+    let copied = ProxyConfig::chain_arc([Arc::clone(&gated)]).unwrap();
+    assert!(!Arc::ptr_eq(&copied, &gated));
+    assert!(copied.gate.is_none());
+    assert_eq!(copied.host, "exit");
+    assert!(gated.gate.is_some(), "the input keeps its gate");
+    assert_eq!(
+        gated.gate.as_deref().map(|gate| gate.host.as_str()),
+        Some("gate")
+    );
+    assert_eq!(
+        ChainKey::new(copied),
+        ChainKey::new(Arc::new(ProxyConfig::chain([Arc::clone(&gated)]).unwrap()))
+    );
+}
+
+/// Only the first node of a multi-node chain is shared (found through the
+/// gate links); every later node is a copy because its gate link changes.
+#[test]
+fn chain_arc_shares_only_the_first_node_of_a_multi_node_chain() {
+    let first = Arc::new(ProxyConfig::http("outer", 10));
+    let second = Arc::new(ProxyConfig::https("middle", 20).as_gate());
+    let exit = Arc::new(ProxyConfig::socks5("exit", 30));
+    let built =
+        ProxyConfig::chain_arc([Arc::clone(&first), Arc::clone(&second), Arc::clone(&exit)])
+            .unwrap();
+    let mut outermost = Arc::clone(&built);
+    while let Some(gate) = outermost.gate.clone() {
+        outermost = gate;
+    }
+    assert!(Arc::ptr_eq(&outermost, &first), "first node shared");
+    assert!(
+        !Arc::ptr_eq(built.gate.as_ref().unwrap(), &second),
+        "later nodes are copies"
+    );
+    assert!(!Arc::ptr_eq(&built, &exit));
+    assert_eq!(Arc::strong_count(&first), 2);
+    assert_eq!(
+        ChainKey::new(Arc::clone(&built)),
+        ChainKey::new(Arc::new(ProxyConfig::chain([first, second, exit]).unwrap()))
+    );
+}
