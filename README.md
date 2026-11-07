@@ -580,7 +580,9 @@ storage, logging and routing policy stay in the host application.
 Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
 existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate` and the
 opt-in inbound options need 0.5.0), or as a
-git dependency to follow unreleased changes:
+git dependency to follow unreleased changes — secure auth, GSSAPI, method
+negotiation and the other APIs added alongside them are unreleased changes on
+`main`, not yet in a published release:
 
 ```toml
 [dependencies]

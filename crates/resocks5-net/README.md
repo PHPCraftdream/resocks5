@@ -29,9 +29,15 @@ What's inside:
   restart need not rediscover dead upstreams; it holds durations only — the
   caller saves it and subtracts the downtime.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
+- **Strong authentication** — inbound SOCKS5 can require secure auth
+  (private method 0x80, feature `secure-auth`) or GSSAPI (RFC 1961, method
+  0x01, feature `gssapi`); upstream SOCKS5 dials can use both to log in to
+  a proxy.
 
 No application concerns leak in: no config-file format, logger, credential
-storage, or egress policy. Inbound authentication is supplied by the host closure.
+storage, or egress policy. Inbound authentication is supplied by the host
+closure, or by a `SecretStore` / `GssAcceptor` with the strong acceptors
+(`accept_secure`, `accept_with`).
 
 ## Features
 
@@ -79,10 +85,60 @@ storage, or egress policy. Inbound authentication is supplied by the host closur
   upstream selection. Connector/pool-only consumers can opt out for a
   smaller public API and less to compile. Unlike `tls` and `serde` this
   removes no dependency — both modules are `std` only.
+- `secure-auth` (**enabled by default**): password authentication for SOCKS5
+  that never puts the password on the wire. Private-use method 0x80
+  (`secure_auth::METHOD`); the server stores per user only a `UserSecret` —
+  random salt, `KdfParams`, and the Argon2id key
+  `K = Argon2id(password, salt, params)` (`KEY_LEN` = 32) — never the
+  password. A login is a mutual HMAC-SHA256 challenge-response over `K`
+  with fresh 32-byte nonces on both sides: a recorded exchange cannot be
+  replayed, and a peer not holding `K` cannot pose as the server (the
+  client checks the server proof in constant time). Unknown users are
+  answered with a decoy derived from a `DecoyKey` (process-local random
+  key; the same name always gets the same decoy salt), indistinguishable
+  from a wrong password, so user names are not enumerable. A client
+  refuses server KDF parameters below its floor
+  (`SecureCredentials::with_min_kdf`, default `KdfParams::DEFAULT`:
+  19 MiB / 2 passes / 1 lane, the OWASP minimum) and above the hard limits
+  (1 GiB, 16 passes, 16 lanes; `KdfParams::is_in_range`), so a man in the
+  middle cannot downgrade the KDF. First-login enrollment: a user stored
+  as `StoredUser::Init` is enrolled by its first client, which sends `K`
+  sealed with X25519 + HKDF-SHA256 + ChaCha20-Poly1305 bound to both
+  nonces; `SecretStore::claim` stores it atomically (of two concurrent
+  first logins exactly one wins). Limits, stated plainly: this is not a
+  PAKE — a passive observer can still try passwords offline (the Argon2id
+  cost slows that; use strong passwords), and only the authentication is
+  protected: the SOCKS5 request that follows travels plain, and tunnel
+  data is never protected. Pulls argon2, hmac/hkdf/sha2, subtle,
+  getrandom, zeroize, x25519-dalek and chacha20poly1305.
+- `gssapi` (off by default; **implies `secure-auth`**): GSSAPI
+  authentication for SOCKS5, RFC 1961, method 0x01. The context exchange,
+  abort, protection-level negotiation and, opt-in, the protected SOCKS
+  request and reply are implemented in the crate over the
+  `gssapi::GssBackend` / `GssContext` traits; no password and no credential
+  ever crosses the wire. Needs a backend: a test-only mock mechanism ships
+  with `test-instrumentation` (`gssapi::mock`), the system Kerberos
+  backend is `gssapi-system`.
+- `gssapi-system` (off by default; implies `gssapi`, links `libgssapi`
+  0.11): Kerberos 5 through the system GSS-API — MIT Kerberos / Heimdal on
+  Linux, Apple GSS on macOS; not Windows. Not in the default set: it links
+  the platform library and needs its headers and libclang to build.
+- `test-instrumentation` (off by default; implies `rotator`): test-only
+  cross-crate instrumentation — `testing::MockUpstream` (a scripted
+  SOCKS5/HTTP CONNECT upstream on 127.0.0.1:0, see the `testing` module
+  below), the `gssapi::mock` backend, and the rotator's
+  `pick_order_calls()` diagnostic counter. Dependents enable it from
+  `[dev-dependencies]`; it is not default, so release builds compile it to
+  nothing.
 - `zeroize` (off by default): wipes inbound credentials from memory when
   `server::Credentials` and `server::IncomingRequest` are dropped (the
   `zeroize` crate, already part of the TLS dependency tree). Outbound
   `ProxyConfig` credentials are plain public `String` fields and are not wiped.
+  With the feature, `ProxyConfig::wipe_credentials()` also overwrites and
+  clears `user`/`password` at this node and every gate it solely owns, drops
+  the secure-auth/GSSAPI credentials (the secure-auth password is wiped when
+  the last copy goes), and returns `false` when a shared gate was left
+  untouched — `ProxyConfig` has no `Drop`, so clones keep their values.
 - `cleartext-client` / `cleartext-server` (**off by default**): the only way this
   crate sends or accepts a password in clear text. Without `cleartext-client`
   a dial that would send SOCKS5 UNAME/PASSWD (RFC 1929) or HTTP Basic to a
@@ -225,6 +281,8 @@ behaviour described above.
   `server::Prefixed<S>`, which serves the over-read pipeline bytes before the
   stream itself (writes pass through), instead of forwarding `take_pipeline()` by
   hand.
+- `server::Credentials::basic_payload()` is the whole decoded HTTP Basic
+  token as `Option<&str>`, without splitting at `:`.
 
 ```text
 use resocks5_net::server::{accept, ServerOptions};
@@ -243,6 +301,56 @@ let credentials = req.take_credentials();   // exact bytes via username_bytes()/
 let mut stream = req.into_prefixed(client); // pipelined bytes first, then the socket
 ```
 
+### Strong inbound authentication (secure auth, GSSAPI)
+
+`server::accept_secure(stream, options, store, decoy)` is like `accept`, but
+users authenticate with secure auth (SOCKS5 method 0x80). SOCKS5 offers 0x80
+(when the options allow passwords) and 0x00 (when they allow anonymous),
+never 0x02, whatever the build. HTTP has no strong method here: the HTTP side
+runs as "no users configured", any `Proxy-Authorization` is answered 407 and
+the credential callback never runs — secure auth is SOCKS5-only, consistent
+with the HTTP 407 policy above. `decoy` (a `DecoyKey`) answers unknown user
+names. The returned request carries the authenticated user in `username()`;
+no credentials are retained.
+
+`server::accept_with(stream, options, &AuthMethods)` takes the chosen set of
+strong methods: `AuthMethods::secure(store, decoy)`, then `.with_gssapi(&acceptor)`
+(feature `gssapi`), or `AuthMethods::gssapi(&acceptor)` alone with the
+`NoSecrets` empty store for a GSSAPI-only server. When a client offers
+several methods the server picks the strongest it has enabled: GSSAPI
+(0x01), then secure auth (0x80), then anonymous (0x00) if `options` allow
+it; if nothing matches it answers `[5, 255]` and fails with
+`ServerError::Authentication`. Clear text is never offered or accepted,
+regardless of features.
+
+`IncomingRequest::auth_method()` returns `server::AuthMethod` — `Anonymous`,
+`ClearText` (only the plain `accept` with `cleartext-server`), `Secure`
+(method 0x80), `Gssapi` (method 0x01); the enum is `#[non_exhaustive]`. With
+GSSAPI `username()` is the authenticated principal (Kerberos `name@REALM`),
+and when a protection level was negotiated the SOCKS reply written by
+`IncomingRequest::reply` is wrapped in the negotiated protection.
+`set_identity(name)` replaces the identity everything downstream sees (map a
+principal to a local account); `auth_method()` is unchanged.
+
+The `SecretStore` trait is the host's half: async `lookup(user) ->
+Option<StoredUser>`, atomic `claim(user, secret) -> bool`, and
+`enrollment_floor()` defaulting to `KdfParams::DEFAULT`. `None` from
+`lookup` is answered with the decoy, so the store never reveals which names
+exist. `StoredUser::Secret(UserSecret)` authenticates normally;
+`StoredUser::Init` enrolls on the first login (see the `secure-auth`
+feature above).
+
+```text
+use resocks5_net::server::{accept_with, AuthMethod, AuthMethods};
+
+let decoy = resocks5_net::secure_auth::DecoyKey::generate()?;
+let methods = AuthMethods::secure(&store, &decoy).with_gssapi(&acceptor);
+let mut req = accept_with(&mut client, &options, &methods).await?;
+if req.auth_method() == AuthMethod::Gssapi {
+    // req.username() is the Kerberos principal; map it with req.set_identity(..)
+}
+```
+
 
 ## Usage
 
@@ -257,7 +365,11 @@ and `chain_len` its count. `ChainKey` identity includes node order, length,
 and every node's protocol, host, port, username, password and gate level.
 Parse a proxy entry with `parse_proxy_str(line, protocol)` or use
 `ProxyConfig::from_addr(protocol, addr)`; host accepts domains, IPv4 and
-bracketed or bare IPv6, and password may contain `:`.
+bracketed or bare IPv6, and password may contain `:`. A URI form exists
+too: `ProxyConfig::from_uri(uri)` / `from_uri_with(uri, &ProxyUriOptions)`
+parse `scheme://[user:password@]host:port` with schemes `socks5`, `socks5h`,
+`http`, `https` — percent-decoded credentials, a required port, no path,
+query or fragment; the typed `ProxyUriError` never carries the input text.
 
 ```toml
 [dependencies]
@@ -320,7 +432,12 @@ async fn main() -> anyhow::Result<()> {
 CONNECT upstreams `dial_plain` is the simpler entry point; `dial`
 returns an `AnyUpstream` through an extra `tls_connector` argument and
 is the one to use when the upstream is HTTPS (pass a `TlsConnector`).
-Cap accounting is then up to the caller.
+Cap accounting is then up to the caller. `DialOptions::with_nodelay(bool)` /
+`with_keepalive(Duration)` set `TCP_NODELAY` and TCP keepalive on the socket
+to the proxy (fields `nodelay`, `keepalive`; by default the OS defaults
+stay). `connect::dial_tcp(proxy, host, port, opts)` returns the bare
+`TcpStream` of a SOCKS5 / HTTP CONNECT tunnel (no wrapper, no permit) and
+refuses an HTTPS upstream before any connect.
 
 ```text
 use std::time::Duration;
@@ -372,7 +489,8 @@ let stream = dial_chain_over(base, &proxy, "example.com", 80, &opts, None).await
 Connect and pool calls return `resocks5_net::ConnectError`
 (`#[non_exhaustive]`): match on `Timeout { stage, .. }`, `ProxyRejected`,
 `AuthFailed`, `MethodUnsupported`, `Protocol(ProtocolViolation)`,
-`InvalidTarget`,
+`InvalidTarget`, `SecureAuth(SecureAuthError)`, `Gssapi(GssapiError)`
+(these carry the typed exchange errors, re-exported from the crate root),
 `TlsFeatureMissing`, `Io` (the `io::Error` is reachable via `source()`)
 and, with `pool`, `AtCapacity` — no message parsing needed.
 `Protocol` carries a structured `ProtocolViolation` (e.g.
@@ -385,7 +503,18 @@ legacy message text. A peer that answers the greeting with a
 non-SOCKS5 version byte is `Protocol(Socks5BadVersion { got })`, not
 `MethodUnsupported`. For `ProxyRejected { code, .. }` on SOCKS5,
 `resocks5_net::socks5_rep_description(code)` gives the RFC 1928 reply
-meaning.
+meaning. `ConnectError::suggested_reply()` maps an error to the reply a
+gateway should send its own client: any `Timeout` → `Reply::TimedOut`;
+SOCKS5 `ProxyRejected` REP 2/3/4/5/6 →
+`Forbidden`/`NetworkUnreachable`/`UpstreamUnavailable`/`ConnectionRefused`/
+`TimedOut`; HTTP(S) 403/504/502+503 →
+`Forbidden`/`TimedOut`/`UpstreamUnavailable`; other refusals, auth/method
+failures, `Protocol`, `InvalidTarget`, `CleartextCredentialsRefused`,
+secure-auth/GSSAPI exchange errors and a missing TLS feature →
+`GeneralFailure`; I/O at the connect stage and TLS failures →
+`UpstreamUnavailable`; with `pool`, `AtCapacity` → `Overloaded`. Only the
+destination's own verdict selects a specific reply; hop failures never
+answer "connection refused".
 
 `ProxyConfig` builders include `socks5/http/https(..)`, `with_auth` and
 `with_gate`. `dial_chain` follows explicit `gate` links without a pool;
@@ -436,7 +565,8 @@ means strictly sequential; `HedgeError` carries the attempt count and the
 last error.
 
 `ConnectError::is_upstream_down` treats TCP-connect failures, HTTPS TLS
-handshake failures, auth/method refusal, bad SOCKS5 response versions, and
+handshake failures, auth/method refusal (secure-auth and GSSAPI exchange
+failures included), bad SOCKS5 response versions, and
 TLS errors as hard upstream failures. It excludes destination-dependent
 CONNECT failures and ambiguous handshakes. `counts_against_upstream` is
 false for local `AtCapacity` errors when `pool` is enabled. The chain
@@ -457,15 +587,100 @@ host bound probes by its own capacity: `None` defers the probe without a
 connection or a health change, `Some(guard)` holds the guard (for example a
 pool permit) while the probe runs.
 
+Three no-copy helpers on the dial path: `ChainKey::singleton(&Arc<ProxyConfig>)`
+keys one node without its gate link — a gate-less node is shared by
+refcount, a gated node is copied once with the link dropped.
+`ChainPick::config_arc()` returns the pick's linked configuration as a
+shared `Arc` (a refcount bump; `config()` still returns an owned copy).
+`ProxyRotator::link_proxy(addr, proxy)` inserts or replaces the sticky-cache
+entry for `addr` (`impl AsRef<str>`: nothing is allocated for the address
+when the entry already exists; it takes the `Arc<ProxyConfig>` so the
+caller can hand off its only clone), with `unlink_proxy(addr)` and
+`get_linked(addr)` — an expired entry is a miss, and an entry whose
+upstream is quarantined is not returned (the entry itself stays until it
+expires or is replaced). A full cache reclaims an expired entry first,
+otherwise it evicts the least-recently-used one.
+
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
 `error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`
-feature), `rotator` (`rotator` feature), `types`, and `chain` (`rotator`
-feature).
+feature), `rotator` (`rotator` feature), `types`, `chain` (`rotator`
+feature), `secure_auth` (`secure-auth` feature), `gssapi` (`gssapi`
+feature), and `testing` (`test-instrumentation` feature).
+
+`testing::MockUpstream` (feature `test-instrumentation`) is a scripted
+upstream proxy for tests: `MockUpstream::socks5()` / `::http()` with
+`.auth(MockAuth)` (default `MockAuth::None`; `Cleartext { user, password }`;
+`Secure { user, secret }` — SOCKS5 method 0x80, HTTP answered 407) and
+`.script(Script)` (default `Script::Tunnel` — handshake then echo; also
+`Refuse(code)`, `SilentGreeting`, `SilentConnect`, `Hangup`). `.spawn()`
+listens on `127.0.0.1:0`; `addr()`, `proxy()` (a ready `ProxyConfig`
+pointing at it), `targets()` (the recorded CONNECT targets) and
+`connections()` report what happened; dropping it stops the listener and
+every open connection.
 
 A working version of the pooled example lives at
 [`examples/connect_through_proxy.rs`](examples/connect_through_proxy.rs).
 CI compiles that file, so it tracks the API; the Markdown blocks above are
 not extracted.
+
+## Authenticating to a SOCKS5 upstream
+
+`ProxyConfig::with_secure_auth(SecureCredentials)` (feature `secure-auth`):
+dial and chain hops authenticate to a SOCKS5 upstream with secure auth. The
+user name is kept in `ProxyConfig::user` (it is the upstream's identity);
+the password stays inside the credentials — never on the wire, never a
+plain `ProxyConfig::password` field. `SecureCredentials::new(user,
+password)`; `.allow_enrollment(true)` opts in to first-login enrollment
+(off by default: a man in the middle could claim "init" to an already
+enrolled client; `SecureAuthError::EnrollmentNotAllowed` otherwise);
+`.with_enrollment_kdf(params)` sets the enrollment cost; `.with_min_kdf(floor)`
+refuses a server whose KDF is cheaper than the floor (default
+`KdfParams::DEFAULT`). The derived key is cached after the first exchange
+(per salt and parameters), so the Argon2id cost is paid once per process
+and server, not per connection.
+
+`ProxyConfig::with_gssapi(GssCredentials)` (feature `gssapi`) can be
+combined with `with_secure_auth` — both are offered, GSSAPI first, and the
+server chooses. A client with strong methods configured offers them all and
+nothing weaker: no anonymous, no clear text, no downgrade if the server
+answers another method.
+
+`GssCredentials::new(Arc<dyn GssBackend>, service)` takes a host-based
+service name such as `socks@proxy.example.com`; by default it asks for no
+per-message protection and accepts whatever the server answers;
+`.with_requested_protection(level)` asks, `.with_min_protection(level)`
+requires. Server side: `GssAcceptor::new(backend)`, `.with_protection(level)`
+— RFC 1961 lets the server decide, and a client that finds the answer too
+weak closes the connection. `Protection` levels: `None` (0 — only the
+authentication is protected; the context is mutual Kerberos, the SOCKS
+request and reply travel plain; this is what `curl --socks5-gssapi` and
+Dante's `clear` speak), `Integrity` (1), `Confidential` (2); the
+"selective" level 3 is not offered. The tunnel data is NEVER protected, at
+any level.
+
+Backends: `gssapi::mock::MockBackend` for tests (ships with
+`test-instrumentation`), `gssapi::system::SystemBackend` for real Kerberos
+(feature `gssapi-system`, Unix only).
+[`examples/gssapi_interop_server.rs`](examples/gssapi_interop_server.rs)
+is built with `gssapi-system`; the CI interop target is
+`curl --socks5-gssapi`. Limit: stock curl up to and including 8.11 (e.g.
+8.5.0 in Ubuntu 24.04) cannot use a SOCKS5 GSSAPI proxy — a SOCKS5
+state-machine bug makes it reject method 1 with "SOCKS5 GSSAPI per-message
+authentication is not supported" when the server response does not arrive
+instantly; newer curl works (CI checks 8.23.0).
+
+```text
+use resocks5_net::connect::{dial_plain, DialOptions};
+use resocks5_net::secure_auth::SecureCredentials;
+use resocks5_net::types::ProxyConfig;
+
+let proxy = ProxyConfig::socks5("198.51.100.7", 1080)
+    .with_secure_auth(SecureCredentials::new("alice", "correct horse"));
+let stream = dial_plain(&proxy, "example.com", 443, &DialOptions::new()).await?;
+```
+
+Only SOCKS5 upstreams get strong methods; HTTP CONNECT upstreams still use
+Basic inside TLS (`https` scheme) as before.
 
 ## Status
 
