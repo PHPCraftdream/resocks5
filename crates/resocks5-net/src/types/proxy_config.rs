@@ -209,16 +209,16 @@ impl ProxyConfig {
     }
 
     /// Would using this entry send its credentials in clear text? SOCKS5
-    /// UNAME/PASSWD always does; HTTP Basic does unless the proxy is reached over
+    /// UNAME/PASSWD would; HTTP Basic does unless the proxy is reached over
     /// TLS (`https`).
     pub(crate) fn sends_cleartext_credentials(&self) -> bool {
         self.user.is_some() && self.password.is_some() && self.protocol != ProxyProtocol::Https
     }
 
-    /// Refuse an entry that would have to send credentials in clear text when
-    /// the build does not allow it (feature `cleartext-client`).
+    /// Refuse an entry that would have to send credentials in clear text: this
+    /// crate never does (no RFC 1929, no Basic over plain HTTP).
     pub(crate) fn refuse_cleartext(&self) -> Result<(), crate::ConnectError> {
-        if !crate::CLEARTEXT_CLIENT && self.sends_cleartext_credentials() {
+        if self.sends_cleartext_credentials() {
             return Err(crate::ConnectError::CleartextCredentialsRefused);
         }
         Ok(())

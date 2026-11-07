@@ -668,10 +668,7 @@ let prefix = req.take_pipeline(); // send exactly once before relaying unread by
 ```
 
 The snippet's stream, deadline, authentication state and egress are supplied by the
-host, not fabricated by the parser. See the [complete API contracts and usage](crates/resocks5-net/README.md#inbound-server-api)
-and the [finite local-egress example](crates/resocks5-net/examples/serve_local.rs).
-The example requires a separately running local echo target, actually dials it,
-and accepts two clients on one smart port; it sends success only after that dial.
+host, not fabricated by the parser. See the [complete API contracts and usage](crates/resocks5-net/README.md#inbound-server-api).
 
 `accept` returns an unresolved destination, verified username (`None` for anonymous)
 and owned pipeline bytes. It bounds detection/auth/framing with one absolute Tokio

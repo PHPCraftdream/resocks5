@@ -102,28 +102,6 @@ async fn handshake_error(
     .expect_err("stub reply must fail the handshake")
 }
 
-/// Same as [`handshake_error`] but the proxy config carries
-/// credentials, so the client asks for username/password auth.
-#[cfg(feature = "pool")]
-async fn authed_handshake_error(
-    target: &str,
-    method_reply: &'static [u8],
-    connect_reply: &'static [u8],
-) -> ConnectError {
-    let (host, port) = socks5_stub_replying(method_reply, connect_reply).await;
-    let mut proxy = socks5_proxy_config(&host, port);
-    proxy.user = Some("user".into());
-    proxy.password = Some("pass".into());
-    crate::connect::connect_socks5_proxy(
-        target,
-        &proxy,
-        &ProxyPool::new(PoolConfig::default(), Duration::from_secs(2), 1),
-        Duration::from_secs(2),
-    )
-    .await
-    .expect_err("stub reply must fail the handshake")
-}
-
 #[cfg(feature = "pool")]
 #[tokio::test]
 async fn pool_connect_timeout_yields_typed_timeout() {
@@ -346,38 +324,7 @@ async fn http_rejected_connect_yields_proxy_rejected_with_status_line() {
 
 #[cfg(feature = "pool")]
 #[tokio::test]
-async fn auth_failure_yields_typed_auth_failed() {
-    let err = authed_handshake_error("1.2.3.4:443", &[0x05, 0x02], &[0x01, 0x2a]).await;
-    match &err {
-        ConnectError::AuthFailed { status } => assert_eq!(*status, 0x2a),
-        other => panic!("expected AuthFailed, got: {other:?}"),
-    }
-    assert_eq!(
-        err.to_string(),
-        "[SOCKS5] Authentication failed (status 2a)"
-    );
-}
-
-#[cfg(feature = "pool")]
-#[tokio::test]
-async fn method_unsupported_yields_typed_variant_both_flavors() {
-    // Proxy refuses username/password auth.
-    let err = authed_handshake_error("1.2.3.4:443", &[0x05, 0x00], &[]).await;
-    assert!(
-        matches!(
-            &err,
-            ConnectError::MethodUnsupported {
-                got: 0x00,
-                with_auth: true
-            }
-        ),
-        "got: {err:?}"
-    );
-    assert_eq!(
-        err.to_string(),
-        "[SOCKS5] Proxy does not support username/password authentication (received: 00)"
-    );
-
+async fn method_unsupported_yields_typed_variant() {
     // Proxy refuses no-auth.
     let err = handshake_error("1.2.3.4:443", &[0x05, 0x02], &[]).await;
     assert!(
@@ -444,33 +391,6 @@ async fn non_socks5_greeting_reply_is_bad_version_not_method_unsupported() {
         ),
         "got: {err:?}"
     );
-
-    // Same on the username/password greeting.
-    let err = authed_handshake_error("1.2.3.4:443", &[0x48, 0x54], &[]).await;
-    assert!(
-        matches!(
-            &err,
-            ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 0x48 })
-        ),
-        "got: {err:?}"
-    );
-}
-
-#[cfg(feature = "pool")]
-#[tokio::test]
-async fn bad_auth_subnegotiation_version_is_protocol_not_auth_failed() {
-    let err = authed_handshake_error("1.2.3.4:443", &[0x05, 0x02], &[0x05, 0x00]).await;
-    assert!(
-        matches!(
-            &err,
-            ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 5 })
-        ),
-        "got: {err:?}"
-    );
-    assert_eq!(
-        err.to_string(),
-        "[SOCKS5] Invalid authentication response version"
-    );
 }
 
 #[test]
@@ -506,7 +426,7 @@ async fn oversized_domain_yields_typed_protocol() {
     });
     let domain = "a".repeat(300);
     let target = format!("{domain}:443");
-    let err = handshake_over_stream(&mut client, &target, None)
+    let err = handshake_over_stream(&mut client, &target)
         .await
         .expect_err("oversized domain must fail");
     assert!(
@@ -517,32 +437,6 @@ async fn oversized_domain_yields_typed_protocol() {
         "got: {err:?}"
     );
     assert_eq!(err.to_string(), "[SOCKS5] Domain name too long");
-    peer.await.unwrap();
-}
-
-#[tokio::test]
-async fn oversized_credentials_yield_typed_protocol_with_lengths() {
-    let (mut client, mut upstream) = duplex(8192);
-    let peer = tokio::spawn(async move {
-        let mut greeting = [0u8; 3];
-        upstream.read_exact(&mut greeting).await.unwrap();
-        upstream.write_all(&[0x05, 0x02]).await.unwrap();
-    });
-    let long = "u".repeat(256);
-    let err = handshake_over_stream(&mut client, "1.2.3.4:443", Some((&long, "p")))
-        .await
-        .expect_err("oversized credentials must fail");
-    assert!(
-        matches!(
-            &err,
-            ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong {
-                username_len: 256,
-                password_len: 1
-            })
-        ),
-        "got: {err:?}"
-    );
-    assert_eq!(err.to_string(), "[SOCKS5] Username or password too long");
     peer.await.unwrap();
 }
 
@@ -631,7 +525,7 @@ async fn http_closed_early_yields_typed_protocol() {
 #[tokio::test]
 async fn unparseable_target_yields_invalid_target() {
     let (mut client, mut upstream) = duplex(4096);
-    let err = handshake_over_stream(&mut client, "no-port-target", None)
+    let err = handshake_over_stream(&mut client, "no-port-target")
         .await
         .expect_err("invalid target must fail");
     assert!(matches!(

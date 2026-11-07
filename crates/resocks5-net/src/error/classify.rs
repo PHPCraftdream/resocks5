@@ -20,14 +20,10 @@ impl ConnectError {
                     | TimeoutKind::Socks5Greeting
             ),
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
-            ConnectError::AuthFailed { .. }
-            | ConnectError::MethodUnsupported { .. }
+            ConnectError::MethodUnsupported { .. }
             | ConnectError::SecureAuth(_)
             | ConnectError::Gssapi(_) => true,
-            ConnectError::Protocol(
-                ProtocolViolation::Socks5BadVersion { .. }
-                | ProtocolViolation::Socks5BadAuthVersion { .. },
-            ) => true,
+            ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { .. }) => true,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => true,
             _ => false,
@@ -44,7 +40,7 @@ impl ConnectError {
     /// | SOCKS5 `ProxyRejected` REP 2 / 3 / 4 / 5 / 6 | `Forbidden` / `NetworkUnreachable` / `UpstreamUnavailable` / `ConnectionRefused` / `TimedOut` |
     /// | HTTP(S) `ProxyRejected` 403 / 504 / 502, 503 | `Forbidden` / `TimedOut` / `UpstreamUnavailable` |
     /// | other `ProxyRejected` (REP 1, 7, 8, other statuses, malformed) | `GeneralFailure` |
-    /// | HTTP 407, SOCKS5 [`AuthFailed`](ConnectError::AuthFailed) / [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream) | `GeneralFailure` |
+    /// | HTTP 407, SOCKS5 [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream) | `GeneralFailure` |
     /// | [`Io`](ConnectError::Io) timed out | `TimedOut` |
     /// | other [`Io`](ConnectError::Io) at [`Stage::Connect`] (the upstream itself is unreachable) | `UpstreamUnavailable` |
     /// | other [`Io`](ConnectError::Io) | `GeneralFailure` |
@@ -80,8 +76,7 @@ impl ConnectError {
                 }
                 _ => Reply::GeneralFailure,
             },
-            ConnectError::AuthFailed { .. }
-            | ConnectError::MethodUnsupported { .. }
+            ConnectError::MethodUnsupported { .. }
             | ConnectError::Protocol(_)
             | ConnectError::InvalidTarget(_)
             | ConnectError::CleartextCredentialsRefused
@@ -157,7 +152,6 @@ mod tests {
         assert!(io_error(Stage::Connect).is_upstream_down());
         assert!(!io_error(Stage::Handshake).is_upstream_down());
         assert!(!io_error(Stage::Total).is_upstream_down());
-        assert!(ConnectError::AuthFailed { status: 1 }.is_upstream_down());
         assert!(ConnectError::MethodUnsupported {
             got: 0xff,
             with_auth: false
@@ -167,17 +161,9 @@ mod tests {
             ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
                 .is_upstream_down()
         );
-        assert!(
-            ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 })
-                .is_upstream_down()
-        );
         for violation in [
             ProtocolViolation::Socks5UnknownAddressType { got: 9 },
             ProtocolViolation::Socks5DomainTooLong { len: 256 },
-            ProtocolViolation::Socks5CredentialsTooLong {
-                username_len: 256,
-                password_len: 0,
-            },
             ProtocolViolation::HttpInvalidConnectTarget,
             ProtocolViolation::HttpResponseTooLarge,
             ProtocolViolation::HttpClosedEarly,
@@ -243,7 +229,6 @@ mod tests {
             (io_error(Stage::Connect), true, true),
             (io_error(Stage::Handshake), false, true),
             (io_error(Stage::Total), false, true),
-            (ConnectError::AuthFailed { status: 1 }, true, true),
             (
                 ConnectError::MethodUnsupported {
                     got: 0xff,
@@ -258,25 +243,12 @@ mod tests {
                 true,
             ),
             (
-                ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 }),
-                true,
-                true,
-            ),
-            (
                 ConnectError::Protocol(ProtocolViolation::Socks5UnknownAddressType { got: 9 }),
                 false,
                 true,
             ),
             (
                 ConnectError::Protocol(ProtocolViolation::Socks5DomainTooLong { len: 256 }),
-                false,
-                true,
-            ),
-            (
-                ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong {
-                    username_len: 256,
-                    password_len: 0,
-                }),
                 false,
                 true,
             ),
@@ -478,11 +450,6 @@ mod tests {
             (
                 "socks code 403",
                 rejected(ProxyProtocol::Socks5, Some(403)),
-                Reply::GeneralFailure,
-            ),
-            (
-                "auth failed",
-                ConnectError::AuthFailed { status: 1 },
                 Reply::GeneralFailure,
             ),
             (

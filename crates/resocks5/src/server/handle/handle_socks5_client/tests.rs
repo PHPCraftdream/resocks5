@@ -785,7 +785,6 @@ pub(super) async fn recovery_request() -> resocks5_net::server::IncomingRequest 
             true,
             false,
         ),
-        |_| async { false },
     )
     .await
     .unwrap()

@@ -50,14 +50,6 @@ pub use error::{
     TimeoutKind,
 };
 
-/// May this build send credentials in clear text (feature `cleartext-client`)?
-/// The crate's own unit tests always may; integration tests link the library
-/// without `cfg(test)` and so exercise the default (refusing) build.
-pub(crate) const CLEARTEXT_CLIENT: bool = cfg!(any(test, feature = "cleartext-client"));
-/// May this build offer and accept clear-text credentials (feature
-/// `cleartext-server`)? Same test rule as [`CLEARTEXT_CLIENT`].
-pub(crate) const CLEARTEXT_SERVER: bool = cfg!(any(test, feature = "cleartext-server"));
-
 #[cfg(feature = "rotator")]
 #[path = "session/chain/mod.rs"]
 pub mod chain;
@@ -92,9 +84,6 @@ mod perf;
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "session/testing/perf_cases.rs"]
 mod perf_cases;
-#[cfg(all(test, feature = "test-instrumentation"))]
-#[path = "session/testing/perf_credentials.rs"]
-mod perf_credentials;
 
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "session/testing/perf_cow.rs"]

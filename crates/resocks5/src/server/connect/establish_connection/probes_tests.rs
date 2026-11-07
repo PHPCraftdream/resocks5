@@ -263,7 +263,7 @@ fn classification_only_destination_unreachable_is_a_hard_failure() {
         ProbeVerdict::Inconclusive
     );
     // Non-refusal target-stage errors name the prefix's own handshake.
-    let auth = || ConnectError::AuthFailed { status: 0xff };
+    let auth = || ConnectError::SecureAuth(resocks5_net::SecureAuthError::Denied);
     let method = || ConnectError::MethodUnsupported {
         got: 0xff,
         with_auth: false,

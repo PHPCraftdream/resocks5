@@ -180,7 +180,6 @@ pub async fn handle_client(
             handle_http_client(
                 client_stream,
                 req,
-                auth,
                 gate_rotator,
                 v6_rotator,
                 v4_rotator,
@@ -190,7 +189,6 @@ pub async fn handle_client(
                 frag,
                 network,
                 tls_connector,
-                direct_limiter,
                 client_deadline,
             )
             .await

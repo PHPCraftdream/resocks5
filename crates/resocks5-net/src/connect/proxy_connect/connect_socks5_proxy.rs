@@ -1,4 +1,4 @@
-//! SOCKS5 (RFC 1928) upstream connector with optional RFC 1929 auth.
+//! SOCKS5 (RFC 1928) upstream connector: no authentication, secure auth or GSSAPI.
 
 #[cfg(feature = "pool")]
 use std::time::Duration;
@@ -12,15 +12,16 @@ use crate::connect::host_port::HostPort;
 use crate::connect::tcp_dial::upstream_endpoint;
 #[cfg(feature = "pool")]
 use crate::connect::UpstreamStream;
-#[cfg(feature = "pool")]
 use crate::error::ConnectError;
 #[cfg(feature = "pool")]
 use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
 
-/// How the SOCKS5 greeting to `proxy` authenticates: secure auth when
-/// configured, else the clear-text pair when both parts are set, else none.
-pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Socks5Auth<'_> {
+/// How the SOCKS5 greeting to `proxy` authenticates: secure auth and/or GSSAPI
+/// when configured, else none. A bare user/password pair would travel in clear
+/// text (RFC 1929), which this crate does not implement: such an entry is
+/// refused before any byte is sent.
+pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Result<Socks5Auth<'_>, ConnectError> {
     #[cfg(feature = "secure-auth")]
     {
         let secure = proxy.secure_auth.as_deref();
@@ -31,21 +32,17 @@ pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Socks5Auth<'_> {
         #[cfg(not(feature = "gssapi"))]
         let any = secure.is_some();
         if any {
-            return Socks5Auth::Strong(crate::connect::handshake_over_stream::Strong {
-                #[cfg(feature = "gssapi")]
-                gssapi,
-                secure,
-            });
+            return Ok(Socks5Auth::Strong(
+                crate::connect::handshake_over_stream::Strong {
+                    #[cfg(feature = "gssapi")]
+                    gssapi,
+                    secure,
+                },
+            ));
         }
     }
-    Socks5Auth::from_pair(socks5_pair(proxy))
-}
-
-fn socks5_pair(proxy: &ProxyConfig) -> Option<(&str, &str)> {
-    match (&proxy.user, &proxy.password) {
-        (Some(user), Some(password)) => Some((user.as_str(), password.as_str())),
-        _ => None,
-    }
+    proxy.refuse_cleartext()?;
+    Ok(Socks5Auth::None)
 }
 
 /// Establishes a connection to the target through a SOCKS5 proxy.
@@ -92,7 +89,7 @@ pub(crate) async fn socks5_on_acquired(
         stream,
         parsed.host,
         parsed.port,
-        socks5_auth(proxy),
+        socks5_auth(proxy)?,
         deadline_after(handshake_timeout),
         &upstream_endpoint(proxy),
         handshake_timeout,

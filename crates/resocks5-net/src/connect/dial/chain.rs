@@ -430,7 +430,7 @@ async fn hop(
                 stream,
                 parsed.host,
                 parsed.port,
-                socks5_auth(node),
+                socks5_auth(node)?,
                 deadline_after(hs),
                 &format!("{}:{}", node.host, node.port),
                 hs,

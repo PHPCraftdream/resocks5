@@ -33,9 +33,7 @@
   with `Proxy-Authenticate: Resocks5-Secure`, without advertising Basic.
   This does not implement secure authentication over HTTP; use SOCKS5 for
   that. Status 403 denotes an access denial, while 407 carries a proxy
-  authentication challenge (RFC 9110 §15.5.8). An SDK build with
-  `cleartext-server` preserves `Basic realm="resocks5", charset="UTF-8"`;
-  the standard application does not enable that feature. A preconfigured
+  authentication challenge (RFC 9110 §15.5.8). A preconfigured
   client, such as `curl --proxy-user`, may send Basic without a challenge:
   the server cannot prevent transmission, only reject the credentials.
   Browser prompt behavior for the unknown scheme has not been tested and

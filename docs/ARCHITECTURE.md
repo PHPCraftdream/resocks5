@@ -262,7 +262,7 @@ Tor), connected to `ProxyConfig::outermost()`. All three attribute errors by
 or an empty bound domain is a `ProtocolViolation` counted against the upstream.
 
 Inbound framing lives in the SDK too (`server::accept`, used by both listeners).
-Its opt-in `ServerOptions` (`strict_http`, `raw_credentials`, `retain_credentials`)
+Its opt-in `ServerOptions::strict_http`
 default to the permissive behaviour the application relies on and the application
 does not enable them; hosts such as pluggable-transport front ends do.
 
@@ -346,10 +346,9 @@ method 0x80); `handle_client` calls `server::accept_secure`, which never
 offers SOCKS5 username/password and answers any HTTP `Proxy-Authorization`
 with 407.
 
-Without the SDK's `cleartext-server` feature, every HTTP 407 contains
+Every HTTP 407 contains
 `Proxy-Authenticate: Resocks5-Secure`, not Basic: the server does not invite
-the client to send a clear-text password. Enabling the feature preserves
-`Basic realm="resocks5", charset="UTF-8"`. `Resocks5-Secure` is a marker
+the client to send a clear-text password. `Resocks5-Secure` is a marker
 rejecting Basic, not an implementation of secure authentication over HTTP;
 secure authentication remains a SOCKS5 mechanism. Status 407 and its challenge
 are retained as required by RFC 9110 §15.5.8; 403 expresses an access denial,

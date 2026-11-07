@@ -514,9 +514,7 @@ async fn into_prefixed_streams_pipeline_and_payload_end_to_end() {
         // (a) HTTP: the over-read pipeline is served by the wrapper.
         let (mut client, mut server) = duplex(1024);
         let server_side = async {
-            let req = accept(&mut server, &options(true, false), |_| async { true })
-                .await
-                .unwrap();
+            let req = accept(&mut server, &options(true, false)).await.unwrap();
             assert_eq!(req.protocol(), Protocol::Http);
             assert_eq!(req.pipeline(), b"EARLY");
             req.reply(&mut server, Reply::Established).await.unwrap();
@@ -545,9 +543,7 @@ async fn into_prefixed_streams_pipeline_and_payload_end_to_end() {
         // (b) SOCKS5: no pipeline; the wrapper is transparent.
         let (mut client, mut server) = duplex(1024);
         let server_side = async {
-            let req = accept(&mut server, &options(true, false), |_| async { true })
-                .await
-                .unwrap();
+            let req = accept(&mut server, &options(true, false)).await.unwrap();
             assert!(req.pipeline().is_empty());
             let mut p = req.into_prefixed(server);
             assert!(p.prefix_remaining().is_empty());
@@ -581,8 +577,6 @@ fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
         auth: crate::server::AuthMethod::Anonymous,
         #[cfg(feature = "gssapi")]
         gss: None,
-        username_raw: None,
-        credentials: None,
         protocol: Protocol::Http,
         target: "h:1".into(),
         username: None,
@@ -598,8 +592,6 @@ fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
         auth: crate::server::AuthMethod::Anonymous,
         #[cfg(feature = "gssapi")]
         gss: None,
-        username_raw: None,
-        credentials: None,
         protocol: Protocol::Http,
         target: "h:1".into(),
         username: None,

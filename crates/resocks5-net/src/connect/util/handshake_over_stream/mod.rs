@@ -19,21 +19,17 @@ use crate::types::ProxyProtocol;
 /// violation (method negotiation, auth, version, ATYP). An unparseable
 /// `target_addr` yields [`ConnectError::InvalidTarget`] before any byte
 /// is written.
-pub async fn handshake_over_stream<S>(
-    stream: S,
-    target_addr: &str,
-    auth: Option<(&str, &str)>,
-) -> Result<S, ConnectError>
+pub async fn handshake_over_stream<S>(stream: S, target_addr: &str) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
     let parsed = super::HostPort::parse(target_addr)
         .ok_or_else(|| ConnectError::InvalidTarget(target_addr.to_string()))?;
-    socks5_handshake(stream, parsed.host, parsed.port, auth).await
+    socks5_handshake(stream, parsed.host, parsed.port).await
 }
 
-/// SOCKS5 (RFC 1928) CONNECT handshake with optional RFC 1929
-/// username/password auth over an existing stream. `host` is unbracketed:
+/// SOCKS5 (RFC 1928) CONNECT handshake without authentication (method 0x00)
+/// over an existing stream. `host` is unbracketed:
 /// an IPv4/IPv6 literal sends ATYP 1/4, anything else a domain (ATYP 3).
 ///
 /// Takes the stream by value or as `&mut S`; every step is flushed. There
@@ -49,19 +45,14 @@ where
 /// violation (method negotiation, auth, version, ATYP, domain length).
 ///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
-pub async fn socks5_handshake<S>(
-    stream: S,
-    host: &str,
-    port: u16,
-    auth: Option<(&str, &str)>,
-) -> Result<S, ConnectError>
+pub async fn socks5_handshake<S>(stream: S, host: &str, port: u16) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
-    let (stream, mut gss) = socks5_greeting(stream, Socks5Auth::from_pair(auth)).await?;
+    let (stream, mut gss) = socks5_greeting(stream, Socks5Auth::None).await?;
     socks5_connect_request(stream, host, port, &mut gss).await
 }
 
@@ -70,12 +61,14 @@ where
 pub(crate) enum Socks5Auth<'a> {
     /// Method 0x00.
     None,
-    /// RFC 1929 UNAME/PASSWD (method 0x02): the password in clear text.
-    Cleartext(&'a str, &'a str),
     /// Strong authentication, nothing weaker: every configured method is
     /// offered, strongest first, and the server picks (see [`Strong`]).
     #[cfg(feature = "secure-auth")]
     Strong(Strong<'a>),
+    /// Only to use the lifetime when `secure-auth` is off.
+    #[cfg(not(feature = "secure-auth"))]
+    #[allow(dead_code)]
+    Unused(std::marker::PhantomData<&'a ()>),
 }
 
 /// The strong methods a client can offer, in order of preference: GSSAPI
@@ -103,18 +96,8 @@ fn no_gss() -> Gss {
 #[cfg(not(feature = "gssapi"))]
 fn no_gss() -> Gss {}
 
-impl<'a> Socks5Auth<'a> {
-    pub(crate) fn from_pair(pair: Option<(&'a str, &'a str)>) -> Self {
-        match pair {
-            Some((user, password)) => Self::Cleartext(user, password),
-            None => Self::None,
-        }
-    }
-}
-
-/// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3) and,
-/// when `auth` is set, complete the RFC 1929 username/password
-/// sub-negotiation.
+/// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3): the
+/// strong methods when configured, else no authentication.
 ///
 /// On success the stream sits right after the method-selection (or
 /// auth-status) reply, ready for [`socks5_connect_request`] (with the returned
@@ -192,79 +175,24 @@ where
             })?;
         return Ok((stream, no_gss()));
     }
-    let auth = match auth {
-        Socks5Auth::Cleartext(user, password) => Some((user, password)),
-        _ => None,
-    };
-    if auth.is_some() && !crate::CLEARTEXT_CLIENT {
-        // RFC 1929 sends the password as is: refused before any byte.
-        return Err(ConnectError::CleartextCredentialsRefused);
+    #[cfg(not(feature = "secure-auth"))]
+    let _ = auth;
+    // No authentication: method 0x00 only. A password is never sent in clear
+    // text (RFC 1929 is not implemented).
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    stream.flush().await?;
+    let mut response = [0u8; 2];
+    stream.read_exact(&mut response).await?;
+    if response[0] != 0x05 {
+        return Err(ConnectError::Protocol(
+            ProtocolViolation::Socks5BadVersion { got: response[0] },
+        ));
     }
-    if let Some((username, password)) = auth {
-        stream.write_all(&[0x05, 0x01, 0x02]).await?;
-        stream.flush().await?;
-        let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await?;
-        if response[0] != 0x05 {
-            return Err(ConnectError::Protocol(
-                ProtocolViolation::Socks5BadVersion { got: response[0] },
-            ));
-        }
-        if response[1] != 0x02 {
-            return Err(ConnectError::MethodUnsupported {
-                got: response[1],
-                with_auth: true,
-            });
-        }
-
-        let uname = username.as_bytes();
-        let passwd = password.as_bytes();
-        if uname.len() > 255 || passwd.len() > 255 {
-            return Err(ConnectError::Protocol(
-                ProtocolViolation::Socks5CredentialsTooLong {
-                    username_len: uname.len(),
-                    password_len: passwd.len(),
-                },
-            ));
-        }
-
-        let mut auth_req = Vec::with_capacity(3 + uname.len() + passwd.len());
-        auth_req.push(0x01);
-        auth_req.push(uname.len() as u8);
-        auth_req.extend_from_slice(uname);
-        auth_req.push(passwd.len() as u8);
-        auth_req.extend_from_slice(passwd);
-        stream.write_all(&auth_req).await?;
-        stream.flush().await?;
-
-        let mut auth_resp = [0u8; 2];
-        stream.read_exact(&mut auth_resp).await?;
-        if auth_resp[0] != 0x01 {
-            return Err(ConnectError::Protocol(
-                ProtocolViolation::Socks5BadAuthVersion { got: auth_resp[0] },
-            ));
-        }
-        if auth_resp[1] != 0x00 {
-            return Err(ConnectError::AuthFailed {
-                status: auth_resp[1],
-            });
-        }
-    } else {
-        stream.write_all(&[0x05, 0x01, 0x00]).await?;
-        stream.flush().await?;
-        let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await?;
-        if response[0] != 0x05 {
-            return Err(ConnectError::Protocol(
-                ProtocolViolation::Socks5BadVersion { got: response[0] },
-            ));
-        }
-        if response[1] != 0x00 {
-            return Err(ConnectError::MethodUnsupported {
-                got: response[1],
-                with_auth: false,
-            });
-        }
+    if response[1] != 0x00 {
+        return Err(ConnectError::MethodUnsupported {
+            got: response[1],
+            with_auth: false,
+        });
     }
     Ok((stream, no_gss()))
 }
@@ -424,7 +352,6 @@ pub async fn socks5_handshake_until<S>(
     stream: S,
     host: &str,
     port: u16,
-    auth: Option<(&str, &str)>,
     deadline: tokio::time::Instant,
     endpoint: &str,
 ) -> Result<S, ConnectError>
@@ -436,7 +363,7 @@ where
         stream,
         host,
         port,
-        Socks5Auth::from_pair(auth),
+        Socks5Auth::None,
         deadline,
         endpoint,
         after,
