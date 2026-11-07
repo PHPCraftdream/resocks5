@@ -59,8 +59,8 @@ async fn bad_gate_rig() -> Rig {
     chain4.gate = Some(Arc::new(gate4_cfg.clone()));
     let v6 = Arc::new(ProxyRotator::new(vec![exit6_cfg]));
     let v4 = Arc::new(ProxyRotator::new(vec![exit4_cfg]));
-    v6.link_proxy(target.to_string(), Arc::new(chain6));
-    v4.link_proxy(target.to_string(), Arc::new(chain4));
+    v6.link_proxy(target, Arc::new(chain6));
+    v4.link_proxy(target, Arc::new(chain4));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![gate6_cfg, gate4_cfg])),
@@ -146,7 +146,7 @@ async fn budget_one_still_serves_the_cache_first() {
     let mut chain = exit_cfg.clone();
     chain.gate = Some(Arc::new(gate_cfg.clone()));
     let v4 = Arc::new(ProxyRotator::new(vec![exit_cfg]));
-    v4.link_proxy(target.to_string(), Arc::new(chain));
+    v4.link_proxy(target, Arc::new(chain));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![gate_cfg])),
@@ -206,7 +206,7 @@ async fn ample_budget_keeps_the_cache_first() {
     let mut chain = exit_cfg.clone();
     chain.gate = Some(Arc::new(gate_cfg.clone()));
     let v4 = Arc::new(ProxyRotator::new(vec![exit_cfg]));
-    v4.link_proxy(target.to_string(), Arc::new(chain));
+    v4.link_proxy(target, Arc::new(chain));
     let gates = Arc::new(GateLevels::new(vec![(
         1,
         Arc::new(ProxyRotator::new(vec![gate_cfg])),

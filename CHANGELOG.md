@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a preconfigured client cannot be prevented; browser prompt behavior
   for the unknown scheme has not been tested.
 
+### Changed
+
+- `resocks5-net`: fewer copies on the dial path, behavior unchanged.
+  `ChainKey::singleton(&Arc<ProxyConfig>)` keys one node without copying it
+  (a gate-less node is shared); `ChainPick::config_arc()` returns the pick's
+  linked configuration as a shared `Arc` (`config()` still returns an owned
+  copy); `ProxyRotator::link_proxy` takes `impl AsRef<str>` (source compatible:
+  `String`, `&String` and `&str` all work) and only allocates a key for a new
+  address; hedged attempts share one `Arc<str>` target. The application uses
+  these on its dial path and no longer clones the client and target for the
+  direct-cap log line.
+
 ### Added
 
 - `resocks5-net`: secure auth (`secure_auth` module, feature `secure-auth`, on by

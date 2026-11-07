@@ -169,11 +169,14 @@ impl StickyCache {
         Some(entry.proxy.clone())
     }
 
-    fn insert(&mut self, addr: String, proxy: Arc<ProxyConfig>, now: Instant) {
+    fn insert(&mut self, addr: impl AsRef<str>, proxy: Arc<ProxyConfig>, now: Instant) {
+        let addr = addr.as_ref();
         if self.max_entries == 0 {
             return;
         }
-        let key = self.remove(&addr);
+        // A replaced entry hands its key back, so only a new address
+        // allocates one.
+        let key = self.remove(addr);
         if self.map.len() >= self.max_entries {
             // Reclaim one expired entry before evicting any live entry.
             let victim = self
@@ -431,11 +434,12 @@ impl ProxyRotator {
 
     /// Insert (or replace) the cache entry for `addr`. Takes ownership
     /// of `Arc<ProxyConfig>` so the caller can hand off the only clone
-    /// it had — refcount stays the same.
+    /// it had — refcount stays the same. `addr` is only borrowed: pass a
+    /// `&str` and nothing is allocated when the entry already exists.
     ///
     /// A full cache reclaims an expired entry first, otherwise evicting
     /// the least-recently-used entry.
-    pub fn link_proxy(&self, addr: String, proxy: Arc<ProxyConfig>) {
+    pub fn link_proxy(&self, addr: impl AsRef<str>, proxy: Arc<ProxyConfig>) {
         self.sticky
             .lock()
             .unwrap()

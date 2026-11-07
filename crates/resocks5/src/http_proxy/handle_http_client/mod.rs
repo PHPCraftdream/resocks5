@@ -58,13 +58,11 @@ pub async fn handle_http_client(
         match direct_limiter.clone().try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
-                let target_c = target_addr.to_owned();
-                let user_c = user_owned.to_string();
                 let cap = network.max_concurrent_direct;
-                logger.connection_error(move || {
+                logger.connection_error(|| {
                     format!(
                         "Direct cap reached ({}) — dropping client={} target={}",
-                        cap, user_c, target_c
+                        cap, user_owned, target_addr
                     )
                 });
                 let _ = req.reply(&mut client_stream, Reply::Overloaded).await;

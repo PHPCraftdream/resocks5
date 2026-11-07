@@ -310,3 +310,71 @@ fn chain_matches_manual_with_gate_dial_chain_shape() {
         "outer"
     );
 }
+
+/// A gate-less node is shared, not copied. Mutation: copying it anyway keeps
+/// the equality below but fails the pointer check.
+#[test]
+fn singleton_key_shares_a_gateless_node() {
+    let exit = node("exit", 1, 0);
+    let key = ChainKey::singleton(&exit);
+    assert!(Arc::ptr_eq(key.exit(), &exit));
+    assert_eq!(Arc::strong_count(&exit), 2);
+}
+
+/// The key equals the key of a one-node `chain`, hash included, so the two
+/// ways of building a route key can sit in one set.
+#[test]
+fn singleton_key_equals_the_chain_key_of_the_same_node() {
+    let nodes = [
+        node("plain", 1, 0),
+        node("leveled", 2, 3),
+        Arc::new(ProxyConfig::https("anon", 3)),
+        Arc::new(ProxyConfig::socks5("::1", 4).with_auth("u", "")),
+    ];
+    for exit in nodes {
+        let via_chain = ChainKey::new(Arc::new(ProxyConfig::chain([exit.clone()]).unwrap()));
+        let singleton = ChainKey::singleton(&exit);
+        assert_eq!(singleton, via_chain, "{exit:?}");
+        assert_eq!(hash(&singleton), hash(&via_chain), "{exit:?}");
+        assert_eq!(HashSet::from([singleton, via_chain]).len(), 1);
+    }
+}
+
+/// A node that carries a gate is keyed without it and the input is left
+/// untouched. Mutation: sharing the node as is keeps the gate in the key and
+/// makes it differ from the one-node chain.
+#[test]
+fn singleton_key_drops_the_gate_link_without_touching_the_node() {
+    let exit = Arc::new(ProxyConfig::socks5("exit", 9).with_gate((*node("gate", 8, 1)).clone()));
+    let key = ChainKey::singleton(&exit);
+    assert!(key.exit().gate.is_none());
+    assert!(!Arc::ptr_eq(key.exit(), &exit));
+    assert!(exit.gate.is_some(), "the input keeps its gate");
+    let alone = ChainKey::new(Arc::new(ProxyConfig::chain([exit.clone()]).unwrap()));
+    assert_eq!(key, alone);
+    assert_ne!(
+        key,
+        ChainKey::new(exit.clone()),
+        "the gate is part of the full key"
+    );
+}
+
+/// Identity fields still tell singletons apart.
+#[test]
+fn singleton_keys_differ_by_identity_fields() {
+    let base = node("h", 1, 0);
+    let others = [
+        node("other", 1, 0),
+        node("h", 2, 0),
+        node("h", 1, 1),
+        Arc::new(ProxyConfig::socks5("h", 1).with_auth("chain-user", "different")),
+        Arc::new(ProxyConfig::http("h", 1).with_auth("chain-user", "chain-password")),
+    ];
+    for other in others {
+        assert_ne!(
+            ChainKey::singleton(&base),
+            ChainKey::singleton(&other),
+            "{other:?}"
+        );
+    }
+}

@@ -132,9 +132,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
     for rotator in [v6_rotator, v4_rotator].iter().filter_map(|&r| r.as_ref()) {
         if let Some(cached_proxy) = rotator.get_linked(target_addr) {
             if cached_proxy.gate.is_none() {
-                let route = ChainKey::new(Arc::new(
-                    ProxyConfig::chain([cached_proxy.clone()]).expect("singleton chain"),
-                ));
+                let route = ChainKey::singleton(&cached_proxy);
                 if tried_routes.insert(route) {
                     candidates.push(Candidate {
                         rotator: rotator.clone(),
@@ -187,7 +185,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
             logger.cache_attempt(|| {
                 format!("Attempting to use cached proxy for {}{}", target_addr, ctag)
             });
-            let config = pick.config();
+            let config = pick.config_arc();
             let t0 = Instant::now();
             match resocks5_net::connect::connect_chain(
                 &config,
@@ -268,7 +266,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
             continue;
         }
         attempts += 1;
-        let config = pick.config();
+        let config = pick.config_arc();
         let t0 = Instant::now();
         match resocks5_net::connect::connect_chain(
             &config,
@@ -291,9 +289,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
                         ctag
                     )
                 });
-                pick.exit()
-                    .rotator
-                    .link_proxy(target_addr.to_string(), Arc::new(config));
+                pick.exit().rotator.link_proxy(target_addr, config);
                 logger
                     .cache_write(|| format!("Cache written for {} with gate{}", target_addr, ctag));
                 return Ok(stream);
@@ -344,9 +340,7 @@ pub(super) async fn establish_connection_traced<R: PlanBuildRecorder>(
             break;
         }
         for proxy_config in rotator.pick_order() {
-            let route = ChainKey::new(Arc::new(
-                ProxyConfig::chain([proxy_config.clone()]).expect("singleton chain"),
-            ));
+            let route = ChainKey::singleton(&proxy_config);
             if tried_routes.contains(&route) {
                 continue;
             }
@@ -435,7 +429,7 @@ fn report_attempt(
             if !report.after_win && *cached {
                 logger.cache_hit(|| format!("Cache used for {}{}", target_addr, ctag));
             } else if !report.after_win {
-                rotator.link_proxy(target_addr.to_string(), proxy.clone());
+                rotator.link_proxy(target_addr, proxy.clone());
                 logger
                     .cache_write(|| format!("Cache written for {} directly{}", target_addr, ctag));
             }

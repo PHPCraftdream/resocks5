@@ -64,7 +64,7 @@ fn soft_failures_do_not_quarantine() {
 fn sticky_cache_skips_a_quarantined_proxy() {
     let r = rotator(&["a", "b"]);
     let a = Arc::new(proxy("a"));
-    r.link_proxy("example.com:443".to_string(), a.clone());
+    r.link_proxy("example.com:443", a.clone());
     assert!(r.get_linked("example.com:443").is_some());
     trip(&r, &a);
     assert!(r.get_linked("example.com:443").is_none());
