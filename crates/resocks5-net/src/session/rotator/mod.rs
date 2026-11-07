@@ -699,7 +699,8 @@ impl ProxyRotator {
     }
 
     /// Diagnostic/test-only reader: how many times
-    /// [`ProxyRotator::pick_order`] has been called on this rotator.
+    /// [`ProxyRotator::pick_order`] or [`ProxyRotator::pick_iter`] has been
+    /// called on this rotator.
     /// Hidden from docs; nothing in production consumes it — it exists
     /// so tests in dependent crates can assert that budget
     /// exhaustion skips order building. Compiled only with the
@@ -718,6 +719,21 @@ impl ProxyRotator {
             rotator: Arc::clone(self),
             eligible,
             cursor,
+        }
+    }
+
+    /// Public lazy twin of [`ProxyRotator::pick_order`]: the same snapshot
+    /// (eligibility, quarantine screening and RNG consumption at call
+    /// time) yielding the same order, but the weighted keys are sorted
+    /// and the `Arc<ProxyConfig>` candidates materialised only as the
+    /// iterator is consumed, so the cost is proportional to consumption
+    /// instead of the pool size. Draining it produces exactly
+    /// [`ProxyRotator::pick_order`] for the same RNG state.
+    pub fn pick_iter(self: &Arc<Self>) -> PickOrder {
+        #[cfg(feature = "test-instrumentation")]
+        self.pick_order_calls.fetch_add(1, Ordering::Relaxed);
+        PickOrder {
+            inner: self.pick_order_lazy(),
         }
     }
 
@@ -769,6 +785,25 @@ impl LazyCandidates {
         std::iter::from_fn(|| self.next_proxy()).collect()
     }
 }
+
+/// Lazy candidate iterator returned by [`ProxyRotator::pick_iter`].
+/// See that method for the snapshot, ordering and cost contract: the
+/// order equals [`ProxyRotator::pick_order`] for the same RNG state, and
+/// sorting/materialisation happen only as items are pulled. After
+/// exhaustion it keeps returning `None`.
+pub struct PickOrder {
+    inner: LazyCandidates,
+}
+
+impl Iterator for PickOrder {
+    type Item = Arc<ProxyConfig>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next_proxy()
+    }
+}
+
+impl std::iter::FusedIterator for PickOrder {}
 
 #[cfg(test)]
 mod construction_tests;
