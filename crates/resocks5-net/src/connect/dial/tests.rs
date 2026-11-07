@@ -149,9 +149,14 @@ fn options_defaults_and_builders() {
     assert_eq!(o.total_timeout, Some(Duration::from_secs(3)));
     assert!(!d.nodelay);
     assert_eq!(d.keepalive, None);
-    let o = o.with_nodelay(true).with_keepalive(Duration::from_secs(30));
+    assert_eq!(d.keepalive_interval, None);
+    let o = o
+        .with_nodelay(true)
+        .with_keepalive(Duration::from_secs(30))
+        .with_keepalive_interval(Duration::from_secs(5));
     assert!(o.nodelay);
     assert_eq!(o.keepalive, Some(Duration::from_secs(30)));
+    assert_eq!(o.keepalive_interval, Some(Duration::from_secs(5)));
 }
 
 #[tokio::test]
@@ -682,9 +687,9 @@ async fn dial_tcp_refuses_https_without_connecting() {
     );
 }
 
-/// `nodelay` and `keepalive` reach the socket to the proxy; by default the
-/// OS defaults (both off) stay. Mutation: not applying the options leaves
-/// both off.
+/// `nodelay` and `keepalive` reach the socket to the proxy; defaults leave
+/// these options off. Mutation: not applying an option leaves its readback at
+/// the default.
 #[tokio::test]
 async fn socket_options_reach_the_proxy_socket() {
     for set in [false, true] {
@@ -694,18 +699,52 @@ async fn socket_options_reach_the_proxy_socket() {
         if set {
             options = options
                 .with_nodelay(true)
-                .with_keepalive(Duration::from_secs(45));
+                .with_keepalive(Duration::from_secs(45))
+                .with_keepalive_interval(Duration::from_secs(5));
         }
         let tcp = dial_tcp_guarded(&ProxyConfig::socks5("127.0.0.1", port), &options)
             .await
             .unwrap();
         assert_eq!(tcp.nodelay().unwrap(), set, "nodelay, set={set}");
-        assert_eq!(
-            socket2::SockRef::from(&tcp).keepalive().unwrap(),
-            set,
-            "keepalive, set={set}"
-        );
+        let sock = socket2::SockRef::from(&tcp);
+        assert_eq!(sock.keepalive().unwrap(), set, "keepalive, set={set}");
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "cygwin",
+        ))]
+        if set {
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(5),
+                "keepalive interval, set={set}"
+            );
+        }
         drop(tcp);
         stub.await.unwrap();
     }
+}
+
+/// An interval without an idle setting must not enable keepalive.
+#[tokio::test]
+async fn keepalive_interval_alone_does_not_enable_keepalive() {
+    let (l, port) = bind().await;
+    let stub = socks5_stub(l, None, 0x05, 0);
+    let options = opts().with_keepalive_interval(Duration::from_secs(5));
+    let tcp = dial_tcp_guarded(&ProxyConfig::socks5("127.0.0.1", port), &options)
+        .await
+        .unwrap();
+    assert!(!socket2::SockRef::from(&tcp).keepalive().unwrap());
+    drop(tcp);
+    stub.await.unwrap();
 }

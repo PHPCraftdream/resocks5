@@ -37,7 +37,8 @@ impl ConnectError {
     ///
     /// | Error | Reply |
     /// |---|---|
-    /// | any [`Timeout`](ConnectError::Timeout) | [`Reply::TimedOut`] |
+    /// | TCP connect, SOCKS5 greeting, HTTPS TLS handshake timeout | [`Reply::UpstreamUnavailable`] |
+    /// | SOCKS5 handshake, HTTP handshake, HTTPS CONNECT handshake, total timeout | [`Reply::TimedOut`] |
     /// | SOCKS5 `ProxyRejected` REP 2 / 3 / 4 / 5 / 6 | `Forbidden` / `NetworkUnreachable` / `UpstreamUnavailable` / `ConnectionRefused` / `TimedOut` |
     /// | HTTP(S) `ProxyRejected` 403 / 504 / 502, 503 | `Forbidden` / `TimedOut` / `UpstreamUnavailable` |
     /// | other `ProxyRejected` (REP 1, 7, 8, other statuses, malformed) | `GeneralFailure` |
@@ -54,7 +55,15 @@ impl ConnectError {
     /// unavailable" or "general failure", never "connection refused".
     pub fn suggested_reply(&self) -> Reply {
         match self {
-            ConnectError::Timeout { .. } => Reply::TimedOut,
+            ConnectError::Timeout { kind, .. } => match kind {
+                TimeoutKind::TcpConnect
+                | TimeoutKind::Socks5Greeting
+                | TimeoutKind::HttpsTlsHandshake => Reply::UpstreamUnavailable,
+                TimeoutKind::Socks5Handshake
+                | TimeoutKind::HttpHandshake
+                | TimeoutKind::HttpsConnectHandshake
+                | TimeoutKind::Total => Reply::TimedOut,
+            },
             ConnectError::Io { stage, source, .. } => {
                 if source.kind() == std::io::ErrorKind::TimedOut {
                     Reply::TimedOut
@@ -335,6 +344,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timeout_replies_cover_every_kind_and_upstream_classification() {
+        let cases = [
+            (TimeoutKind::TcpConnect, Reply::UpstreamUnavailable),
+            (TimeoutKind::Socks5Greeting, Reply::UpstreamUnavailable),
+            (TimeoutKind::HttpsTlsHandshake, Reply::UpstreamUnavailable),
+            (TimeoutKind::Socks5Handshake, Reply::TimedOut),
+            (TimeoutKind::HttpHandshake, Reply::TimedOut),
+            (TimeoutKind::HttpsConnectHandshake, Reply::TimedOut),
+            (TimeoutKind::Total, Reply::TimedOut),
+        ];
+        for (kind, expected) in cases {
+            let error = timeout(kind, Stage::Handshake);
+            assert_eq!(error.suggested_reply(), expected, "{kind:?}");
+            if error.is_upstream_down() {
+                assert_eq!(expected, Reply::UpstreamUnavailable, "{kind:?}");
+            }
+        }
+    }
+
     /// The single mapping from a connect failure to the reply a gateway gives
     /// its client. Mutations: moving a code to another reply, dropping the
     /// 504/REP 6 timeout rows, or sending the upstream-hop failures
@@ -352,21 +381,26 @@ mod tests {
             (
                 "timeout connect",
                 timeout(TimeoutKind::TcpConnect, Stage::Connect),
-                Reply::TimedOut,
+                Reply::UpstreamUnavailable,
             ),
             (
                 "timeout greeting",
                 timeout(TimeoutKind::Socks5Greeting, Stage::Handshake),
-                Reply::TimedOut,
+                Reply::UpstreamUnavailable,
             ),
             (
-                "timeout connect reply",
+                "timeout TLS handshake",
+                timeout(TimeoutKind::HttpsTlsHandshake, Stage::Handshake),
+                Reply::UpstreamUnavailable,
+            ),
+            (
+                "timeout SOCKS5 handshake",
                 timeout(TimeoutKind::Socks5Handshake, Stage::Handshake),
                 Reply::TimedOut,
             ),
             (
                 "timeout total",
-                timeout(TimeoutKind::HttpHandshake, Stage::Total),
+                timeout(TimeoutKind::Total, Stage::Total),
                 Reply::TimedOut,
             ),
             (

@@ -84,4 +84,5 @@ zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }

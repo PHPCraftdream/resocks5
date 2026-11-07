@@ -43,6 +43,10 @@ pub struct DialOptions {
     pub nodelay: bool,
     /// Enable TCP keepalive on the socket to the proxy with this idle time.
     pub keepalive: Option<Duration>,
+    /// Keepalive probe interval; only applies together with
+    /// [`with_keepalive`](Self::with_keepalive); best-effort and ignored where
+    /// `socket2` lacks `with_interval`.
+    pub keepalive_interval: Option<Duration>,
 }
 
 impl Default for DialOptions {
@@ -53,6 +57,7 @@ impl Default for DialOptions {
             total_timeout: None,
             nodelay: false,
             keepalive: None,
+            keepalive_interval: None,
         }
     }
 }
@@ -97,6 +102,15 @@ impl DialOptions {
     #[must_use]
     pub fn with_keepalive(mut self, idle: Duration) -> Self {
         self.keepalive = Some(idle);
+        self
+    }
+
+    /// Set the TCP keepalive probe interval. This applies only together with
+    /// [`with_keepalive`](Self::with_keepalive), and is best-effort: it is
+    /// ignored on platforms where `socket2` does not support `with_interval`.
+    #[must_use]
+    pub fn with_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = Some(interval);
         self
     }
 }
