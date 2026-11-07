@@ -3,7 +3,7 @@
 //! Available without default features. Destinations remain unresolved: this module
 //! never dials, resolves DNS, selects a route, or grants a direct-routing privilege.
 //! [`accept`] (anonymous clients only) and, with feature `secure-auth`,
-//! [`accept_secure`]/[`accept_with`] (strong authentication) parse only; the host
+//! `accept_secure`/`accept_with` (strong authentication) parse only; the host
 //! sends [`Reply::Established`] after egress is ready (or deliberately before a
 //! host-owned recovery phase). No clear-text password is ever accepted: SOCKS5
 //! method 0x02 is never offered and any HTTP `Proxy-Authorization` is a 407.
@@ -39,7 +39,7 @@ pub use secure::{accept_secure, accept_with, AuthMethods, NoSecrets};
 /// Which clients the host admits and the host-supplied absolute deadline.
 ///
 /// "Users" means configured accounts exist (they authenticate with a strong
-/// method, see [`accept_with`]), not that any particular user is enabled.
+/// method, see `accept_with`), not that any particular user is enabled.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
     deadline: Instant,
@@ -52,8 +52,8 @@ pub struct ServerOptions {
 impl ServerOptions {
     /// Use one absolute deadline for detection, framing, and authentication.
     /// A past deadline refuses to poll the stream or the authentication exchange.
-    /// `has_users` says that configured accounts exist: only [`accept_with`] and
-    /// [`accept_secure`] let them in, with a strong method.
+    /// `has_users` says that configured accounts exist: only `accept_with` and
+    /// `accept_secure` let them in, with a strong method.
     pub fn new(deadline: Instant, allow_anonymous: bool, has_users: bool) -> Self {
         Self {
             deadline,
