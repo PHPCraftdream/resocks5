@@ -252,9 +252,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p resocks5-net ${{ matrix.args }} --locked ${{ needs.changes.outputs.net_test_args }}
-      - name: No clear-text password policy (integration test, no cfg(test))
+      - name: Authentication policy (integration tests, no cfg(test))
         if: matrix.name == 'default' && needs.changes.outputs.net_test_args != ''
-        run: cargo test -p resocks5-net ${{ matrix.args }} --locked --test no_cleartext
+        run: cargo test -p resocks5-net ${{ matrix.args }} --locked --test auth_policy --test secure_auth
 
   # Lean clippy for the library: dead-code and unused-import lints surface
   # only in feature-off builds, and the workspace `lint` job always sees
