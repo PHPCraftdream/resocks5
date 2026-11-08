@@ -183,6 +183,9 @@ use the firewall/network policies of the OS.
 |-------|------|---------|---------|
 | `auth.allow_anonymous` | bool | true | Allow SOCKS5 without a name/password and HTTP CONNECT without Proxy-Authorization. The presence of users does not by itself disable anonymous access. |
 | `auth.secure_only` | bool | false | Accept only our own secure method (SOCKS5 0x80, HTTP `Resocks5-Secure`): clear-text passwords (0x02, Basic) and anonymous access are disabled and `auth.allow_anonymous` is ignored. An optional field: when absent it is `false`, so old configs behave as before. |
+| `auth.argon2.memory_kib` | u32 | 19456 | Argon2id memory cost, in KiB, of NEW user secrets (`users add`, `users set-password`, the claim of an `init` account) and the floor of an `init` enrollment. An optional section: when absent, or partly given, the missing fields keep their defaults. The default (19 MiB) is the OWASP minimum and what 0.4.x used. Valid range: from `8 * parallelism` to 262144; an out-of-range value stops the server at startup. Existing secrets keep the cost stored with them. |
+| `auth.argon2.iterations` | u32 | 2 | Argon2id passes over the memory (1..=16). |
+| `auth.argon2.parallelism` | u32 | 1 | Argon2id lanes (1..=16). |
 | `upstream_auth.secure_only` | bool | false | For every upstream with `user:password` use only our own method: an upstream that offers nothing but a clear-text password is refused before the password is sent. The `upstream_auth` section is optional; a single list entry can be restricted with the `;secure_only` suffix (see section 4). |
 
 - Empty users + `true`: anonymous access is possible, but an upstream route
@@ -241,14 +244,24 @@ protect the window of the first login, for example with `allowed_clients`:
 the filter applies before the claim, and a filtered peer gets the same
 refusal as for a wrong password.
 
-**Argon2id cost and flood protection.** New secrets are derived with
-m=4096 KiB (4 MiB), t=1, p=1. This is deliberately below the OWASP minimum
-(19 MiB, 2 passes): guessing a password from a stolen users file or from a
-captured secure-method exchange is noticeably faster (roughly 10 times).
-This cost gives no ASIC or GPU resistance: use random passwords of 22+
-characters (128 bits), for which the cost hardly matters. Hashes that are
-already stored keep their parameters; a 0.4.x hash (m=5120, t=2, p=1) is
-accepted without a warning. The load on the server is bounded as follows:
+**Argon2id cost and flood protection.** New secrets are derived with the
+cost set by `auth.argon2`; the defaults are `memory_kib: 19456` (19 MiB),
+`iterations: 2`, `parallelism: 1` — the OWASP minimum, and what 0.4.x used.
+The same cost is the floor of an `init` enrollment and the cost an unknown name
+is offered, so a server cannot be told apart by it. Lower values make guessing
+a password from a stolen users file or from a captured secure-method exchange
+cheaper; higher values cost more memory and time per login. The section is
+optional and each field is optional; an out-of-range value (parallelism
+1..=16, iterations 1..=16, `memory_kib` from `8 * parallelism` to 262144)
+stops the server at startup with a message naming `auth.argon2`. Stored
+secrets keep the parameters written with them whatever the setting, so
+changing it never invalidates a users file; a 0.4.x hash (m=5120 or m=19456)
+is accepted without a warning. The `users` commands read `auth.argon2` from
+the main config when it exists (a missing or broken file warns on stderr and
+uses the defaults). The cost gives no ASIC or GPU resistance: use random
+passwords of 22+ characters (128 bits). The SDK client asks nothing of a
+server's cost by default; `SecureCredentials::with_min_kdf` demands a
+minimum. The load on the server is bounded as follows:
 the secure method costs the server one HMAC; clear-text verification goes
 through a shared limit on concurrent derivations (half of the cores, at
 least one) — the excess waits at most a second and is then refused; an

@@ -472,6 +472,7 @@ async fn secure_only_refuses_clear_text_and_anonymous() {
             &crate::config::AuthConfig {
                 allow_anonymous: false,
                 secure_only: true,
+                argon2: Default::default(),
             },
             &UsersConfig {
                 users: vec![user("alice", "pw", None, false)],

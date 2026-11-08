@@ -116,16 +116,17 @@ not protect:
   `upstream_auth.secure_only: true`, or a `;secure_only` suffix on one list
   entry, does the same for upstream hops. Both flags are optional and default
   to `false`, so existing configs behave exactly as before.
-- **Argon2id cost is deliberately low**: new secrets use 4 MiB, 1 pass,
-  1 lane (`KdfParams::DEFAULT`), below the OWASP minimum of 19 MiB and 2
-  passes, to keep clear-text checks cheap. The trade-off is explicit: guessing
-  a password from a stolen users file, or from a captured secure-auth exchange
+- **Argon2id cost is configurable**: new secrets use the cost set by
+  `auth.argon2` (default 19 MiB, 2 passes, 1 lane — the OWASP minimum and what
+  0.4.x used; `KdfParams::DEFAULT` in the SDK). A lower cost makes guessing a
+  password from a stolen users file, or from a captured secure-auth exchange
   (the exchange is an offline-guessing oracle at the cost of one derivation),
-  is roughly 10 times cheaper than at the OWASP cost, and at this size the
-  memory-hardness gives no ASIC or GPU resistance. **Use random passwords of at
-  least 22 characters (128 bits)**: for those the cost is irrelevant. Secrets
-  stored by earlier versions keep their parameters. A PAKE (OPAQUE, SRP) would
-  remove the offline-guessing oracle; it is not part of this release.
+  proportionally cheaper, and at small sizes the memory-hardness gives no ASIC
+  or GPU resistance. **Use random passwords of at least 22 characters (128
+  bits)**: for those the cost is irrelevant. Secrets stored earlier keep the
+  parameters written with them, so changing the setting never breaks a users
+  file. A PAKE (OPAQUE, SRP) would remove the offline-guessing oracle; it is not
+  part of this release.
 - **Flood protection**: a flood of false logins cannot take the server down.
   Secure auth costs the server HMACs only; clear-text checks share a
   process-wide limit on concurrent derivations (half of the cores, at least

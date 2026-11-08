@@ -1,13 +1,12 @@
-//! Argon2id cost policy for the secrets this server writes (CLI `user
-//! add`/`user set`) and the floor it demands from an init enrollment.
-//! Existing secrets keep the parameters stored with them.
+//! Argon2id cost policy: the default every new secret is created with. The
+//! operator tunes it with `auth.argon2`; existing secrets keep the
+//! parameters stored with them.
 
 use resocks5_net::secure_auth::KdfParams;
 
-/// The single cost policy for every new secret — deliberately below the
-/// OWASP minimum (4 MiB, single pass) — a documented cost trade-off
-/// (see SECURITY).
-const PRODUCTION: KdfParams = KdfParams::DEFAULT;
+/// The default cost for a new secret: the SDK default (the OWASP minimum,
+/// 19 MiB, 2 passes, 1 lane).
+pub(crate) const PRODUCTION: KdfParams = KdfParams::DEFAULT;
 
 /// Test-only cost: keeps the many derivations in tests fast.
 #[cfg(test)]
@@ -17,8 +16,9 @@ pub(crate) const TEST: KdfParams = KdfParams {
     parallelism: 1,
 };
 
-/// Parameters for a new secret.
-pub(in crate::auth) fn new_secret_params() -> KdfParams {
+/// What an unconfigured `auth.argon2` resolves to (test builds: the cheap
+/// cost).
+pub(crate) fn default_params() -> KdfParams {
     #[cfg(test)]
     {
         TEST
@@ -27,11 +27,6 @@ pub(in crate::auth) fn new_secret_params() -> KdfParams {
     {
         PRODUCTION
     }
-}
-
-/// The cheapest derivation an init enrollment may use.
-pub(in crate::auth) fn enrollment_floor() -> KdfParams {
-    new_secret_params()
 }
 
 #[cfg(test)]
@@ -69,7 +64,7 @@ mod tests {
         let secret = UserSecret::from_password("policy-check", PRODUCTION).unwrap();
         let stored = encode_secret(&secret);
         assert!(
-            stored.starts_with("$argon2id$v=19$m=4096,t=1,p=1$"),
+            stored.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
             "unexpected prefix: {stored}"
         );
         assert_eq!(parse_secret(&stored).unwrap().key(), secret.key());

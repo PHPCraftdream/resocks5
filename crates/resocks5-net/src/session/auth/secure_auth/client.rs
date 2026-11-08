@@ -30,6 +30,21 @@ pub struct SecureCredentials {
     id: u64,
 }
 
+impl Clone for SecureCredentials {
+    /// A copy with its own derived-key cache entry (the cache is keyed by a
+    /// process-unique id).
+    fn clone(&self) -> Self {
+        Self {
+            user: self.user.clone(),
+            password: self.password.clone(),
+            min_kdf: self.min_kdf,
+            allow_enrollment: self.allow_enrollment,
+            enrollment_kdf: self.enrollment_kdf,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
 /// Derived keys of live credentials, by credentials id. Bounded; entries go
 /// when their credentials are dropped.
 static KEY_CACHE: Mutex<Vec<Cached>> = Mutex::new(Vec::new());
@@ -44,14 +59,14 @@ struct Cached {
 }
 
 impl SecureCredentials {
-    /// Credentials with the default KDF floor ([`KdfParams::DEFAULT`]). An
+    /// Credentials with no KDF floor beyond [`KdfParams::MIN`]. An
     /// empty user name or password is accepted here but refused at the first
     /// exchange (`BadLength`); `try_new` refuses up front.
     pub fn new(user: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             user: user.into(),
             password: Zeroizing::new(password.into()),
-            min_kdf: KdfParams::DEFAULT,
+            min_kdf: KdfParams::MIN,
             allow_enrollment: false,
             enrollment_kdf: KdfParams::DEFAULT,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -95,7 +110,7 @@ impl SecureCredentials {
 
     /// Refuse a server that offers a KDF cheaper than `floor` (a downgrade
     /// would let an attacker pose as the server and harvest a cheaply
-    /// attackable proof). The default floor is [`KdfParams::DEFAULT`].
+    /// attackable proof). By default only [`KdfParams::MIN`] is required.
     #[must_use]
     pub fn with_min_kdf(mut self, floor: KdfParams) -> Self {
         self.min_kdf = floor;
@@ -105,6 +120,12 @@ impl SecureCredentials {
     /// The user name.
     pub fn user(&self) -> &str {
         &self.user
+    }
+
+    /// The downgrade floor: the cheapest server key derivation these
+    /// credentials accept.
+    pub fn min_kdf(&self) -> KdfParams {
+        self.min_kdf
     }
 
     /// Whether a derived key is already cached.

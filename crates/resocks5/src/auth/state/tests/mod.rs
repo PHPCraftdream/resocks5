@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+mod argon2_tests;
 mod claim_tests;
 mod cleartext_tests;
 mod flood_tests;
@@ -381,41 +382,31 @@ fn phc_at(params: resocks5_net::secure_auth::KdfParams) -> String {
     crate::auth::secret::encode_secret(&secret)
 }
 
-/// A 0.4.x-era hash at `m=5120,t=2,p=1` parses into a usable secret (it is
-/// ABOVE the new default floor), raises no startup warning, while a
-/// genuinely below-floor hash warns with the derived floor text, and an
-/// exactly-at-floor hash stays silent.
-/// Mutation: restoring the old literal `m=19456,t=2,p=1` in the warning
-/// text, or hard-coding the floor as a literal instead of deriving it from
-/// `KdfParams::DEFAULT`, fails the contained-text assert.
+/// Stored secrets of ANY cost load and stay silent at startup: a 0.4.x-era
+/// `m=5120,t=2,p=1`, the OWASP `m=19456,t=2,p=1`, and a cheap tuned one; only
+/// a value that does not parse warns. Mutation: reintroducing a cost floor
+/// in `unusable_secret_reason` makes the cheap or old hash warn.
 #[test]
-fn pre_0_5_hash_above_the_new_floor_loads_and_warns_silently() {
+fn stored_secrets_of_any_cost_load_without_a_warning() {
     use resocks5_net::secure_auth::KdfParams;
-    let old = KdfParams {
-        memory_kib: 5120,
-        iterations: 2,
-        parallelism: 1,
-    };
-    // (a) parses end to end and is above the new floor.
-    let secret = crate::auth::secret::parse_secret(&phc_at(old)).unwrap();
-    assert_eq!(secret.params, old);
-    assert!(secret.params.at_least(&KdfParams::DEFAULT));
-    // (b) no warning for it.
-    assert_eq!(super::unusable_secret_reason(&phc_at(old)), None);
-    // exactly-at-floor: no warning either.
-    assert_eq!(
-        super::unusable_secret_reason(&phc_at(KdfParams::DEFAULT)),
-        None
-    );
-    // (c) genuinely below floor: a warning naming the DERIVED floor.
-    let weak = KdfParams {
-        memory_kib: 4088,
-        iterations: 1,
-        parallelism: 1,
-    };
-    let reason = super::unusable_secret_reason(&phc_at(weak)).expect("below floor must warn");
-    assert!(
-        reason.contains("m=4096,t=1,p=1"),
-        "warning must carry the derived floor, got: {reason}"
-    );
+    for params in [
+        KdfParams {
+            memory_kib: 5120,
+            iterations: 2,
+            parallelism: 1,
+        },
+        KdfParams::DEFAULT,
+        KdfParams {
+            memory_kib: 64,
+            iterations: 1,
+            parallelism: 1,
+        },
+    ] {
+        let hash = phc_at(params);
+        let secret = crate::auth::secret::parse_secret(&hash).unwrap();
+        assert_eq!(secret.params, params);
+        assert_eq!(super::unusable_secret_reason(&hash), None, "{params:?}");
+    }
+    let reason = super::unusable_secret_reason("not-a-secret").expect("garbage must warn");
+    assert!(reason.contains("unusable"), "{reason}");
 }

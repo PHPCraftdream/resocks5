@@ -37,13 +37,23 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// The default Argon2id cost: 4 MiB, 1 pass, 1 lane. Below the OWASP
-    /// minimum (19 MiB, 2 passes) as a documented cost trade-off (see the
-    /// project SECURITY notes). Hosts that prefer the OWASP cost override
-    /// `enrollment_floor()` and pass a stronger `KdfParams` when enrolling
-    /// or checking.
+    /// The default Argon2id cost for a new secret: 19 MiB, 2 passes, 1 lane
+    /// (the OWASP minimum). Hosts tune it per deployment (the `resocks5`
+    /// application reads it from `auth.argon2`); a lower cost trades offline
+    /// resistance for CPU/memory per login.
     pub const DEFAULT: KdfParams = KdfParams {
-        memory_kib: 4096,
+        memory_kib: 19456,
+        iterations: 2,
+        parallelism: 1,
+    };
+
+    /// The smallest cost this crate accepts at all (8 KiB, 1 pass, 1 lane):
+    /// the default downgrade floor of [`SecureCredentials`](
+    /// super::SecureCredentials) — in practice none, so secrets created with
+    /// any tuned cost keep working. Demand more with
+    /// `SecureCredentials::with_min_kdf` / `ProxyConfig::with_min_kdf`.
+    pub const MIN: KdfParams = KdfParams {
+        memory_kib: 8,
         iterations: 1,
         parallelism: 1,
     };

@@ -175,6 +175,20 @@ impl ProxyConfig {
         self
     }
 
+    /// Refuse an upstream whose secure-auth key derivation is cheaper than
+    /// `floor` (the downgrade floor; by default only
+    /// [`KdfParams::MIN`](crate::secure_auth::KdfParams::MIN) is required, so
+    /// nothing is refused). Raise it to demand a stronger derivation from an
+    /// upstream. No effect without secure-auth credentials.
+    #[cfg(feature = "secure-auth")]
+    #[must_use]
+    pub fn with_min_kdf(mut self, floor: crate::secure_auth::KdfParams) -> Self {
+        if let Some(credentials) = self.secure_auth.take() {
+            self.secure_auth = Some(Arc::new((*credentials).clone().with_min_kdf(floor)));
+        }
+        self
+    }
+
     /// Allow or refuse clear-text authentication (SOCKS5 0x02, HTTP Basic)
     /// for this upstream. Default true. Ignored in `secure_only` mode, which
     /// never offers clear text at all.
@@ -604,6 +618,32 @@ mod tests {
     /// derives `secure_auth` from the same password, but never from a pair
     /// with an empty member. Mutation: deriving from the fields (or not
     /// screening empty) breaks the assertions.
+    /// `with_min_kdf` replaces the floor of the derived secure credentials and
+    /// is a no-op without them. Mutation: ignoring the argument leaves the
+    /// default floor.
+    #[cfg(feature = "secure-auth")]
+    #[test]
+    fn with_min_kdf_sets_the_floor_of_the_secure_credentials() {
+        use crate::secure_auth::KdfParams;
+        let weak = KdfParams {
+            memory_kib: 64,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let plain = ProxyConfig::socks5("h", 1).with_auth("u", "p");
+        assert_eq!(
+            plain.secure_auth.as_ref().unwrap().min_kdf(),
+            KdfParams::MIN
+        );
+        let lowered = plain.with_min_kdf(weak);
+        assert_eq!(lowered.secure_auth.as_ref().unwrap().min_kdf(), weak);
+        assert_eq!(lowered.password.as_deref(), Some("p"));
+        assert!(ProxyConfig::socks5("h", 1)
+            .with_min_kdf(weak)
+            .secure_auth
+            .is_none());
+    }
+
     #[test]
     fn with_auth_derives_secure_credentials() {
         let c = ProxyConfig::socks5("h", 1).with_auth("u", "p");

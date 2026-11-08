@@ -29,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   challenge-response over `K` with fresh nonces on both sides, so a recorded
   exchange cannot be replayed and a server without `K` cannot pass. Unknown users
   get a decoy (`DecoyKey`) indistinguishable from a wrong password; the client
-  refuses server parameters below its floor (`KdfParams::DEFAULT`, 4 MiB / t=1 /
-  p=1 — deliberately below the OWASP minimum, a documented cost trade-off) and
-  above hard limits (256 MiB, 16 passes, 16 lanes; `secure_auth::MAX_MEMORY_KIB`).
+  can demand a minimum cost from a server (`SecureCredentials::with_min_kdf`,
+  `ProxyConfig::with_min_kdf`; nothing is refused by default, `KdfParams::MIN`)
+  and refuses parameters above hard limits (256 MiB, 16 passes, 16 lanes; `secure_auth::MAX_MEMORY_KIB`).
 - `resocks5-net`: `Resocks5-Secure` over HTTP: the same messages, one per `407`
   round on a kept-alive connection (base64 in `Proxy-Authorization` /
   `Proxy-Authenticate`, at most four rounds); the server's last token rides on the
@@ -186,19 +186,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `resocks5`: `users[].hash` keeps the Argon2id v19 PHC form and is now the one
   secret for every method and protocol: a user that enrolled over secure auth logs
   in over Basic and the other way round. Hashes written by 0.4.x (m=5120, t=2,
-  p=1) are valid as they are; a stored value in another format, or derived below
-  the new floor (m=4096, t=1, p=1), is reported at startup and is reset with
+  p=1) are valid as they are, and so is a secret of any other cost; only a stored
+  value in another format is reported at startup and is reset with
   `users set-password`.
 - `resocks5`: `hash: init` accounts are claimed by the first successful login by
   any method and protocol (secure enrollment, or a clear-text login); concurrent
   first logins have exactly one winner, the others are denied, an empty password
   never claims. A user filtered by `allowed_clients` is answered like a wrong
   password and cannot claim an init account.
-- `resocks5`: new Argon2id secrets are derived with m=4096 KiB, t=1, p=1 — a
-  deliberate trade-off below the OWASP minimum (19 MiB, t=2): guessing a password
-  from a stolen users file or a captured secure exchange is about 10 times
-  cheaper and gives no ASIC/GPU resistance, so use random passwords of 22+
-  characters (see `SECURITY.md`). Stored secrets keep their parameters.
+- `resocks5`: the Argon2id cost of new secrets is configurable with the optional
+  `auth.argon2` section (`memory_kib`, `iterations`, `parallelism`); the default
+  stays the OWASP minimum used by 0.4.x (19 MiB, 2 passes, 1 lane), the same cost
+  is the floor of an `init` enrollment, and an out-of-range value stops the server
+  at startup. Stored secrets keep their parameters, so old users files keep
+  working; the `users` commands read the section from the main config. The cost
+  gives no ASIC/GPU resistance, so use random passwords of 22+ characters (see
+  `SECURITY.md`).
 - `resocks5`: clear-text logins are bounded against floods: a verified-credential
   cache (HMAC tags only, 4096 entries, 300 s, only successes, invalidated when the
   stored secret changes) answers repeated logins without deriving, misses derive

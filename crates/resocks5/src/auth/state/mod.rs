@@ -6,7 +6,6 @@ use anyhow::{anyhow, Result};
 use resocks5_net::secure_auth::{DecoyKey, DerivationLimiter, KdfParams, StoredUser};
 use tokio::sync::Semaphore;
 
-use crate::auth::params::enrollment_floor;
 use crate::auth::secret::parse_secret;
 use crate::config::{AuthConfig, User, UsersConfig};
 
@@ -98,6 +97,7 @@ impl AuthState {
         users_path: impl Into<String>,
     ) -> Result<Self> {
         let users_path = users_path.into();
+        let argon2 = auth_cfg.argon2.to_params().map_err(|e| anyhow!(e))?;
         let mut entries = HashMap::with_capacity(users.users.len());
         for (index, user) in users.users.iter().enumerate() {
             // Compile EVERY user's rule — including disabled users and
@@ -131,8 +131,8 @@ impl AuthState {
             claim_slots: Arc::new(Semaphore::new(2)),
             allow_anonymous: auth_cfg.allow_anonymous,
             secure_only: auth_cfg.secure_only,
-            decoy: DecoyKey::generate().map_err(|e| anyhow!("decoy key: {e}"))?,
-            enrollment_floor: enrollment_floor(),
+            decoy: DecoyKey::generate_with(argon2).map_err(|e| anyhow!("decoy key: {e}"))?,
+            enrollment_floor: argon2,
             users_path,
             password_cache,
             limiter: Arc::clone(resocks5_net::secure_auth::derivation_limiter()),
@@ -208,26 +208,13 @@ impl AuthState {
     }
 }
 
-/// Why an enabled user's stored value is not usable by any client: a
-/// parse failure, or derivation below the client floor. Names only, never
-/// the values.
+/// Why an enabled user's stored value is not usable by any client: it does
+/// not parse as an Argon2id secret. Any cost is accepted — existing secrets
+/// keep the parameters stored with them. Names only, never the values.
 pub(crate) fn unusable_secret_reason(hash: &str) -> Option<String> {
-    let KdfParams {
-        memory_kib,
-        iterations,
-        parallelism,
-    } = KdfParams::DEFAULT;
-    let floor = format!("m={memory_kib},t={iterations},p={parallelism}");
-    match parse_secret(hash) {
-        Err(e) => Some(format!(
-            "stored hash unusable ({e}); reset it with `resocks5 user set-password`"
-        )),
-        Ok(secret) if !secret.params.at_least(&KdfParams::DEFAULT) => Some(format!(
-            "secret derived below the client default ({floor}); \
-             default clients refuse it — reset it with `resocks5 user set-password`"
-        )),
-        Ok(_) => None,
-    }
+    parse_secret(hash)
+        .err()
+        .map(|e| format!("stored hash unusable ({e}); reset it with `resocks5 user set-password`"))
 }
 
 /// Startup notice for accounts no client can log in to.

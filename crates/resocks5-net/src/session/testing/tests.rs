@@ -478,9 +478,7 @@ async fn http_secure_auth_modes_reject_with_407() {
     }
 }
 
-/// Cheap derivation cost matching the client's default KDF floor
-/// ([`KdfParams::DEFAULT`]): anything cheaper is rejected by
-/// `SecureCredentials::new` before the exchange even starts.
+/// Cheap derivation cost for the mocks' stored secrets.
 #[cfg(feature = "secure-auth")]
 const CHEAP: crate::secure_auth::KdfParams = crate::secure_auth::KdfParams {
     memory_kib: 4096,

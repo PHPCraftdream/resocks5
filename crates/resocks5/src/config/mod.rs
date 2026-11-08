@@ -22,6 +22,7 @@ mod main;
 mod proxy_list;
 mod users;
 
+pub use crate::auth::argon2_config::cost_for_cli;
 pub(crate) use allowed_clients::compile_allowed_clients;
 pub(crate) use allowed_clients::AllowedClients;
 pub use configs::Configs;

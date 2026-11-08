@@ -92,7 +92,7 @@ async fn serve_once(
             inner: socket,
             log: Arc::clone(&recorded),
         };
-        let decoy = DecoyKey::generate().unwrap();
+        let decoy = DecoyKey::generate_with(WEAK).unwrap();
         let options =
             ServerOptions::new(Instant::now() + Duration::from_secs(10)).allow_cleartext(false);
         let user = match accept_secure(&mut socket, &options, &*store, &decoy).await {
@@ -262,7 +262,7 @@ async fn secure_only_options_refuse_cleartext_on_accept_secure() {
             let store = Arc::clone(&store);
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let decoy = DecoyKey::generate().unwrap();
+                let decoy = DecoyKey::generate_with(WEAK).unwrap();
                 let options =
                     ServerOptions::new(Instant::now() + Duration::from_secs(5)).secure_only();
                 accept_secure(&mut socket, &options, &*store, &decoy).await
@@ -312,7 +312,7 @@ async fn accept_secure_accepts_basic_against_the_same_store() {
                 let port = listener.local_addr().unwrap().port();
                 let server = tokio::spawn(async move {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let decoy = DecoyKey::generate().unwrap();
+                    let decoy = DecoyKey::generate_with(WEAK).unwrap();
                     let options = ServerOptions::new(Instant::now() + Duration::from_secs(5));
                     accept_secure(&mut socket, &options, &*store, &decoy).await
                 });

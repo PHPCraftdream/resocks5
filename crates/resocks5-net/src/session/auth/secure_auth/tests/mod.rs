@@ -328,8 +328,8 @@ async fn a_kdf_downgrade_or_bomb_is_refused_before_any_work() {
             SecureAuthError::KdfOutOfRange,
         ),
     ] {
-        // The default floor: WEAK is below it.
-        let credentials = SecureCredentials::new("alice", "right");
+        // A client that demands the default cost: WEAK is below it.
+        let credentials = SecureCredentials::new("alice", "right").with_min_kdf(KdfParams::DEFAULT);
         let (mut client, mut server) = duplex(4096);
         let rogue = tokio::spawn(async move {
             let offer = rogue_offer(&mut server, params).await;
@@ -351,13 +351,18 @@ async fn a_kdf_downgrade_or_bomb_is_refused_before_any_work() {
     }
 }
 
-/// The client floor is the new default cost exactly: one step below is
-/// refused, the default itself passes. Mutation: pinning the boundary at the
-/// old 19 MiB default (or dropping the floor check) fails one of the rows.
+/// The client floor is exactly what `with_min_kdf` says: one step below is
+/// refused, the floor itself passes. Mutation: an off-by-one boundary (or
+/// dropping the floor check) fails one of the rows.
 #[tokio::test]
-async fn the_client_floor_is_pinned_at_the_new_default() {
+async fn the_client_floor_is_exactly_the_configured_one() {
+    const FLOOR: KdfParams = KdfParams {
+        memory_kib: 4096,
+        iterations: 1,
+        parallelism: 1,
+    };
     async fn exchange(params: KdfParams, password: &str) -> SecureAuthError {
-        let credentials = SecureCredentials::new("alice", password);
+        let credentials = SecureCredentials::new("alice", password).with_min_kdf(FLOOR);
         let (mut client, mut server) = duplex(4096);
         let rogue = tokio::spawn(async move {
             let offer = rogue_offer(&mut server, params).await;
@@ -380,10 +385,10 @@ async fn the_client_floor_is_pinned_at_the_new_default() {
         error
     }
 
-    // One step below the default floor is refused without any derivation.
+    // One step below the floor is refused without any derivation.
     let below = exchange(
         KdfParams {
-            memory_kib: KdfParams::DEFAULT.memory_kib - 1,
+            memory_kib: FLOOR.memory_kib - 1,
             iterations: 1,
             parallelism: 1,
         },
@@ -392,9 +397,9 @@ async fn the_client_floor_is_pinned_at_the_new_default() {
     .await;
     assert_eq!(below, SecureAuthError::KdfTooWeak);
 
-    // Exactly the default passes the floor; the bogus salt makes the rogue
+    // Exactly the floor passes it; the bogus salt makes the rogue
     // server's fake proof fail instead.
-    let equal = exchange(KdfParams::DEFAULT, "right").await;
+    let equal = exchange(FLOOR, "right").await;
     assert_eq!(equal, SecureAuthError::ServerProofMismatch);
 }
 
@@ -756,4 +761,5 @@ async fn tampered_or_degenerate_enrollments_are_refused() {
     }
 }
 
+mod cost;
 mod limiter;

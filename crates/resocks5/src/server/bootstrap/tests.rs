@@ -727,6 +727,7 @@ fn auth_state(
             &crate::config::AuthConfig {
                 allow_anonymous,
                 secure_only,
+                argon2: Default::default(),
             },
             &UsersConfig { users },
             "test-users.ktav",

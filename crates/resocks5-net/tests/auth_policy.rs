@@ -26,19 +26,13 @@ mod server_side {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Instant};
 
-    /// Cheap parameters: the default 4 MiB would still be noticeable across
+    /// Cheap parameters: the default 19 MiB would be noticeable across
     /// many logins, and the fixture is not a policy.
-    const WEAK: KdfParams = KdfParams {
+    pub(super) const WEAK: KdfParams = KdfParams {
         memory_kib: 64,
         iterations: 1,
         parallelism: 1,
     };
-
-    /// The client-side KDF floor is `KdfParams::DEFAULT` (4 MiB): a secret a
-    /// `with_auth`-dialing client must verify against has to be stored at (or
-    /// above) that cost, so use the DEFAULT explicitly where a config dial
-    /// meets the store.
-    pub(super) const CLIENT_FLOOR: KdfParams = KdfParams::DEFAULT;
 
     pub(super) fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(10)
@@ -120,7 +114,7 @@ mod server_side {
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let decoy = DecoyKey::generate().unwrap();
+            let decoy = DecoyKey::generate_with(WEAK).unwrap();
             match accept_with(&mut socket, &options, &AuthMethods::secure(&*store, &decoy)).await {
                 Ok(request) => {
                     request
@@ -820,9 +814,8 @@ mod client_side {
     #[tokio::test]
     async fn the_dial_offers_every_method_and_the_upstream_picks() {
         timeout(Duration::from_secs(30), async {
-            // NOTE: the stored secret must be at (or above) the CLIENT floor,
-            // KdfParams::DEFAULT (4 MiB), or the 0x80 exchange would be
-            // refused as a downgrade before any password is sent.
+            // No client floor is imposed by default, so a cheap stored secret
+            // is fine for the 0x80 exchange.
             let strong = server_side_like_strong_server().await;
             let (port, server) = strong;
             let proxy = ProxyConfig::socks5("127.0.0.1", port).with_auth("alice", "pw");
@@ -951,7 +944,7 @@ mod client_side {
     async fn server_side_like_strong_server(
     ) -> (u16, tokio::task::JoinHandle<super::server_side::Served>) {
         super::server_side::serve_once(
-            super::server_side::Store::enrolled_at("alice", "pw", super::server_side::CLIENT_FLOOR),
+            super::server_side::Store::enrolled_at("alice", "pw", super::server_side::WEAK),
             ServerOptions::new(super::server_side::deadline()),
             true,
         )

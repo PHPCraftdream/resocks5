@@ -16,7 +16,7 @@ use super::VERSION;
 use crate::error::SecureAuthError;
 
 /// Wall-time filler for unknown users: cheap (no CPU) and of the same order
-/// as one default-parameter (4 MiB, 1 pass) derivation, so a missing name
+/// as one default-parameter derivation, so a missing name
 /// does not answer noticeably faster than a wrong password.
 const UNKNOWN_USER_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
@@ -162,31 +162,56 @@ pub trait SecretStore: Send + Sync {
 /// A process-local random key from which the answers for unknown users are
 /// derived: the same name always gets the same decoy salt, a different name a
 /// different one, and nothing about them can be predicted from outside.
-pub struct DecoyKey(Zeroizing<[u8; KEY_LEN]>);
+///
+/// The decoys advertise one set of Argon2id parameters; it should be the cost
+/// the host stores its real secrets at, so an unknown name cannot be told
+/// apart by the parameters it is offered.
+pub struct DecoyKey {
+    key: Zeroizing<[u8; KEY_LEN]>,
+    params: KdfParams,
+}
 
 impl DecoyKey {
-    /// A fresh random key.
+    /// A fresh random key whose decoys advertise [`KdfParams::DEFAULT`].
     ///
     /// # Errors
     ///
     /// [`SecureAuthError::Kdf`] when the OS random source fails.
     pub fn generate() -> Result<Self, SecureAuthError> {
+        Self::generate_with(KdfParams::DEFAULT)
+    }
+
+    /// A fresh random key whose decoys advertise `params` — the cost the host
+    /// stores its real secrets at.
+    ///
+    /// # Errors
+    ///
+    /// [`SecureAuthError::KdfOutOfRange`] when `params` are outside the
+    /// limits this crate ever derives with; [`SecureAuthError::Kdf`] when the
+    /// OS random source fails.
+    pub fn generate_with(params: KdfParams) -> Result<Self, SecureAuthError> {
+        if !params.is_in_range() {
+            return Err(SecureAuthError::KdfOutOfRange);
+        }
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         getrandom::getrandom(key.as_mut_slice()).map_err(|_| SecureAuthError::Kdf)?;
-        Ok(Self(key))
+        Ok(Self { key, params })
     }
 
     /// A key from fixed bytes (for tests).
     #[cfg(test)]
     pub(crate) fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self {
+            key: Zeroizing::new(bytes),
+            params: KdfParams::MIN,
+        }
     }
 
     pub(super) fn decoy_secret(&self, user: &[u8]) -> UserSecret {
-        let salt = decoy_material(&self.0, b"decoy salt", user)[..SALT_LEN].to_vec();
-        let key = decoy_material(&self.0, b"decoy key", user);
-        UserSecret::from_parts(salt, KdfParams::DEFAULT, key)
-            .expect("decoy salt and default parameters are valid")
+        let salt = decoy_material(&self.key, b"decoy salt", user)[..SALT_LEN].to_vec();
+        let key = decoy_material(&self.key, b"decoy key", user);
+        UserSecret::from_parts(salt, self.params, key)
+            .expect("decoy salt and validated parameters are valid")
     }
 }
 

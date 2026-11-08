@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Argon2Config;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AuthConfig {
     /// When `true`, the server advertises SOCKS5 method `0x00`
@@ -32,6 +34,11 @@ pub struct AuthConfig {
     /// `allow_anonymous`).
     #[serde(default)]
     pub secure_only: bool,
+    /// Argon2id cost of new secrets and the floor of an `init` enrollment
+    /// (see [`Argon2Config`]). Optional; existing secrets keep their stored
+    /// cost, so changing it never breaks a users file.
+    #[serde(default)]
+    pub argon2: Argon2Config,
 }
 
 impl Default for AuthConfig {
@@ -39,6 +46,7 @@ impl Default for AuthConfig {
         Self {
             allow_anonymous: default_allow_anonymous(),
             secure_only: false,
+            argon2: Argon2Config::default(),
         }
     }
 }

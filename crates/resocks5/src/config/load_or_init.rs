@@ -29,6 +29,11 @@ auth: {
     ## Resocks5-Secure); clear-text passwords (0x02, Basic) and anonymous
     ## access are refused. Optional, default false.
     secure_only: false
+    ## Argon2id cost of NEW user secrets (users add / set-password, the claim
+    ## of an `init` account) and the floor of an init enrollment. Optional;
+    ## existing secrets keep the cost stored with them, so changing it never
+    ## breaks a users file. Defaults shown (the OWASP minimum).
+    ## argon2: { memory_kib: 19456, iterations: 2, parallelism: 1 }
 }
 
 ## Outbound policy: how upstreams authenticate when an entry has user:password.

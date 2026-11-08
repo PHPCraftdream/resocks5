@@ -19,6 +19,7 @@
 //! Unknown, disabled and IP-filtered users are answered with a decoy in
 //! both paths that fails exactly like a wrong password.
 
+pub mod argon2_config;
 pub mod compute_hash;
 pub(crate) mod params;
 pub mod secret;
@@ -26,5 +27,8 @@ pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use argon2_config::Argon2Config;
+#[cfg(test)]
 pub use compute_hash::compute_hash;
+pub use compute_hash::compute_hash_with;
 pub use state::AuthState;

@@ -370,8 +370,8 @@ when clear text is on); a refusal or the round cap is a `407` with
 
 - `users[].hash` is an Argon2id v19 PHC string: salt, parameters and the
   32-byte key `K = Argon2id(password, salt)`. New secrets use
-  `KdfParams::DEFAULT` (4 MiB, 1 pass, 1 lane), deliberately below the OWASP
-  minimum; stored secrets keep their own parameters.
+  the cost of `auth.argon2` (default `KdfParams::DEFAULT`: 19 MiB, 2 passes,
+  1 lane); stored secrets keep their own parameters.
 - Secure auth: the server sends salt, parameters and a nonce; the client
   derives K and returns an HMAC proof; the server answers with its own proof.
   The server never runs Argon2 for it and never sees the password.

@@ -581,10 +581,11 @@ Old configs behave exactly as before: `allow_anonymous` still defaults to
 `true` and clear text is accepted. For an untrusted network turn
 `auth.secure_only` on or wrap the port in a protected transport.
 
-**Cost trade-off and flood protection.** New secrets use Argon2id with
-4 MiB, 1 pass, 1 lane — deliberately below the OWASP minimum (19 MiB,
-2 passes). Guessing a password from a stolen users file or a captured secure
-exchange is therefore roughly 10 times cheaper, and this gives no ASIC/GPU
+**Cost and flood protection.** New secrets use Argon2id at the cost set by
+`auth.argon2` (default: 19 MiB, 2 passes, 1 lane — the OWASP minimum and what
+0.4.x used). Raise or lower `memory_kib`, `iterations` and `parallelism` to
+fit the machine; stored secrets keep the cost they were written with, so an
+update or a change never breaks a users file. The cost gives no ASIC/GPU
 resistance: use random passwords of 22+ characters. Floods of false logins
 cannot take the server down: secure auth costs the server one HMAC;
 clear-text checks share a limit on concurrent derivations (half of the

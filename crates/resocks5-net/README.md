@@ -101,9 +101,8 @@ or by the host's admission policy through the anonymous-only `accept`.
   key; the same name always gets the same decoy salt), indistinguishable
   from a wrong password, so user names are not enumerable. A client
   refuses server KDF parameters below its floor
-  (`SecureCredentials::with_min_kdf`, default `KdfParams::DEFAULT`:
-  4 MiB / 1 pass / 1 lane — below the OWASP minimum, a
-  documented cost trade-off) and above the hard limits
+  (`SecureCredentials::with_min_kdf` / `ProxyConfig::with_min_kdf`; by default
+  only `KdfParams::MIN` is required, so no cost is refused) and above the hard limits
   (256 MiB, 16 passes, 16 lanes; `KdfParams::is_in_range`), so a man in the
   middle cannot downgrade the KDF. One secret per user, any protocol, any
   method: the stored `UserSecret` verifies both the strong exchange and the
@@ -719,7 +718,11 @@ password)`; `.allow_enrollment(true)` opts in to first-login enrollment
 enrolled client; `SecureAuthError::EnrollmentNotAllowed` otherwise);
 `.with_enrollment_kdf(params)` sets the enrollment cost; `.with_min_kdf(floor)`
 refuses a server whose KDF is cheaper than the floor (default
-`KdfParams::DEFAULT`: 4 MiB / 1 pass / 1 lane). The derived key is cached
+`KdfParams::MIN`: nothing is refused; `ProxyConfig::with_min_kdf` sets it for
+the credentials a `with_auth` entry derives). `KdfParams::DEFAULT` (19 MiB, 2
+passes, 1 lane) is the cost new secrets and enrollments use; `DecoyKey::
+generate_with(params)` makes unknown names advertise the cost a host stores
+its real secrets at. The derived key is cached
 after the first exchange
 (per salt and parameters), so the Argon2id cost is paid once per process
 and server, not per connection. Client derivations run under their own

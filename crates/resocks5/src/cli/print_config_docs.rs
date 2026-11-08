@@ -18,6 +18,7 @@ mod tests {
         for (prefix, source) in [
             ("", include_str!("../config/main/main_config.rs")),
             ("auth.", include_str!("../config/main/auth_config.rs")),
+            ("auth.argon2.", include_str!("../auth/argon2_config.rs")),
             (
                 "upstream_auth.",
                 include_str!("../config/main/upstream_auth_config.rs"),

@@ -211,7 +211,7 @@ impl MockUpstreamBuilder {
             #[cfg(feature = "secure-auth")]
             user,
             #[cfg(feature = "secure-auth")]
-            decoy: crate::secure_auth::DecoyKey::generate()
+            decoy: crate::secure_auth::DecoyKey::generate_with(MOCK_KDF)
                 .map_err(|e| io::Error::other(e.to_string()))?,
         });
         let protocol = self.protocol;
