@@ -28,35 +28,37 @@ async fn buffered_http_failure_paths_are_visible_before_drop() {
                 true,
                 EXPECT_HTTP_400,
             ),
+            // No scheme is enabled on this server: any credentials are a bare
+            // closing 407, anonymous refusal included.
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: \xff\r\n\r\n".as_slice(),
                 true,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Bearer token\r\n\r\n".as_slice(),
                 true,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic !!!\r\n\r\n".as_slice(),
                 true,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
                 true,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\nProxy-Authorization: Basic dTpw\r\n\r\n".as_slice(),
                 false,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
             (
                 b"CONNECT h:1 HTTP/x\r\n\r\n".as_slice(),
                 false,
-                EXPECT_HTTP_407,
+                EXPECT_HTTP_407_BARE_CLOSE,
             ),
         ] {
             let error = buffered_failure(bytes, anonymous, true, expected).await;
@@ -178,7 +180,7 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
                 let (mut peer, inner) = duplex(1024);
                 peer.write_all(&bytes).await.unwrap();
                 let mut stream = flush_fault(inner, fault_at, fail_write, false);
-                let result = accept(&mut stream, &options(anonymous, users)).await;
+                let result = accept(&mut stream, &options(soon(), anonymous, users)).await;
                 assert!(matches!(result, Err(ServerError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe));
                 assert_eq!(stream.write_calls, fault_at);
                 assert_eq!(stream.flush_calls, fault_at - 1);
@@ -188,9 +190,7 @@ async fn reply_write_and_flush_errors_propagate_without_replay() {
                 for reply in [Reply::Established, Reply::Forbidden, Reply::UpstreamUnavailable, Reply::ConnectionRefused, Reply::NetworkUnreachable, Reply::TimedOut, Reply::GeneralFailure, Reply::Overloaded] {
                     let req = IncomingRequest {
         auth: crate::server::AuthMethod::Anonymous,
-        #[cfg(feature = "gssapi")]
-        gss: None,
-                        protocol, target: "h:1".into(), username: None, pipeline: Vec::new(),
+                        protocol, target: "h:1".into(), username: None, auth_info: None, pipeline: Vec::new(),
                     };
                     let (_peer, inner) = duplex(64);
                     let mut stream = flush_fault(inner, 1, fail_write, false);
@@ -225,7 +225,9 @@ async fn stalled_handshake_and_error_flushes_share_absolute_deadline() {
                 stream.first_flush_delay =
                     Some(Box::pin(tokio::time::sleep(Duration::from_millis(900))));
             }
-            let opts = ServerOptions::new(start + Duration::from_secs(1), anonymous, users);
+            let opts = ServerOptions::new(start + Duration::from_secs(1))
+                .allow_anonymous(anonymous)
+                .allow_cleartext(users);
             let result = accept(&mut stream, &opts).await;
             assert!(matches!(result, Err(ServerError::Deadline)));
             assert_eq!(start.elapsed(), Duration::from_secs(1));
@@ -246,7 +248,7 @@ async fn external_cancellation_during_accept_flush_is_terminal() {
             .await
             .unwrap();
         let mut stream = flush_fault(inner, 1, false, true);
-        let opts = options(true, false);
+        let opts = anon_options(true);
         let result = timeout(Duration::from_secs(1), accept(&mut stream, &opts)).await;
         assert!(result.is_err());
         assert_eq!(stream.writes, [5, 0]);
@@ -264,11 +266,10 @@ async fn host_budget_cancels_final_flush_without_replay() {
         for protocol in [Protocol::Socks5, Protocol::Http] {
             let req = IncomingRequest {
                 auth: crate::server::AuthMethod::Anonymous,
-                #[cfg(feature = "gssapi")]
-                gss: None,
                 protocol,
                 target: "h:1".into(),
                 username: None,
+                auth_info: None,
                 pipeline: Vec::new(),
             };
             let (_peer, inner) = duplex(64);
@@ -320,40 +321,29 @@ async fn thousands_of_header_lines_are_still_fully_scanned() {
     with_auth.extend_from_slice(b"Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n");
     let (result, response) = parse(&with_auth, true, false).await;
     assert!(matches!(result, Err(ServerError::Authentication(_))));
-    assert_eq!(response, EXPECT_HTTP_407);
+    // No scheme is enabled on this server: the bare closing 407.
+    assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     bytes.extend_from_slice(b"\r\n");
     let (result, response) = parse(&bytes, true, false).await;
     assert_eq!(result.unwrap().target(), "example.com:443");
     assert!(response.is_empty());
 }
 
-#[tokio::test]
-async fn proxy_auth_challenge_names_only_the_secure_scheme() {
-    let (_, response) = parse(
-        b"CONNECT h:443 HTTP/x\r\nProxy-Authorization: Bearer token\r\n\r\n",
-        true,
-        false,
-    )
-    .await;
-    let text = String::from_utf8(response).unwrap();
-    assert!(text.contains("Proxy-Authenticate: Resocks5-Secure"));
-    assert!(!text.contains("Basic"));
-}
-
+// (The old `proxy_auth_challenge_names_only_the_secure_scheme` test moved to
+// `negotiation.rs`: naming the challenge schemes needs `accept_with`, which
+// the feature-less `accept` has no schemes to name.)
 #[tokio::test]
 async fn socks_single_method_offers_and_no_match_rows() {
     for anonymous in [false, true] {
-        for users in [false, true] {
-            for offered in [0, 2, 99] {
-                // Only "no authentication" can be selected; 2 never is.
-                let supported = offered == 0 && anonymous;
-                let mut bytes = vec![5, 1, offered];
-                bytes.extend_from_slice(&socks_request(b"h")[3..]);
-                let (result, response) = parse(&bytes, anonymous, users).await;
-                assert_eq!(result.is_ok(), supported);
-                let expected = if supported { vec![5, 0] } else { vec![5, 255] };
-                assert_eq!(response, expected);
-            }
+        for offered in [0, 2, 99] {
+            // Only "no authentication" can be selected; 2 never is.
+            let supported = offered == 0 && anonymous;
+            let mut bytes = vec![5, 1, offered];
+            bytes.extend_from_slice(&socks_request(b"h")[3..]);
+            let (result, response) = parse(&bytes, anonymous, true).await;
+            assert_eq!(result.is_ok(), supported);
+            let expected = if supported { vec![5, 0] } else { vec![5, 255] };
+            assert_eq!(response, expected);
         }
     }
     let (result, response) = parse(&[5, 0], true, true).await;
@@ -371,7 +361,7 @@ async fn maximum_valid_headers_do_not_count_binary_payload() {
     let (mut peer, mut stream) = duplex(64 * 1024);
     peer.write_all(&bytes).await.unwrap();
     peer.shutdown().await.unwrap();
-    let mut req = accept(&mut stream, &options(true, false)).await.unwrap();
+    let mut req = accept(&mut stream, &anon_options(true)).await.unwrap();
     let mut received = req.take_pipeline();
     assert!(
         !received.is_empty(),
@@ -389,13 +379,13 @@ async fn fragmented_obs_headers_reach_the_real_auth_field() {
         for byte in bytes {
             peer.write_all(&[*byte]).await.unwrap();
         }
-        // The padded header name was found: the 407 comes back.
-        let mut response = vec![0; EXPECT_HTTP_407.len()];
+        // The padded header name was found: the bare closing 407 comes back.
+        let mut response = vec![0; EXPECT_HTTP_407_BARE_CLOSE.len()];
         peer.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, EXPECT_HTTP_407);
+        assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     };
     let server = async {
-        let result = accept(&mut stream, &options(true, true)).await;
+        let result = accept(&mut stream, &anon_options(true)).await;
         assert!(matches!(result, Err(ServerError::Authentication(_))));
     };
     timeout(Duration::from_secs(5), async {

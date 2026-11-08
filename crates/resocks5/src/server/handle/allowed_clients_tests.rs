@@ -6,8 +6,10 @@
 //! `blocked.invalid:443` banned by the banned-regex → an allowed client
 //! gets 403 (HTTP) / SOCKS reply `Forbidden` ([5,2,…]); a disallowed one —
 //! a plain auth failure (secure auth `Denied` / 407) or a close without
-//! a single byte. Passwords — secure auth only (SOCKS5 0x80); HTTP Basic and
-//! SOCKS5 UNAME/PASSWD are always rejected.
+//! a single byte. Clear text (SOCKS5 0x02 / HTTP Basic) is accepted BY
+//! DEFAULT against the same stored secret as the secure method; only
+//! `secure_only` refuses it along with anonymous. The allowed_clients
+//! filters cascade BEFORE authentication.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -407,43 +409,13 @@ async fn anonymous_obeys_only_global_rule() {
     }
 }
 
-/// Case 5: a cleartext password is never accepted even if correct and from an allowed
-/// peer: SOCKS5 UNAME/PASSWD is not selected ([5,0xFF]), HTTP Basic — 407.
-/// Counterfactual: an app on a clear-text `accept` would let both through.
-#[tokio::test]
-async fn a_cleartext_password_is_never_accepted() {
-    for protocol in BOTH {
-        let auth = Arc::new(
-            AuthState::build(
-                &crate::config::AuthConfig {
-                    allow_anonymous: false,
-                    ..Default::default()
-                },
-                &UsersConfig {
-                    users: vec![user("alice", "pw", None, false)],
-                },
-                "unused",
-            )
-            .unwrap(),
-        );
-        let request = match protocol {
-            Protocol::Socks5 => vec![0x05, 0x01, 0x02],
-            Protocol::Http => http_connect(Some(&B64.encode("alice:pw"))),
-        };
-        let response = exchange_raw(auth, &request).await;
-        match protocol {
-            Protocol::Socks5 => assert_eq!(response, [0x05, 0xFF], "0x02 не выбирается"),
-            Protocol::Http => assert!(
-                response.starts_with(b"HTTP/1.1 407 "),
-                "ожидался 407, получено: {:?}",
-                String::from_utf8_lossy(&response)
-            ),
-        }
-    }
-}
-
-/// One exchange: the client writes `request` and reads everything until close.
-async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
+/// One raw exchange: the client drives the whole leg with `leg` and the
+/// handler is expected to end in an error (refusal or banned target).
+async fn raw_session<F, Fut>(auth: Arc<AuthState>, leg: F) -> Fut::Output
+where
+    F: FnOnce(TcpStream) -> Fut,
+    Fut: std::future::Future,
+{
     let logger = test_logger();
     let banned = Arc::new(regex::RegexSet::new([BANNED]).unwrap());
     let pool = Arc::new(resocks5_net::pool::ProxyPool::new(
@@ -458,7 +430,7 @@ async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
     let no_rotator: Option<Arc<ProxyRotator>> = None;
     timeout(Duration::from_secs(8), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        let client = TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
         let (stream, _) = listener.accept().await.unwrap();
@@ -478,18 +450,150 @@ async fn exchange_raw(auth: Arc<AuthState>, request: &[u8]) -> Vec<u8> {
             &None,
             Instant::now() + Duration::from_secs(5),
         );
-        let leg = async {
-            client.write_all(request).await.unwrap();
-            let mut response = Vec::new();
-            let _ = client.read_to_end(&mut response).await;
-            response
-        };
-        let (handler_res, response) = tokio::join!(handler, leg);
-        assert!(handler_res.is_err(), "открытый пароль обязан дать ошибку");
-        response
+        let (handler_res, out) = tokio::join!(handler, leg(client));
+        assert!(
+            handler_res.is_err(),
+            "raw session must end in a handler error"
+        );
+        out
     })
     .await
     .expect("общий таймаут 8с на обмен")
+}
+
+/// secure_only is "our method only": clear text (0x02 / Basic) and
+/// anonymous are refused even with the CORRECT password. Mutation:
+/// dropping `secure_only` from the ServerOptions mapping re-admits
+/// 0x02/0x00/Basic.
+#[tokio::test]
+async fn secure_only_refuses_clear_text_and_anonymous() {
+    let auth = Arc::new(
+        AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous: false,
+                secure_only: true,
+            },
+            &UsersConfig {
+                users: vec![user("alice", "pw", None, false)],
+            },
+            "unused",
+        )
+        .unwrap(),
+    );
+
+    // SOCKS5: greeting offering [0x00, 0x02] → no acceptable method.
+    let response = raw_session(auth.clone(), |mut c| async move {
+        c.write_all(&[0x05, 0x02, 0x00, 0x02]).await.unwrap();
+        let mut m = [0u8; 2];
+        c.read_exact(&mut m).await.unwrap();
+        m.to_vec()
+    })
+    .await;
+    assert_eq!(response, [0x05, 0xFF], "0x00/0x02 must be refused");
+
+    // SOCKS5: greeting including 0x80 → the strongest (0x80) is selected.
+    let response = raw_session(auth.clone(), |mut c| async move {
+        c.write_all(&[0x05, 0x03, 0x00, 0x02, METHOD])
+            .await
+            .unwrap();
+        let mut m = [0u8; 2];
+        c.read_exact(&mut m).await.unwrap();
+        m.to_vec()
+    })
+    .await;
+    assert_eq!(response, [0x05, METHOD], "strongest method must win");
+
+    // HTTP: Basic with the CORRECT password → 407 challenging only
+    // Resocks5-Secure (no Basic challenge).
+    let response = raw_session(auth.clone(), |mut c| async move {
+        c.write_all(&http_connect(Some(&B64.encode("alice:pw"))))
+            .await
+            .unwrap();
+        let mut r = Vec::new();
+        let _ = c.read_to_end(&mut r).await;
+        r
+    })
+    .await;
+    let text = String::from_utf8_lossy(&response).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 407 "), "{text:?}");
+    assert!(text.contains("resocks5-secure"), "{text:?}");
+    assert!(!text.contains("basic realm"), "{text:?}");
+
+    // HTTP: no credentials → 407.
+    let response = raw_session(auth, |mut c| async move {
+        c.write_all(&http_connect(None)).await.unwrap();
+        let mut r = Vec::new();
+        let _ = c.read_to_end(&mut r).await;
+        r
+    })
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 407 "), "{response:?}");
+}
+
+/// With the default config, clear text (0x02 / Basic) is accepted against
+/// the same stored secret, exactly like before the secure-only era.
+/// Mutation: making the default secure_only, or refusing 0x02/Basic,
+/// fails the admissions.
+#[tokio::test]
+async fn clear_text_is_accepted_by_default_like_before() {
+    let auth = Arc::new(
+        AuthState::build(
+            &crate::config::AuthConfig::default(),
+            &UsersConfig {
+                users: vec![user("alice", "pw", None, false)],
+            },
+            "unused",
+        )
+        .unwrap(),
+    );
+
+    // SOCKS5: 0x02 selected, RFC-1929 subnegotiation accepted, then the
+    // banned target answers Forbidden — full routing reached.
+    let reply = raw_session(auth.clone(), |mut c| async move {
+        c.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut m = [0u8; 2];
+        c.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x02]);
+        c.write_all(&[0x01, 5, b'a', b'l', b'i', b'c', b'e', 2, b'p', b'w'])
+            .await
+            .unwrap();
+        let mut v = [0u8; 2];
+        c.read_exact(&mut v).await.unwrap();
+        assert_eq!(v, [0x01, 0x00]);
+        c.write_all(&socks_connect()).await.unwrap();
+        let mut r = [0u8; 10];
+        c.read_exact(&mut r).await.unwrap();
+        r
+    })
+    .await;
+    assert_eq!(reply, SOCKS_FORBIDDEN, "clear text must reach routing");
+
+    // HTTP: Basic with the right password reaches routing (banned → 403).
+    let response = raw_session(auth.clone(), |mut c| async move {
+        c.write_all(&http_connect(Some(&B64.encode("alice:pw"))))
+            .await
+            .unwrap();
+        let mut r = Vec::new();
+        let _ = c.read_to_end(&mut r).await;
+        r
+    })
+    .await;
+    assert_eq!(
+        response, b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        "clear text must reach routing"
+    );
+
+    // HTTP: Basic with a wrong password → 407.
+    let response = raw_session(auth, |mut c| async move {
+        c.write_all(&http_connect(Some(&B64.encode("alice:bad"))))
+            .await
+            .unwrap();
+        let mut r = Vec::new();
+        let _ = c.read_to_end(&mut r).await;
+        r
+    })
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 407 "), "{response:?}");
 }
 
 /// Case 6: a direct user obeys the filter; a banned IP
@@ -512,7 +616,9 @@ async fn direct_user_denied_before_direct_paths() {
 
 /// Case 7: a user with hash='init' and a filter excluding the peer: enrollment
 /// yields a plain auth failure; init-claim does NOT happen — the users file on
-/// disk is unchanged byte-for-byte.
+/// disk is unchanged byte-for-byte. The filtered init user is ALSO protected
+/// against the clear-text claim path: HTTP Basic `bob:first-password` from a
+/// filtered peer gets 407, and the file stays untouched.
 /// Counterfactual: remove the user filter — the claim would pass, the file would change,
 /// the test would fail on the byte comparison and on the outcome.
 #[tokio::test]

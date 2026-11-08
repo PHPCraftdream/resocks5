@@ -297,3 +297,178 @@ async fn success_reply_shapes_preserve_payload() {
     .await
     .expect("successful reply exchange timed out");
 }
+
+/// Mutation: offering clear text first (or dropping 0x80) changes the greeting bytes.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn the_greeting_offers_configured_methods_strongest_first() {
+    use super::Socks5Auth;
+    use crate::secure_auth::SecureCredentials;
+    let creds: &'static SecureCredentials = Box::leak(Box::new(SecureCredentials::new("u", "p")));
+    let (client, mut peer) = duplex(1024);
+    let task = tokio::spawn(super::socks5_handshake_bounded(
+        client,
+        "g",
+        80,
+        Socks5Auth {
+            secure: Some(creds),
+            cleartext: Some(("u", "p")),
+            secure_only: false,
+        },
+        super::deadline_after(Duration::from_secs(10)),
+        "ep",
+        Duration::from_secs(10),
+    ));
+    let mut greeting = [0u8; 4];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x02, 0x80, 0x02]);
+    task.abort();
+}
+
+/// Mutation: falling back to another method (or emitting two method bytes)
+/// changes the greeting bytes.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn secure_only_greeting_offers_only_0x80() {
+    use super::Socks5Auth;
+    use crate::secure_auth::SecureCredentials;
+    let creds: &'static SecureCredentials = Box::leak(Box::new(SecureCredentials::new("u", "p")));
+    let (client, mut peer) = duplex(1024);
+    let task = tokio::spawn(super::socks5_handshake_bounded(
+        client,
+        "g",
+        80,
+        Socks5Auth {
+            secure: Some(creds),
+            cleartext: None,
+            secure_only: true,
+        },
+        super::deadline_after(Duration::from_secs(10)),
+        "ep",
+        Duration::from_secs(10),
+    ));
+    let mut greeting = [0u8; 3];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x01, 0x80]);
+    task.abort();
+}
+
+/// Mutation: offering anonymous alongside 0x02 (a 2-method greeting, or
+/// 0x00 in the bytes) breaks the assertion.
+#[tokio::test]
+async fn cleartext_pair_offers_0x02_only_when_no_secure_creds() {
+    let (client, mut peer) = duplex(1024);
+    let task = tokio::spawn(super::socks5_handshake_bounded(
+        client,
+        "g",
+        80,
+        super::Socks5Auth {
+            #[cfg(feature = "secure-auth")]
+            secure: None,
+            cleartext: Some(("u", "p")),
+            secure_only: false,
+        },
+        super::deadline_after(Duration::from_secs(10)),
+        "ep",
+        Duration::from_secs(10),
+    ));
+    let mut greeting = [0u8; 3];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x01, 0x02]);
+    task.abort();
+}
+
+/// The RFC 1929 sub-negotiation sends `1 | len(u) u | len(p) p` exactly,
+/// maps a non-zero status to `AuthFailed` and a wrong version byte to
+/// `Socks5BadAuthVersion`.
+/// Mutation: leaking the password into the version or length fields (or
+/// accepting any status byte) breaks the byte assertion or the error matches.
+#[tokio::test]
+async fn rfc1929_client_subnegotiation_sends_fields_and_maps_errors() {
+    use crate::error::{ConnectError, ProtocolViolation};
+
+    async fn run(reply: [u8; 2]) -> Result<(), ConnectError> {
+        let (client, mut peer) = duplex(128);
+        let task = tokio::spawn(super::socks5_handshake_bounded(
+            client,
+            "g",
+            80,
+            super::Socks5Auth {
+                #[cfg(feature = "secure-auth")]
+                secure: None,
+                cleartext: Some(("u", "p")),
+                secure_only: false,
+            },
+            super::deadline_after(Duration::from_secs(10)),
+            "ep",
+            Duration::from_secs(10),
+        ));
+        let mut greeting = [0u8; 3];
+        peer.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x02]);
+        peer.write_all(&[0x05, 0x02]).await.unwrap();
+        let mut sub = [0u8; 5]; // version + 1 + 'u' + 1 + 'p'
+        peer.read_exact(&mut sub).await.unwrap();
+        assert_eq!(sub, [0x01, 1, b'u', 1, b'p']);
+        peer.write_all(&reply).await.unwrap();
+        let result = task.await.unwrap();
+        if reply == [1, 0] {
+            let mut head = [0u8; 8]; // head + len + 'g' + port
+            peer.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..4], &[0x05, 0x01, 0x00, 0x03]);
+            assert_eq!(&head[4..], &[1, b'g', 0, 80]);
+            peer.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        }
+        result.map(|_| ())
+    }
+
+    assert!(run([1, 0]).await.is_ok());
+    assert!(matches!(
+        run([1, 5]).await.unwrap_err(),
+        ConnectError::AuthFailed { status: 5 }
+    ));
+    assert!(matches!(
+        run([2, 0]).await.unwrap_err(),
+        ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 })
+    ));
+}
+
+/// A 256-byte username is refused before the sub-negotiation is written:
+/// only the greeting and the method reply ever cross the wire, and the peer
+/// receives nothing after answering the greeting.
+/// Mutation: writing the sub-negotiation before the length check would leak
+/// the oversized credentials (a non-empty tail).
+#[tokio::test]
+async fn too_long_credentials_are_refused_before_writing() {
+    use crate::error::{ConnectError, ProtocolViolation};
+    let (client, mut peer) = duplex(128);
+    let long_user = "u".repeat(256);
+    let long_user: &'static str = Box::leak(long_user.into_boxed_str());
+    let task = tokio::spawn(super::socks5_handshake_bounded(
+        client,
+        "g",
+        80,
+        super::Socks5Auth {
+            #[cfg(feature = "secure-auth")]
+            secure: None,
+            cleartext: Some((long_user, "p")),
+            secure_only: false,
+        },
+        super::deadline_after(Duration::from_secs(10)),
+        "ep",
+        Duration::from_secs(10),
+    ));
+    let mut greeting = [0u8; 3];
+    peer.read_exact(&mut greeting).await.unwrap();
+    peer.write_all(&[0x05, 0x02]).await.unwrap();
+    let error = task.await.unwrap().unwrap_err();
+    assert!(matches!(
+        error,
+        ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong { .. })
+    ));
+    let mut tail = Vec::new();
+    peer.read_to_end(&mut tail).await.unwrap();
+    assert!(tail.is_empty(), "no sub-negotiation byte may be written");
+}

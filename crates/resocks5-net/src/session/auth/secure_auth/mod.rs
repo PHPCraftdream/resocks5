@@ -48,8 +48,11 @@ mod tests;
 mod wire;
 
 pub use client::{client_authenticate, SecureCredentials};
-pub use kdf::{derive_key, KdfParams, UserSecret, KEY_LEN, SALT_LEN};
-pub use server::{server_authenticate, DecoyKey, SecretStore, StoredUser};
+pub use kdf::{
+    derivation_limiter, derive_key, DerivationLimiter, DerivationPermit, KdfParams, UserSecret,
+    KEY_LEN, MAX_MEMORY_KIB, SALT_LEN,
+};
+pub use server::{server_authenticate, DecoyKey, PasswordCheck, SecretStore, StoredUser};
 
 /// The private-use SOCKS5 authentication method number for this protocol.
 pub const METHOD: u8 = 0x80;

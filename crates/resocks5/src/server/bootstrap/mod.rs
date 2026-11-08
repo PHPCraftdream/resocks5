@@ -3,9 +3,9 @@ mod runtime;
 mod startup;
 
 #[cfg(test)]
-mod gssapi_tests;
-#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod upstream_auth_tests;
 
 pub(crate) use runtime::run_server;
 

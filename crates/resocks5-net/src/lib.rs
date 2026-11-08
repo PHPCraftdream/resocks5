@@ -46,8 +46,7 @@
 #![warn(missing_docs)]
 
 pub use error::{
-    socks5_rep_description, ConnectError, GssapiError, ProtocolViolation, SecureAuthError, Stage,
-    TimeoutKind,
+    socks5_rep_description, ConnectError, ProtocolViolation, SecureAuthError, Stage, TimeoutKind,
 };
 
 #[cfg(feature = "rotator")]
@@ -55,9 +54,14 @@ pub use error::{
 pub mod chain;
 pub mod connect;
 pub mod error;
-#[cfg(feature = "gssapi")]
-#[path = "session/auth/gssapi/mod.rs"]
-pub mod gssapi;
+/// HTTP proxy-header authentication shared by the inbound server and the
+/// upstream HTTP connector: the header-value helpers (always built) and,
+/// for feature `secure-auth`, the `Resocks5-Secure` scheme (one
+/// `secure_auth` protocol message per round, base64-encoded) with the
+/// in-memory [`Pipe`] that runs a stream-oriented exchange over those
+/// rounds.
+#[path = "session/auth/http_auth.rs"]
+mod http_auth;
 #[cfg(feature = "pool")]
 #[path = "session/pool/mod.rs"]
 pub mod pool;

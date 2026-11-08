@@ -1,4 +1,5 @@
-//! SOCKS5 (RFC 1928) upstream connector: no authentication, secure auth or GSSAPI.
+//! SOCKS5 (RFC 1928) upstream connector: the greeting offers the strongest
+//! methods the entry can speak (secure auth, RFC 1929) or anonymous.
 
 #[cfg(feature = "pool")]
 use std::time::Duration;
@@ -17,32 +18,51 @@ use crate::error::ConnectError;
 use crate::pool::ProxyPool;
 use crate::types::ProxyConfig;
 
-/// How the SOCKS5 greeting to `proxy` authenticates: secure auth and/or GSSAPI
-/// when configured, else none. A bare user/password pair would travel in clear
-/// text (RFC 1929), which this crate does not implement: such an entry is
-/// refused before any byte is sent.
+/// How the SOCKS5 greeting to `proxy` authenticates: the strongest methods
+/// the entry can speak. A credentials entry offers secure auth (0x80) and,
+/// while `allow_cleartext` is on, RFC 1929 (0x02); `secure_only` offers
+/// nothing but 0x80; an entry without usable credentials offers 0x00. The
+/// pre-flight policy check runs first, before any byte is sent.
+///
+/// An entry with secure credentials but no usable pair (the
+/// `with_secure_auth` advanced API) still offers the strong 0x80 greeting;
+/// RFC 1929 is only offered when a usable pair exists and clear text is
+/// allowed — never a bare 0x00 when strong credentials are present.
 pub(crate) fn socks5_auth(proxy: &ProxyConfig) -> Result<Socks5Auth<'_>, ConnectError> {
+    proxy.preflight_auth()?;
+    let pair = proxy.usable_pair();
     #[cfg(feature = "secure-auth")]
-    {
-        let secure = proxy.secure_auth.as_deref();
-        #[cfg(feature = "gssapi")]
-        let gssapi = proxy.gssapi.as_deref();
-        #[cfg(feature = "gssapi")]
-        let any = secure.is_some() || gssapi.is_some();
-        #[cfg(not(feature = "gssapi"))]
-        let any = secure.is_some();
-        if any {
-            return Ok(Socks5Auth::Strong(
-                crate::connect::handshake_over_stream::Strong {
-                    #[cfg(feature = "gssapi")]
-                    gssapi,
-                    secure,
-                },
-            ));
-        }
+    if proxy.secure_only {
+        let secure = proxy
+            .secure_auth
+            .as_deref()
+            .expect("preflight guarantees secure credentials in secure_only mode");
+        return Ok(Socks5Auth {
+            secure: Some(secure),
+            cleartext: None,
+            secure_only: true,
+        });
     }
-    proxy.refuse_cleartext()?;
-    Ok(Socks5Auth::None)
+    // Secure credentials alone (the `with_secure_auth` advanced API keeps
+    // `password` unset): offer the strong method, plus RFC 1929 only while a
+    // clear-text pair is usable and allowed.
+    #[cfg(feature = "secure-auth")]
+    if let Some(secure) = proxy.secure_auth.as_deref() {
+        return Ok(Socks5Auth {
+            secure: Some(secure),
+            cleartext: pair.filter(|_| proxy.allow_cleartext),
+            secure_only: false,
+        });
+    }
+    match pair {
+        Some((user, password)) => Ok(Socks5Auth {
+            #[cfg(feature = "secure-auth")]
+            secure: None,
+            cleartext: Some((user, password)),
+            secure_only: false,
+        }),
+        None => Ok(Socks5Auth::anonymous()),
+    }
 }
 
 /// Establishes a connection to the target through a SOCKS5 proxy.

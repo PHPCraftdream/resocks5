@@ -92,6 +92,19 @@ pub enum ProtocolViolation {
         /// Domain length in bytes.
         len: usize,
     },
+    /// The RFC 1929 auth sub-negotiation reply carried an unexpected
+    /// version byte (must be 1).
+    Socks5BadAuthVersion {
+        /// The version byte the proxy sent.
+        got: u8,
+    },
+    /// The RFC 1929 UNAME or PASSWD exceeded the 255-byte limit.
+    Socks5CredentialsTooLong {
+        /// Username length in bytes.
+        username_len: usize,
+        /// Password length in bytes.
+        password_len: usize,
+    },
     /// The HTTP CONNECT target contained control or whitespace bytes.
     HttpInvalidConnectTarget,
     /// The HTTP CONNECT response headers exceeded the 4 KiB buffer.
@@ -118,6 +131,12 @@ impl fmt::Display for ProtocolViolation {
             }
             ProtocolViolation::Socks5DomainTooLong { .. } => {
                 write!(f, "[SOCKS5] Domain name too long")
+            }
+            ProtocolViolation::Socks5BadAuthVersion { .. } => {
+                write!(f, "[SOCKS5] invalid auth sub-negotiation version")
+            }
+            ProtocolViolation::Socks5CredentialsTooLong { .. } => {
+                write!(f, "[SOCKS5] username or password too long")
             }
             ProtocolViolation::HttpInvalidConnectTarget => {
                 write!(f, "[HTTP] invalid CONNECT target")
@@ -184,50 +203,6 @@ impl fmt::Display for SecureAuthError {
 
 impl std::error::Error for SecureAuthError {}
 
-/// Why a GSSAPI exchange (SOCKS5 method 0x01, RFC 1961, see `gssapi`) failed.
-/// Never carries a token or key material.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum GssapiError {
-    /// A message had an unexpected version byte.
-    BadVersion,
-    /// A message had an unexpected type, length or an empty token where one is
-    /// required.
-    BadFrame,
-    /// The peer sent the abort message (0xFF): it refused the client.
-    Aborted,
-    /// The GSSAPI backend failed (bad ticket, unknown service, clock skew, ...).
-    Backend(String),
-    /// The peer agreed to a weaker per-message protection than the minimum
-    /// this side accepts.
-    ProtectionTooWeak,
-    /// A protected message did not verify or decrypt.
-    Integrity,
-    /// The context was used before it was established.
-    NotEstablished,
-    /// The stream failed or ended during the exchange.
-    Io(io::ErrorKind),
-}
-
-impl fmt::Display for GssapiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BadVersion => f.write_str("[GSSAPI] unexpected version"),
-            Self::BadFrame => f.write_str("[GSSAPI] malformed message"),
-            Self::Aborted => f.write_str("[GSSAPI] the server refused the client"),
-            Self::Backend(reason) => write!(f, "[GSSAPI] backend error: {reason}"),
-            Self::ProtectionTooWeak => {
-                f.write_str("[GSSAPI] the agreed protection level is below the minimum")
-            }
-            Self::Integrity => f.write_str("[GSSAPI] a protected message failed verification"),
-            Self::NotEstablished => f.write_str("[GSSAPI] the context is not established"),
-            Self::Io(_) => f.write_str("[GSSAPI] I/O error during the exchange"),
-        }
-    }
-}
-
-impl std::error::Error for GssapiError {}
-
 /// The typed error returned by every public connect/pool entry point.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -275,9 +250,15 @@ pub enum ConnectError {
     MethodUnsupported {
         /// The method byte the proxy returned.
         got: u8,
-        /// Whether we had asked for strong auth, secure auth or GSSAPI (`true`) or
+        /// Whether the greeting offered authentication methods (`true`) or only
         /// no-auth (`false`) — the two messages differ.
         with_auth: bool,
+    },
+    /// The upstream rejected the RFC 1929 username/password sub-negotiation:
+    /// the status byte after our UNAME/PASSWD was not 0.
+    AuthFailed {
+        /// The status byte the upstream returned.
+        status: u8,
     },
     /// Protocol violation with the offending detail carried in a
     /// [`ProtocolViolation`] variant (bad version, unknown ATYP, domain
@@ -291,10 +272,12 @@ pub enum ConnectError {
     /// Basic to a plain-HTTP proxy); it never does.
     /// Raised before the first byte of the handshake; nothing was sent.
     CleartextCredentialsRefused,
+    /// `secure_only` mode: the upstream did not offer secure auth (SOCKS5
+    /// method 0x80 or HTTP `Resocks5-Secure`), so this crate refuses to fall
+    /// back to any weaker method. Raised before any credential byte is sent.
+    SecureAuthUnsupported,
     /// The secure-auth exchange (SOCKS5 method 0x80) with the upstream failed.
     SecureAuth(SecureAuthError),
-    /// The GSSAPI exchange (SOCKS5 method 0x01) with the upstream failed.
-    Gssapi(GssapiError),
     /// An HTTPS upstream was requested but the crate was built without
     /// the `tls` feature.
     TlsFeatureMissing {
@@ -415,6 +398,10 @@ impl fmt::Display for ConnectError {
                     )
                 }
             }
+            ConnectError::AuthFailed { status } => write!(
+                f,
+                "[SOCKS5] proxy rejected the username/password authentication (status {status:#04x})"
+            ),
             ConnectError::Protocol(violation) => write!(f, "{}", violation),
             ConnectError::InvalidTarget(target) => {
                 write!(f, "[SOCKS5] Invalid target address format: {}", target)
@@ -431,9 +418,11 @@ impl fmt::Display for ConnectError {
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
             ConnectError::SecureAuth(error) => write!(f, "{}", error),
-            ConnectError::Gssapi(error) => write!(f, "{}", error),
             ConnectError::CleartextCredentialsRefused => f.write_str(
-                "refusing to send credentials in clear text (use secure auth, GSSAPI or an https proxy)",
+                "refusing to send credentials in clear text (use secure auth or an https proxy)",
+            ),
+            ConnectError::SecureAuthUnsupported => f.write_str(
+                "secure-only mode: the upstream does not support secure auth (SOCKS5 0x80 / HTTP Resocks5-Secure); refusing any weaker method",
             ),
         }
     }

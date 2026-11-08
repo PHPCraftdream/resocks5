@@ -1,6 +1,10 @@
 //! Key derivation and the per-user stored secret.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
 use argon2::{Algorithm, Argon2, Params, Version};
+use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
 use crate::error::SecureAuthError;
@@ -10,9 +14,12 @@ pub const KEY_LEN: usize = 32;
 /// Length of a freshly generated salt in bytes.
 pub const SALT_LEN: usize = 16;
 
-/// Hard upper limits a client accepts from a server (a malicious server must
-/// not be able to make it allocate gigabytes or burn minutes).
-const MAX_MEMORY_KIB: u32 = 1 << 20; // 1 GiB
+/// Hard ceiling on `memory_kib` this crate ever derives with or accepts
+/// from a peer (256 MiB). Argon2id parameters arrive over the wire in both
+/// directions — a server offers them to the client, a client seals them in
+/// an enrollment — so the ceiling bounds the worst-case memory burn a
+/// hostile peer can trigger per proof, here and in the host process.
+pub const MAX_MEMORY_KIB: u32 = 256 * 1024;
 const MAX_ITERATIONS: u32 = 16;
 const MAX_PARALLELISM: u32 = 16;
 /// Longest salt a message may carry.
@@ -30,16 +37,20 @@ pub struct KdfParams {
 }
 
 impl KdfParams {
-    /// The OWASP minimum for Argon2id: 19 MiB, 2 passes, 1 lane.
+    /// The default Argon2id cost: 4 MiB, 1 pass, 1 lane. Below the OWASP
+    /// minimum (19 MiB, 2 passes) as a documented cost trade-off (see the
+    /// project SECURITY notes). Hosts that prefer the OWASP cost override
+    /// `enrollment_floor()` and pass a stronger `KdfParams` when enrolling
+    /// or checking.
     pub const DEFAULT: KdfParams = KdfParams {
-        memory_kib: 19 * 1024,
-        iterations: 2,
+        memory_kib: 4096,
+        iterations: 1,
         parallelism: 1,
     };
 
     /// Whether the values are inside the hard limits this crate will ever use
     /// (`memory_kib` at least `8 * parallelism` as Argon2 requires; at most
-    /// 1 GiB, 16 passes, 16 lanes).
+    /// 256 MiB, 16 passes, 16 lanes).
     pub fn is_in_range(&self) -> bool {
         self.parallelism >= 1
             && self.parallelism <= MAX_PARALLELISM
@@ -61,6 +72,102 @@ impl Default for KdfParams {
     fn default() -> Self {
         Self::DEFAULT
     }
+}
+
+/// How long a caller waits for a derivation slot before giving up. A caller
+/// that times out must treat the derivation as refused, not queue
+/// unboundedly.
+pub(crate) const DERIVATION_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A cap on concurrent Argon2id derivations. Key derivation is CPU- and
+/// memory-heavy; a limiter keeps many simultaneous logins from multiplying
+/// that cost without bound: a caller takes a slot with [`acquire`], waits at
+/// most a short constant time for one, and refuses the login instead of
+/// queueing when none frees up.
+///
+/// The server side of this crate uses one process-wide limiter
+/// ([`derivation_limiter`]) through [`SecretStore::derivation_limiter`]; the
+/// client side has its own, so a flood of inbound clear-text checks can never
+/// starve the outbound key derivations of a host that is both a server and a
+/// client. A host may give a store a limiter of its own.
+///
+/// [`acquire`]: DerivationLimiter::acquire
+/// [`SecretStore::derivation_limiter`]: super::SecretStore::derivation_limiter
+#[derive(Debug)]
+pub struct DerivationLimiter {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+    granted: AtomicU64,
+}
+
+/// A held derivation slot; the cap frees up when it is dropped.
+#[derive(Debug)]
+pub struct DerivationPermit(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+impl DerivationLimiter {
+    /// A limiter allowing `capacity` concurrent derivations (at least 1).
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity,
+            granted: AtomicU64::new(0),
+        }
+    }
+
+    /// The default cap: half the available parallelism, at least 1.
+    fn for_this_machine() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        Self::new(cpus / 2)
+    }
+
+    /// How many derivations may run at once.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many slots are free right now.
+    pub fn available(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// How many slots this limiter has granted since it was created.
+    pub fn granted(&self) -> u64 {
+        self.granted.load(Ordering::Relaxed)
+    }
+
+    /// One slot, waiting at most [`DERIVATION_WAIT`] for it. `None` when the
+    /// limiter stays saturated: the caller must not derive. Drop the permit
+    /// when the derivation has finished.
+    pub async fn acquire(&self) -> Option<DerivationPermit> {
+        let semaphore = Arc::clone(&self.semaphore);
+        match tokio::time::timeout(DERIVATION_WAIT, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                self.granted.fetch_add(1, Ordering::Relaxed);
+                Some(DerivationPermit(permit))
+            }
+            _ => None,
+        }
+    }
+}
+
+static SERVER_LIMITER: OnceLock<Arc<DerivationLimiter>> = OnceLock::new();
+static CLIENT_LIMITER: OnceLock<Arc<DerivationLimiter>> = OnceLock::new();
+
+/// The process-wide cap on server-side derivations: what the default
+/// `SecretStore::derivation_limiter` returns. A host that derives itself —
+/// for instance in its own `check_password` behind a cache — takes a slot
+/// from it around each derivation.
+pub fn derivation_limiter() -> &'static Arc<DerivationLimiter> {
+    SERVER_LIMITER.get_or_init(|| Arc::new(DerivationLimiter::for_this_machine()))
+}
+
+/// The process-wide cap on client-side key derivations (separate from the
+/// server's).
+pub(crate) fn client_limiter() -> &'static Arc<DerivationLimiter> {
+    CLIENT_LIMITER.get_or_init(|| Arc::new(DerivationLimiter::for_this_machine()))
 }
 
 /// `K = Argon2id(password, salt, params)`, [`KEY_LEN`] bytes, wiped on drop.

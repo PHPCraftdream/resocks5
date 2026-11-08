@@ -44,7 +44,9 @@ struct Cached {
 }
 
 impl SecureCredentials {
-    /// Credentials with the default KDF floor ([`KdfParams::DEFAULT`]).
+    /// Credentials with the default KDF floor ([`KdfParams::DEFAULT`]). An
+    /// empty user name or password is accepted here but refused at the first
+    /// exchange (`BadLength`); `try_new` refuses up front.
     pub fn new(user: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
             user: user.into(),
@@ -54,6 +56,23 @@ impl SecureCredentials {
             enrollment_kdf: KdfParams::DEFAULT,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Like [`SecureCredentials::new`], but refuses an empty user name or
+    /// password with [`SecureAuthError::BadLength`].
+    ///
+    /// # Errors
+    ///
+    /// [`SecureAuthError::BadLength`] when either field is empty.
+    pub fn try_new(
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, SecureAuthError> {
+        let credentials = Self::new(user, password);
+        if credentials.user.is_empty() || credentials.password.is_empty() {
+            return Err(SecureAuthError::BadLength);
+        }
+        Ok(credentials)
     }
 
     /// Enroll when the server says the user is waiting for its first secret
@@ -113,7 +132,10 @@ impl SecureCredentials {
     }
 
     /// The key for `salt`/`params`: the cached one, or derived (on the blocking
-    /// pool: Argon2id is CPU- and memory-heavy) and cached.
+    /// pool: Argon2id is CPU- and memory-heavy) and cached. The derivation
+    /// holds one process-wide permit (see [`super::kdf::derivation_permit`]);
+    /// when the limiter is saturated, the login fails with
+    /// [`SecureAuthError::Kdf`] instead of queueing unboundedly.
     async fn key_for(
         &self,
         salt: &[u8],
@@ -129,12 +151,16 @@ impl SecureCredentials {
                 return Ok(cached.key.clone());
             }
         }
+        let Some(_permit) = super::kdf::client_limiter().acquire().await else {
+            return Err(SecureAuthError::Kdf);
+        };
         let password = Zeroizing::new(self.password.as_bytes().to_vec());
         let (salt_owned, params_owned) = (salt.to_vec(), *params);
         let key =
             tokio::task::spawn_blocking(move || derive_key(&password, &salt_owned, &params_owned))
                 .await
                 .map_err(|_| SecureAuthError::Kdf)??;
+        drop(_permit);
         self.remember(salt, *params, &key);
         Ok(key)
     }
@@ -181,6 +207,9 @@ where
     let user = credentials.user.as_bytes();
     let ulen = u8::try_from(user.len()).map_err(|_| SecureAuthError::BadLength)?;
     if ulen == 0 {
+        return Err(SecureAuthError::BadLength);
+    }
+    if credentials.password.is_empty() {
         return Err(SecureAuthError::BadLength);
     }
     let cnonce = random_nonce()?;
@@ -284,12 +313,18 @@ where
         return Err(SecureAuthError::Crypto);
     }
 
-    // A fresh salt and the key, on the blocking pool (Argon2id).
+    // A fresh salt and the key, on the blocking pool (Argon2id). Like the
+    // login derivation, this holds one process-wide permit; a saturated
+    // limiter fails the enrollment instead of queueing.
+    let Some(_permit) = super::kdf::client_limiter().acquire().await else {
+        return Err(SecureAuthError::Kdf);
+    };
     let password = Zeroizing::new(credentials.password.to_string());
     let params = credentials.enrollment_kdf;
     let secret = tokio::task::spawn_blocking(move || UserSecret::from_password(&password, params))
         .await
         .map_err(|_| SecureAuthError::Kdf)??;
+    drop(_permit);
     let sealed = init::seal(
         &secret,
         shared.as_bytes(),

@@ -1,86 +1,89 @@
-# resocks5 — полный справочник
+# resocks5 — full reference
 
-Этот справочник встроен в бинарник: `resocks5 --help` и `resocks5 config`
-показывают его без интернета. `resocks5 -h` — короткая справка.
-Документ описывает версию из текущих исходников; установленный GitHub latest
-может быть старше `main`. Версия бинарника: `resocks5 --version`.
+This reference is embedded in the binary: `resocks5 --help` and
+`resocks5 config` print it without internet access. `resocks5 -h` is the
+short help. The document describes the version in the current sources; the
+installed GitHub latest release may be older than `main`. Binary version:
+`resocks5 --version`.
 
-## 1. Возможности и границы
+## 1. Capabilities and limits
 
-- Один TCP-порт принимает SOCKS5 и HTTP CONNECT с автоматическим определением
-  протокола. SOCKS5 поддерживает CONNECT, а не BIND/UDP ASSOCIATE.
-- HTTP-интерфейс предназначен для CONNECT-туннелей, не для обычных запросов
-  HTTP forward proxy вида `GET http://…`. TCP-туннель может переносить HTTPS,
-  SSH, WebSocket и другие протоколы; содержимое после установления туннеля
-  обычно передаётся в обе стороны без изменений.
-- Именованный аккаунт с `direct: true` использует сервер как самостоятельный
-  прокси: сервер сам подключается к цели, upstream-прокси не нужны.
-- Остальные аккаунты и анонимные клиенты используют upstream-прокси:
-  SOCKS5, HTTP CONNECT или HTTPS CONNECT; группы IPv4/IPv6, цепочки через
-  gates, per-target sticky cache и sand-rating для выбора маршрута.
-- Есть аутентификация по имени/паролю (secure auth, пароль не
-  передаётся), списки допуска IP клиентов,
-  запрет целей регулярными выражениями, лимиты соединений, таймауты,
-  TCP keepalive, предварительно открытые TCP-соединения и журналирование.
-- Входной клиентский TCP-транспорт сам по себе не обёрнут TLS. Пароли
-  принимаются только через secure auth (SOCKS5 метод 0x80): пароль не
-  передаётся, сервер хранит только Argon2id-ключ. SOCKS5 username/password
-  и HTTP Basic отклоняются; стандартные клиенты (браузеры, curl) подключаются
-  только анонимно, вход по паролю — клиентом на `resocks5-net`
-  (`ProxyConfig::with_secure_auth`). Сам трафик не шифруется: для
-  недоверенной сети нужен защищённый транспорт, например VPN или SSH-туннель.
-- HTTP authentication failures remain `407 Proxy Authentication Required`
-  with `Proxy-Authenticate: Resocks5-Secure`, without advertising Basic.
-  This does not implement secure authentication over HTTP; use SOCKS5 for
-  that. Status 403 denotes an access denial, while 407 carries a proxy
-  authentication challenge (RFC 9110 §15.5.8). A preconfigured
-  client, such as `curl --proxy-user`, may send Basic without a challenge:
-  the server cannot prevent transmission, only reject the credentials.
-  Browser prompt behavior for the unknown scheme has not been tested and
-  is not guaranteed.
-- HTTPS upstream означает TLS до upstream-прокси, не HTTPS listener.
-  Собственный центр сертификации, входной TLS, UDP, автоматическое
-  создание системной службы и автоматическая перезагрузка конфигов
-  этим бинарником не предоставляются.
+- One TCP port accepts SOCKS5 and HTTP CONNECT with automatic protocol
+  detection. SOCKS5 supports CONNECT, not BIND/UDP ASSOCIATE.
+- The HTTP interface is meant for CONNECT tunnels, not for ordinary HTTP
+  forward-proxy requests such as `GET http://…`. A TCP tunnel can carry
+  HTTPS, SSH, WebSocket and other protocols; once the tunnel is established
+  the content usually passes unchanged in both directions.
+- A named account with `direct: true` uses the server as a standalone proxy:
+  the server connects to the target itself, no upstream proxies are needed.
+- All other accounts and anonymous clients use upstream proxies: SOCKS5,
+  HTTP CONNECT or HTTPS CONNECT; IPv4/IPv6 groups, chains through gates,
+  a per-target sticky cache and sand-rating for route selection.
+- There is name/password authentication (our own secure method, where the
+  password is never sent, and the standard SOCKS5 username/password and HTTP
+  Basic, allowed by default), client IP allow-lists, regex target bans,
+  connection limits, timeouts, TCP keepalive, pre-opened TCP connections and
+  logging.
+- One port serves SOCKS5 and HTTP CONNECT, and the client picks the method:
+  the server takes the strongest one the client offers — our secure method
+  (SOCKS5 method 0x80, HTTP scheme `Resocks5-Secure`), then a clear-text
+  password (SOCKS5 0x02, HTTP Basic), then anonymous access (if enabled).
+  Standard clients (browsers, curl) do not know our method and connect with
+  Basic or 0x02. The "Authentication" section below describes the methods,
+  the single per-user secret and `init` registration.
+- The inbound client TCP transport is not wrapped in TLS. The secure method
+  never sends the password, but a clear-text password (0x02, Basic) crosses
+  the network as is: on an untrusted network set `auth.secure_only: true` or
+  use a protected transport (VPN, SSH tunnel). The tunnel traffic itself is
+  not encrypted.
+- An HTTP authentication failure is `407 Proxy Authentication Required` with
+  `Proxy-Authenticate: Resocks5-Secure` and (while clear text is allowed)
+  `Basic realm="resocks5"`; the connection stays open so that the client
+  retries with credentials, and is closed after a refusal. Status 403 means
+  access denied, 407 asks for authentication (RFC 9110 §15.5.8).
+- An HTTPS upstream means TLS to the upstream proxy, not an HTTPS listener.
+  A private certificate authority, inbound TLS, UDP, automatic system-service
+  creation and automatic config reloading are not provided by this binary.
 
-## 2. Команды и управление аккаунтами
+## 2. Commands and account management
 
-| Команда | Действие и детали |
-|---------|-------------------|
-| `resocks5` | Загрузить конфиги из cwd и запустить listener; при отсутствии доступного маршрута завершиться с ошибкой. |
-| `resocks5 -h` | Краткая справка. |
-| `resocks5 --help` | Команды и полный встроенный справочник. |
-| `resocks5 --version` | Версия бинарника; короткий вариант — `-V`. |
-| `resocks5 help` | Стандартная справка CLI; например, `resocks5 help users`. |
-| `resocks5 config` | Напечатать этот справочник без запуска listener и без загрузки конфигов. |
-| `resocks5 users` | Группа команд управления аккаунтами; требуется подкоманда. |
-| `resocks5 users add <name>` | Создать включённый pool-аккаунт; пароль вводится без CLI-флага, сохраняется Argon2id-ключ (PHC-строка), не пароль. |
-| `resocks5 users add-init <name>` | Создать аккаунт с `hash: init`; первый вход (клиент с разрешённой регистрацией) задаёт пароль, по сети передаётся только зашифрованный ключ. Использовать только при контроле первого подключения. |
-| `resocks5 users add-gssapi <principal>` | Создать аккаунт без пароля для входа по GSSAPI (Kerberos): имя — принципал целиком (`alice@EXAMPLE.COM`), `hash: gssapi`. Работает при заданном `auth.gssapi_service`. |
-| `resocks5 users set-password <name>` | Задать новый пароль существующего аккаунта. |
-| `resocks5 users remove <name>` | Удалить аккаунт. В TTY запрашивается подтверждение; `--yes` пропускает его. При неинтерактивном stdin подтверждение не запрашивается. |
-| `resocks5 users list` | Показать имена, enabled/disabled и direct/pool; хеши не выводятся. |
-| `resocks5 users enable <name>` | Разрешить аутентификацию аккаунта. |
-| `resocks5 users disable <name>` | Запретить аутентификацию; внешний отказ не раскрывает, неизвестен аккаунт или выключен. |
-| `resocks5 users direct <name>` | Включить прямое подключение от IP сервера для этого аккаунта. |
-| `resocks5 users pool <name>` | Вернуть аккаунт к upstream-маршрутизации. |
+| Command | Action and details |
+|---------|--------------------|
+| `resocks5` | Load the configs from the cwd and start the listener; exit with an error if there is no usable route. |
+| `resocks5 -h` | Short help. |
+| `resocks5 --help` | Commands and the full embedded reference. |
+| `resocks5 --version` | Binary version; the short form is `-V`. |
+| `resocks5 help` | Standard CLI help; for example `resocks5 help users`. |
+| `resocks5 config` | Print this reference without starting the listener and without loading configs. |
+| `resocks5 users` | Account management command group; a subcommand is required. |
+| `resocks5 users add <name>` | Create an enabled pool account; the password is read without a CLI flag and an Argon2id key (a PHC string), not the password, is stored. This one secret verifies a login by any method and over any protocol. Use a random password of 22+ characters (see "Authentication"). |
+| `resocks5 users add-init <name>` | Create an account with `hash: init`; the first successful login by any method (secure registration or a clear-text password over 0x02/Basic) binds that client's password to the account. Use only when you control the first connection. |
+| `resocks5 users set-password <name>` | Set a new password for an existing account. |
+| `resocks5 users remove <name>` | Delete an account. A TTY asks for confirmation; `--yes` skips it. With non-interactive stdin no confirmation is requested. |
+| `resocks5 users list` | Show names, enabled/disabled and direct/pool; hashes are not printed. |
+| `resocks5 users enable <name>` | Allow the account to authenticate. |
+| `resocks5 users disable <name>` | Forbid authentication; the external refusal does not reveal whether the account is unknown or disabled. |
+| `resocks5 users direct <name>` | Enable a direct connection from the server IP for this account. |
+| `resocks5 users pool <name>` | Return the account to upstream routing. |
 
-У каждой команды есть `--help`, например `resocks5 users direct --help`.
-Имя при создании: 1–255 байт, без `:`; сравнение имён регистрозависимое.
-Пароль: 1–255 байт, не символов. В TTY вводятся пароль и подтверждение,
-эхо отключено; при перенаправленном stdin читается один пароль без
-подтверждения. Не помещайте секреты в аргументы, историю shell и логи.
+Every command has `--help`, for example `resocks5 users direct --help`.
+A name at creation: 1–255 bytes, no `:`; names are compared case-sensitively.
+A password: 1–255 bytes, not characters. A TTY prompts for the password and
+its confirmation with echo off; with redirected stdin one password is read
+without confirmation. Do not put secrets into arguments, shell history or
+logs.
 
-Команды `users` работают только с `resocks5.users.ktav` из cwd, при
-необходимости создавая его: сломанный main/proxy_list не мешает управлять
-аккаунтами. Изменения записываются атомарно под межпроцессной блокировкой.
-Для применения к уже работающему серверу нужен перезапуск: это снимок
-аккаунтов, политик и конфигурации на старте, не hot reload. Исключение —
-запись пароля при init-claim внутри текущего процесса.
+The `users` commands work only with `resocks5.users.ktav` in the cwd,
+creating it when needed: a broken main/proxy_list does not prevent account
+management. Changes are written atomically under an inter-process lock. A
+running server needs a restart to apply them: it holds a snapshot of the
+accounts, policies and configuration taken at startup, not a hot reload. The
+exception is the password written by an init claim inside the current
+process.
 
-### Самостоятельный прокси без upstream
+### Standalone proxy without upstreams
 
-В каталоге выбранного экземпляра:
+In the directory of the chosen instance:
 
 ```sh
 resocks5 users add alice
@@ -88,55 +91,56 @@ resocks5 users direct alice
 resocks5
 ```
 
-Сервер создаст недостающие конфиги. В `resocks5.main.ktav` установите
-`auth: { allow_anonymous: false }`, чтобы требовать пароль. Если сервер
-уже работал, перезапустите его после изменения аккаунта или настроек.
-`socks5_v4`, `socks5_v6`, `http_v4`, `http_v6`, `https_v4`, `https_v6`
-могут оставаться пустыми: достаточно одного включённого direct-пользователя.
-Без upstream и без такого пользователя старт завершится ошибкой;
-одних gates тоже недостаточно. Не включайте direct автоматически всем.
+The server creates the missing configs. Set
+`auth: { allow_anonymous: false }` in `resocks5.main.ktav` to require a
+password. If the server was already running, restart it after changing the
+account or the settings. `socks5_v4`, `socks5_v6`, `http_v4`, `http_v6`,
+`https_v4`, `https_v6` may stay empty: a single enabled direct user is
+enough. Without upstreams and without such a user the start fails; gates
+alone are not enough either. Do not enable direct for everyone by default.
 
-`direct` — разрешение аккаунта, а не глобальный fallback при отказе
-upstream. Анонимный клиент direct-доступ не получает. Direct-цель видит
-IP сервера; доменное имя разрешается DNS-резолвером сервера.
-`banned_patterns`, `allowed_clients`, таймауты и лимиты сохраняются.
+`direct` is a permission of an account, not a global fallback when the
+upstream refuses. An anonymous client gets no direct access. The direct
+target sees the server IP; a domain name is resolved by the server's DNS
+resolver. `banned_patterns`, `allowed_clients`, timeouts and limits still
+apply.
 
-Примеры клиента curl (пароль запрашивается, не включён в пример):
+curl client examples (the password is prompted for and not part of the
+example):
 
 ```sh
 curl --proxy socks5h://127.0.0.1:20082 --proxy-user alice https://example.com/
 curl --proxy http://127.0.0.1:20082 --proxytunnel --proxy-user alice https://example.com/
 ```
 
-Для SOCKS5 используйте удалённое разрешение DNS (`socks5h` у curl),
-если имя цели должно передаваться серверу, а не разрешаться клиентом.
+For SOCKS5 use remote DNS resolution (`socks5h` in curl) when the target
+name must be sent to the server instead of being resolved by the client.
 
-## 3. Каталог настроек и формат KTAV
+## 3. Settings directory and the KTAV format
 
-Все пути конфигов относятся к текущему рабочему каталогу запуска (cwd),
-а не к каталогу установленного бинарника. Разные cwd дают независимые
-экземпляры. Это верно и при запуске через PATH, и для команд `users`.
-Каталог должен разрешать необходимые записи; при ошибке прав сервер
-не переключается молча на другой каталог.
+All config paths are relative to the current working directory of the launch
+(cwd), not to the directory of the installed binary. Different cwds give
+independent instances. This holds both for a launch through PATH and for the
+`users` commands. The directory must allow the writes the server needs; on a
+permission error the server does not silently switch to another directory.
 
-| Файл | Содержимое |
-|------|------------|
-| `resocks5.main.ktav` | Listener, допуск клиентов, auth, сеть, pool, fragmentation и логи. |
-| `resocks5.proxy_list.ktav` | Шесть массивов upstream-прокси. |
-| `resocks5.users.ktav` | Аккаунты и их политики. |
-| `resocks5.health.ktav` | Память о мёртвых upstream между запусками; пишет сам сервер, руками не править (см. «Память о мёртвых upstream»). |
+| File | Contents |
+|------|----------|
+| `resocks5.main.ktav` | Listener, client admission, auth, network, pool, fragmentation and logs. |
+| `resocks5.proxy_list.ktav` | Six arrays of upstream proxies. |
+| `resocks5.users.ktav` | Accounts and their policies. |
+| `resocks5.health.ktav` | Memory of dead upstreams between runs; written by the server itself, do not edit by hand (see "Memory of dead upstreams"). |
 
-Без подкоманды отсутствующие файлы создаются с default-значениями.
-Первый запуск без upstream и direct-пользователя создаёт конфиги,
-после чего завершается с сообщением об отсутствии маршрутов.
-Объекты KTAV записываются через `{ ... }`, массивы — `[ ... ]`, комментарии —
-строками `## ...`. Не используйте YAML-отступы вместо объектов.
-Строковые значения KTAV пишутся без кавычек, включая маски, запятые и IPv6.
-Кавычки не снимаются парсером и станут частью значения — это не JSON/YAML.
-При редактировании заменяйте существующий ключ, не добавляйте второй ключ
-с тем же именем.
+Without a subcommand missing files are created with default values. A first
+run without upstreams and without a direct user creates the configs and then
+exits with a message about missing routes. KTAV objects are written as
+`{ ... }`, arrays as `[ ... ]`, comments as `## ...` lines. Do not use YAML
+indentation instead of objects. KTAV string values are written without
+quotes, including masks, commas and IPv6. The parser does not strip quotes:
+they become part of the value — this is not JSON/YAML. When editing, replace
+the existing key; do not add a second key with the same name.
 
-Пример части main-файла (остальные секции получают defaults):
+An example of part of the main file (the other sections take defaults):
 
 ```text
 port: 20082
@@ -145,188 +149,226 @@ allowed_clients: loopback
 auth: { allow_anonymous: false }
 ```
 
-Значения «по умолчанию» ниже относятся к созданному конфигу или полям,
-для которых настроен serde default. Кавычки в табличном Default лишь
-обозначают тип String, не являются синтаксисом значения KTAV.
-`port` и `auth` в main обязательны
-при ручном создании файла. Если секция `tls_fragment` задана явно,
-укажите все три её поля; отсутствие всей секции включает её Default.
+The "Default" values below refer to a created config or to fields with a
+serde default. Quotes in the Default column only denote the String type;
+they are not KTAV value syntax. `port` and `auth` are mandatory in main when
+the file is created by hand. If the `tls_fragment` section is given
+explicitly, give all three of its fields; omitting the whole section selects
+its Default.
 
-### Все поля resocks5.main.ktav
+### All fields of resocks5.main.ktav
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `port` | u16 | 20082 | TCP-порт обоих входных протоколов. `0` позволяет ОС выбрать свободный порт. |
-| `listen_host` | String | `"127.0.0.1"` | Адрес bind; `"0.0.0.0"` открывает все IPv4-интерфейсы. Поведение `"::"` для IPv4 зависит от ОС, не гарантирует dual-stack везде. |
-| `banned_patterns` | [String] | [] | Регулярные выражения по строке цели `host:port`, проверяются до соединения. Это не автоматически разрешённый IP домена и не CIDR-фильтр. |
-| `allowed_clients` | String | `"*"` | Глобальный список допуска TCP peer, синтаксис ниже. |
-| `auth` | object | см. ниже | Политика аутентификации; секция обязательна. |
-| `log` | object | см. ниже | Флаги категорий событий. |
-| `file_log` | object | см. ниже | Файловое назначение логов. |
-| `pool` | object | см. ниже | Предварительно открытые TCP-соединения к upstream. |
-| `tls_fragment` | object | см. ниже | Дробление первого TLS ClientHello в пересылаемом трафике. |
-| `network` | object | см. ниже | Таймауты, лимиты и sand-rating. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `port` | u16 | 20082 | TCP port of both inbound protocols. `0` lets the OS pick a free port. |
+| `listen_host` | String | `"127.0.0.1"` | Bind address; `"0.0.0.0"` opens all IPv4 interfaces. The behaviour of `"::"` for IPv4 depends on the OS and is not guaranteed to be dual-stack everywhere. |
+| `banned_patterns` | [String] | [] | Regular expressions over the target string `host:port`, checked before connecting. This is not the automatically resolved IP of a domain and not a CIDR filter. |
+| `allowed_clients` | String | `"*"` | Global TCP peer allow-list, syntax below. |
+| `auth` | object | see below | Authentication policy; the section is mandatory. |
+| `upstream_auth` | object | see below | Authentication policy towards upstream proxies; optional. |
+| `log` | object | see below | Event category flags. |
+| `file_log` | object | see below | File log destination. |
+| `pool` | object | see below | Pre-opened TCP connections to upstreams. |
+| `tls_fragment` | object | see below | Splitting the first TLS ClientHello in forwarded traffic. |
+| `network` | object | see below | Timeouts, limits and sand-rating. |
 
-Некорректное регулярное выражение не позволяет запустить сервер.
-Правило вида `^10\.` фильтрует строку цели, начинающуюся с `10.`,
-но не запрещает домен, который DNS впоследствии разрешит в `10.x.x.x`.
-Для изоляции сетей применяйте также firewall/сетевые политики ОС.
+An invalid regular expression prevents the server from starting. A rule such
+as `^10\.` filters target strings that begin with `10.`, but does not forbid
+a domain that DNS later resolves to `10.x.x.x`. For network isolation also
+use the firewall/network policies of the OS.
 
-### Аутентификация
+### Authentication
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `auth.gssapi_service` | optional String | отсутствует | Принимать клиентов GSSAPI (SOCKS5 метод 0x01): host-based имя сервиса `socks@proxy.example.com` (принципал `socks/proxy.example.com@REALM` в keytab) или `*` — любой принципал из keytab. Нужна сборка с фичей `gssapi-system`; без неё сервер с этой настройкой не стартует. |
-| `auth.gssapi_protection` | optional String | отсутствует | Защита SOCKS-запроса и ответа для клиентов GSSAPI: `none` (по умолчанию: защищена только аутентификация — так говорят `curl --socks5-gssapi` и Dante `clear`), `integrity` или `confidentiality` (уровни 1 и 2 RFC 1961, клиент должен их поддерживать). Данные туннеля не защищаются никогда. Требует `auth.gssapi_service`. |
-| `auth.allow_anonymous` | bool | true | Разрешить SOCKS5 без имени/пароля и HTTP CONNECT без Proxy-Authorization. Наличие пользователей само по себе не отключает anonymous. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `auth.allow_anonymous` | bool | true | Allow SOCKS5 without a name/password and HTTP CONNECT without Proxy-Authorization. The presence of users does not by itself disable anonymous access. |
+| `auth.secure_only` | bool | false | Accept only our own secure method (SOCKS5 0x80, HTTP `Resocks5-Secure`): clear-text passwords (0x02, Basic) and anonymous access are disabled and `auth.allow_anonymous` is ignored. An optional field: when absent it is `false`, so old configs behave as before. |
+| `upstream_auth.secure_only` | bool | false | For every upstream with `user:password` use only our own method: an upstream that offers nothing but a clear-text password is refused before the password is sent. The `upstream_auth` section is optional; a single list entry can be restricted with the `;secure_only` suffix (see section 4). |
 
-- Пустые users + `true`: можно anonymous, но нужен upstream-маршрут.
-- Пустые users + `false`: все клиенты отвергаются.
-- Непустые users + `true`: anonymous остаётся доступен, именной вход
-  возможен; предъявленные credentials всё равно проверяются.
-- Непустые users + `false`: требуется успешный именной вход.
+- Empty users + `true`: anonymous access is possible, but an upstream route
+  is needed.
+- Empty users + `false`: all clients are rejected; the server refuses to
+  start and tells how to add an account.
+- Non-empty users + `true`: anonymous access stays available, named login is
+  possible; presented credentials are still verified.
+- Non-empty users + `false`: a successful named login is required.
+- `auth.secure_only: true` together with `auth.allow_anonymous: true`:
+  anonymous clients are not accepted and a warning is printed at startup;
+  such a server does not start without users.
 
-Пароль не хранится и не передаётся. Для каждого пользователя в PHC-строке
-Argon2id v19 хранятся соль, параметры и выведенный ключ K; вход — взаимный
-HMAC challenge-response над K (SOCKS5 метод 0x80): Argon2 считает клиент,
-сервер — только HMAC. Хэши прежних версий имеют ровно этот вид, поэтому
-существующие аккаунты работают без изменений; аккаунт с другим форматом
-или с параметрами ниже m=19456,t=2,p=1 при старте печатает предупреждение —
-задайте пароль заново (`users set-password`). Ключ K даёт вход так же, как
-пароль: берегите users-файл. Неизвестное, выключенное и отфильтрованное
-имя получают одинаковый отказ (decoy). Для `hash: init` первый клиент
-присылает ключ, зашифрованный эфемерным X25519; сервер атомарно фиксирует
-его (также между процессами), другие одновременные попытки получают отказ.
-Знающий имя посторонний может первым захватить init-аккаунт — защищайте
-окно первого входа, например `allowed_clients`.
+Both new flags are optional: when they are absent from the file the server
+neither fails nor warns, and the value is `false`. They are written
+explicitly, with comments, into a freshly created `resocks5.main.ktav`.
 
-**Методы и их выбор.** Клиент предлагает в greeting все настроенные сильные
-методы, сильнейший первым, и ничего слабее: GSSAPI (0x01), затем secure auth
-(0x80); анонимный и открытый пароль не предлагаются. Сервер выбирает сильнейший
-из включённых у него и предложенных клиентом: GSSAPI, затем secure auth, затем
-анонимный (если разрешён); пароль открытым текстом не выбирается никогда. Так
-один и тот же сервер обслуживает клиентов с Kerberos, клиентов с паролем и (при
-`allow_anonymous`) анонимных; сервер, ответивший клиенту более слабым методом,
-чем тот предложил, получает разрыв, а не понижение.
+**Methods and how one is chosen.** The server picks the strongest method
+that both the client offered and the server has enabled:
 
-**GSSAPI (Kerberos).** Пароля нет ни на проводе, ни на диске, ни в процессе:
-клиент предъявляет билет, сервер проверяет его по keytab (`KRB5_KTNAME`) и узнаёт
-принципал. Принципал входит в аккаунт с тем же именем (`users add-gssapi
-alice@EXAMPLE.COM`): enabled, direct и allowed_clients действуют как обычно;
-принципал без включённого аккаунта и с IP вне правила получает отказ.
-Защищена аутентификация (Kerberos взаимный: клиент и сервер доказывают друг
-другу подлинность), а SOCKS-запрос и ответ по умолчанию не защищаются
-отдельно (`auth.gssapi_protection: none`); уровни целостности и
-конфиденциальности (RFC 1961) включаются настройкой. Данные туннеля не
-защищаются никогда. Клиент для GSSAPI — `resocks5-net` (`ProxyConfig::with_gssapi`) или
-любой клиент со стандартным SOCKS5 GSSAPI. Совместимость проверяется в CI на
-реальном Kerberos с curl 8.23.0 (`curl --socks5-hostname host:port
---socks5-gssapi-service socks`). curl до 8.11 включительно (в том числе 8.5.0 из Ubuntu 24.04) с
-GSSAPI-прокси не работает: в нём ошибка автомата SOCKS5, из-за которой метод 1
-отвергается с «SOCKS5 GSSAPI per-message authentication is not supported»,
-если ответ сервера не пришёл мгновенно. Нужен curl новее (в 8.23.0 исправлено).
-В релизных бинарниках GSSAPI нет: нужна сборка `--features gssapi-system` и
-системные библиотеки Kerberos.
+1. our own secure method: SOCKS5 method 0x80, HTTP scheme `Resocks5-Secure`
+   (the same messages, one per 407 round, base64-encoded; the server's last
+   token rides in the `Proxy-Authenticate` header of the `200` reply so that
+   the client completes the mutual check). The password never crosses the
+   network. This is our own protocol: standard clients do not offer it;
+2. a clear-text password: SOCKS5 0x02 (RFC 1929), HTTP Basic (RFC 7617).
+   This is how browsers, curl and other standard clients connect. Disabled
+   by `auth.secure_only: true`;
+3. anonymous: SOCKS5 0x00, HTTP without Proxy-Authorization — with
+   `auth.allow_anonymous: true`.
 
-### Допуск IP клиентов
+A client without an acceptable method gets `[5, 0xFF]` (SOCKS5) or a `407`
+listing the enabled schemes (HTTP). The HTTP `407` keeps the connection
+open, and a standard client repeats the request with credentials on the same
+connection; after four rounds or on a refusal (`Connection: close`) the
+connection is closed.
 
-Пример: `allowed_clients: loopback,192.168.*.*,2001:db8:*:*:*:*:*:*`.
+**One secret for all methods and protocols.** For every user the PHC string
+holds the Argon2id v19 salt, parameters and the derived key K. The secure
+method verifies a mutual HMAC over K: the client computes Argon2, the server
+only an HMAC. A clear-text password is verified by the server itself: it
+derives Argon2id(password, salt, parameters) and compares it with K in
+constant time. So an account created through the secure method also logs in
+over Basic and 0x02, and the other way round: switching the protocol or the
+method breaks nothing. The key K grants access just like the password: guard
+the users file. An unknown, disabled and filtered name get the same refusal.
 
-- Элементы через запятую, пробелы по краям удаляются; внутри списка ИЛИ.
-- Глобальное и пользовательское правила объединяются по И. Поле
-  пользователя отсутствует — дополнительных ограничений нет.
-- `*` допускает любой IP; точные IPv4/IPv6 сравниваются численно.
-- `loopback` (без учёта регистра) — `127.0.0.0/8` и `::1`, не адреса
-  всех интерфейсов этой машины и не замена аутентификации.
-- IPv4-маска содержит четыре октета, `*` заменяет целый октет.
-  IPv6-маска содержит восемь hextet-групп после раскрытия `::`,
-  `*` заменяет одну группу; `::` означает только нули.
-  `2001:db8::*` — `2001:db8:0:0:0:0:0:*`, не весь /64.
-- IPv4-mapped IPv6 нормализуется к IPv4. При сравнении с IPv6-маской
-  IPv4 представляется как `::ffff:a.b.c.d`: `::ffff:7f00:*` покрывает
-  `127.0.0.1` и `127.0.255.255`, но не `127.1.0.1`.
-  IPv4-compatible IPv6 без `ffff` автоматически в IPv4 не превращается.
-- Имена хостов, порты, CIDR, `%zone`, скобки, частичные `*`, ведущие
-  нули в IPv4, пустые строки и пустые элементы не поддерживаются.
-  Ошибка любого элемента останавливает запуск даже при наличии `*`;
-  проверяются и disabled-пользователи, и дубликаты имён.
-- Источник — реальный TCP peer, не X-Forwarded-For. NAT/обратный прокси
-  меняет видимый peer. Глобальный отказ закрывает TCP до handshake;
-  пользовательский даёт тот же отказ, что неверный пароль, и не пускает к
-  init-claim.
+**`init` registration.** An account with `hash: init` is bound by the first
+successful login by any method and over any protocol: either by secure
+registration (the client sends its key encrypted with an ephemeral X25519
+key) or by a clear-text login (the server derives the secret from the
+presented password). The server records the secret atomically (also across
+processes); concurrent attempts are refused; an empty password never claims
+an account. An outsider who knows the name can claim an init account first —
+protect the window of the first login, for example with `allowed_clients`:
+the filter applies before the claim, and a filtered peer gets the same
+refusal as for a wrong password.
 
-### Сеть, таймауты и лимиты
+**Argon2id cost and flood protection.** New secrets are derived with
+m=4096 KiB (4 MiB), t=1, p=1. This is deliberately below the OWASP minimum
+(19 MiB, 2 passes): guessing a password from a stolen users file or from a
+captured secure-method exchange is noticeably faster (roughly 10 times).
+This cost gives no ASIC or GPU resistance: use random passwords of 22+
+characters (128 bits), for which the cost hardly matters. Hashes that are
+already stored keep their parameters; a 0.4.x hash (m=5120, t=2, p=1) is
+accepted without a warning. The load on the server is bounded as follows:
+the secure method costs the server one HMAC; clear-text verification goes
+through a shared limit on concurrent derivations (half of the cores, at
+least one) — the excess waits at most a second and is then refused; an
+unknown or filtered name does not compute Argon2 at all (only a short
+pause); successful logins are cached (HMAC tags only, up to 4096 entries for
+300 s, dropped when the secret changes), so clients that send Basic with
+every request do not trigger a derivation again. `auth.secure_only: true`
+switches the clear-text path off completely.
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `network.connect_timeout_sec` | u64 | 10 | Бюджет подключения к upstream или direct-цели. |
-| `network.handshake_timeout_sec` | u64 | 10 | Бюджет протокольного handshake с upstream; direct не выполняет upstream-handshake. |
-| `network.tunnel_max_lifetime_sec` | u64 | 1800 | Максимальная жизнь туннеля; `0` отключает предел. |
-| `network.tcp_keepalive_sec` | u64 | 60 | TCP keepalive idle на активных сокетах; `0` отключает. Не заменяет прикладные таймауты. |
-| `network.client_protocol_timeout_sec` | u64 | 30 | Общий deadline клиентских фаз от accept: определение протокола, handshake и recovery peek делят остаток одного бюджета. |
-| `network.max_concurrent_clients` | usize | 1024 | Общий лимит клиентских соединений. При заполнении новое TCP-соединение сразу закрывается; `0` не означает unlimited. |
-| `network.max_upstream_attempts` | usize | 10 | Общий предел попыток upstream-маршрутов одного запроса, включая fallback; `0` не означает unlimited. |
-| `network.max_per_upstream` | usize | 8 | Лимит соединений к `(host, port)`, включая занятые и spare-соединения; значение `0` нормализуется к `1`. При заполнении кандидат пропускается без ожидания и без штрафа sand. |
-| `network.tunnel_idle_timeout_sec` | u64 | 30 | Отсутствие подтверждённой передачи данных в обе стороны завершает туннель; `0` отключает idle-предел. |
-| `network.max_concurrent_direct` | usize | 256 | Общий лимит direct-туннелей после auth. SOCKS5 получает отказ, HTTP — 503; `0` запрещает direct-туннели. Direct также занимает общий клиентский слот. |
-| `network.sand_half_life_sec` | f64 | 30.0 | Время уменьшения sand вдвое; конечное положительное значение. |
-| `network.sand_fail_penalty` | f64 | 1.0 | Прибавка sand за отказ; конечное значение >= 0; `0` отключает штрафную модель. |
-| `network.sand_max` | f64 | 8.0 | Верхняя граница sand; конечное положительное значение. |
-| `network.sand_min_weight` | f64 | 0.05 | Вес насыщенного кандидата относительно свежего; конечное нормальное число в (0, 1]. Это не гарантированный процент трафика. |
-| `network.sand_success_factor` | f64 | 0.5 | Множитель sand при успехе; конечное число в [0, 1]. |
-| `network.quarantine_threshold` | u32 | 3 | Сколько отказов подряд, означающих «upstream мёртв» (TCP connect отклонён или не уложился в таймаут, провален TLS, отклонены учётные данные), выводят upstream из ротации. Отказ или зависание CONNECT к одной цели таковым не считается. Пока есть живой upstream, карантинный не пробуется вовсе; если живых нет, карантин игнорируется. `0` отключает карантин. |
-| `network.quarantine_initial_sec` | u64 | 30 | Длина первого карантина. После окончания upstream проверяется в фоне одним TCP-подключением (клиентские запросы его не ждут): доступен — возвращается в ротацию, нет — следующий карантин вдвое длиннее. При включённом карантине >= 1. |
-| `network.hedge_delay_ms` | u64 | 2000 | Сколько миллисекунд попытка может ждать TCP-подключения к upstream, прежде чем рядом запускается следующий кандидат: первый успех выигрывает. Пока подключившийся upstream говорит с целью, новые попытки не запускаются (цель не видит дублей CONNECT). Неизвестный мёртвый upstream (например, сразу после старта) стоит запросу этой задержки, а не `connect_timeout_sec`. `0` отключает (строго по очереди). Действует на прямые upstream-маршруты, не на цепочки через gate. |
-| `network.quarantine_max_sec` | u64 | 600 | Потолок растущей длины карантина; не меньше `quarantine_initial_sec`. |
-| `network.health_save_sec` | u64 | 30 | Как часто (сек) сохранять в `resocks5.health.ktav`, какие upstream в карантине, и читать этот файл при старте; сохраняется только при изменениях и при штатной остановке. `0` отключает и запись, и чтение. Не действует при `quarantine_threshold: 0`. |
-| `network.recover_host_from_payload` | bool | true | Для pool-запроса к буквальному IPv4 попытаться восстановить домен из SNI/HTTP Host; direct и буквальный IPv6 этот путь не используют. |
+**What was removed.** GSSAPI/Kerberos is removed entirely. The keys
+`auth.gssapi_service` and `auth.gssapi_protection` are ignored with a
+warning, the `;gssapi=` suffix in upstream lists skips the entry with a
+warning, and `hash: gssapi` accounts are flagged as unusable at startup (set
+a password with `resocks5 users set-password`).
 
-Общий клиентский deadline не становится новым полным таймером на каждом
-этапе. Подключение к upstream имеет отдельные connect/handshake-бюджеты;
-после установления туннеля действуют idle и lifetime. Не считайте эти
-настройки единственным глобальным end-to-end таймаутом всех fallback.
-Политика sand и производные коэффициенты проверяются при создании rotator;
-в direct-only режиме rotator может вообще не создаваться.
+### Client IP allow-list
 
-Recovery может послать успех SOCKS5/HTTP CONNECT до готовности upstream,
-чтобы прочитать первый payload клиента. Поздняя ошибка видна как закрытие
-туннеля, а не обычный отказ CONNECT. Читается ограниченный первый payload
-под остатком клиентского deadline; при отсутствии подходящего SNI/Host
-используется исходный IP. Это не расшифровка TLS и не восстановление
-скрытого ECH-имени. Для строгого порядка ответа после подключения и без
-этой инспекции задайте `recover_host_from_payload: false`.
+Example: `allowed_clients: loopback,192.168.*.*,2001:db8:*:*:*:*:*:*`.
 
-### Память о мёртвых upstream
+- Elements are comma-separated, surrounding spaces are trimmed; within the
+  list the elements are OR-ed.
+- The global and the per-user rules are combined with AND. A missing user
+  field means no extra restriction.
+- `*` admits any IP; exact IPv4/IPv6 addresses are compared numerically.
+- `loopback` (case-insensitive) is `127.0.0.0/8` and `::1`, not the addresses
+  of all interfaces of this machine and not a replacement for
+  authentication.
+- An IPv4 mask has four octets, `*` replaces a whole octet. An IPv6 mask has
+  eight hextet groups after `::` expansion, `*` replaces one group; `::`
+  means only zeros. `2001:db8::*` is `2001:db8:0:0:0:0:0:*`, not the whole
+  /64.
+- IPv4-mapped IPv6 is normalized to IPv4. When compared with an IPv6 mask an
+  IPv4 address is represented as `::ffff:a.b.c.d`: `::ffff:7f00:*` covers
+  `127.0.0.1` and `127.0.255.255` but not `127.1.0.1`. IPv4-compatible IPv6
+  without `ffff` is not turned into IPv4 automatically.
+- Host names, ports, CIDR, `%zone`, brackets, partial `*`, leading zeros in
+  IPv4, empty strings and empty elements are not supported. An error in any
+  element stops the start even when `*` is present; disabled users and
+  duplicate names are checked too.
+- The source is the real TCP peer, not X-Forwarded-For. NAT or a reverse
+  proxy changes the visible peer. A global refusal closes the TCP connection
+  before the handshake; a per-user refusal gives the same refusal as a wrong
+  password and does not let the peer reach an init claim.
 
-Карантин живёт в памяти процесса, поэтому после перезапуска сервер не знал бы,
-что часть upstream мертва, и клиентские запросы снова тратили бы на них время.
-Чтобы этого не было, сервер ведёт файл `resocks5.health.ktav` в текущем
-каталоге: раз в `network.health_save_sec` секунд (если картина изменилась) и
-при штатной остановке он записывает состояние каждого upstream. При старте
-файл читается до приёма клиентов:
+### Network, timeouts and limits
 
-- `quarantined` с оставшимся временем — возвращается в карантин на остаток,
-  уменьшенный на время простоя сервера;
-- `quarantined`, время которого вышло, и `probation` — идут на испытательный
-  срок: клиентам не выдаются, а фоновая проверка (один TCP-connect) решает, жив
-  ли upstream; живой возвращается в ротацию, мёртвый получает следующий, вдвое
-  более длинный карантин;
-- `alive` и неизвестные upstream (список прокси изменился) пропускаются.
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `network.connect_timeout_sec` | u64 | 10 | Budget for connecting to an upstream or a direct target. |
+| `network.handshake_timeout_sec` | u64 | 10 | Budget of the protocol handshake with an upstream; direct performs no upstream handshake. |
+| `network.tunnel_max_lifetime_sec` | u64 | 1800 | Maximum tunnel lifetime; `0` disables the limit. |
+| `network.tcp_keepalive_sec` | u64 | 60 | TCP keepalive idle on active sockets; `0` disables it. Does not replace application timeouts. |
+| `network.client_protocol_timeout_sec` | u64 | 30 | Total deadline of the client phases counted from accept: protocol detection, handshake and the recovery peek share the remainder of one budget. |
+| `network.max_concurrent_clients` | usize | 1024 | Total limit of client connections. When full, a new TCP connection is closed at once; `0` does not mean unlimited. |
+| `network.max_upstream_attempts` | usize | 10 | Total limit of upstream route attempts of one request, fallback included; `0` does not mean unlimited. |
+| `network.max_per_upstream` | usize | 8 | Limit of connections to `(host, port)`, busy and spare ones included; the value `0` is normalized to `1`. When full, the candidate is skipped without waiting and without a sand penalty. |
+| `network.tunnel_idle_timeout_sec` | u64 | 30 | No confirmed data transfer in both directions ends the tunnel; `0` disables the idle limit. |
+| `network.max_concurrent_direct` | usize | 256 | Total limit of direct tunnels after auth. SOCKS5 gets a refusal, HTTP gets 503; `0` forbids direct tunnels. Direct also occupies a total client slot. |
+| `network.sand_half_life_sec` | f64 | 30.0 | Time for sand to halve; a finite positive value. |
+| `network.sand_fail_penalty` | f64 | 1.0 | Sand increment per failure; a finite value >= 0; `0` disables the penalty model. |
+| `network.sand_max` | f64 | 8.0 | Upper bound of sand; a finite positive value. |
+| `network.sand_min_weight` | f64 | 0.05 | Weight of a saturated candidate relative to a fresh one; a finite normal number in (0, 1]. This is not a guaranteed traffic percentage. |
+| `network.sand_success_factor` | f64 | 0.5 | Sand multiplier on success; a finite number in [0, 1]. |
+| `network.quarantine_threshold` | u32 | 3 | How many consecutive failures that mean "the upstream is dead" (TCP connect refused or timed out, TLS failed, credentials rejected) take the upstream out of rotation. A refused or hung CONNECT to a single target does not count. While a live upstream exists, a quarantined one is not tried at all; if none is alive, the quarantine is ignored. `0` disables quarantine. |
+| `network.quarantine_initial_sec` | u64 | 30 | Length of the first quarantine. After it ends the upstream is checked in the background with one TCP connection (client requests do not wait for it): reachable — it returns to rotation, not — the next quarantine is twice as long. >= 1 while quarantine is enabled. |
+| `network.hedge_delay_ms` | u64 | 2000 | How many milliseconds an attempt may wait for the TCP connection to an upstream before the next candidate is started next to it: the first success wins. While the connected upstream talks to the target no new attempts are started (the target sees no duplicate CONNECT). An unknown dead upstream (for example right after startup) costs the request this delay, not `connect_timeout_sec`. `0` disables it (strictly one after another). Applies to direct upstream routes, not to chains through a gate. |
+| `network.quarantine_max_sec` | u64 | 600 | Cap of the growing quarantine length; not less than `quarantine_initial_sec`. |
+| `network.health_save_sec` | u64 | 30 | How often (seconds) to save into `resocks5.health.ktav` which upstreams are in quarantine, and to read that file at startup; it is saved only on changes and on a clean stop. `0` disables both writing and reading. Has no effect with `quarantine_threshold: 0`. |
+| `network.recover_host_from_payload` | bool | true | For a pool request to a literal IPv4, try to recover the domain from the SNI/HTTP Host; direct and literal IPv6 do not use this path. |
 
-Если файл прочитан, стартовая проверка «один TCP-connect ко всем upstream»
-пропускается: файл уже знает, кто был мёртв, а единичный connect в первую
-секунду после рестарта может ошибочно провалиться из-за состояния хоста (сеть
-ещё не устоялась). Без файла (первый запуск) проверка выполняется как раньше.
-Причина отказа проверки пишется в лог: `is unreachable at startup (…)`.
+The total client deadline does not become a new full timer at every stage.
+Connecting to an upstream has separate connect/handshake budgets; once the
+tunnel is established the idle and lifetime limits apply. Do not treat these
+settings as a single global end-to-end timeout of all fallbacks. The sand
+policy and its derived coefficients are validated when the rotator is
+created; in direct-only mode the rotator may not be created at all.
 
-Счётчик карантинов (`trips`) сохраняется, так что backoff продолжает расти, а не
-начинается с нуля. Пароли в файл не попадают; upstream опознаётся по
-`протокол://пользователь@хост:порт` и уровню gate. Файл не считается
-конфигурацией: его создаёт и перезаписывает сервер, удалите его, чтобы начать с
-чистого листа. Повреждённый файл игнорируется с предупреждением. При kill -9
-или аварийном выключении теряются изменения последних `health_save_sec` секунд.
+Recovery can send a SOCKS5/HTTP CONNECT success before the upstream is ready
+in order to read the client's first payload. A late error is then visible as
+the tunnel closing, not as an ordinary CONNECT refusal. A bounded first
+payload is read within the remainder of the client deadline; when there is
+no suitable SNI/Host the original IP is used. This is not TLS decryption and
+not recovery of a hidden ECH name. For a strict order of the reply after
+connecting, and without this inspection, set
+`recover_host_from_payload: false`.
 
-Пример файла (записи upstream в порядке: gate-уровни, затем v6 и v4):
+### Memory of dead upstreams
+
+Quarantine lives in process memory, so after a restart the server would not
+know that some upstreams are dead and client requests would spend time on
+them again. To avoid that, the server keeps the file `resocks5.health.ktav`
+in the current directory: every `network.health_save_sec` seconds (if the
+picture changed) and on a clean stop it writes the state of every upstream.
+At startup the file is read before clients are accepted:
+
+- `quarantined` with remaining time — returns to quarantine for the
+  remainder, reduced by the server's downtime;
+- `quarantined` whose time has run out, and `probation` — go on probation:
+  they are not given to clients, and a background check (one TCP connect)
+  decides whether the upstream is alive; a live one returns to rotation, a
+  dead one gets the next, twice as long quarantine;
+- `alive` and unknown upstreams (the proxy list changed) are skipped.
+
+If the file was read, the startup check "one TCP connect to all upstreams"
+is skipped: the file already knows who was dead, and a single connect in the
+first second after a restart may fail by mistake because of the host state
+(the network has not settled yet). Without the file (a first run) the check
+runs as before. The reason a check failed is written to the log:
+`is unreachable at startup (…)`.
+
+The quarantine counter (`trips`) is kept, so the backoff keeps growing
+instead of starting from zero. Passwords do not get into the file; an
+upstream is identified by `protocol://user@host:port` and the gate level. The
+file is not configuration: the server creates and rewrites it, delete it to
+start from a clean slate. A corrupted file is ignored with a warning. On
+kill -9 or a power failure the changes of the last `health_save_sec` seconds
+are lost.
+
+An example of the file (upstream records in the order: gate levels, then v6
+and v4):
 
 ```ktav
 saved_at: 1793000000
@@ -350,68 +392,69 @@ upstreams: [
 ]
 ```
 
-### Предварительные TCP-соединения
+### Pre-opened TCP connections
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `pool.enabled` | bool | false | Включить pre-connect spare sockets; это не переключатель direct/pool-аккаунта. |
-| `pool.spare_per_proxy` | usize | 1 | Целевое число spare-сокетов на upstream; эффективное значение ограничено снизу 1 и сверху max_per_upstream. |
-| `pool.max_session_age_sec` | u64 | 30 | Возраст spare-сокета, после которого он заменяется. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `pool.enabled` | bool | false | Enable pre-connect spare sockets; this is not the direct/pool account switch. |
+| `pool.spare_per_proxy` | usize | 1 | Target number of spare sockets per upstream; the effective value is bounded below by 1 and above by max_per_upstream. |
+| `pool.max_session_age_sec` | u64 | 30 | Age of a spare socket after which it is replaced. |
 
-Пустой spare-пул не равен отсутствию upstream: при необходимости создаётся
-новое соединение. Лимит max_per_upstream действует и при выключенном
-предварительном pool. Для direct-целей этот pool не используется.
+An empty spare pool is not the same as no upstream: a new connection is
+created when needed. The max_per_upstream limit applies even with the
+pre-connect pool disabled. This pool is not used for direct targets.
 
-### Фрагментация ClientHello
+### ClientHello fragmentation
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `tls_fragment.enabled` | bool | false | Включить дробление первого распознанного TLS ClientHello при пересылке. |
-| `tls_fragment.fragment_size` | usize | 40 | Размер частей; `0` нормализуется к `1`. Меньше — больше операций и накладных расходов. |
-| `tls_fragment.delay_ms` | u64 | 0 | Задержка после частей; `0` — без дополнительной задержки. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `tls_fragment.enabled` | bool | false | Enable splitting of the first recognized TLS ClientHello when forwarding. |
+| `tls_fragment.fragment_size` | usize | 40 | Part size; `0` is normalized to `1`. Smaller means more operations and overhead. |
+| `tls_fragment.delay_ms` | u64 | 0 | Delay after the parts; `0` means no extra delay. |
 
-Применяется к TLS ClientHello клиента в туннеле, не превращает сервер в
-TLS MITM. TCP_NODELAY уменьшает склеивание, но границы TCP-пакетов не
-гарантируются приложением. Это не гарантия обхода DPI: анализатор с полной
-сборкой потока продолжает видеть ClientHello. Для неподходящего payload
-передача остаётся обычной. Большие задержки ограничиваются таймаутами.
+Applies to the client's TLS ClientHello inside the tunnel and does not make
+the server a TLS MITM. TCP_NODELAY reduces coalescing, but the application
+cannot guarantee TCP packet boundaries. This is not a guarantee of bypassing
+DPI: an analyzer that reassembles the whole stream still sees the
+ClientHello. For an unsuitable payload the transfer stays ordinary. Large
+delays are bounded by the timeouts.
 
-### Категории логов
+### Log categories
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `log.lifecycle` | bool | true | Старт, listener, режим auth, остановка. |
-| `log.cache_attempts` | bool | false | Попытки использовать sticky-маршрут. |
-| `log.cache_hits` | bool | false | Успешное использование sticky-маршрута. |
-| `log.cache_writes` | bool | false | Обновление привязки цели к upstream. |
-| `log.proxy_failures` | bool | true | Ошибки upstream. |
-| `log.banned_targets` | bool | true | Запрещённые цели. |
-| `log.connection_errors` | bool | true | Ошибки обработки клиента, включая auth/protocol. |
-| `log.client_disconnects` | bool | false | Сброс/разрыв/закрытый peer; по умолчанию не засоряет журнал. |
-| `log.attempts` | bool | false | Диагностика попыток: исход, время, цель и путь. |
-| `log.tunnels` | bool | false | Строка на каждый закрытый туннель: цель, как закончился, сколько байт отправлено и получено, длительность. Туннель, по которому upstream не вернул ни байта, пишется в `proxy_failures` независимо от этого флага. Туннель, оборванный ошибкой ввода-вывода, называет сторону: `failed on client side` (сбросил клиент) или `failed on upstream side` (сбросил upstream). |
-| `file_log.enabled` | bool | false | Дополнительно направлять события в файл. |
-| `file_log.path` | String | `"resocks5.log"` | Append/create; относительный путь считается от cwd. |
-| `file_log.also_console` | bool | true | При включённом file_log писать также в консоль. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `log.lifecycle` | bool | true | Start, listener, auth mode, stop. |
+| `log.cache_attempts` | bool | false | Attempts to use a sticky route. |
+| `log.cache_hits` | bool | false | Successful use of a sticky route. |
+| `log.cache_writes` | bool | false | Update of a target-to-upstream binding. |
+| `log.proxy_failures` | bool | true | Upstream errors. |
+| `log.banned_targets` | bool | true | Banned targets. |
+| `log.connection_errors` | bool | true | Client handling errors, including auth/protocol. |
+| `log.client_disconnects` | bool | false | Reset/abort/closed peer; does not clutter the log by default. |
+| `log.attempts` | bool | false | Attempt diagnostics: outcome, time, target and path. |
+| `log.tunnels` | bool | false | One line per closed tunnel: target, how it ended, how many bytes were sent and received, duration. A tunnel on which the upstream returned no byte at all is written to `proxy_failures` regardless of this flag. A tunnel torn down by an I/O error names the side: `failed on client side` (the client reset it) or `failed on upstream side` (the upstream reset it). |
+| `file_log.enabled` | bool | false | Additionally route events to a file. |
+| `file_log.path` | String | `"resocks5.log"` | Append/create; a relative path is taken from the cwd. |
+| `file_log.also_console` | bool | true | Also write to the console while file_log is enabled. |
 
-Выключенная категория не формирует сообщение. Канал логов ограничен
-2048 событиями; при перегрузке часть сообщений может быть потеряна,
-это не гарантированная доставка аудита. Некоторые стартовые сообщения
-печатаются отдельно от категорий. Автоматической ротации/reopen нет:
-после переноса файла перезапустите процесс для открытия нового файла.
+A disabled category does not build the message. The log channel is bounded
+to 2048 events; under overload some messages may be lost, so this is not
+guaranteed audit delivery. Some startup messages are printed separately from
+the categories. There is no automatic rotation/reopen: after moving the file
+restart the process to open a new one.
 
-## 4. Все поля resocks5.proxy_list.ktav
+## 4. All fields of resocks5.proxy_list.ktav
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `socks5_v4` | [String] | [] | SOCKS5 upstream, группа IPv4. |
-| `socks5_v6` | [String] | [] | SOCKS5 upstream, группа IPv6. |
-| `http_v4` | [String] | [] | HTTP CONNECT upstream, группа IPv4. |
-| `http_v6` | [String] | [] | HTTP CONNECT upstream, группа IPv6. |
-| `https_v4` | [String] | [] | TLS к HTTP CONNECT upstream, группа IPv4. |
-| `https_v6` | [String] | [] | TLS к HTTP CONNECT upstream, группа IPv6. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `socks5_v4` | [String] | [] | SOCKS5 upstreams, IPv4 group. |
+| `socks5_v6` | [String] | [] | SOCKS5 upstreams, IPv6 group. |
+| `http_v4` | [String] | [] | HTTP CONNECT upstreams, IPv4 group. |
+| `http_v6` | [String] | [] | HTTP CONNECT upstreams, IPv6 group. |
+| `https_v4` | [String] | [] | TLS to an HTTP CONNECT upstream, IPv4 group. |
+| `https_v6` | [String] | [] | TLS to an HTTP CONNECT upstream, IPv6 group. |
 
-Элемент: `[*][user:password@]host:port`. Примеры KTAV:
+An element: `[*][user:password@]host:port`. KTAV examples:
 
 ```text
 socks5_v4: [
@@ -425,42 +468,49 @@ http_v4: [ 192.0.2.30:8080 ]
 https_v4: [ user:secret@proxy.example.com:443 ]
 ```
 
-SOCKS5-элемент может заканчиваться на `;gssapi=<service@host>`
-(`192.0.2.10:1080;gssapi=socks@proxy.example.com`): upstream тогда
-аутентифицируется по GSSAPI (Kerberos) как этот сервис, а при заданных
-`user:password` клиент предлагает и secure auth, сильнейший первым. Нужна сборка
-`gssapi-system`; без неё и для HTTP/HTTPS-upstream элемент пропускается с
-предупреждением (не превращается в неаутентифицированный).
+Credentials are stored in the file as written. How they are used depends on
+the protocol:
 
-Учётные данные хранятся в файле как записаны, но по сети открытым текстом
-не отправляются. SOCKS5-upstream с `user:password` авторизуется secure auth
-(метод 0x80, пароль остаётся в процессе): upstream обязан его поддерживать —
-это другой экземпляр resocks5 или клиент на `resocks5-net`; обычный SOCKS5-
-сервер, принимающий только username/password, получит отказ без отправки
-пароля. HTTPS-upstream получает Basic внутри TLS. HTTP-upstream (без TLS) с
-`user:password` при старте даёт предупреждение, а соединения к нему
-отклоняются: используйте `https_*` или SOCKS5.
+- A SOCKS5 entry with `user:password` upgrades automatically: the greeting
+  offers our secure method (0x80) first and clear text (0x02) after it, and
+  the upstream picks. The password stays in the process when the secure
+  method is chosen.
+- An HTTP or HTTPS entry sends `Basic` in its first CONNECT, exactly as
+  0.4.x did. Many upstreams (3proxy among them) answer an unauthenticated
+  CONNECT with `407` and close the connection, so the client does not probe
+  first. Basic inside TLS (`https_*`) is not clear text on the wire.
 
-IPv6 с портом записывается в квадратных скобках. Схема протокола задаётся
-именем массива, а не обязательным URL-префиксом элемента. Невалидные
-элементы пропускаются с предупреждением без публикации credentials.
-Внутри массивов поддерживаются старые строки с ведущим `#` как комментарии;
-для обычного KTAV-комментария используйте `##`.
+A single entry can end with `;secure_only` (a line suffix without a value,
+for example `192.0.2.10:1080;secure_only`), and the global
+`upstream_auth: { secure_only: true }` does the same for every entry. Such
+an entry offers only our own method (SOCKS5 0x80, or an HTTP probe that
+requires `Resocks5-Secure`): an upstream that offers nothing but a
+clear-text password is refused before the password is sent. This requires
+the upstream to be another resocks5 or a client built on `resocks5-net`. A
+malformed `;secure_only` option, or a leftover 0.4.x `;gssapi=` suffix,
+skips the entry with a warning (the entry text is never printed).
 
-HTTPS upstream использует проверку сертификата и имени прокси со встроенным
-набором Mozilla `webpki-roots`, а не автоматически с CA-хранилищем ОС.
-TLS handshake и последующий CONNECT делят один upstream handshake deadline.
-Флага отключения проверки сертификатов и настройки собственного CA в CLI нет.
+IPv6 with a port is written in square brackets. The protocol scheme is given
+by the array name, not by a mandatory URL prefix of the element. Invalid
+elements are skipped with a warning that does not publish credentials.
+Inside arrays old lines with a leading `#` are supported as comments; for an
+ordinary KTAV comment use `##`.
 
-Звёзды задают ранг gate: ноль звёзд — обычный выход, от одной до 255 —
-уровни gate 1..255; более 255 звёзд недопустимы. Для каждого
-присутствующего уровня выбирается ровно один gate, уровни идут по убыванию;
-после них следует ровно один обычный выход, затем цель. Пропуски уровней
-разрешены. Одна звезда сохраняет прежнее значение gate. Только gates не
-образуют маршрут.
+An HTTPS upstream verifies the certificate and the proxy name against the
+built-in Mozilla `webpki-roots` set, not automatically against the OS CA
+store. The TLS handshake and the following CONNECT share one upstream
+handshake deadline. There is no CLI flag to disable certificate verification
+and no private-CA setting.
 
-Например, здесь указаны ровно по одному узлу на уровнях 3, 2 и 1,
-затем один обычный выход:
+Stars set the gate rank: zero stars is an ordinary exit, one to 255 are gate
+levels 1..255; more than 255 stars are invalid. For every level present
+exactly one gate is chosen, the levels go in descending order; after them
+comes exactly one ordinary exit, then the target. Gaps between levels are
+allowed. One star keeps the previous gate value. Gates alone do not form a
+route.
+
+For example, here exactly one node is given on levels 3, 2 and 1, then one
+ordinary exit:
 
 ```text
 ***user:pass@h1:1080
@@ -469,106 +519,111 @@ TLS handshake и последующий CONNECT делят один upstream han
 h4:1080
 ```
 
-Результат: сервер -> h1 -> h2 -> h3 -> h4 -> цель. Пропуски рангов
-допустимы: например, `***user:pass@h1:1080`, `*h3:1080` и `h4:1080`
-задают два gate (уровни 3 и 1) и выход. В цепочном режиме попытки
-цепей и fallback используют общий бюджет `network.max_upstream_attempts`,
-причём как минимум одна попытка зарезервирована на fallback. Fallback
-обходит gates и выбирает только обычный выход; прямого подключения к цели
-он не выполняет.
+The result: server -> h1 -> h2 -> h3 -> h4 -> target. Gaps in ranks are
+allowed: for example `***user:pass@h1:1080`, `*h3:1080` and `h4:1080` define
+two gates (levels 3 and 1) and an exit. In chain mode the attempts of chains
+and the fallback share the `network.max_upstream_attempts` budget, with at
+least one attempt reserved for the fallback. The fallback bypasses gates and
+chooses only an ordinary exit; it never connects to the target directly.
 
-Каждый уровень gate имеет отдельный rotator; обычные выходы также
-распределены по независимым rotator-ам. Узлы сохраняют собственные
-sand/quarantine и sticky-состояние. Успешная цепочка целиком закрепляется
-за целью в sticky cache. Permits `network.max_per_upstream` удерживаются
-для каждого узла всё время жизни туннеля. Startup probes и pre-connect
-pool применяются только к внешнему уровню gate и обычным выходам.
-Quarantined gate внутреннего уровня проверяется через здоровый внешний
-префикс. При отказе, который помечает узел мёртвым, план пропускает его
-поддерево, не перебирая комбинации потомков.
+Every gate level has its own rotator; ordinary exits are also spread across
+independent rotators. Nodes keep their own sand/quarantine and sticky state.
+A successful chain is pinned to the target as a whole in the sticky cache.
+The `network.max_per_upstream` permits are held for every node for the whole
+tunnel lifetime. Startup probes and the pre-connect pool apply only to the
+outer gate level and the ordinary exits. A quarantined inner-level gate is
+checked through a healthy outer prefix. On a failure that marks a node dead
+the plan skips its subtree without trying the combinations of descendants.
 
-Sticky cache предпочитает ранее успешный маршрут для той же строки цели;
-кеш ограничен 4096 записями на rotator и TTL 600 секунд, не бессрочный.
-Эти пределы SDK не являются полями main-конфига бинарника.
-Sand-rating понижает вес неудачного upstream, постепенно восстанавливает
-его без жёсткого исключения; ошибка нашей ёмкости не штрафует upstream.
+The sticky cache prefers a previously successful route for the same target
+string; the cache is bounded to 4096 entries per rotator and a TTL of 600
+seconds, not unbounded. These SDK limits are not fields of the binary's main
+config. Sand-rating lowers the weight of a failing upstream and gradually
+restores it without hard exclusion; an error of our own capacity does not
+penalize the upstream.
 
-## 5. Все поля resocks5.users.ktav
+## 5. All fields of resocks5.users.ktav
 
-| Поле | Тип | Default | Значение |
-|------|-----|---------|----------|
-| `users` | [object] | [] | Массив аккаунтов. CLI не создаёт одинаковые имена; при ручных дубликатах runtime использует первую запись. |
-| `users[].name` | String | обязательно | Имя аккаунта. |
-| `users[].hash` | String | обязательно | Argon2id v19 PHC (соль, параметры, ключ) либо специальная строка `init`; не открытый пароль. |
-| `users[].is_enabled` | bool | true | Разрешить вход. |
-| `users[].direct` | bool | false | Самостоятельный прокси от IP сервера, без upstream. |
-| `users[].allowed_clients` | optional String | отсутствует | Дополнительное ограничение IP; None не сериализуется и не расширяет глобальную политику. |
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `users` | [object] | [] | Array of accounts. The CLI does not create identical names; with manual duplicates the runtime uses the first record. |
+| `users[].name` | String | required | Account name. |
+| `users[].hash` | String | required | Argon2id v19 PHC (salt, parameters, key) or the special string `init`; never a clear-text password. |
+| `users[].is_enabled` | bool | true | Allow login. |
+| `users[].direct` | bool | false | Standalone proxy from the server IP, without upstreams. |
+| `users[].allowed_clients` | optional String | absent | Additional IP restriction; None is not serialized and does not widen the global policy. |
 
-Создавайте и меняйте пароли/режимы через `users`. Пользовательское
-`allowed_clients` редактируется вручную в остановленном экземпляре:
-отдельной CLI-команды для этого поля нет. Не редактируйте users-файл
-одновременно с init-claim или другим писателем: сторонний редактор
-не обязан соблюдать блокировку приложения. Не публикуйте users-файл,
-proxy-list с credentials и конфиги в логах/репозитории.
+Create and change passwords/modes through `users`. The per-user
+`allowed_clients` is edited by hand on a stopped instance: there is no
+separate CLI command for this field. Do not edit the users file at the same
+time as an init claim or another writer: a third-party editor is not obliged
+to honour the application's lock. Do not publish the users file, a proxy list
+with credentials and configs in logs or repositories.
 
-## 6. Установка, обновление и эксплуатация
+## 6. Installation, upgrade and operation
 
-- Официальные архивы: Linux x86_64 и arm64 (статический musl — запускается
-  на любом дистрибутиве, включая Alpine), macOS Intel/Apple Silicon,
-  Windows x86_64 (статический CRT, без VC++ Redistributable). Windows ARM64
-  native-архива пока нет. Статические Linux-архивы появились в 0.4.0;
-  в 0.3.0 и ранее есть только glibc-архив `x86_64-unknown-linux-gnu`, не
-  обещающий совместимости со всеми старыми glibc. Контейнерный образ остаётся
-  альтернативой.
-- `.github/scripts/install.sh` и `install.ps1` скачивают последний
-  стабильный релиз, фиксируют тег и проверяют SHA-256 из sha256sums.txt.
-  Checksums защищают загрузку, но не заменяют доверие издателю.
-- Без администратора: `~/.local/bin` или `%LOCALAPPDATA%\resocks5\bin`.
-  Альтернатива: `sh install.sh /путь/к/bin` или PowerShell `-InstallDir`.
-  PATH не меняется автоматически; команды добавления приведены в README.
-- Обновление не останавливает сервер. Unix атомарно меняет имя; старый inode
-  остаётся процессу. Windows переименовывает старый exe в собственное
-  `.resocks5-old-<GUID>.exe`, публикует новый, при ошибке пытается вернуть
-  прежнее имя. Свободные резервные копии удаляются при успешной установке,
-  занятые остаются до следующего запуска установщика после завершения
-  процесса. `.resocks5-install.lock` — постоянное имя для временной
-  handle-блокировки, а не признак вечного зависания установщика.
-- Работающий процесс продолжает использовать старую версию и старые
-  настройки, новый запуск — новый бинарник и конфиги выбранного cwd.
-- Docker: `ghcr.io/phpcraftdream/resocks5:latest`, Linux amd64/arm64;
-  cwd контейнера `/etc/resocks5`, процесс UID 65532. Примонтированный
-  каталог должен быть доступен для записи этому UID. В distroless-образе
-  нет shell: редактируйте конфиги с хоста. Публикуйте порт как
-  `127.0.0.1:20082:20082`, пока не настроены auth/firewall.
-- Ctrl+C, а на Unix также SIGTERM закрывают listener и дают активным
-  туннелям до 30 секунд на завершение. Принудительное завершение процесса
-  не является graceful shutdown. SIGHUP/hot reload и daemon/service-команды
-  не предоставляются; supervision настраивается средствами ОС отдельно.
-- Legacy: при отсутствии новых файлов мигрируются `resocks5.conf` и старые
-  SOCKS-списки `socks5_ipv4_list.txt`/`socks5_ipv6_list.txt`. Старые файлы
-  остаются на месте; удаляйте их после проверки результата, не заранее.
+- Official archives: Linux x86_64 and arm64 (static musl — runs on any
+  distribution, Alpine included), macOS Intel/Apple Silicon, Windows x86_64
+  (static CRT, no VC++ Redistributable). There is no native Windows ARM64
+  archive yet. Static Linux archives appeared in 0.4.0; 0.3.0 and earlier
+  have only the glibc archive `x86_64-unknown-linux-gnu`, which does not
+  promise compatibility with all old glibc versions. The container image
+  remains an alternative.
+- `.github/scripts/install.sh` and `install.ps1` download the latest stable
+  release, pin the tag and verify the SHA-256 from sha256sums.txt. Checksums
+  protect the download but do not replace trust in the publisher.
+- Without administrator rights: `~/.local/bin` or
+  `%LOCALAPPDATA%\resocks5\bin`. Alternative: `sh install.sh /path/to/bin` or
+  PowerShell `-InstallDir`. PATH is not changed automatically; the commands
+  to add it are in the README.
+- An upgrade does not stop the server. Unix renames atomically; the old inode
+  stays with the process. Windows renames the old exe to its own
+  `.resocks5-old-<GUID>.exe`, publishes the new one and on error tries to
+  restore the previous name. Free backups are deleted on a successful
+  install, busy ones stay until the next installer run after the process
+  ends. `.resocks5-install.lock` is a permanent name for a temporary handle
+  lock, not a sign of an installer hung forever.
+- A running process keeps using the old version and the old settings; a new
+  launch uses the new binary and the configs of the chosen cwd.
+- Docker: `ghcr.io/phpcraftdream/resocks5:latest`, Linux amd64/arm64; the
+  container cwd is `/etc/resocks5`, the process UID is 65532. The mounted
+  directory must be writable for this UID. The distroless image has no shell:
+  edit the configs from the host. Publish the port as
+  `127.0.0.1:20082:20082` until auth/firewall are configured.
+- Ctrl+C, and on Unix also SIGTERM, close the listener and give active
+  tunnels up to 30 seconds to finish. Forced process termination is not a
+  graceful shutdown. SIGHUP/hot reload and daemon/service commands are not
+  provided; supervision is configured separately by OS means.
+- Legacy: when the new files are absent, `resocks5.conf` and the old SOCKS
+  lists `socks5_ipv4_list.txt`/`socks5_ipv6_list.txt` are migrated. The old
+  files stay in place; delete them after checking the result, not in
+  advance.
 
-## 7. Диагностика и безопасные настройки
+## 7. Diagnostics and safe settings
 
-- «no upstream proxies»: заполните обычный upstream-массив либо включите
-  существующего direct-пользователя. Anonymous сам по себе не создаёт route.
-- Отказ auth: проверьте cwd, enabled, пароль, auth.allow_anonymous,
-  allowed_clients и необходимость перезапуска. `users list` не описывает
-  auth-политику main-файла; пустой users не означает anonymous при false.
-- TCP закрывается без ответа: проверьте глобальный allowed_clients,
-  max_concurrent_clients, клиентский deadline и журнал ошибок.
-- HTTP 407 / SOCKS5 auth failure: неверные credentials или пользовательский
-  IP-фильтр; disabled/unknown намеренно не различаются внешне.
+- "no upstream proxies": fill an ordinary upstream array or enable an
+  existing direct user. Anonymous access alone does not create a route.
+- Auth refusal: check the cwd, enabled, the password, auth.allow_anonymous,
+  auth.secure_only (a standard client cannot log in when it is on),
+  allowed_clients and whether a restart is needed. `users list` does not
+  describe the auth policy of the main file; empty users does not mean
+  anonymous when it is false.
+- TCP is closed without a reply: check the global allowed_clients,
+  max_concurrent_clients, the client deadline and the error log.
+- HTTP 407 / SOCKS5 auth failure: wrong credentials or a per-user IP filter;
+  disabled/unknown are deliberately not distinguished externally.
 - HTTP 403 / SOCKS5 Forbidden (REP 2): banned_patterns.
-- HTTP 502 / SOCKS5 host unreachable (REP 4): недоступный upstream-маршрут
-  или ошибка direct-подключения. HTTP 503 / SOCKS5 general failure
-  (REP 1): исчерпанный direct-лимит.
-- Нужен именно ответ об ошибке upstream после CONNECT: выключите recovery.
-  Если нужен минимум диагностики — log.attempts, proxy_failures и
-  connection_errors; noisy cache-категории включайте только при надобности.
-- До открытия listener наружу отключите anonymous, заведите аккаунты,
-  ограничьте IP клиентов, настройте firewall и защищённый транспорт.
-  Не считайте loopback bind или banned_patterns полноценной сетевой ACL.
+- HTTP 502 / SOCKS5 host unreachable (REP 4): an unreachable upstream route
+  or a direct-connect error. HTTP 503 / SOCKS5 general failure (REP 1): an
+  exhausted direct limit.
+- If you need exactly the upstream's error reply after CONNECT: turn
+  recovery off. For minimal diagnostics use log.attempts, proxy_failures and
+  connection_errors; enable the noisy cache categories only when needed.
+- Before opening the listener to the outside, disable anonymous access,
+  create accounts, restrict client IPs, configure the firewall and a
+  protected transport (or `auth.secure_only`). Do not treat a loopback bind
+  or banned_patterns as a full network ACL.
 
-README содержит команды установки и быстрые сценарии. docs/ARCHITECTURE.md
-описывает реализацию и алгоритмы; SECURITY.md — сообщения об уязвимостях.
+The README has installation commands and quick scenarios.
+docs/ARCHITECTURE.md describes the implementation and algorithms;
+SECURITY.md covers vulnerability reports.

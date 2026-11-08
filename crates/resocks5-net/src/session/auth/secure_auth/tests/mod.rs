@@ -8,18 +8,21 @@ use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use super::kdf::{derive_key, KdfParams, UserSecret, KEY_LEN};
 use super::wire::{client_proof, encode_params, server_proof, NONCE_LEN};
 use super::{
-    client_authenticate, server_authenticate, DecoyKey, SecretStore, SecureCredentials, StoredUser,
+    client_authenticate, server_authenticate, DecoyKey, DerivationLimiter, PasswordCheck,
+    SecretStore, SecureCredentials, StoredUser,
 };
 use crate::error::SecureAuthError;
 
-/// Cheap parameters so the tests do not pay for 19 MiB of Argon2id each.
+/// Cheap parameters so the tests do not pay for the default Argon2id cost each.
 const WEAK: KdfParams = KdfParams {
     memory_kib: 64,
     iterations: 1,
     parallelism: 1,
 };
 
-struct Store(Mutex<HashMap<String, StoredUser>>);
+/// A store with its OWN derivation limiter (2 slots), so tests that saturate or
+/// count derivations never disturb tests running beside them.
+struct Store(Mutex<HashMap<String, StoredUser>>, DerivationLimiter);
 
 impl Store {
     fn with(user: &str, password: &str) -> Self {
@@ -28,13 +31,34 @@ impl Store {
             user.to_owned(),
             StoredUser::Secret(UserSecret::from_password(password, WEAK).unwrap()),
         );
-        Self(Mutex::new(map))
+        Self(Mutex::new(map), DerivationLimiter::new(2))
     }
 
     fn init(user: &str) -> Self {
         let mut map = HashMap::new();
         map.insert(user.to_owned(), StoredUser::Init);
-        Self(Mutex::new(map))
+        Self(Mutex::new(map), DerivationLimiter::new(2))
+    }
+
+    /// An empty store: no users at all (every lookup misses).
+    fn empty() -> Self {
+        Self(Mutex::new(HashMap::new()), DerivationLimiter::new(2))
+    }
+
+    /// Mixed population for flood tests: enrolled "alice", enrolled "bob"
+    /// and an unclaimed init user "carol".
+    fn mixed() -> Self {
+        let mut map = HashMap::new();
+        map.insert(
+            "alice".to_owned(),
+            StoredUser::Secret(UserSecret::from_password("pw", WEAK).unwrap()),
+        );
+        map.insert(
+            "bob".to_owned(),
+            StoredUser::Secret(UserSecret::from_password("pw", WEAK).unwrap()),
+        );
+        map.insert("carol".to_owned(), StoredUser::Init);
+        Self(Mutex::new(map), DerivationLimiter::new(2))
     }
 
     fn secret(&self, user: &str) -> Option<UserSecret> {
@@ -63,6 +87,10 @@ impl SecretStore for Store {
 
     fn enrollment_floor(&self) -> KdfParams {
         WEAK
+    }
+
+    fn derivation_limiter(&self) -> &DerivationLimiter {
+        &self.1
     }
 }
 
@@ -259,6 +287,22 @@ async fn a_server_without_the_key_is_rejected() {
     rogue.await.unwrap();
 }
 
+/// Read the client hello, then hand-encode and return the `params` offer (bomb values exceed `encode_params`).
+async fn rogue_offer<R>(server: &mut R, params: KdfParams) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut head = [0u8; 2];
+    server.read_exact(&mut head).await.unwrap();
+    let mut rest = vec![0u8; usize::from(head[1]) + NONCE_LEN];
+    server.read_exact(&mut rest).await.unwrap();
+    let mut offer = vec![1, 0, 16];
+    offer.extend([3u8; 16].into_iter().chain(params.memory_kib.to_be_bytes()));
+    offer.extend([params.iterations, params.parallelism].map(|v| v as u8));
+    offer.extend_from_slice(&[4u8; NONCE_LEN]);
+    offer
+}
+
 /// A server that offers a cheaper KDF than the client's floor is refused
 /// before any key is derived (no downgrade); absurd parameters are refused as
 /// out of range (no memory bomb). Mutation: no floor check derives and sends a
@@ -277,7 +321,7 @@ async fn a_kdf_downgrade_or_bomb_is_refused_before_any_work() {
         ),
         (
             KdfParams {
-                memory_kib: 19 * 1024,
+                memory_kib: super::kdf::KdfParams::DEFAULT.memory_kib,
                 iterations: 200,
                 parallelism: 1,
             },
@@ -288,17 +332,7 @@ async fn a_kdf_downgrade_or_bomb_is_refused_before_any_work() {
         let credentials = SecureCredentials::new("alice", "right");
         let (mut client, mut server) = duplex(4096);
         let rogue = tokio::spawn(async move {
-            let mut head = [0u8; 2];
-            server.read_exact(&mut head).await.unwrap();
-            let mut rest = vec![0u8; usize::from(head[1]) + NONCE_LEN];
-            server.read_exact(&mut rest).await.unwrap();
-            let mut offer = vec![1, 0, 16];
-            offer.extend_from_slice(&[3u8; 16]);
-            // Encoded by hand: the bomb values do not fit `encode_params`.
-            offer.extend_from_slice(&params.memory_kib.to_be_bytes());
-            offer.push(u8::try_from(params.iterations).unwrap_or(u8::MAX));
-            offer.push(u8::try_from(params.parallelism).unwrap_or(u8::MAX));
-            offer.extend_from_slice(&[4u8; NONCE_LEN]);
+            let offer = rogue_offer(&mut server, params).await;
             server.write_all(&offer).await.unwrap();
             // The client must hang up without sending a proof.
             let mut proof = [0u8; 1];
@@ -315,6 +349,49 @@ async fn a_kdf_downgrade_or_bomb_is_refused_before_any_work() {
             "no key may be derived for refused parameters"
         );
     }
+}
+
+/// The client floor is the new default cost exactly: one step below is
+/// refused, the default itself passes. Mutation: pinning the boundary at the
+/// old 19 MiB default (or dropping the floor check) fails one of the rows.
+#[tokio::test]
+async fn the_client_floor_is_pinned_at_the_new_default() {
+    async fn exchange(params: KdfParams, password: &str) -> SecureAuthError {
+        let credentials = SecureCredentials::new("alice", password);
+        let (mut client, mut server) = duplex(4096);
+        let rogue = tokio::spawn(async move {
+            let offer = rogue_offer(&mut server, params).await;
+            server.write_all(&offer).await.unwrap();
+            // Accept any proof, reply with a made-up proof of our own.
+            let mut proof = [0u8; 1 + 32];
+            server.read_exact(&mut proof).await.unwrap();
+            let mut ok = vec![1, 0];
+            ok.extend_from_slice(&[0xAA; 32]);
+            server.write_all(&ok).await.unwrap();
+        });
+        let error = client_authenticate(&mut client, &credentials)
+            .await
+            .unwrap_err();
+        rogue.await.unwrap();
+        error
+    }
+
+    // One step below the default floor is refused without any derivation.
+    let below = exchange(
+        KdfParams {
+            memory_kib: KdfParams::DEFAULT.memory_kib - 1,
+            iterations: 1,
+            parallelism: 1,
+        },
+        "right",
+    )
+    .await;
+    assert_eq!(below, SecureAuthError::KdfTooWeak);
+
+    // Exactly the default passes the floor; the bogus salt makes the rogue
+    // server's fake proof fail instead.
+    let equal = exchange(KdfParams::DEFAULT, "right").await;
+    assert_eq!(equal, SecureAuthError::ServerProofMismatch);
 }
 
 /// A recorded client proof is useless in a new session: the server nonce is
@@ -674,3 +751,5 @@ async fn tampered_or_degenerate_enrollments_are_refused() {
         assert!(store.secret("bob").is_none(), "nothing may be stored");
     }
 }
+
+mod limiter;

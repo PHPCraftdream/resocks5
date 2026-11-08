@@ -1,12 +1,20 @@
-//! Inbound SOCKS5 and HTTP CONNECT framing, independent of application policy storage.
+//! Inbound SOCKS5 and HTTP CONNECT framing on one dual port, independent of
+//! application policy storage.
 //!
-//! Available without default features. Destinations remain unresolved: this module
-//! never dials, resolves DNS, selects a route, or grants a direct-routing privilege.
-//! [`accept`] (anonymous clients only) and, with feature `secure-auth`,
-//! `accept_secure`/`accept_with` (strong authentication) parse only; the host
-//! sends [`Reply::Established`] after egress is ready (or deliberately before a
-//! host-owned recovery phase). No clear-text password is ever accepted: SOCKS5
-//! method 0x02 is never offered and any HTTP `Proxy-Authorization` is a 407.
+//! Available without default features; full negotiation needs feature
+//! `secure-auth`. The server always picks the strongest method the client
+//! supports, in this order: secure auth (SOCKS5 method 0x80 / HTTP
+//! `Resocks5-Secure`), clear text (SOCKS5 method 0x02 / HTTP `Basic`, subject
+//! to `ServerOptions::allow_cleartext`, verified against the same
+//! [`SecretStore`](crate::secure_auth::SecretStore) that secures the strong
+//! method — one secret per user, any protocol, any method), and anonymous
+//! (SOCKS5 0x00 / HTTP without credentials, only when
+//! `ServerOptions::allow_anonymous`, default off). [`accept`] serves
+//! anonymous-only hosts; `accept_with`/`accept_secure` (feature
+//! `secure-auth`) run the full negotiation and parse only — the host sends
+//! [`Reply::Established`] after egress is ready. Destinations remain
+//! unresolved: this module never dials, resolves DNS, selects a route, or
+//! grants a direct-routing privilege.
 
 use std::fmt;
 use std::future::Future;
@@ -31,41 +39,74 @@ mod prefixed;
 pub use prefixed::Prefixed;
 
 #[cfg(feature = "secure-auth")]
+mod http_rounds;
+#[cfg(feature = "secure-auth")]
 mod secure;
 mod strict_http;
 #[cfg(feature = "secure-auth")]
 pub use secure::{accept_secure, accept_with, AuthMethods, NoSecrets};
 
-/// Which clients the host admits and the host-supplied absolute deadline.
+/// The host-supplied absolute deadline and the admission policy.
 ///
-/// "Users" means configured accounts exist (they authenticate with a strong
-/// method, see `accept_with`), not that any particular user is enabled.
+/// `allow_anonymous` is OFF by default and `allow_cleartext` is ON by
+/// default; users exist exactly when an [`AuthMethods`](secure::AuthMethods)
+/// is handed to `accept_with`/`accept_secure`.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
     deadline: Instant,
     anonymous: bool,
     #[cfg_attr(not(feature = "secure-auth"), allow(dead_code))]
-    users: bool,
+    cleartext: bool,
     strict_http: bool,
 }
 
 impl ServerOptions {
-    /// Use one absolute deadline for detection, framing, and authentication.
-    /// A past deadline refuses to poll the stream or the authentication exchange.
-    /// `has_users` says that configured accounts exist: only `accept_with` and
-    /// `accept_secure` let them in, with a strong method.
-    pub fn new(deadline: Instant, allow_anonymous: bool, has_users: bool) -> Self {
+    /// Use one absolute deadline for detection, framing, and authentication
+    /// (all HTTP authentication rounds included). A past deadline refuses to
+    /// poll the stream or the authentication exchange. Anonymous access and
+    /// clear text start at their defaults (`allow_anonymous` off,
+    /// `allow_cleartext` on).
+    pub fn new(deadline: Instant) -> Self {
         Self {
             deadline,
-            anonymous: allow_anonymous,
-            users: has_users,
+            anonymous: false,
+            cleartext: true,
             strict_http: false,
         }
+    }
+
+    /// Allow or refuse anonymous clients (SOCKS5 method 0x00, HTTP without
+    /// credentials). Default off.
+    #[must_use]
+    pub fn allow_anonymous(mut self, allow: bool) -> Self {
+        self.anonymous = allow;
+        self
+    }
+
+    /// Allow or refuse clear-text authentication (SOCKS5 0x02, HTTP Basic).
+    /// Default on; it only matters when users are configured (an
+    /// `AuthMethods` was given) and is ignored otherwise.
+    #[must_use]
+    pub fn allow_cleartext(mut self, allow: bool) -> Self {
+        self.cleartext = allow;
+        self
+    }
+
+    /// Convenience for the strongest mode: refuse clear text AND anonymous
+    /// access, so only secure auth (SOCKS5 method 0x80 / HTTP
+    /// `Resocks5-Secure`) is ever accepted. With the feature-less [`accept`]
+    /// (no users configured) a `secure_only` server accepts nobody.
+    #[must_use]
+    pub fn secure_only(mut self) -> Self {
+        self.anonymous = false;
+        self.cleartext = false;
+        self
     }
 
     /// Default off. When on, the HTTP CONNECT request is validated against
     /// RFC 9112; violations are answered with the HTTP status below and
     /// `ServerError::Protocol`.
+    #[must_use]
     pub fn strict_http(mut self, strict: bool) -> Self {
         self.strict_http = strict;
         self
@@ -87,12 +128,48 @@ pub enum Protocol {
 #[non_exhaustive]
 pub enum AuthMethod {
     /// No authentication (SOCKS5 method 0x00, or HTTP without credentials).
+    /// [`IncomingRequest::username`] is `None`.
     Anonymous,
-    /// Secure auth (SOCKS5 method 0x80): `username()` is the user name.
+    /// Clear-text password authentication (SOCKS5 0x02, HTTP Basic),
+    /// verified against the user's stored secret.
+    #[cfg(feature = "secure-auth")]
+    Cleartext,
+    /// Secure auth (SOCKS5 method 0x80, HTTP `Resocks5-Secure`).
+    #[cfg(feature = "secure-auth")]
     Secure,
-    /// GSSAPI (SOCKS5 method 0x01): `username()` is the authenticated
-    /// principal (for Kerberos, `name@REALM`).
-    Gssapi,
+}
+
+/// The authenticated identity of a request: how it authenticated and as whom.
+pub(crate) enum Who {
+    /// Anonymous admission (the host's `allow_anonymous` policy).
+    Anonymous,
+    /// Clear text (SOCKS5 0x02 / HTTP Basic), verified via
+    /// `SecretStore::check_password`.
+    #[cfg(feature = "secure-auth")]
+    Cleartext(String),
+    /// Secure auth (SOCKS5 0x80 / HTTP `Resocks5-Secure`).
+    #[cfg(feature = "secure-auth")]
+    Secure(String),
+}
+
+impl Who {
+    fn method(&self) -> AuthMethod {
+        match self {
+            Who::Anonymous => AuthMethod::Anonymous,
+            #[cfg(feature = "secure-auth")]
+            Who::Cleartext(_) => AuthMethod::Cleartext,
+            #[cfg(feature = "secure-auth")]
+            Who::Secure(_) => AuthMethod::Secure,
+        }
+    }
+    /// Moves the verified name out; anonymous is `None`.
+    fn username(self) -> Option<String> {
+        match self {
+            Who::Anonymous => None,
+            #[cfg(feature = "secure-auth")]
+            Who::Cleartext(name) | Who::Secure(name) => Some(name),
+        }
+    }
 }
 
 /// An authenticated, unresolved request and the exact payload already consumed.
@@ -100,10 +177,8 @@ pub struct IncomingRequest {
     protocol: Protocol,
     target: String,
     auth: AuthMethod,
-    /// The GSSAPI session whose protection the SOCKS reply travels under.
-    #[cfg(feature = "gssapi")]
-    gss: Option<std::sync::Mutex<crate::gssapi::GssSession>>,
     username: Option<String>,
+    auth_info: Option<String>,
     pipeline: Vec<u8>,
 }
 
@@ -115,11 +190,41 @@ impl fmt::Debug for IncomingRequest {
             .field("auth", &self.auth)
             .field("has_username", &self.username.is_some())
             .field("pipeline_len", &self.pipeline.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl IncomingRequest {
+    /// An authenticated/anonymous HTTP CONNECT request.
+    #[cfg(feature = "secure-auth")]
+    pub(crate) fn http(
+        target: String,
+        who: Who,
+        auth_info: Option<String>,
+        pipeline: Vec<u8>,
+    ) -> Self {
+        Self {
+            protocol: Protocol::Http,
+            target,
+            auth: who.method(),
+            username: who.username(),
+            auth_info,
+            pipeline,
+        }
+    }
+
+    /// An anonymous HTTP CONNECT request (feature-less `accept`).
+    pub(crate) fn http_anonymous(target: String, pipeline: Vec<u8>) -> Self {
+        Self {
+            protocol: Protocol::Http,
+            target,
+            auth: AuthMethod::Anonymous,
+            username: None,
+            auth_info: None,
+            pipeline,
+        }
+    }
+
     /// Detected protocol, used to encode host replies.
     pub fn protocol(&self) -> Protocol {
         self.protocol
@@ -132,25 +237,7 @@ impl IncomingRequest {
     pub fn auth_method(&self) -> AuthMethod {
         self.auth
     }
-
-    /// Record how the client authenticated (and, for GSSAPI, the session the
-    /// reply is protected under).
-    #[cfg(feature = "secure-auth")]
-    pub(crate) fn authenticated_with(
-        mut self,
-        auth: AuthMethod,
-        #[cfg(feature = "gssapi")] gss: Option<crate::gssapi::GssSession>,
-    ) -> Self {
-        self.auth = auth;
-        #[cfg(feature = "gssapi")]
-        {
-            self.gss = gss.map(std::sync::Mutex::new);
-        }
-        self
-    }
-
-    /// Verified username (the secure-auth user or the GSSAPI principal).
-    /// Anonymous acceptance is always `None`, never a synthetic empty identity.
+    /// Verified username (`None` only for anonymous admission).
     pub fn username(&self) -> Option<&str> {
         self.username.as_deref()
     }
@@ -163,14 +250,13 @@ impl IncomingRequest {
     pub fn take_pipeline(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pipeline)
     }
-    /// Replace the authenticated identity: for a host that maps an
-    /// authenticated GSSAPI principal (`name@REALM`) to a local account name,
-    /// so that everything downstream sees the account. `auth_method()` is
-    /// unchanged.
+    /// Replace the authenticated identity with `name`, so that everything
+    /// downstream sees the chosen account name. `auth_method()` is unchanged.
     pub fn set_identity(&mut self, name: String) {
+        #[cfg(feature = "zeroize")]
+        zeroize::Zeroize::zeroize(&mut self.username);
         self.username = Some(name);
     }
-
     /// Moves the verified username out; afterwards `username()` is `None`.
     /// Anonymous: `None`.
     pub fn take_username(&mut self) -> Option<String> {
@@ -178,6 +264,10 @@ impl IncomingRequest {
     }
     /// Write and flush the host's tunnel outcome. Call once, before forwarding payload.
     /// Never send another protocol reply after early success.
+    ///
+    /// Over HTTP, when this request completed a `Resocks5-Secure` exchange,
+    /// the `200` carries the server's last authentication token as
+    /// `Proxy-Authenticate`, which a mutually authenticating client checks.
     ///
     /// cancel-safe: NO — a partial reply is terminal; discard the stream on
     /// cancellation or error. This operation has no implicit timeout: the host
@@ -187,17 +277,16 @@ impl IncomingRequest {
         stream: &mut S,
         reply: Reply,
     ) -> Result<(), ServerError> {
-        let bytes = reply_bytes(self.protocol, reply);
-        #[cfg(feature = "gssapi")]
-        if let Some(gss) = &self.gss {
-            let framed = gss
-                .lock()
-                .expect("gss session lock")
-                .seal(bytes)
-                .map_err(|error| ServerError::Protocol(error.to_string()))?;
-            stream.write_all(&framed).await?;
+        if let (Protocol::Http, Reply::Established, Some(info)) =
+            (self.protocol, reply, &self.auth_info)
+        {
+            let head = format!(
+                "HTTP/1.1 200 Connection Established\r\nProxy-Authenticate: {info}\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await?;
             return stream.flush().await.map_err(ServerError::Io);
         }
+        let bytes = reply_bytes(self.protocol, reply);
         stream.write_all(bytes).await?;
         stream.flush().await.map_err(ServerError::Io)
     }
@@ -250,13 +339,15 @@ impl From<io::Error> for ServerError {
 /// Detect and parse one inbound request from an anonymous client.
 ///
 /// `0x05` selects SOCKS5; an ASCII letter selects HTTP; other bytes fail.
-/// Only anonymous clients are served, and only when `options` allow them: no
-/// clear-text password is ever accepted (SOCKS5 method 0x02 is never offered, a
-/// request carrying `Proxy-Authorization` is answered 407). Users authenticate
-/// with a strong method through `accept_with`/`accept_secure` (feature
-/// `secure-auth`). No DNS, egress, final success reply, or application routing
-/// occurs here. Completed handshake and error replies are flushed within the same
-/// absolute deadline before reading the next frame or returning.
+/// This entry point serves anonymous clients only, and only when `options`
+/// allow them: the SOCKS5 greeting answers method 0x00 and nothing else, and
+/// a request carrying `Proxy-Authorization` is answered with a bare `407`
+/// (`Connection: close`) — no scheme is enabled here. Users authenticate
+/// through `accept_with`/`accept_secure` (feature `secure-auth`), which run
+/// the full negotiation. No DNS, egress, final success reply, or application
+/// routing occurs here. Completed handshake and error replies are flushed
+/// within the same absolute deadline before reading the next frame or
+/// returning.
 ///
 /// cancel-safe: NO — partial reads/writes and owned prefixes cannot be resumed.
 /// On timeout, error, or cancellation the host MUST discard the stream, including
@@ -279,8 +370,10 @@ where
     })
     .await?;
     match first {
-        5 => phase(options.deadline, socks(stream, options)).await,
-        b if b.is_ascii_alphabetic() => phase(options.deadline, http(stream, b, options)).await,
+        5 => phase(options.deadline, socks_anonymous(stream, options)).await,
+        b if b.is_ascii_alphabetic() => {
+            phase(options.deadline, http_anonymous(stream, b, options)).await
+        }
         other => Err(ServerError::Protocol(format!(
             "unrecognised first byte {other:#04x} — neither SOCKS5 (0x05) nor an HTTP method"
         ))),
@@ -304,16 +397,19 @@ async fn phase<T>(
 
 /// cancel-safe: NO — exact reads and replies may be partial. The host discards
 /// the stream.
-async fn socks<S>(stream: &mut S, options: &ServerOptions) -> Result<IncomingRequest, ServerError>
+async fn socks_anonymous<S>(
+    stream: &mut S,
+    options: &ServerOptions,
+) -> Result<IncomingRequest, ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let nmethods = stream.read_u8().await?;
     let mut methods = vec![0; usize::from(nmethods)];
     stream.read_exact(&mut methods).await?;
-    // Only "no authentication": method 0x02 (RFC 1929) would carry a password
-    // in clear text and is never offered.
-    if !(options.anonymous && methods.contains(&0)) {
+    // Anonymous-only entry point: only "no authentication" is available.
+    let chosen = options.anonymous && methods.contains(&0);
+    if !chosen {
         stream.write_all(&[5, 255]).await?;
         stream.flush().await?;
         return Err(ServerError::Authentication(format!(
@@ -324,7 +420,44 @@ where
     }
     stream.write_all(&[5, 0]).await?;
     stream.flush().await?;
-    socks_request(stream, None).await
+    socks_request(stream, Who::Anonymous).await
+}
+
+/// cancel-safe: NO — exact reads and replies may be partial.
+async fn http_anonymous<S>(
+    stream: &mut S,
+    first: u8,
+    options: &ServerOptions,
+) -> Result<IncomingRequest, ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = read_http_request(stream, Some(first), options).await?;
+    if request.authorization.is_some() {
+        return http_fail(
+            stream,
+            407,
+            ServerError::Authentication(
+                "credentials are not accepted: no authentication scheme is enabled on this server"
+                    .into(),
+            ),
+        )
+        .await;
+    }
+    if !options.anonymous {
+        return http_fail(
+            stream,
+            407,
+            ServerError::Authentication(
+                "anonymous HTTP CONNECT not allowed (allow_anonymous=false)".into(),
+            ),
+        )
+        .await;
+    }
+    Ok(IncomingRequest::http_anonymous(
+        request.target,
+        request.pipeline,
+    ))
 }
 
 /// The SOCKS5 request after authentication: `CONNECT` and its target.
@@ -332,7 +465,7 @@ where
 /// cancel-safe: NO — exact reads and replies may be partial.
 pub(super) async fn socks_request<S>(
     stream: &mut S,
-    username: Option<String>,
+    who: Who,
 ) -> Result<IncomingRequest, ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -401,14 +534,9 @@ where
     Ok(IncomingRequest {
         protocol: Protocol::Socks5,
         target,
-        auth: if username.is_some() {
-            AuthMethod::Secure
-        } else {
-            AuthMethod::Anonymous
-        },
-        #[cfg(feature = "gssapi")]
-        gss: None,
-        username,
+        auth: who.method(),
+        username: who.username(),
+        auth_info: None,
         pipeline: Vec::new(),
     })
 }
@@ -447,18 +575,30 @@ impl<'a> Iterator for ByteLines<'a> {
     }
 }
 
-/// cancel-safe: NO — consumed header/pipeline bytes are future-owned and replies
-/// may be partial; authentication side effects may survive stream disposal.
-async fn http<S>(
+/// One parsed HTTP CONNECT request: its target, its `Proxy-Authorization`
+/// value and the bytes read past its header block.
+pub(super) struct HttpRequest {
+    pub(super) target: String,
+    pub(super) authorization: Option<String>,
+    pub(super) pipeline: Vec<u8>,
+}
+
+/// Read and validate one CONNECT request head; `first` is its first byte
+/// when detection already consumed it. Malformed requests are answered
+/// (400, 431, 501, 505) and fail; authentication is the caller's.
+///
+/// cancel-safe: NO — consumed header/pipeline bytes are future-owned and
+/// replies may be partial.
+pub(super) async fn read_http_request<S>(
     stream: &mut S,
-    first: u8,
+    first: Option<u8>,
     options: &ServerOptions,
-) -> Result<IncomingRequest, ServerError>
+) -> Result<HttpRequest, ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(2048);
-    buf.push(first);
+    buf.extend(first);
     let mut tmp = [0; 1024];
     let header_end = loop {
         let n = stream.read(&mut tmp).await?;
@@ -553,7 +693,7 @@ where
         )
         .await;
     }
-    let mut auth_value = None;
+    let mut authorization = None;
     for line in header_lines {
         if line.is_empty() {
             continue;
@@ -576,49 +716,26 @@ where
             )
             .await;
         };
-        auth_value = Some(value);
+        authorization = Some(value.to_owned());
         break;
     }
-    // Over HTTP the only way in is "no credentials": a Proxy-Authorization
-    // header, whatever its scheme, is a 407. Basic would be a password in
-    // (base64) clear text; strong methods exist for SOCKS5 only.
-    if let Some(value) = auth_value {
-        // Only a single SP separates scheme and token (RFC 9110 section 11).
-        let scheme = value.split(' ').next().unwrap_or("");
-        let message = if scheme.eq_ignore_ascii_case("Basic") {
-            "clear-text credentials (HTTP Basic) are not accepted"
-        } else {
-            "unsupported Proxy-Authorization scheme"
-        };
-        return http_fail(stream, 407, ServerError::Authentication(message.into())).await;
-    }
-    if !options.anonymous {
-        return http_fail(
-            stream,
-            407,
-            ServerError::Authentication(
-                "anonymous HTTP CONNECT not allowed (allow_anonymous=false)".into(),
-            ),
-        )
-        .await;
-    }
-    Ok(IncomingRequest {
-        protocol: Protocol::Http,
+    Ok(HttpRequest {
         target: target.to_owned(),
-        auth: AuthMethod::Anonymous,
-        #[cfg(feature = "gssapi")]
-        gss: None,
-        username: None,
+        authorization,
         pipeline,
     })
 }
 
 #[cfg(feature = "zeroize")]
 impl IncomingRequest {
-    /// Overwrite the retained user name in place; the pipeline is payload and stays.
-    pub(crate) fn wipe(&mut self) {
+    /// Overwrite the retained user name and authentication info in place; the
+    /// pipeline is payload and stays.
+    fn wipe(&mut self) {
         if let Some(username) = &mut self.username {
             zeroize::Zeroize::zeroize(username);
+        }
+        if let Some(auth_info) = &mut self.auth_info {
+            zeroize::Zeroize::zeroize(auth_info);
         }
     }
 }

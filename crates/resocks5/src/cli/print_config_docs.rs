@@ -18,6 +18,10 @@ mod tests {
         for (prefix, source) in [
             ("", include_str!("../config/main/main_config.rs")),
             ("auth.", include_str!("../config/main/auth_config.rs")),
+            (
+                "upstream_auth.",
+                include_str!("../config/main/upstream_auth_config.rs"),
+            ),
             ("log.", include_str!("../logger/log_config.rs")),
             (
                 "file_log.",
@@ -65,7 +69,8 @@ mod tests {
             };
         }
         check!(main, "", listen_host, banned_patterns, allowed_clients);
-        check!(main.auth, "auth.", allow_anonymous);
+        check!(main.auth, "auth.", allow_anonymous, secure_only);
+        check!(main.upstream_auth, "upstream_auth.", secure_only);
         check!(
             main.network,
             "network.",
@@ -127,6 +132,18 @@ mod tests {
         check!(user, "users[].", is_enabled, direct);
     }
 
+    /// Mutation: flipping any of the fresh-template auth switches
+    /// (allow_anonymous, auth.secure_only, upstream_auth.secure_only)
+    /// fails here.
+    #[test]
+    fn fresh_template_auth_switches_pin_the_defaults() {
+        let main: crate::config::MainConfig =
+            ktav::from_str(crate::config::load_or_init::DEFAULT_MAIN_TEMPLATE).unwrap();
+        assert!(main.auth.allow_anonymous);
+        assert!(!main.auth.secure_only);
+        assert!(!main.upstream_auth.secure_only);
+    }
+
     fn check_commands(command: &clap::Command, parent: &str) {
         for subcommand in command.get_subcommands() {
             let name = format!("{parent} {}", subcommand.get_name());
@@ -148,7 +165,7 @@ mod tests {
         let long = Cli::command().term_width(0).render_long_help().to_string();
         assert!(long.contains(DOCS.trim_end()));
         let short = Cli::command().render_help().to_string();
-        assert!(!short.contains("## 3. Каталог настроек"));
+        assert!(!short.contains("## 3. Settings directory and the KTAV format"));
         assert!(short.contains("config"));
     }
 

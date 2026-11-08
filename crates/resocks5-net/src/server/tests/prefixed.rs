@@ -514,7 +514,7 @@ async fn into_prefixed_streams_pipeline_and_payload_end_to_end() {
         // (a) HTTP: the over-read pipeline is served by the wrapper.
         let (mut client, mut server) = duplex(1024);
         let server_side = async {
-            let req = accept(&mut server, &options(true, false)).await.unwrap();
+            let req = accept(&mut server, &anon_options(true)).await.unwrap();
             assert_eq!(req.protocol(), Protocol::Http);
             assert_eq!(req.pipeline(), b"EARLY");
             req.reply(&mut server, Reply::Established).await.unwrap();
@@ -543,7 +543,7 @@ async fn into_prefixed_streams_pipeline_and_payload_end_to_end() {
         // (b) SOCKS5: no pipeline; the wrapper is transparent.
         let (mut client, mut server) = duplex(1024);
         let server_side = async {
-            let req = accept(&mut server, &options(true, false)).await.unwrap();
+            let req = accept(&mut server, &anon_options(true)).await.unwrap();
             assert!(req.pipeline().is_empty());
             let mut p = req.into_prefixed(server);
             assert!(p.prefix_remaining().is_empty());
@@ -575,11 +575,10 @@ fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
     // `tests/framing.rs` still covers accept-level pipeline regression (unchanged).
     let mut req = IncomingRequest {
         auth: crate::server::AuthMethod::Anonymous,
-        #[cfg(feature = "gssapi")]
-        gss: None,
         protocol: Protocol::Http,
         target: "h:1".into(),
         username: None,
+        auth_info: None,
         pipeline: b"PIP".to_vec(),
     };
     assert_eq!(req.pipeline(), b"PIP");
@@ -590,11 +589,10 @@ fn take_pipeline_and_pipeline_survive_into_prefixed_addition() {
     drop(peer);
     let req = IncomingRequest {
         auth: crate::server::AuthMethod::Anonymous,
-        #[cfg(feature = "gssapi")]
-        gss: None,
         protocol: Protocol::Http,
         target: "h:1".into(),
         username: None,
+        auth_info: None,
         pipeline: b"REST".to_vec(),
     };
     let prefixed = req.into_prefixed(server);

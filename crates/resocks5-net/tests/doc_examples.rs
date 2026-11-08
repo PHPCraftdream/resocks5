@@ -113,7 +113,9 @@ async fn inbound_options_example() {
     drop(peer);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let options = ServerOptions::new(deadline, true, false).strict_http(true);
+    let options = ServerOptions::new(deadline)
+        .allow_anonymous(true)
+        .strict_http(true);
     let req = accept(&mut client, &options).await.unwrap();
     assert_eq!(req.target(), "example.com:443");
     assert_eq!(req.username(), None);

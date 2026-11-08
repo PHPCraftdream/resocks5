@@ -98,6 +98,16 @@ pub(crate) use lock::UsersFileLock;
 ///   place).
 pub(crate) fn write_atomic<T: serde::Serialize>(path: &Path, config: &T) -> Result<()> {
     let text = ktav::to_string(config).context("serialize config")?;
+    write_atomic_text(path, &text)
+}
+
+/// Atomically replace the file at `path` with `text` (byte-exact).
+///
+/// Same durability and permission model as [`write_atomic`]: the bytes go
+/// to a private `<target>.tmp`, are fsync'd, then committed over the
+/// target via [`platform::commit`] (rename / ReplaceFileW). Allows
+/// non-ktav content — e.g. the commented default main template.
+pub(crate) fn write_atomic_text(path: &Path, text: &str) -> Result<()> {
     let tmp = sibling_path(path, ".tmp");
 
     #[cfg(unix)]

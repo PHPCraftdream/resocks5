@@ -29,15 +29,18 @@ What's inside:
   restart need not rediscover dead upstreams; it holds durations only — the
   caller saves it and subtracts the downtime.
 - **TLS ClientHello fragmentation** for SNI-based DPI evasion.
-- **Strong authentication** — inbound SOCKS5 can require secure auth
-  (private method 0x80, feature `secure-auth`) or GSSAPI (RFC 1961, method
-  0x01, feature `gssapi`); upstream SOCKS5 dials can use both to log in to
-  a proxy.
+- **Strong authentication** — one dual port serves SOCKS5 and HTTP CONNECT,
+  and the server always picks the strongest method the client supports:
+  secure auth (private method 0x80 / HTTP `Resocks5-Secure`, feature
+  `secure-auth`), clear text (SOCKS5 0x02 / HTTP `Basic`, switchable off),
+  or anonymous (off by default) — one stored secret per user verifies all
+  of them. Upstream dials upgrade a plain user/password pair to secure
+  auth automatically.
 
 No application concerns leak in: no config-file format, logger, credential
-storage, or egress policy. Inbound authentication is supplied by the host
-closure, or by a `SecretStore` / `GssAcceptor` with the strong acceptors
-(`accept_secure`, `accept_with`).
+storage, or egress policy. Inbound authentication is supplied by a
+`SecretStore` with the strong acceptors (`accept_secure`, `accept_with`),
+or by the host's admission policy through the anonymous-only `accept`.
 
 ## Features
 
@@ -99,34 +102,40 @@ closure, or by a `SecretStore` / `GssAcceptor` with the strong acceptors
   from a wrong password, so user names are not enumerable. A client
   refuses server KDF parameters below its floor
   (`SecureCredentials::with_min_kdf`, default `KdfParams::DEFAULT`:
-  19 MiB / 2 passes / 1 lane, the OWASP minimum) and above the hard limits
-  (1 GiB, 16 passes, 16 lanes; `KdfParams::is_in_range`), so a man in the
-  middle cannot downgrade the KDF. First-login enrollment: a user stored
-  as `StoredUser::Init` is enrolled by its first client, which sends `K`
-  sealed with X25519 + HKDF-SHA256 + ChaCha20-Poly1305 bound to both
-  nonces; `SecretStore::claim` stores it atomically (of two concurrent
-  first logins exactly one wins). Limits, stated plainly: this is not a
+  4 MiB / 1 pass / 1 lane — below the OWASP minimum, a
+  documented cost trade-off) and above the hard limits
+  (256 MiB, 16 passes, 16 lanes; `KdfParams::is_in_range`), so a man in the
+  middle cannot downgrade the KDF. One secret per user, any protocol, any
+  method: the stored `UserSecret` verifies both the strong exchange and the
+  clear-text methods through the default `SecretStore::check_password`
+  (`Argon2id(password, stored salt + params)` compared to the stored key in
+  constant time), so switching between SOCKS5 0x80/0x02 and HTTP
+  `Resocks5-Secure`/`Basic` never breaks the account. Clear-text derivations
+  run under a `DerivationLimiter` — by default the process-wide
+  `secure_auth::derivation_limiter()` (half the CPU count in flight, a
+  bounded 1 s wait, saturation rejects without queueing), replaceable per
+  store through `SecretStore::derivation_limiter` — so the server is not
+  taken down by a couple of hundred false authorizations; the client side
+  has its own limiter, so inbound floods never starve outbound derivations.
+  Unknown users cost no server-side derivation (a cheap fixed sleep keeps
+  timing in the same order) and hosts SHOULD override `check_password` with
+  a verified-credential cache. First-login enrollment works for every protocol
+  and method: a user stored as `StoredUser::Init` is claimed by its first
+  client — either by sending `K` sealed with X25519 + HKDF-SHA256 +
+  ChaCha20-Poly1305 bound to both nonces over method 0x80, or by a
+  clear-text login that stores `UserSecret::from_password` at the store's
+  `enrollment_floor()` (`PasswordCheck::Claimed`); of two concurrent first
+  logins exactly one wins. Limits, stated plainly: this is not a
   PAKE — a passive observer can still try passwords offline (the Argon2id
   cost slows that; use strong passwords), and only the authentication is
   protected: the SOCKS5 request that follows travels plain, and tunnel
   data is never protected. Pulls argon2, hmac/hkdf/sha2, subtle,
   getrandom, zeroize, x25519-dalek and chacha20poly1305.
-- `gssapi` (off by default; **implies `secure-auth`**): GSSAPI
-  authentication for SOCKS5, RFC 1961, method 0x01. The context exchange,
-  abort, protection-level negotiation and, opt-in, the protected SOCKS
-  request and reply are implemented in the crate over the
-  `gssapi::GssBackend` / `GssContext` traits; no password and no credential
-  ever crosses the wire. Needs a backend: a test-only mock mechanism ships
-  with `test-instrumentation` (`gssapi::mock`), the system Kerberos
-  backend is `gssapi-system`.
-- `gssapi-system` (off by default; implies `gssapi`, links `libgssapi`
-  0.11): Kerberos 5 through the system GSS-API — MIT Kerberos / Heimdal on
-  Linux, Apple GSS on macOS; not Windows. Not in the default set: it links
-  the platform library and needs its headers and libclang to build.
 - `test-instrumentation` (off by default; implies `rotator`): test-only
   cross-crate instrumentation — `testing::MockUpstream` (a scripted
   SOCKS5/HTTP CONNECT upstream on 127.0.0.1:0, see the `testing` module
-  below), the `gssapi::mock` backend, and the rotator's
+  below, with `MockAuth::{None, Cleartext, Secure, SecureDenied,
+  AuthStatus, NoAcceptableMethod}`), and the rotator's
   `pick_order_calls()` diagnostic counter. Dependents enable it from
   `[dev-dependencies]`; it is not default, so release builds compile it to
   nothing.
@@ -137,36 +146,71 @@ closure, or by a `SecretStore` / `GssAcceptor` with the strong acceptors
   `String` fields and are not wiped.
   With the feature, `ProxyConfig::wipe_credentials()` also overwrites and
   clears `user`/`password` at this node and every gate it solely owns, drops
-  the secure-auth/GSSAPI credentials, and returns `false` when a shared gate was
+  the secure-auth credentials, and returns `false` when a shared gate was
   left untouched — `ProxyConfig` has no `Drop`, so clones keep their values.
 
-## No clear-text passwords
+## Authentication
 
-This crate never sends or accepts a password in clear text, and no feature
-turns that on. The inbound side never offers or accepts SOCKS5 method 0x02
-(RFC 1929) and answers any HTTP `Proxy-Authorization` (Basic included) with 407.
-The dial side refuses, with `ConnectError::CleartextCredentialsRefused` and
-before the first byte is written, an entry that would have to send a user name
-and password in clear text: SOCKS5 without secure auth or GSSAPI, or HTTP Basic
-to a plain-HTTP proxy. HTTP Basic inside the TLS connection to an HTTPS proxy is
-not clear text and is allowed. The integration tests in `tests/no_cleartext.rs`
-pin both.
+Inbound (one dual port, SOCKS5 + HTTP CONNECT; the server always picks the
+strongest method the client supports):
 
-Every HTTP 407 advertises `Proxy-Authenticate: Resocks5-Secure`, never Basic.
-The marker does not implement secure authentication over HTTP; use SOCKS5 for
-that. Status 407 and its required challenge are retained (RFC 9110 §15.5.8),
-rather than replaced with 403. A preconfigured client, such as
-`curl --proxy-user`, may send Basic before receiving a challenge; the server
-cannot prevent that transmission, only reject it. Browser prompt behavior for
-the unknown scheme has not been tested and is not guaranteed.
+- **Secure auth** — SOCKS5 method 0x80, HTTP scheme `Resocks5-Secure` (the
+  same secure_auth messages, one per 407 round, base64); the server's last
+  token rides on the `200` as `Proxy-Authenticate: Resocks5-Secure <b64>`,
+  completing mutual auth. Feature `secure-auth`.
+- **Clear text** — SOCKS5 0x02 (RFC 1929) and HTTP `Basic`, verified
+  against the same store via the default `SecretStore::check_password`.
+  Allowed unless `ServerOptions::allow_cleartext(false)`.
+- **Anonymous** — SOCKS5 0x00 / HTTP without credentials, only when
+  `ServerOptions::allow_anonymous(true)` (default off).
+
+With no acceptable method, SOCKS5 answers `[5, 0xFF]`; HTTP answers a
+keep-alive `407` listing the enabled schemes (`Proxy-Authenticate:
+Resocks5-Secure`, then `Proxy-Authenticate: Basic realm="resocks5"` while
+clear text is on) so standard clients retry on the same connection. After
+`MAX_ROUNDS`, on an unsupported scheme or any refusal the 407 closes
+(`Connection: close`).
+
+One secret per user, any protocol, any method: the stored `UserSecret`
+(Argon2id salt + params + key; a PHC string in the host app) verifies both
+secure auth and clear text, so switching protocol or method never breaks
+the account. Init registration works for every protocol and method:
+enrollment sealed-K over 0x80, or a clear-text login claiming the user
+with `UserSecret::from_password` at the store's `enrollment_floor()`; of
+two concurrent first logins exactly one wins.
+
+Outbound, `with_auth(u, p)` is all a caller needs. A SOCKS5 upstream
+upgrades automatically — the SDK derives secure-auth credentials from the
+same password and the greeting offers 0x80 plus (while `allow_cleartext`,
+default true) 0x02; the upstream picks. An HTTP/HTTPS upstream gets `Basic`
+in the first CONNECT, as 0.4.x did (see "Authenticating to an upstream").
+`ProxyConfig::secure_only()` never offers or accepts anything weaker:
+an upstream without our method fails with
+`ConnectError::SecureAuthUnsupported` before any credential byte.
+
+```text
+use resocks5_net::connect::{dial_plain, DialOptions};
+use resocks5_net::server::{accept_with, ServerOptions};
+use resocks5_net::types::ProxyConfig;
+
+// Inbound: strong methods plus clear text, anonymous refused.
+let options = ServerOptions::new(deadline)
+    .allow_cleartext(true);      // or .secure_only(): 0x80 / Resocks5-Secure only
+let req = accept_with(&mut client, &options, &AuthMethods::secure(&store, &decoy)).await?;
+
+// Outbound: one call, upgraded to secure auth when the upstream has it.
+let proxy = ProxyConfig::socks5("198.51.100.7", 1080).with_auth("alice", "correct horse");
+let stream = dial_plain(&proxy, "example.com", 80, &DialOptions::new()).await?;
+```
 
 ## Inbound server API
 
 `server` is unconditional, including `default-features = false`; it requires no
 pool, TLS, serde, rating, or rotator feature. `accept` borrows any
-`AsyncRead + AsyncWrite + Unpin` stream and serves anonymous clients only;
-users authenticate with a strong method through `accept_secure` / `accept_with`
-(feature `secure-auth`, below).
+`AsyncRead + AsyncWrite + Unpin` stream and serves only when anonymous access
+is allowed (`allow_anonymous`, default off); users authenticate through
+`accept_secure` / `accept_with` (feature `secure-auth`, below), which run
+the full negotiation: strong, clear text, and anonymous per the options.
 
 ```text
 use std::time::Duration;
@@ -175,7 +219,7 @@ use tokio::{io::AsyncWriteExt, net::TcpStream, time::{timeout, Instant}};
 
 async fn serve(mut client: TcpStream) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5); // anchor at accept in the host
-    let options = ServerOptions::new(deadline, true, false); // anonymous clients, no users
+    let options = ServerOptions::new(deadline).allow_anonymous(true);
     let mut req = accept(&mut client, &options).await?;
     // Apply destination policy before dialing: this sample permits one local target.
     if req.target() != "127.0.0.1:20084" {
@@ -204,13 +248,16 @@ Contracts:
   No DNS or egress occurs in `accept`. The deadline never renews on read/write progress.
 - `target()` stays unresolved. HTTP authority spelling is preserved; SOCKS IPs are
   canonical. Validation reuses `HostPort` (including legacy bare IPv6 and port zero).
-- `username()` is `Some` only after a strong authentication (secure-auth user or
-  GSSAPI principal); anonymous is `None`. Routing privileges are exclusively host
-  policy.
-- SOCKS selects "no authentication" when offered and enabled, otherwise answers
-  `[5, 255]`. HTTP serves a request without `Proxy-Authorization` when anonymous
-  access is allowed; any `Proxy-Authorization` is a 407 and never falls back to
-  anonymous.
+- `username()` is `Some` after secure auth or clear text (verified against
+  the store); anonymous admission is `None`. Routing privileges are
+  exclusively host policy.
+- SOCKS selects the strongest method offered and enabled: secure auth
+  (0x80), then clear text (0x02, while `allow_cleartext`), then anonymous
+  (0x00, while `allow_anonymous`); nothing acceptable answers `[5, 255]`.
+  HTTP serves a request without `Proxy-Authorization` when anonymous access
+  is allowed; otherwise a keep-alive 407 lists the enabled schemes
+  (`Resocks5-Secure`, then `Basic realm="resocks5"` while clear text is on)
+  so standard clients retry with credentials on the same connection.
 - HTTP request line and headers are limited to 16KiB **including** `\r\n\r\n`.
   Unused headers remain bytes and accept obs-text; only the first auth header is
   looked at. By default the parser stays permissive (any `HTTP/…` version, no
@@ -270,55 +317,64 @@ use resocks5_net::types::ProxyConfig;
 let proxy = ProxyConfig::socks5("198.51.100.7", 1080).try_with_auth("user", "pass")?;
 proxy.validate()?;
 
-let options = ServerOptions::new(deadline, true, false).strict_http(true);
+let options = ServerOptions::new(deadline).allow_anonymous(true).strict_http(true);
 let req = accept(&mut client, &options).await?;
 let mut stream = req.into_prefixed(client); // pipelined bytes first, then the socket
 ```
 
-### Strong inbound authentication (secure auth, GSSAPI)
+### Strong inbound authentication (feature `secure-auth`)
 
-`server::accept_secure(stream, options, store, decoy)` is like `accept`, but
-users authenticate with secure auth (SOCKS5 method 0x80). SOCKS5 offers 0x80
-(when the options say users exist) and 0x00 (when they allow anonymous),
-never 0x02. HTTP has no strong method here: the HTTP side runs as "no users
-configured", any `Proxy-Authorization` is answered 407 — secure auth is
-SOCKS5-only, consistent with the HTTP 407 policy above. `decoy` (a `DecoyKey`)
-answers unknown user names. The returned request carries the authenticated user
-in `username()`; no credentials are retained.
+`server::accept_secure(stream, options, store, decoy)` is a shorthand for
+`accept_with(stream, options, &AuthMethods::secure(store, decoy))`.
+`accept_with` runs the full negotiation, strongest first: the SOCKS5 side
+offers secure auth (0x80), then clear text (0x02, while
+`options.allow_cleartext`), then anonymous (0x00, while
+`options.allow_anonymous`); a client offering none of them gets
+`[5, 0xFF]` and `ServerError::Authentication`. The HTTP side serves a
+request without `Proxy-Authorization` when anonymous access is allowed;
+otherwise it answers a keep-alive `407` listing the enabled schemes
+(`Proxy-Authenticate: Resocks5-Secure`, then
+`Proxy-Authenticate: Basic realm="resocks5"` while clear text is on), so a
+standard client retries with credentials on the same connection. The
+`Resocks5-Secure` exchange runs one message per 407 round (base64), and
+the server's last token rides on the final `200` as
+`Proxy-Authenticate: Resocks5-Secure <b64>`, which a mutually
+authenticating client checks. After `MAX_ROUNDS`, an unsupported scheme
+or a failed check the answer is a 407 with `Connection: close`. `decoy`
+(a `DecoyKey`) answers unknown user names, indistinguishable from a wrong
+password.
 
-`server::accept_with(stream, options, &AuthMethods)` takes the chosen set of
-strong methods: `AuthMethods::secure(store, decoy)`, then `.with_gssapi(&acceptor)`
-(feature `gssapi`), or `AuthMethods::gssapi(&acceptor)` alone with the
-`NoSecrets` empty store for a GSSAPI-only server. When a client offers
-several methods the server picks the strongest it has enabled: GSSAPI
-(0x01), then secure auth (0x80), then anonymous (0x00) if `options` allow
-it; if nothing matches it answers `[5, 255]` and fails with
-`ServerError::Authentication`.
+`IncomingRequest::auth_method()` returns `server::AuthMethod` —
+`Anonymous`, `Cleartext` (SOCKS5 0x02 / HTTP `Basic`), `Secure` (method
+0x80 / HTTP `Resocks5-Secure`); the enum is `#[non_exhaustive]`, and the
+last two variants need the feature. `username()` is the verified user
+(`None` only for anonymous admission); `set_identity(name)` replaces the
+identity everything downstream sees (`auth_method()` is unchanged);
+`take_username()` moves it out. When a request completed a
+`Resocks5-Secure` exchange over HTTP, the `reply()` final answer carries
+that last authentication token on the `200` as `Proxy-Authenticate`.
 
-`IncomingRequest::auth_method()` returns `server::AuthMethod` — `Anonymous`,
-`Secure` (method 0x80), `Gssapi` (method 0x01); the enum is `#[non_exhaustive]`.
-With GSSAPI `username()` is the authenticated principal (Kerberos `name@REALM`),
-and when a protection level was negotiated the SOCKS reply written by
-`IncomingRequest::reply` is wrapped in the negotiated protection.
-`set_identity(name)` replaces the identity everything downstream sees (map a
-principal to a local account); `auth_method()` is unchanged.
-
-The `SecretStore` trait is the host's half: async `lookup(user) ->
-Option<StoredUser>`, atomic `claim(user, secret) -> bool`, and
-`enrollment_floor()` defaulting to `KdfParams::DEFAULT`. `None` from
-`lookup` is answered with the decoy, so the store never reveals which names
-exist. `StoredUser::Secret(UserSecret)` authenticates normally;
+The `SecretStore` trait is the host's half: async
+`lookup(user) -> Option<StoredUser>`, atomic
+`claim(user, secret) -> bool`, `enrollment_floor()` defaulting to
+`KdfParams::DEFAULT`, and — for the clear-text methods — the default
+`check_password(user, password)`, returning a `PasswordCheck` verdict:
+`Accepted`, `Claimed` (this login set an init user's secret) or
+`Rejected`. `None` from `lookup` is answered with the decoy / a fixed
+sleep, so the store never reveals which names exist.
+`StoredUser::Secret(UserSecret)` authenticates normally;
 `StoredUser::Init` enrolls on the first login (see the `secure-auth`
-feature above).
+feature above). `NoSecrets` is a store with no users, for hosts that only
+want the policy plumbing.
 
 ```text
 use resocks5_net::server::{accept_with, AuthMethod, AuthMethods};
 
 let decoy = resocks5_net::secure_auth::DecoyKey::generate()?;
-let methods = AuthMethods::secure(&store, &decoy).with_gssapi(&acceptor);
+let methods = AuthMethods::secure(&store, &decoy);
 let mut req = accept_with(&mut client, &options, &methods).await?;
-if req.auth_method() == AuthMethod::Gssapi {
-    // req.username() is the Kerberos principal; map it with req.set_identity(..)
+if req.auth_method() == AuthMethod::Cleartext {
+    // RFC 1929 / HTTP Basic, verified via SecretStore::check_password
 }
 ```
 
@@ -462,9 +518,12 @@ let stream = dial_chain_over(base, &proxy, "example.com", 80, &opts, None).await
 
 Connect and pool calls return `resocks5_net::ConnectError`
 (`#[non_exhaustive]`): match on `Timeout { stage, .. }`, `ProxyRejected`,
-`MethodUnsupported`, `Protocol(ProtocolViolation)`,
-`InvalidTarget`, `SecureAuth(SecureAuthError)`, `Gssapi(GssapiError)`
-(these carry the typed exchange errors, re-exported from the crate root),
+`MethodUnsupported`, `AuthFailed { status }` (the upstream rejected the
+RFC 1929 username/password sub-negotiation), `SecureAuthUnsupported`
+(a `secure_only` upstream that did not offer our method),
+`Protocol(ProtocolViolation)`,
+`InvalidTarget`, `SecureAuth(SecureAuthError)`
+(this carries the typed exchange error, re-exported from the crate root),
 `TlsFeatureMissing`, `Io` (the `io::Error` is reachable via `source()`)
 and, with `pool`, `AtCapacity` — no message parsing needed.
 `Protocol` carries a structured `ProtocolViolation` (e.g.
@@ -486,8 +545,10 @@ failures → `UpstreamUnavailable`. SOCKS5 `ProxyRejected` REP 2/3/4/5/6 →
 `Forbidden`/`NetworkUnreachable`/`UpstreamUnavailable`/`ConnectionRefused`/
 `TimedOut`; HTTP(S) 403/504/502+503 →
 `Forbidden`/`TimedOut`/`UpstreamUnavailable`; other refusals, auth/method
-failures, `Protocol`, `InvalidTarget`, `CleartextCredentialsRefused`,
-secure-auth/GSSAPI exchange errors and a missing TLS feature →
+failures (`AuthFailed` and `SecureAuthUnsupported` included — both count
+as upstream-down like the other auth refusals), `Protocol`,
+`InvalidTarget`, `CleartextCredentialsRefused`,
+secure-auth exchange errors and a missing TLS feature →
 `GeneralFailure`; with `pool`, `AtCapacity` → `Overloaded`. Only the
 destination's own verdict selects a specific reply; hop failures never
 answer "connection refused".
@@ -541,8 +602,9 @@ means strictly sequential; `HedgeError` carries the attempt count and the
 last error.
 
 `ConnectError::is_upstream_down` treats TCP-connect failures, HTTPS TLS
-handshake failures, auth/method refusal (secure-auth and GSSAPI exchange
-failures included), bad SOCKS5 response versions, and
+handshake failures, auth/method refusal (secure-auth exchange failures,
+`AuthFailed` and `SecureAuthUnsupported` included), bad SOCKS5 response
+versions, and
 TLS errors as hard upstream failures. It excludes destination-dependent
 CONNECT failures and ambiguous handshakes. `counts_against_upstream` is
 false for local `AtCapacity` errors when `pool` is enabled. The chain
@@ -580,16 +642,24 @@ otherwise it evicts the least-recently-used one.
 Top-level modules: `connect` (dial, connectors, tunnel, fragmentation),
 `error`, `server`, `progress`, `pool` (`pool` feature), `rating` (`rating`
 feature), `rotator` (`rotator` feature), `types`, `chain` (`rotator`
-feature), `secure_auth` (`secure-auth` feature), `gssapi` (`gssapi`
-feature), and `testing` (`test-instrumentation` feature).
+feature), `secure_auth` (`secure-auth` feature), and `testing`
+(`test-instrumentation` feature).
 
 `testing::MockUpstream` (feature `test-instrumentation`) is a scripted
 SOCKS5/HTTP CONNECT proxy for tests. `.auth(MockAuth)` defaults to `None`;
-`Secure { user, secret }` and `SecureDenied` use secure auth;
-`AuthStatus(byte)` answers the first secure-auth message with
+`Cleartext { user, password }` speaks clear text only (SOCKS5 method 0x02,
+HTTP Basic); `Secure { user, secret }` stores one secret for one user and,
+because that same secret verifies clear text too, accepts RFC 1929 / Basic
+against it; `SecureDenied` selects secure auth and always denies via the
+store; `AuthStatus(byte)` answers the first secure-auth message with
 `[VERSION, byte]` (`0xFF` refused, `0x01` enrollment, other non-zero bad
 version); `NoAcceptableMethod` forces SOCKS5
-`[5, 255]`. Every non-None auth mode answers HTTP 407. `.script(Script)`
+`[5, 255]`. The HTTP side runs the real 407 dance: a keep-alive challenge
+listing the enabled schemes, then the `Resocks5-Secure` token rounds,
+ending in a `200` that carries the final `Proxy-Authenticate` token;
+`Basic` is verified against the store, and `AuthStatus(byte)` answers the
+first `Resocks5-Secure` round with `[VERSION, byte]` on a closing 407.
+Every non-None auth mode answers HTTP 407. `.script(Script)`
 defaults to `Tunnel`; it also supports `Refuse(code)`, `SilentGreeting`,
 `SilentConnect`, and `Hangup`. `.spawn()` binds `127.0.0.1:0`; `addr()`,
 `proxy()`, `targets()`, and `connections()` report activity.
@@ -606,10 +676,41 @@ A working version of the pooled example lives at
 CI compiles that file, so it tracks the API; the Markdown blocks above are
 not extracted.
 
-## Authenticating to a SOCKS5 upstream
+## Authenticating to an upstream
+
+`ProxyConfig::with_auth(u, p)` is all a caller needs. With feature
+`secure-auth` the SDK also derives secure-auth credentials from the same
+password, so a **SOCKS5** upstream upgrades automatically: the greeting
+offers method 0x80 and (while `allow_cleartext`, default true) RFC 1929, and
+the upstream picks. An entry built only with `with_secure_auth` offers the
+strong greeting (plus 0x02 only when a clear-text pair also exists and is
+allowed).
+
+**HTTP/HTTPS upstreams send `Basic` in the first CONNECT**, exactly as 0.4.x
+did: many proxies (3proxy among them) answer an unauthenticated CONNECT with
+`407` + `Connection: close`, so probing first would never reach them. HTTPS
+Basic travels inside the TLS connection — not clear text on the wire — and is
+allowed regardless of `allow_cleartext`; plain-HTTP Basic requires
+`allow_cleartext`. The credential-less probe (CONNECT without credentials,
+then the scheme the `407` names) runs only when Basic cannot or must not be
+sent first: `secure_only` entries, plain-HTTP entries with clear text
+disallowed, and entries with secure credentials but no user/password pair. On
+the probe path `Resocks5-Secure` is used when the proxy offers it; if clear
+text is the only method on offer and it is disallowed, the dial fails with
+`ConnectError::CleartextCredentialsRefused` before the password is sent.
+
+`ProxyConfig::secure_only()` (builder + field) offers ONLY method 0x80 and
+uses ONLY `Resocks5-Secure` over HTTP(S) — even Basic inside TLS is
+refused — and an upstream without our method fails with
+`ConnectError::SecureAuthUnsupported` before any password byte.
+`ProxyConfig::allow_cleartext(bool)` sets the field (default true).
+Empty user names or passwords are refused by
+`validate`/`try_with_auth` and by `SecureCredentials::try_new` (`new`,
+like the server, rejects them at use time).
 
 `ProxyConfig::with_secure_auth(SecureCredentials)` (feature `secure-auth`):
-dial and chain hops authenticate to a SOCKS5 upstream with secure auth. The
+dial and chain hops authenticate with secure auth; over HTTP(S) the
+`Resocks5-Secure` scheme. The
 user name is kept in `ProxyConfig::user` (it is the upstream's identity);
 the password stays inside the credentials — never on the wire, never a
 plain `ProxyConfig::password` field. `SecureCredentials::new(user,
@@ -618,39 +719,13 @@ password)`; `.allow_enrollment(true)` opts in to first-login enrollment
 enrolled client; `SecureAuthError::EnrollmentNotAllowed` otherwise);
 `.with_enrollment_kdf(params)` sets the enrollment cost; `.with_min_kdf(floor)`
 refuses a server whose KDF is cheaper than the floor (default
-`KdfParams::DEFAULT`). The derived key is cached after the first exchange
+`KdfParams::DEFAULT`: 4 MiB / 1 pass / 1 lane). The derived key is cached
+after the first exchange
 (per salt and parameters), so the Argon2id cost is paid once per process
-and server, not per connection.
-
-`ProxyConfig::with_gssapi(GssCredentials)` (feature `gssapi`) can be
-combined with `with_secure_auth` — both are offered, GSSAPI first, and the
-server chooses. A client with strong methods configured offers them all and
-nothing weaker: no anonymous, no clear text, no downgrade if the server
-answers another method.
-
-`GssCredentials::new(Arc<dyn GssBackend>, service)` takes a host-based
-service name such as `socks@proxy.example.com`; by default it asks for no
-per-message protection and accepts whatever the server answers;
-`.with_requested_protection(level)` asks, `.with_min_protection(level)`
-requires. Server side: `GssAcceptor::new(backend)`, `.with_protection(level)`
-— RFC 1961 lets the server decide, and a client that finds the answer too
-weak closes the connection. `Protection` levels: `None` (0 — only the
-authentication is protected; the context is mutual Kerberos, the SOCKS
-request and reply travel plain; this is what `curl --socks5-gssapi` and
-Dante's `clear` speak), `Integrity` (1), `Confidential` (2); the
-"selective" level 3 is not offered. The tunnel data is NEVER protected, at
-any level.
-
-Backends: `gssapi::mock::MockBackend` for tests (ships with
-`test-instrumentation`), `gssapi::system::SystemBackend` for real Kerberos
-(feature `gssapi-system`, Unix only).
-[`examples/gssapi_interop_server.rs`](examples/gssapi_interop_server.rs)
-is built with `gssapi-system`; the CI interop target is
-`curl --socks5-gssapi`. Limit: stock curl up to and including 8.11 (e.g.
-8.5.0 in Ubuntu 24.04) cannot use a SOCKS5 GSSAPI proxy — a SOCKS5
-state-machine bug makes it reject method 1 with "SOCKS5 GSSAPI per-message
-authentication is not supported" when the server response does not arrive
-instantly; newer curl works (CI checks 8.23.0).
+and server, not per connection. Client derivations run under their own
+process-wide limiter (separate from the server's, so a flood of inbound
+clear-text checks cannot starve outbound derivations); a saturated limiter
+fails the exchange with `SecureAuthError::Kdf` instead of queueing.
 
 ```text
 use resocks5_net::connect::{dial_plain, DialOptions};
@@ -662,8 +737,10 @@ let proxy = ProxyConfig::socks5("198.51.100.7", 1080)
 let stream = dial_plain(&proxy, "example.com", 443, &DialOptions::new()).await?;
 ```
 
-Only SOCKS5 upstreams get strong methods; HTTP CONNECT upstreams still use
-Basic inside TLS (`https` scheme) as before.
+Only SOCKS5 upstreams get the strong SOCKS greeting. An HTTP CONNECT upstream
+uses `Resocks5-Secure` only on the probe path above (`secure_only`, or secure
+credentials without a user/password pair); a plain `with_auth` entry sends
+Basic first.
 
 ## Status
 

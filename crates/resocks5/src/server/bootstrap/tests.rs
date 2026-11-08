@@ -8,8 +8,9 @@ use resocks5_net::connect::parse_proxy_str;
 use resocks5_net::types::{ProxyConfig, ProxyProtocol};
 
 use super::startup::{
-    directly_dialed_rotators, group_gate_levels, has_usable_route, partition_proxy_groups,
-    should_bail_no_upstreams, GateSplit,
+    apply_upstream_auth, directly_dialed_rotators, group_gate_levels, has_usable_route,
+    obsolete_gssapi_keys, parse_proxy_list_checked, partition_proxy_groups, secure_only_conflict,
+    should_bail_no_upstreams, split_secure_only_option, validate_admission, GateSplit,
 };
 use super::*;
 use crate::config::{User, UsersConfig};
@@ -65,7 +66,7 @@ fn skipped_line_diagnostic_identifies_line_without_credentials() {
         "not-a-proxy".to_string(),
         "bob:hunter2@[::1]:1080".to_string(),
     ];
-    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5);
+    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5, false);
     assert_eq!(parsed.len(), 2);
     assert_eq!(failed, vec![2]);
     let msg = skipped_line_message("socks5_v4", failed[0]);
@@ -88,7 +89,7 @@ fn skipped_line_diagnostic_identifies_line_without_credentials() {
 #[test]
 fn comment_lines_are_skipped_silently() {
     let list = vec!["# comment".to_string(), "1.2.3.4:1080".to_string()];
-    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5);
+    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5, false);
     assert_eq!(parsed.len(), 1);
     assert!(
         failed.is_empty(),
@@ -161,7 +162,7 @@ fn group_gate_levels_moves_owned_entries_without_cloning_and_keeps_gaps() {
 #[test]
 fn parsed_star_prefix_accepts_255_and_groups_at_exact_rank() {
     let raw = format!("{}v4:p@10.0.0.255:1080", "*".repeat(255));
-    let (parsed, failed) = parse_proxy_list_checked(&[raw], ProxyProtocol::Socks5);
+    let (parsed, failed) = parse_proxy_list_checked(&[raw], ProxyProtocol::Socks5, false);
     assert!(failed.is_empty());
     assert_eq!(parsed.len(), 1);
     let (_, _, gates) = partition_proxy_groups(Vec::new(), parsed);
@@ -180,8 +181,8 @@ fn parsed_v4_and_v6_gates_merge_by_level_preserving_source_order() {
         "**v4a:p@10.0.0.1:1080".to_string(),
         "**v4b:p@10.0.0.2:1080".to_string(),
     ];
-    let (v6, failed_v6) = parse_proxy_list_checked(&v6, ProxyProtocol::Socks5);
-    let (v4, failed_v4) = parse_proxy_list_checked(&v4, ProxyProtocol::Socks5);
+    let (v6, failed_v6) = parse_proxy_list_checked(&v6, ProxyProtocol::Socks5, false);
+    let (v4, failed_v4) = parse_proxy_list_checked(&v4, ProxyProtocol::Socks5, false);
     assert!(failed_v6.is_empty() && failed_v4.is_empty());
     let (_, _, gates) = partition_proxy_groups(v6, v4);
     let levels = group_gate_levels(gates);
@@ -201,9 +202,13 @@ fn parsed_three_stars_plus_one_star_yields_exact_levels_one_and_three() {
     let parsed_v6 = parse_proxy_list_checked(
         &["***v6:p@[2001:db8::3]:1080".to_string()],
         ProxyProtocol::Socks5,
+        false,
     );
-    let parsed_v4 =
-        parse_proxy_list_checked(&["*v4:p@10.0.0.1:1080".to_string()], ProxyProtocol::Socks5);
+    let parsed_v4 = parse_proxy_list_checked(
+        &["*v4:p@10.0.0.1:1080".to_string()],
+        ProxyProtocol::Socks5,
+        false,
+    );
     assert!(parsed_v6.1.is_empty() && parsed_v4.1.is_empty());
     let (_, _, gates) = partition_proxy_groups(parsed_v6.0, parsed_v4.0);
     let levels = group_gate_levels(gates);
@@ -216,7 +221,7 @@ fn parsed_three_stars_plus_one_star_yields_exact_levels_one_and_three() {
 fn star_prefix_256_is_rejected_with_redacted_failed_line_diagnostic() {
     let raw = format!("{}alice:s3cret@secret.example:1080", "*".repeat(256));
     let (parsed, failed) =
-        parse_proxy_list_checked(std::slice::from_ref(&raw), ProxyProtocol::Socks5);
+        parse_proxy_list_checked(std::slice::from_ref(&raw), ProxyProtocol::Socks5, false);
     assert!(parsed.is_empty());
     assert_eq!(failed, vec![1]);
     let msg = skipped_line_message("socks5_v4", failed[0]);
@@ -362,6 +367,7 @@ fn main_cfg_with_allowed(rule: &str) -> crate::config::MainConfig {
             allow_anonymous: false,
             ..Default::default()
         },
+        upstream_auth: Default::default(),
         log: crate::logger::LogConfig::default(),
         pool: Default::default(),
         tls_fragment: Default::default(),
@@ -648,122 +654,108 @@ fn all_rotators_lists_every_gate_level_then_exits() {
     assert!(super::startup::all_rotators(&GateLevels::default(), &[None, None]).is_empty());
 }
 
-// ── upstream credentials: stored as written, never sent in clear ──
+// ── outbound (upstream) auth: `;secure_only`, gssapi drop, admission ──
 
-mod upstream_auth {
-    use std::time::Duration;
+/// A 0.4.x `;gssapi=` entry must not survive parsing: GSSAPI was removed
+/// in 0.5.0, so dialing it would hit an upstream that was meant to be
+/// Kerberos-authenticated. Mutation: keeping the entry would dial an
+/// upstream that was meant to be Kerberos-authenticated.
+#[test]
+fn a_gssapi_entry_is_dropped_with_a_warning() {
+    let list = vec![
+        "1.2.3.4:1080;gssapi=socks@h".to_string(),
+        "5.6.7.8:1080".to_string(),
+    ];
+    let (parsed, failed) = parse_proxy_list_checked(&list, ProxyProtocol::Socks5, false);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].host, "5.6.7.8");
+    assert_eq!(failed, vec![1]);
+}
 
-    use resocks5_net::connect::{dial_tcp, DialOptions};
-    use resocks5_net::secure_auth::{KdfParams, UserSecret};
-    use resocks5_net::testing::{MockAuth, MockUpstream};
-    use resocks5_net::types::{ProxyConfig, ProxyProtocol};
-    use resocks5_net::ConnectError;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// `;secure_only` must sit at the very end of the line: anything after it
+/// makes the auth policy unparseable. Mutation: accepting a value after
+/// the flag silently ignores it.
+#[test]
+fn secure_only_option_splits_off_the_line_end() {
+    assert_eq!(
+        split_secure_only_option("u:p@h:1;secure_only"),
+        Ok(("u:p@h:1", true))
+    );
+    assert_eq!(split_secure_only_option("u:p@h:1"), Ok(("u:p@h:1", false)));
+    assert_eq!(split_secure_only_option("u:p@h:1;secure_only=yes"), Err(()));
+}
 
-    use super::super::startup::{
-        cleartext_upstream_credentials, cleartext_upstream_message, secure_upstream_auth,
-    };
+/// The resolution function must not wipe the parsed credentials when
+/// neither switch is on — the clear-text fallback contract depends on
+/// them staying. Mutation: an implementation that wiped user/password
+/// would break the clear-text fallback contract.
+#[test]
+fn the_global_switch_is_overridden_per_entry() {
+    let cfg = || parse_proxy_str("u:p@10.0.0.1:1080", ProxyProtocol::Socks5).unwrap();
+    let untouched = apply_upstream_auth(cfg(), false, false);
+    assert_eq!(untouched.user.as_deref(), Some("u"));
+    assert_eq!(untouched.password.as_deref(), Some("p"));
+    // secure-only passthrough must not clear the credentials either
+    // (the user name stays as the upstream identity).
+    let forced = apply_upstream_auth(cfg(), true, false);
+    assert_eq!(forced.user.as_deref(), Some("u"));
+    let global = apply_upstream_auth(cfg(), false, true);
+    assert_eq!(global.user.as_deref(), Some("u"));
+    // The e2e dial behaviour of the secure-only switch is pinned in
+    // upstream_auth_tests.rs.
+}
 
-    async fn dial(proxy: &ProxyConfig) -> Result<tokio::net::TcpStream, ConnectError> {
-        let opts = DialOptions::new().with_handshake_timeout(Duration::from_secs(10));
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            dial_tcp(proxy, "example.test", 443, &opts),
+/// Mutation: a typo'd prefix missing one key fails.
+#[test]
+fn obsolete_gssapi_keys_are_detected() {
+    let text = "auth: {\n  allow_anonymous: true\n  gssapi_service: \"x\"\n  gssapi_protection: \"none\"\n}\n";
+    assert_eq!(
+        obsolete_gssapi_keys(text),
+        vec!["gssapi_service", "gssapi_protection"]
+    );
+    let clean = "auth: {\n  allow_anonymous: true\n  secure_only: false\n}\n";
+    assert!(obsolete_gssapi_keys(clean).is_empty());
+}
+
+fn auth_state(
+    users: Vec<User>,
+    allow_anonymous: bool,
+    secure_only: bool,
+) -> Arc<crate::auth::AuthState> {
+    Arc::new(
+        crate::auth::AuthState::build(
+            &crate::config::AuthConfig {
+                allow_anonymous,
+                secure_only,
+            },
+            &UsersConfig { users },
+            "test-users.ktav",
         )
-        .await
-        .expect("test guard")
-    }
+        .expect("valid auth state"),
+    )
+}
 
-    /// A SOCKS5 entry with credentials becomes secure auth: the user stays,
-    /// the clear-text password leaves the config. Anything else is untouched.
-    /// Mutation: converting HTTP/HTTPS or credential-less entries fails a row.
-    #[test]
-    fn only_socks5_entries_with_credentials_are_converted() {
-        let socks = secure_upstream_auth(ProxyConfig::socks5("h", 1).with_auth("u", "p"));
-        assert!(socks.secure_auth.is_some());
-        assert_eq!(socks.user.as_deref(), Some("u"));
-        assert_eq!(socks.password, None);
-        for other in [
-            ProxyConfig::socks5("h", 1),
-            ProxyConfig::http("h", 1).with_auth("u", "p"),
-            ProxyConfig::https("h", 1).with_auth("u", "p"),
-        ] {
-            let before = (other.user.clone(), other.password.clone());
-            let after = secure_upstream_auth(other);
-            assert!(after.secure_auth.is_none());
-            assert_eq!((after.user, after.password), before);
-        }
-    }
-
-    /// The converted entry logs in to a secure-auth upstream and tunnels.
-    /// Mutation: leaving the entry as parsed would refuse the dial.
-    #[tokio::test]
-    async fn a_converted_entry_authenticates_with_secure_auth() {
-        let secret = UserSecret::from_password("pw", KdfParams::DEFAULT).unwrap();
-        let mock = MockUpstream::socks5()
-            .auth(MockAuth::Secure {
-                user: "alice".into(),
-                secret,
-            })
-            .spawn()
-            .await
-            .unwrap();
-        let proxy = secure_upstream_auth(mock.proxy().with_auth("alice", "pw"));
-        let mut tunnel = dial(&proxy).await.unwrap();
-        tunnel.write_all(b"ping").await.unwrap();
-        let mut back = [0u8; 4];
-        tunnel.read_exact(&mut back).await.unwrap();
-        assert_eq!(&back, b"ping");
-        assert_eq!(mock.targets(), ["example.test:443"]);
-    }
-
-    /// The password is never sent in clear text: against an upstream that
-    /// offers only "no authentication" the converted entry offers secure
-    /// auth alone (method 0x02 does not exist) and is turned away, and the
-    /// unconverted entry is refused before any connect. Mutation: sending the
-    /// password in clear text makes the second dial reach the mock.
-    #[tokio::test]
-    async fn a_cleartext_only_upstream_never_receives_the_password() {
-        let mock = MockUpstream::socks5().spawn().await.unwrap();
-        let converted = secure_upstream_auth(mock.proxy().with_auth("alice", "pw"));
-        let error = dial(&converted).await.unwrap_err();
-        assert!(
-            matches!(error, ConnectError::MethodUnsupported { .. }),
-            "{error:?}"
-        );
-        let raw = mock.proxy().with_auth("alice", "pw");
-        let error = dial(&raw).await.unwrap_err();
-        assert!(
-            matches!(error, ConnectError::CleartextCredentialsRefused),
-            "{error:?}"
-        );
-        assert!(mock.targets().is_empty());
-        assert_eq!(
-            mock.connections(),
-            1,
-            "the unconverted dial never connected"
-        );
-    }
-
-    /// Plain HTTP with credentials is flagged and refused; the notice names
-    /// the host and never the credentials.
-    #[tokio::test]
-    async fn plain_http_with_credentials_is_flagged_and_refused() {
-        let mock = MockUpstream::http().spawn().await.unwrap();
-        let proxy = mock.proxy().with_auth("alice", "very-secret");
-        assert!(cleartext_upstream_credentials(&proxy));
-        assert!(!cleartext_upstream_credentials(&mock.proxy()));
-        assert!(!cleartext_upstream_credentials(
-            &ProxyConfig::new(ProxyProtocol::Https, "h", 1).with_auth("u", "p")
-        ));
-        let message = cleartext_upstream_message("http_v4", &proxy);
-        assert!(message.contains("127.0.0.1"));
-        assert!(!message.contains("alice") && !message.contains("very-secret"));
-        let error = dial(&proxy).await.unwrap_err();
-        assert!(
-            matches!(error, ConnectError::CleartextCredentialsRefused),
-            "{error:?}"
-        );
-        assert_eq!(mock.connections(), 0);
-    }
+/// A server that no client could ever enter must be refused at startup.
+/// Mutation: dropping the `is_empty` bail lets a server start that no
+/// client can enter.
+#[test]
+fn a_server_that_cannot_admit_anyone_is_refused_at_startup() {
+    // Anonymous off, no users: refused, and the message names the fix.
+    let err = validate_admission(&auth_state(vec![], false, false))
+        .expect_err("no users + no anonymous must be refused");
+    assert!(err.to_string().contains("users add"), "{err}");
+    // Anonymous on, no users: fine.
+    assert!(validate_admission(&auth_state(vec![], true, false)).is_ok());
+    // Anonymous on, one user: fine.
+    assert!(validate_admission(&auth_state(vec![user("alice", true, false)], true, false)).is_ok());
+    // Anonymous off but secure_only on, one user: fine (users still enter
+    // with the secure method).
+    assert!(validate_admission(&auth_state(vec![user("alice", true, false)], false, true)).is_ok());
+    // secure_only on, no users: anonymous is silenced, so refused.
+    assert!(validate_admission(&auth_state(vec![], true, true)).is_err());
+    // secure_only + allow_anonymous is the only conflict combination.
+    assert!(secure_only_conflict(&auth_state(vec![], true, true)));
+    assert!(!secure_only_conflict(&auth_state(vec![], false, true)));
+    assert!(!secure_only_conflict(&auth_state(vec![], true, false)));
+    assert!(!secure_only_conflict(&auth_state(vec![], false, false)));
 }

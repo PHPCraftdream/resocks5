@@ -9,7 +9,7 @@ async fn same_listener_accepts_both_protocols_without_early_success() {
     let server = async {
         for expected in [Protocol::Socks5, Protocol::Http] {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let req = accept(&mut stream, &options(true, false)).await.unwrap();
+            let req = accept(&mut stream, &anon_options(true)).await.unwrap();
             assert_eq!(req.protocol(), expected);
             assert_eq!(req.target(), "unresolved.invalid:443");
             assert_eq!(req.username(), None);
@@ -43,47 +43,49 @@ async fn same_listener_accepts_both_protocols_without_early_success() {
 
 #[tokio::test]
 async fn authentication_policy_matrix_never_selects_a_password_method() {
+    // Feature-less `accept` has no users and no schemes: only anonymous
+    // admission exists, credentials never fall back to it. The "users exist
+    // but anonymous disabled" rows live in `negotiation.rs` (`accept_with`).
     for anonymous in [false, true] {
-        for users in [false, true] {
-            for supplied in [false, true] {
-                let http = if supplied {
-                    b"CONNECT h:0 HTTP/x\r\nProxy-Authorization: bAsIc dTpwOm0=\r\n\r\n".as_slice()
-                } else {
-                    b"CONNECT h:0 HTTP/x\r\n\r\n".as_slice()
-                };
-                let (result, reply) = parse(http, anonymous, users).await;
-                // Credentials never fall back to anonymous: any header is a 407.
-                let allowed = !supplied && anonymous;
-                assert_eq!(result.is_ok(), allowed);
-                if allowed {
-                    assert!(reply.is_empty());
-                    assert_eq!(result.unwrap().username(), None);
-                } else {
-                    assert_eq!(reply, EXPECT_HTTP_407);
-                }
-            }
-            // A client offering "none" and "username/password": only "none" is
-            // ever selected, whatever users exist.
-            let mut socks = vec![5, 2, 0, 2];
-            socks.extend_from_slice(&socks_request(b"h")[3..]);
-            let (result, reply) = parse(&socks, anonymous, users).await;
-            assert_eq!(result.is_ok(), anonymous);
-            if anonymous {
-                assert_eq!(reply, [5, 0]);
+        for supplied in [false, true] {
+            let http = if supplied {
+                b"CONNECT h:0 HTTP/x\r\nProxy-Authorization: bAsIc dTpwOm0=\r\n\r\n".as_slice()
+            } else {
+                b"CONNECT h:0 HTTP/x\r\n\r\n".as_slice()
+            };
+            let (result, reply) = parse(http, anonymous, true).await;
+            let allowed = !supplied && anonymous;
+            assert_eq!(result.is_ok(), allowed);
+            if allowed {
+                assert!(reply.is_empty());
                 assert_eq!(result.unwrap().username(), None);
             } else {
-                assert_eq!(reply, [5, 255]);
+                // No scheme is enabled on this server: the bare closing 407.
+                assert_eq!(reply, EXPECT_HTTP_407_BARE_CLOSE);
             }
-            // A client offering only "username/password" is refused outright.
-            let (result, reply) = parse(&[5, 1, 2, 1, 1, b'u', 1, b'p'], anonymous, users).await;
-            assert!(matches!(result, Err(ServerError::Authentication(_))));
+        }
+        // A client offering "none" and "username/password": only "none" is
+        // ever selected, whatever a store would hold (`accept` has none).
+        let mut socks = vec![5, 2, 0, 2];
+        socks.extend_from_slice(&socks_request(b"h")[3..]);
+        let (result, reply) = parse(&socks, anonymous, true).await;
+        assert_eq!(result.is_ok(), anonymous);
+        if anonymous {
+            assert_eq!(reply, [5, 0]);
+            assert_eq!(result.unwrap().username(), None);
+        } else {
             assert_eq!(reply, [5, 255]);
         }
+        // A client offering only "username/password" is refused outright.
+        let (result, reply) = parse(&[5, 1, 2, 1, 1, b'u', 1, b'p'], anonymous, true).await;
+        assert!(matches!(result, Err(ServerError::Authentication(_))));
+        assert_eq!(reply, [5, 255]);
     }
 }
 
-/// Every `Proxy-Authorization` shape is a 407 and never authenticates, and the
-/// submitted token never appears in the error text.
+/// Every `Proxy-Authorization` shape is a bare closing 407 (no scheme is
+/// enabled on this server) and never authenticates, and the submitted token
+/// never appears in the error text.
 /// Mutation: parsing any scheme (Basic, Bearer, padding-tolerant base64, a TAB
 /// separator) would accept a row here or echo its token.
 #[tokio::test]
@@ -107,14 +109,14 @@ async fn every_proxy_authorization_shape_is_a_407_without_echo() {
                 let text = error.to_string();
                 assert!(!text.contains("private-token"), "{value}");
                 assert!(!text.contains("dTpw"), "{value}");
-                assert_eq!(reply, EXPECT_HTTP_407, "{value}");
+                assert_eq!(reply, EXPECT_HTTP_407_BARE_CLOSE, "{value}");
             }
         }
         // The first header wins and a padded header name is still the header.
         let bytes = b"CONNECT h:443 HTTP/anything\r\n Proxy-Authorization : Basic dTpwOm0=\r\nProxy-Authorization: Bearer ignored\r\n\r\n";
         let (result, reply) = parse(bytes, true, true).await;
         assert!(matches!(result, Err(ServerError::Authentication(_))));
-        assert_eq!(reply, EXPECT_HTTP_407);
+        assert_eq!(reply, EXPECT_HTTP_407_BARE_CLOSE);
     })
     .await
     .expect("bounded proxy-authorization rows");
@@ -252,7 +254,7 @@ async fn delimiter_limit_and_unused_obs_text_are_preserved() {
     ] {
         let expected = match status {
             400 => EXPECT_HTTP_400,
-            407 => EXPECT_HTTP_407,
+            407 => EXPECT_HTTP_407_BARE_CLOSE,
             _ => panic!("unexpected test status"),
         };
         assert_eq!(parse(bytes, true, true).await.1, expected);
@@ -282,7 +284,7 @@ async fn fragmented_headers_and_tls_binary_pipeline_are_lossless() {
             peer.shutdown().await.unwrap();
         };
         let reader = async {
-            let mut req = accept(&mut stream, &options(true, false)).await.unwrap();
+            let mut req = accept(&mut stream, &anon_options(true)).await.unwrap();
             let mut received = req.take_pipeline();
             assert!(req.take_pipeline().is_empty());
             if socks {
@@ -309,7 +311,9 @@ async fn expired_deadline_never_consumes_the_stream() {
     let (mut peer, mut stream) = duplex(1024);
     let frame = b"CONNECT h:443 HTTP/x\r\n\r\n";
     peer.write_all(frame).await.unwrap();
-    let opts = ServerOptions::new(Instant::now(), true, true);
+    let opts = ServerOptions::new(Instant::now())
+        .allow_anonymous(true)
+        .allow_cleartext(true);
     assert!(matches!(
         accept(&mut stream, &opts).await,
         Err(ServerError::Deadline)
@@ -324,7 +328,7 @@ async fn stalled_frame_spends_one_absolute_deadline() {
     let (mut peer, mut stream) = duplex(64);
     peer.write_all(&[5]).await.unwrap();
     let start = Instant::now();
-    let opts = ServerOptions::new(start + Duration::from_secs(1), true, false);
+    let opts = ServerOptions::new(start + Duration::from_secs(1)).allow_anonymous(true);
     assert!(matches!(
         accept(&mut stream, &opts).await,
         Err(ServerError::Deadline)
@@ -337,7 +341,7 @@ async fn stalled_frame_spends_one_absolute_deadline() {
 async fn late_first_byte_does_not_renew_handshake_budget() {
     let (mut peer, mut stream) = duplex(64);
     let start = Instant::now();
-    let opts = ServerOptions::new(start + Duration::from_secs(1), true, false);
+    let opts = ServerOptions::new(start + Duration::from_secs(1)).allow_anonymous(true);
     let reader = async {
         assert!(matches!(
             accept(&mut stream, &opts).await,
@@ -358,7 +362,7 @@ async fn late_first_byte_does_not_renew_handshake_budget() {
 fn public_future_is_send() {
     fn send<F: Future + Send>(_: F) {}
     let (_, mut stream) = duplex(64);
-    let opts = options(true, true);
+    let opts = anon_options(true);
     send(accept(&mut stream, &opts));
 }
 
@@ -413,7 +417,7 @@ async fn buffered_socks_peer_waits_for_each_handshake_reply() {
     timeout(Duration::from_secs(10), async {
         let (mut peer, stream) = duplex(64);
         let mut stream = BufWriter::new(stream);
-        let opts = options(true, false);
+        let opts = anon_options(true);
         let client = async {
             for byte in [5, 1, 0] {
                 peer.write_all(&[byte]).await.unwrap();
@@ -438,13 +442,13 @@ async fn buffered_socks_peer_waits_for_each_handshake_reply() {
 pub(super) async fn buffered_failure(
     bytes: &[u8],
     anonymous: bool,
-    users: bool,
+    _cleartext: bool,
     expected: &[u8],
 ) -> ServerError {
     let (mut peer, stream) = duplex(64 * 1024);
     let mut stream = BufWriter::new(stream);
     peer.write_all(bytes).await.unwrap();
-    let opts = options(anonymous, users);
+    let opts = anon_options(anonymous);
     let mut response = vec![0; expected.len()];
     let (result, read) = tokio::join!(accept(&mut stream, &opts), peer.read_exact(&mut response),);
     read.unwrap();
@@ -498,7 +502,7 @@ async fn buffered_canonical_refusals_after_the_greeting_are_terminal() {
         ] {
             let (mut peer, stream) = duplex(1024);
             let mut stream = BufWriter::new(stream);
-            let opts = options(true, false);
+            let opts = anon_options(true);
             let client = async {
                 peer.write_all(&[5, 1, 0]).await.unwrap();
                 let mut response = [0; 2];
@@ -535,7 +539,7 @@ async fn buffered_wrong_versions_remain_terminal_without_failure_reply() {
             let (mut peer, inner) = duplex(1024);
             let mut stream = BufWriter::new(inner);
             peer.write_all(&bytes).await.unwrap();
-            let opts = options(anonymous, true);
+            let opts = options(soon(), anonymous, true);
             let mut response = vec![0; expected.len()];
             let (result, read) =
                 tokio::join!(accept(&mut stream, &opts), peer.read_exact(&mut response),);

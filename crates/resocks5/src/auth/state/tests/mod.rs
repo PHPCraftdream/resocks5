@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod claim_tests;
+mod cleartext_tests;
+mod flood_tests;
+mod password_cache_tests;
 
 const PEER: &str = "198.51.100.7";
 
@@ -362,4 +365,57 @@ fn counts_include_init_placeholders() {
     assert_eq!(state.users_count(), 2);
     assert!(!state.is_empty());
     assert!(build_state(Vec::new(), true).is_empty());
+}
+
+// ─── unusable-secret classification ─────────────────────────────────
+
+/// Build a PHC string with a real random salt and a real random 32-byte
+/// key at the given cost.
+fn phc_at(params: resocks5_net::secure_auth::KdfParams) -> String {
+    use resocks5_net::secure_auth::{UserSecret, KEY_LEN};
+    let mut salt = [0u8; 16];
+    getrandom::getrandom(&mut salt).unwrap();
+    let mut key = [0u8; KEY_LEN];
+    getrandom::getrandom(&mut key).unwrap();
+    let secret = UserSecret::from_parts(salt.to_vec(), params, key).unwrap();
+    crate::auth::secret::encode_secret(&secret)
+}
+
+/// A 0.4.x-era hash at `m=5120,t=2,p=1` parses into a usable secret (it is
+/// ABOVE the new default floor), raises no startup warning, while a
+/// genuinely below-floor hash warns with the derived floor text, and an
+/// exactly-at-floor hash stays silent.
+/// Mutation: restoring the old literal `m=19456,t=2,p=1` in the warning
+/// text, or hard-coding the floor as a literal instead of deriving it from
+/// `KdfParams::DEFAULT`, fails the contained-text assert.
+#[test]
+fn pre_0_5_hash_above_the_new_floor_loads_and_warns_silently() {
+    use resocks5_net::secure_auth::KdfParams;
+    let old = KdfParams {
+        memory_kib: 5120,
+        iterations: 2,
+        parallelism: 1,
+    };
+    // (a) parses end to end and is above the new floor.
+    let secret = crate::auth::secret::parse_secret(&phc_at(old)).unwrap();
+    assert_eq!(secret.params, old);
+    assert!(secret.params.at_least(&KdfParams::DEFAULT));
+    // (b) no warning for it.
+    assert_eq!(super::unusable_secret_reason(&phc_at(old)), None);
+    // exactly-at-floor: no warning either.
+    assert_eq!(
+        super::unusable_secret_reason(&phc_at(KdfParams::DEFAULT)),
+        None
+    );
+    // (c) genuinely below floor: a warning naming the DERIVED floor.
+    let weak = KdfParams {
+        memory_kib: 4088,
+        iterations: 1,
+        parallelism: 1,
+    };
+    let reason = super::unusable_secret_reason(&phc_at(weak)).expect("below floor must warn");
+    assert!(
+        reason.contains("m=4096,t=1,p=1"),
+        "warning must carry the derived floor, got: {reason}"
+    );
 }

@@ -1,6 +1,7 @@
-//! Direct account relays data without upstream; the other policies still hold.
-//! Password is secure auth (SOCKS5 0x80) only: HTTP with a password is always
-//! 407, so HTTP is only tested anonymously.
+//! Direct accounts relay data without any upstream; the other policies
+//! still hold. The password arrives via secure auth (SOCKS5 0x80) or —
+//! per policy — clear text (SOCKS5 0x02 / HTTP Basic); the direct branch
+//! works over both protocols identically.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +10,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Instant};
+
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 
 use super::handle_client::handle_client;
 use crate::auth::test_support::creds;
@@ -97,8 +101,13 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
             assert_eq!(&reply[..2], &[5, expected]);
         }
         Protocol::Http => {
-            assert!(anonymous, "HTTP не аутентифицирует пароль");
             let mut request = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n");
+            if !anonymous {
+                request.push_str(&format!(
+                    "Proxy-Authorization: Basic {}\r\n",
+                    B64.encode(format!("alice:{password}"))
+                ));
+            }
             request.push_str("\r\n");
             let mut bytes = request.into_bytes();
             if case == Case::Direct {
@@ -288,4 +297,18 @@ async fn direct_preserves_auth_bans_and_concurrency_limits() {
     ] {
         exercise(Protocol::Socks5, case).await;
     }
+}
+
+/// Mutation: removing the HTTP direct branch — HTTP pool-only — fails the
+/// payload relay.
+#[tokio::test]
+async fn a_direct_account_works_over_http_basic() {
+    exercise(Protocol::Http, Case::Direct).await;
+}
+
+/// Mutation: an acceptor that trusts Basic without verifying logs the
+/// attacker in.
+#[tokio::test]
+async fn a_wrong_http_basic_password_is_refused() {
+    exercise(Protocol::Http, Case::WrongPassword).await;
 }

@@ -21,8 +21,9 @@ impl ConnectError {
             ),
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
             ConnectError::MethodUnsupported { .. }
-            | ConnectError::SecureAuth(_)
-            | ConnectError::Gssapi(_) => true,
+            | ConnectError::AuthFailed { .. }
+            | ConnectError::SecureAuthUnsupported
+            | ConnectError::SecureAuth(_) => true,
             ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { .. }) => true,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => true,
@@ -41,7 +42,7 @@ impl ConnectError {
     /// | SOCKS5 `ProxyRejected` REP 2 / 3 / 4 / 5 / 6 | `Forbidden` / `NetworkUnreachable` / `UpstreamUnavailable` / `ConnectionRefused` / `TimedOut` |
     /// | HTTP(S) `ProxyRejected` 403 / 504 / 502, 503 | `Forbidden` / `TimedOut` / `UpstreamUnavailable` |
     /// | other `ProxyRejected` (REP 1, 7, 8, other statuses, malformed) | `GeneralFailure` |
-    /// | HTTP 407, SOCKS5 [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream) | `GeneralFailure` |
+    /// | HTTP 407, SOCKS5 [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream), secure-auth exchange errors | `GeneralFailure` |
     /// | [`Io`](ConnectError::Io) timed out | `TimedOut` |
     /// | other [`Io`](ConnectError::Io) at [`Stage::Connect`] (the upstream itself is unreachable) | `UpstreamUnavailable` |
     /// | other [`Io`](ConnectError::Io) | `GeneralFailure` |
@@ -90,7 +91,8 @@ impl ConnectError {
             | ConnectError::InvalidTarget(_)
             | ConnectError::CleartextCredentialsRefused
             | ConnectError::SecureAuth(_)
-            | ConnectError::Gssapi(_)
+            | ConnectError::AuthFailed { .. }
+            | ConnectError::SecureAuthUnsupported
             | ConnectError::TlsFeatureMissing { .. } => Reply::GeneralFailure,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => Reply::UpstreamUnavailable,
@@ -166,6 +168,8 @@ mod tests {
             with_auth: false
         }
         .is_upstream_down());
+        assert!(ConnectError::AuthFailed { status: 1 }.is_upstream_down());
+        assert!(ConnectError::SecureAuthUnsupported.is_upstream_down());
         assert!(
             ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
                 .is_upstream_down()
@@ -173,6 +177,11 @@ mod tests {
         for violation in [
             ProtocolViolation::Socks5UnknownAddressType { got: 9 },
             ProtocolViolation::Socks5DomainTooLong { len: 256 },
+            ProtocolViolation::Socks5BadAuthVersion { got: 9 },
+            ProtocolViolation::Socks5CredentialsTooLong {
+                username_len: 256,
+                password_len: 256,
+            },
             ProtocolViolation::HttpInvalidConnectTarget,
             ProtocolViolation::HttpResponseTooLarge,
             ProtocolViolation::HttpClosedEarly,
@@ -246,6 +255,8 @@ mod tests {
                 true,
                 true,
             ),
+            (ConnectError::AuthFailed { status: 1 }, true, true),
+            (ConnectError::SecureAuthUnsupported, true, true),
             (
                 ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 }),
                 true,
@@ -258,6 +269,19 @@ mod tests {
             ),
             (
                 ConnectError::Protocol(ProtocolViolation::Socks5DomainTooLong { len: 256 }),
+                false,
+                true,
+            ),
+            (
+                ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 }),
+                false,
+                true,
+            ),
+            (
+                ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong {
+                    username_len: 256,
+                    password_len: 256,
+                }),
                 false,
                 true,
             ),
@@ -492,6 +516,16 @@ mod tests {
                     got: 0xff,
                     with_auth: true,
                 },
+                Reply::GeneralFailure,
+            ),
+            (
+                "auth failed",
+                ConnectError::AuthFailed { status: 1 },
+                Reply::GeneralFailure,
+            ),
+            (
+                "secure auth unsupported",
+                ConnectError::SecureAuthUnsupported,
                 Reply::GeneralFailure,
             ),
             (

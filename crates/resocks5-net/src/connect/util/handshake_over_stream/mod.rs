@@ -1,4 +1,9 @@
 //! SOCKS5 handshake driven over an arbitrary async stream.
+//!
+//! The greeting offers every configured method strongest first (secure auth
+//! 0x80, RFC 1929 clear text 0x02, anonymous 0x00; `secure_only` offers 0x80
+//! alone), the upstream picks, and a method 0x02 choice runs the RFC 1929
+//! username/password sub-negotiation here.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -28,8 +33,9 @@ where
     socks5_handshake(stream, parsed.host, parsed.port).await
 }
 
-/// SOCKS5 (RFC 1928) CONNECT handshake without authentication (method 0x00)
-/// over an existing stream. `host` is unbracketed:
+/// SOCKS5 (RFC 1928) CONNECT handshake over an existing stream. The greeting
+/// depends on the [`Socks5Auth`] given: the no-auth entry points of this
+/// module offer exactly method 0x00 (`[5, 1, 0]`). `host` is unbracketed:
 /// an IPv4/IPv6 literal sends ATYP 1/4, anything else a domain (ATYP 3).
 ///
 /// Takes the stream by value or as `&mut S`; every step is flushed. There
@@ -52,56 +58,46 @@ where
     if host.is_empty() || port == 0 {
         return Err(ConnectError::InvalidTarget(HostPort::format(host, port)));
     }
-    let (stream, mut gss) = socks5_greeting(stream, Socks5Auth::None).await?;
-    socks5_connect_request(stream, host, port, &mut gss).await
+    let stream = socks5_greeting(stream, Socks5Auth::anonymous()).await?;
+    socks5_connect_request(stream, host, port).await
 }
 
-/// How a SOCKS5 greeting authenticates.
+/// How a SOCKS5 greeting authenticates: the configured methods, strongest
+/// first. Secure auth (method 0x80) is offered when credentials are derived
+/// for it; RFC 1929 (method 0x02) when a clear-text pair is allowed; method
+/// 0x00 only for an entry with no credentials at all. `secure_only` offers
+/// nothing but 0x80.
 #[derive(Clone, Copy)]
-pub(crate) enum Socks5Auth<'a> {
-    /// Method 0x00.
-    None,
-    /// Strong authentication, nothing weaker: every configured method is
-    /// offered, strongest first, and the server picks (see [`Strong`]).
+pub(crate) struct Socks5Auth<'a> {
     #[cfg(feature = "secure-auth")]
-    Strong(Strong<'a>),
-    /// Only to use the lifetime when `secure-auth` is off.
-    #[cfg(not(feature = "secure-auth"))]
-    #[allow(dead_code)]
-    Unused(std::marker::PhantomData<&'a ()>),
-}
-
-/// The strong methods a client can offer, in order of preference: GSSAPI
-/// (0x01) before secure auth (0x80). Neither sends a password; anonymous and
-/// clear-text are never offered alongside them.
-#[cfg(feature = "secure-auth")]
-#[derive(Clone, Copy)]
-pub(crate) struct Strong<'a> {
-    #[cfg(feature = "gssapi")]
-    pub(crate) gssapi: Option<&'a crate::gssapi::GssCredentials>,
     pub(crate) secure: Option<&'a crate::secure_auth::SecureCredentials>,
+    pub(crate) cleartext: Option<(&'a str, &'a str)>,
+    /// Without secure credentials (`secure_only` cannot be requested then)
+    /// this is never read.
+    #[cfg_attr(not(feature = "secure-auth"), allow(dead_code))]
+    pub(crate) secure_only: bool,
 }
 
-/// The GSSAPI session of a greeting, when the server chose method 0x01: the
-/// CONNECT request and reply then travel as protected messages.
-#[cfg(feature = "gssapi")]
-pub(crate) type Gss = Option<crate::gssapi::GssSession>;
-#[cfg(not(feature = "gssapi"))]
-pub(crate) type Gss = ();
-
-#[cfg(feature = "gssapi")]
-fn no_gss() -> Gss {
-    None
+impl<'a> Socks5Auth<'a> {
+    /// Method 0x00 only.
+    pub(crate) fn anonymous() -> Self {
+        Self {
+            #[cfg(feature = "secure-auth")]
+            secure: None,
+            cleartext: None,
+            secure_only: false,
+        }
+    }
 }
-#[cfg(not(feature = "gssapi"))]
-fn no_gss() -> Gss {}
 
-/// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3): the
-/// strong methods when configured, else no authentication.
+/// Send the SOCKS5 greeting (method-selection request, RFC 1928 §3) and run
+/// whatever sub-negotiation the upstream's choice demands: every configured
+/// method is offered strongest first (secure auth 0x80, RFC 1929 0x02,
+/// anonymous 0x00; `secure_only` offers 0x80 alone), the server picks, and
+/// [`Socks5Auth`] must be able to speak it.
 ///
 /// On success the stream sits right after the method-selection (or
-/// auth-status) reply, ready for [`socks5_connect_request`] (with the returned
-/// GSSAPI session, when one was negotiated). A stall in
+/// auth-status) reply, ready for [`socks5_connect_request`]. A stall in
 /// this phase means the upstream never answered its own protocol: the
 /// CONNECT request has not been sent, so the destination cannot be the
 /// cause. Producers bound this phase with
@@ -109,77 +105,31 @@ fn no_gss() -> Gss {}
 pub(crate) async fn socks5_greeting<S>(
     mut stream: S,
     auth: Socks5Auth<'_>,
-) -> Result<(S, Gss), ConnectError>
+) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
+    // Offer every configured method, strongest first; the server's choice
+    // decides the exchange.
+    let mut offered: Vec<u8> = Vec::new();
     #[cfg(feature = "secure-auth")]
-    if let Socks5Auth::Strong(strong) = auth {
-        // Offer every configured strong method, strongest first; the server's
-        // choice decides the exchange. Nothing weaker is ever offered.
-        let mut offered: Vec<u8> = Vec::new();
-        #[cfg(feature = "gssapi")]
-        if strong.gssapi.is_some() {
-            offered.push(crate::gssapi::METHOD);
-        }
-        if strong.secure.is_some() {
-            offered.push(crate::secure_auth::METHOD);
-        }
-        if offered.is_empty() {
-            return Err(ConnectError::MethodUnsupported {
-                got: 0xFF,
-                with_auth: true,
-            });
-        }
-        let mut greeting = vec![0x05, u8::try_from(offered.len()).unwrap_or(u8::MAX)];
-        greeting.extend_from_slice(&offered);
-        stream.write_all(&greeting).await?;
-        stream.flush().await?;
-        let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await?;
-        if response[0] != 0x05 {
-            return Err(ConnectError::Protocol(
-                ProtocolViolation::Socks5BadVersion { got: response[0] },
-            ));
-        }
-        let chosen = response[1];
-        if !offered.contains(&chosen) {
-            return Err(ConnectError::MethodUnsupported {
-                got: chosen,
-                with_auth: true,
-            });
-        }
-        let io = |kind| ConnectError::Io {
-            stage: Stage::Handshake,
-            endpoint: None,
-            source: std::io::Error::from(kind),
-        };
-        #[cfg(feature = "gssapi")]
-        if chosen == crate::gssapi::METHOD {
-            let credentials = strong.gssapi.expect("offered only when configured");
-            let session = crate::gssapi::client_gssapi(&mut stream, credentials)
-                .await
-                .map_err(|error| match error {
-                    crate::GssapiError::Io(kind) => io(kind),
-                    other => ConnectError::Gssapi(other),
-                })?;
-            // Level 0: authenticated, but the request and reply are plain.
-            return Ok((stream, session.is_protected().then_some(session)));
-        }
-        let credentials = strong.secure.expect("offered only when configured");
-        crate::secure_auth::client_authenticate(&mut stream, credentials)
-            .await
-            .map_err(|error| match error {
-                crate::SecureAuthError::Io(kind) => io(kind),
-                other => ConnectError::SecureAuth(other),
-            })?;
-        return Ok((stream, no_gss()));
+    if auth.secure.is_some() {
+        offered.push(crate::secure_auth::METHOD);
     }
-    #[cfg(not(feature = "secure-auth"))]
-    let _ = auth;
-    // No authentication: method 0x00 only. A password is never sent in clear
-    // text (RFC 1929 is not implemented).
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    if auth.cleartext.is_some() {
+        offered.push(0x02);
+    }
+    if offered.is_empty() {
+        offered.push(0x00);
+    }
+    let mut greeting = vec![0x05, u8::try_from(offered.len()).unwrap_or(u8::MAX)];
+    greeting.extend_from_slice(&offered);
+    #[cfg(feature = "secure-auth")]
+    debug_assert!(
+        !auth.secure_only || offered == [crate::secure_auth::METHOD],
+        "secure_only offers nothing but method 0x80"
+    );
+    stream.write_all(&greeting).await?;
     stream.flush().await?;
     let mut response = [0u8; 2];
     stream.read_exact(&mut response).await?;
@@ -188,18 +138,85 @@ where
             ProtocolViolation::Socks5BadVersion { got: response[0] },
         ));
     }
-    if response[1] != 0x00 {
+    let chosen = response[1];
+    if !offered.contains(&chosen) {
         return Err(ConnectError::MethodUnsupported {
-            got: response[1],
-            with_auth: false,
+            got: chosen,
+            with_auth: offered != [0x00],
         });
     }
-    Ok((stream, no_gss()))
+    #[cfg(feature = "secure-auth")]
+    if chosen == crate::secure_auth::METHOD {
+        let credentials = auth.secure.expect("offered only when configured");
+        let io = |kind| ConnectError::Io {
+            stage: Stage::Handshake,
+            endpoint: None,
+            source: std::io::Error::from(kind),
+        };
+        crate::secure_auth::client_authenticate(&mut stream, credentials)
+            .await
+            .map_err(|error| match error {
+                crate::SecureAuthError::Io(kind) => io(kind),
+                other => ConnectError::SecureAuth(other),
+            })?;
+        return Ok(stream);
+    }
+    if chosen == 0x02 {
+        socks5_cleartext(
+            &mut stream,
+            auth.cleartext.expect("offered only when configured"),
+        )
+        .await?;
+        return Ok(stream);
+    }
+    Ok(stream)
+}
+
+/// The RFC 1929 username/password sub-negotiation. The upstream's answer is
+/// version byte 1 and a status byte: 0 accepts, anything else is
+/// [`ConnectError::AuthFailed`].
+///
+/// cancel-safe: NO — a cancelled sub-negotiation must close the stream.
+async fn socks5_cleartext<S>(stream: &mut S, credentials: (&str, &str)) -> Result<(), ConnectError>
+where
+    S: AsyncRead + AsyncWriteExt + Unpin,
+{
+    let (username, password) = credentials;
+    let uname = username.as_bytes();
+    let passwd = password.as_bytes();
+    if uname.len() > 255 || passwd.len() > 255 {
+        return Err(ConnectError::Protocol(
+            ProtocolViolation::Socks5CredentialsTooLong {
+                username_len: uname.len(),
+                password_len: passwd.len(),
+            },
+        ));
+    }
+    let mut auth_req = Vec::with_capacity(3 + uname.len() + passwd.len());
+    auth_req.push(0x01);
+    auth_req.push(u8::try_from(uname.len()).expect("checked above"));
+    auth_req.extend_from_slice(uname);
+    auth_req.push(u8::try_from(passwd.len()).expect("checked above"));
+    auth_req.extend_from_slice(passwd);
+    stream.write_all(&auth_req).await?;
+    stream.flush().await?;
+    let mut auth_resp = [0u8; 2];
+    stream.read_exact(&mut auth_resp).await?;
+    if auth_resp[0] != 0x01 {
+        return Err(ConnectError::Protocol(
+            ProtocolViolation::Socks5BadAuthVersion { got: auth_resp[0] },
+        ));
+    }
+    if auth_resp[1] != 0x00 {
+        return Err(ConnectError::AuthFailed {
+            status: auth_resp[1],
+        });
+    }
+    Ok(())
 }
 
 /// Send the SOCKS5 CONNECT request for `host:port` (RFC 1928 §5) and read
-/// the reply through the end of the bound address. With a GSSAPI session the
-/// request and the reply are protected messages (RFC 1961 §5).
+/// the reply through the end of the bound address.
 ///
 /// On success the stream sits right after the CONNECT reply, ready for
 /// payload. A stall waiting for the reply may still be the destination's
@@ -210,32 +227,11 @@ pub(crate) async fn socks5_connect_request<S>(
     mut stream: S,
     host: &str,
     port: u16,
-    gss: &mut Gss,
 ) -> Result<S, ConnectError>
 where
     S: AsyncRead + AsyncWriteExt + Unpin,
 {
     let req = connect_request_bytes(host, port)?;
-    #[cfg(feature = "gssapi")]
-    if let Some(session) = gss.as_mut() {
-        let gss_error = |error: crate::GssapiError| match error {
-            crate::GssapiError::Io(kind) => ConnectError::Io {
-                stage: Stage::Handshake,
-                endpoint: None,
-                source: std::io::Error::from(kind),
-            },
-            other => ConnectError::Gssapi(other),
-        };
-        session
-            .write_message(&mut stream, &req)
-            .await
-            .map_err(gss_error)?;
-        let reply = session.read_message(&mut stream).await.map_err(gss_error)?;
-        read_connect_reply(&mut reply.as_slice()).await?;
-        return Ok(stream);
-    }
-    #[cfg(not(feature = "gssapi"))]
-    let () = *gss;
     stream.write_all(&req).await?;
     stream.flush().await?;
     read_connect_reply(&mut stream).await?;
@@ -363,7 +359,7 @@ where
         stream,
         host,
         port,
-        Socks5Auth::None,
+        Socks5Auth::anonymous(),
         deadline,
         endpoint,
         after,
@@ -395,18 +391,12 @@ where
         endpoint: endpoint.to_owned(),
         after,
     };
-    let (stream, mut gss) =
-        match tokio::time::timeout_at(deadline, socks5_greeting(stream, auth)).await {
-            Ok(Ok(greeted)) => greeted,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(timed_out(TimeoutKind::Socks5Greeting)),
-        };
-    match tokio::time::timeout_at(
-        deadline,
-        socks5_connect_request(stream, host, port, &mut gss),
-    )
-    .await
-    {
+    let stream = match tokio::time::timeout_at(deadline, socks5_greeting(stream, auth)).await {
+        Ok(Ok(greeted)) => greeted,
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err(timed_out(TimeoutKind::Socks5Greeting)),
+    };
+    match tokio::time::timeout_at(deadline, socks5_connect_request(stream, host, port)).await {
         Ok(result) => result,
         Err(_) => Err(timed_out(TimeoutKind::Socks5Handshake)),
     }

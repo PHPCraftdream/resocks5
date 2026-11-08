@@ -65,7 +65,6 @@ pub fn run_user_command(action: UserAction) -> Result<()> {
     let op = match action {
         UserAction::Add { name } => add_user(&users, &name)?,
         UserAction::AddInit { name } => add_init_user(&users, &name)?,
-        UserAction::AddGssapi { principal } => add_gssapi_user(&users, &principal)?,
         UserAction::SetPassword { name } => set_password(&users, &name)?,
         UserAction::Remove { name, yes } => match remove_user(&users, &name, yes)? {
             Some(op) => op,
@@ -118,18 +117,6 @@ fn add_init_user(users: &UsersConfig, name: &str) -> Result<UserOp> {
     }))
 }
 
-/// Create a password-less account named like a Kerberos principal.
-fn add_gssapi_user(users: &UsersConfig, principal: &str) -> Result<UserOp> {
-    validate_name(principal)?;
-    if users.users.iter().any(|u| u.name == principal) {
-        bail!("user '{}' already exists", principal);
-    }
-    Ok(UserOp::Add(build_added_user(
-        principal,
-        crate::auth::state::gssapi::GSSAPI_HASH.to_string(),
-    )))
-}
-
 fn set_password(users: &UsersConfig, name: &str) -> Result<UserOp> {
     // Early existence check so the prompt is not wasted on a typo'd
     // name; re-validated against fresh disk state at commit time.
@@ -158,7 +145,7 @@ fn remove_user(users: &UsersConfig, name: &str, skip_confirm: bool) -> Result<Op
 
 fn list_users(users: &UsersConfig) -> Result<()> {
     if users.users.is_empty() {
-        println!("(no users configured — server runs without authentication)");
+        println!("(no users configured — anonymous clients are admitted only while auth.allow_anonymous is true)");
         return Ok(());
     }
     println!("{:<24} {:<10} {:<6}", "NAME", "STATUS", "MODE");

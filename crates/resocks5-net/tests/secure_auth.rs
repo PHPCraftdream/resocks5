@@ -1,6 +1,6 @@
 //! Secure auth end to end through the public API: an SDK client dials an
 //! `accept_secure` server; the password is never on the wire, a first login
-//! enrolls an `init` user, and clear-text methods are never accepted.
+//! enrolls an `init` user, and the policy switches refuse every weak method.
 
 #![cfg(feature = "secure-auth")]
 
@@ -12,7 +12,7 @@ use resocks5_net::connect::{dial, DialOptions};
 use resocks5_net::secure_auth::{
     DecoyKey, KdfParams, SecretStore, SecureCredentials, StoredUser, UserSecret,
 };
-use resocks5_net::server::{accept_secure, Reply, ServerOptions};
+use resocks5_net::server::{accept_secure, Reply, ServerError, ServerOptions};
 use resocks5_net::types::ProxyConfig;
 use resocks5_net::ConnectError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,7 +93,8 @@ async fn serve_once(
             log: Arc::clone(&recorded),
         };
         let decoy = DecoyKey::generate().unwrap();
-        let options = ServerOptions::new(Instant::now() + Duration::from_secs(10), false, true);
+        let options =
+            ServerOptions::new(Instant::now() + Duration::from_secs(10)).allow_cleartext(false);
         let user = match accept_secure(&mut socket, &options, &*store, &decoy).await {
             Ok(request) => {
                 request
@@ -244,11 +245,11 @@ async fn the_first_dial_enrolls_an_init_user() {
     .expect("bounded enrollment dial");
 }
 
-/// `accept_secure` never takes a clear-text password: SOCKS5 method 0x02 is
-/// not offered and HTTP Basic is a 407. Mutation: delegating to a clear-text
-/// path accepts them.
+/// `accept_secure` with `secure_only` options never takes a clear-text
+/// password: SOCKS5 method 0x02 is not offered and HTTP Basic is a 407.
+/// Mutation: delegating to a clear-text path accepts them.
 #[tokio::test]
-async fn accept_secure_never_takes_a_cleartext_password() {
+async fn secure_only_options_refuse_cleartext_on_accept_secure() {
     timeout(Duration::from_secs(10), async {
         let store = Store::enrolled("alice", "pw");
         for request in [
@@ -263,14 +264,15 @@ async fn accept_secure_never_takes_a_cleartext_password() {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let decoy = DecoyKey::generate().unwrap();
                 let options =
-                    ServerOptions::new(Instant::now() + Duration::from_secs(5), false, true);
+                    ServerOptions::new(Instant::now() + Duration::from_secs(5)).secure_only();
                 accept_secure(&mut socket, &options, &*store, &decoy).await
             });
             let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             client.write_all(&request).await.unwrap();
             let mut answer = Vec::new();
             let _ = client.read_to_end(&mut answer).await;
-            assert!(server.await.unwrap().is_err());
+            let error = server.await.unwrap().unwrap_err();
+            assert!(matches!(error, ServerError::Authentication(_)), "{error:?}");
             if request[0] == 5 {
                 assert_eq!(answer, [5, 255], "method 0x02 must not be chosen");
             } else {
@@ -279,9 +281,98 @@ async fn accept_secure_never_takes_a_cleartext_password() {
                     "{:?}",
                     String::from_utf8_lossy(&answer)
                 );
+                assert!(
+                    answer.windows(17).any(|w| w == b"Resocks5-Secure"),
+                    "the strong scheme must still be offered"
+                );
+                assert!(
+                    !answer.windows(5).any(|w| w == b"Basic"),
+                    "no Basic challenge: {:?}",
+                    String::from_utf8_lossy(&answer)
+                );
             }
         }
     })
     .await
     .expect("bounded clear-text refusal");
+}
+
+/// With the defaults, `accept_secure` accepts Basic against the SAME store:
+/// the correct password succeeds (identity `alice`, method Cleartext) and a
+/// wrong one is a closing 407. Mutation: verifying Basic against a separate
+/// secret store (or skipping the check) breaks one branch.
+#[tokio::test]
+async fn accept_secure_accepts_basic_against_the_same_store() {
+    timeout(Duration::from_secs(10), async {
+        let store = Store::enrolled("alice", "pw");
+        let run = |password: &'static str| {
+            let store = Arc::clone(&store);
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let decoy = DecoyKey::generate().unwrap();
+                    let options = ServerOptions::new(Instant::now() + Duration::from_secs(5));
+                    accept_secure(&mut socket, &options, &*store, &decoy).await
+                });
+                let header = format!(
+                    "CONNECT example.test:443 HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n",
+                    base64_of(&format!("alice:{password}")),
+                );
+                let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                client.write_all(header.as_bytes()).await.unwrap();
+                let mut answer = Vec::new();
+                let _ = client.read_to_end(&mut answer).await;
+                (server.await.unwrap(), answer)
+            }
+        };
+
+        let (request, answer) = run("pw").await;
+        let request = request.unwrap();
+        assert_eq!(request.username(), Some("alice"));
+        assert_eq!(
+            request.auth_method(),
+            resocks5_net::server::AuthMethod::Cleartext
+        );
+        assert!(answer.is_empty(), "no reply before the host's: {answer:?}");
+
+        let (result, answer) = run("wrong").await;
+        assert!(matches!(result, Err(ServerError::Authentication(_))));
+        assert!(
+            answer.starts_with(b"HTTP/1.1 407 "),
+            "{:?}",
+            String::from_utf8_lossy(&answer)
+        );
+    })
+    .await
+    .expect("bounded Basic acceptance");
+}
+
+/// RFC 4648 base64 of `text`, padding included.
+fn base64_of(text: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }

@@ -89,6 +89,27 @@ fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> any
     }
 }
 
+/// Map the app's auth config onto the SDK server options.
+///
+/// `secure_only` means "our method only": secure auth (SOCKS5 0x80 /
+/// HTTP `Resocks5-Secure`) is the only accepted method — no anonymous, no
+/// clear text. Otherwise clear text (0x02 / Basic) is always offered
+/// against the same stored secret, and anonymous access follows the
+/// `allow_anonymous` config flag. The server always selects the strongest
+/// method the client supports.
+pub(crate) fn server_options(
+    deadline: Instant,
+    auth: &AuthState,
+) -> resocks5_net::server::ServerOptions {
+    if auth.secure_only {
+        resocks5_net::server::ServerOptions::new(deadline).secure_only()
+    } else {
+        resocks5_net::server::ServerOptions::new(deadline)
+            .allow_anonymous(auth.allow_anonymous)
+            .allow_cleartext(true)
+    }
+}
+
 /// Parse/authenticate once under the listener-supplied accept deadline, then route egress.
 ///
 /// cancel-safe: NO — owns the client stream and closes it on failure/cancellation;
@@ -117,45 +138,16 @@ pub async fn handle_client(
     let peer_ip = client_stream.peer_addr().ok().map(|a| a.ip());
     #[cfg(test)]
     stage_probe::emit("client_handler_started");
-    let options = resocks5_net::server::ServerOptions::new(
-        client_deadline,
-        auth.allow_anonymous,
-        !auth.is_empty(),
-    );
-    // Secure auth only: no clear-text password is offered or accepted. The
-    // per-connection store applies the user's allowed_clients rule, so a
-    // filtered peer gets the decoy and cannot enroll an init account.
+    let options = server_options(client_deadline, auth);
+    // One per-connection store serves the secure method (0x80 /
+    // Resocks5-Secure) AND — unless `secure_only` — the clear-text method
+    // (0x02 / Basic), both checked against the SAME stored secret. The
+    // store also applies the user's allowed_clients rule: a filtered peer
+    // is answered like a wrong password and can never claim an init
+    // account.
     let store = auth.peer_store(peer_ip);
-    #[cfg(feature = "gssapi")]
-    let methods = {
-        let methods = resocks5_net::server::AuthMethods::secure(&store, auth.decoy());
-        match auth.gssapi_acceptor() {
-            Some(acceptor) => methods.with_gssapi(acceptor),
-            None => methods,
-        }
-    };
-    #[cfg(not(feature = "gssapi"))]
     let methods = resocks5_net::server::AuthMethods::secure(&store, auth.decoy());
-    #[cfg_attr(not(feature = "gssapi"), allow(unused_mut))]
-    let mut req = resocks5_net::server::accept_with(&mut client_stream, &options, &methods).await?;
-    #[cfg(feature = "gssapi")]
-    if req.auth_method() == resocks5_net::server::AuthMethod::Gssapi {
-        // The principal is the identity; the account of that name (enabled,
-        // IP-admitted) is what everything downstream sees.
-        let principal = req.username().map(str::to_owned).unwrap_or_default();
-        match auth.gssapi_account(&principal, peer_ip) {
-            Some(account) => req.set_identity(account),
-            None => {
-                let _ = req
-                    .reply(&mut client_stream, resocks5_net::server::Reply::Forbidden)
-                    .await;
-                return Err(resocks5_net::server::ServerError::Authentication(
-                    "GSSAPI principal has no enabled account".to_owned(),
-                )
-                .into());
-            }
-        }
-    }
+    let req = resocks5_net::server::accept_with(&mut client_stream, &options, &methods).await?;
     match req.protocol() {
         resocks5_net::server::Protocol::Socks5 => {
             handle_socks5_client(
@@ -180,6 +172,7 @@ pub async fn handle_client(
             handle_http_client(
                 client_stream,
                 req,
+                auth,
                 gate_rotator,
                 v6_rotator,
                 v4_rotator,
@@ -189,6 +182,7 @@ pub async fn handle_client(
                 frag,
                 network,
                 tls_connector,
+                direct_limiter,
                 client_deadline,
             )
             .await

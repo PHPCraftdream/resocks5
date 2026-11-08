@@ -261,7 +261,7 @@ async fn strict_reject(
 #[tokio::test]
 async fn strict_end_to_end_rejects_per_rule_class() {
     timeout(Duration::from_secs(10), async {
-        let opts = || options(false, true).strict_http(true);
+        let opts = || anon_options(false).strict_http(true);
         let token = "dXNlcjpwYXNz"; // base64("user:pass")
 
         // (1) Malformed request line (two spaces).
@@ -349,7 +349,7 @@ async fn strict_end_to_end_rejects_per_rule_class() {
 #[tokio::test]
 async fn strict_end_to_end_authority_grammar_and_field_values() {
     timeout(Duration::from_secs(10), async {
-        let opts = || options(false, true).strict_http(true);
+        let opts = || anon_options(false).strict_http(true);
         let token = "dXNlcjpwYXNz"; // base64("user:pass")
         let auth = format!("Proxy-Authorization: Basic {token}");
 
@@ -418,7 +418,7 @@ async fn strict_end_to_end_authority_grammar_and_field_values() {
             );
             let (mut peer, mut server) = duplex(4096);
             peer.write_all(&frame).await.unwrap();
-            let result = accept(&mut server, &options(true, false).strict_http(true)).await;
+            let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
             drop(server);
             peer.read_to_end(&mut Vec::new()).await.unwrap();
             let req = result.expect("strict authority accepted");
@@ -433,7 +433,7 @@ async fn strict_end_to_end_authority_grammar_and_field_values() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         assert_eq!(result.expect("HTAB value accepted").target(), "h:443");
@@ -458,7 +458,7 @@ async fn strict_on_accepts_browser_and_curl_requests() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("browser-like strict request accepted");
@@ -469,7 +469,7 @@ async fn strict_on_accepts_browser_and_curl_requests() {
         let frame = http_req("CONNECT h:443 HTTP/1.0", &[], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("curl-like strict request accepted");
@@ -495,7 +495,7 @@ async fn strict_on_anonymous_and_pipelined_payload() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let mut req = result.expect("anonymous strict request accepted");
@@ -515,7 +515,7 @@ async fn strict_on_keeps_bracketed_ipv6_target() {
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
         // Anonymous access is allowed, so a request with no credentials passes.
-        let result = accept(&mut server, &options(true, true).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("bracketed IPv6 strict request accepted");
@@ -540,12 +540,13 @@ async fn strict_on_still_answers_407_when_anonymous_is_not_allowed() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(false, true).strict_http(true)).await;
+        let result = accept(&mut server, &anon_options(false).strict_http(true)).await;
         drop(server);
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         assert!(matches!(result, Err(ServerError::Authentication(_))));
-        assert_eq!(response, EXPECT_HTTP_407);
+        // No scheme is enabled on this server: the bare closing 407.
+        assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     })
     .await
     .expect("bounded strict_on_still_answers_407_when_anonymous_is_not_allowed");
@@ -556,12 +557,12 @@ async fn strict_on_still_answers_407_when_anonymous_is_not_allowed() {
 async fn strict_off_default_keeps_lenient_behaviour() {
     timeout(Duration::from_secs(10), async {
         // White-box: the flag defaults off and strict_http(false) matches the default.
-        assert!(!options(false, true).strict_http);
-        assert!(!ServerOptions::new(Instant::now(), true, true).strict_http);
-        let off = options(false, true).strict_http(false);
+        assert!(!anon_options(false).strict_http);
+        assert!(!ServerOptions::new(Instant::now()).strict_http);
+        let off = anon_options(false).strict_http(false);
         assert!(!off.strict_http);
-        assert_eq!(off.anonymous, options(false, true).anonymous);
-        assert_eq!(off.users, options(false, true).users);
+        assert_eq!(off.anonymous, anon_options(false).anonymous);
+        assert_eq!(off.cleartext, anon_options(false).cleartext);
 
         // Lenient pins, all with the flag off.
         let lenient = [
@@ -604,7 +605,7 @@ async fn strict_off_default_keeps_lenient_behaviour() {
         for (frame, want_target) in lenient {
             let (mut peer, mut server) = duplex(4096);
             peer.write_all(&frame).await.unwrap();
-            let result = accept(&mut server, &options(true, false)).await;
+            let result = accept(&mut server, &anon_options(true)).await;
             drop(server);
             peer.read_to_end(&mut Vec::new()).await.unwrap();
             let req = result.expect("lenient request accepted");
@@ -618,12 +619,12 @@ async fn strict_off_default_keeps_lenient_behaviour() {
         let frame = http_req("CONNECT h:1 HTTP/1.1", &[first, second], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, true)).await;
+        let result = accept(&mut server, &anon_options(true)).await;
         drop(server);
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         assert!(matches!(result, Err(ServerError::Authentication(_))));
-        assert_eq!(response, EXPECT_HTTP_407);
+        assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     })
     .await
     .expect("bounded strict_off_default_keeps_lenient_behaviour");
@@ -634,12 +635,12 @@ async fn strict_off_default_keeps_lenient_behaviour() {
 async fn strict_http_options_chain_deadline_and_copy() {
     timeout(Duration::from_secs(10), async {
         // White-box: default off.
-        assert!(!options(false, true).strict_http);
+        assert!(!anon_options(false).strict_http);
 
-        let opts = options(false, true).strict_http(true);
+        let opts = anon_options(false).strict_http(true);
         assert!(opts.strict_http);
         assert!(!opts.anonymous);
-        assert!(opts.users);
+        assert!(opts.cleartext);
 
         // Copy semantics: reading through both after the copy compiles only for Copy.
         let copy = opts;
@@ -647,7 +648,10 @@ async fn strict_http_options_chain_deadline_and_copy() {
         assert!(opts.strict_http);
 
         // An expired deadline refuses BEFORE any strict check.
-        let expired = ServerOptions::new(Instant::now(), true, true).strict_http(true);
+        let expired = ServerOptions::new(Instant::now())
+            .allow_anonymous(true)
+            .allow_cleartext(true)
+            .strict_http(true);
         let frame = http_req("CONNECT h:443 HTTP/1.1", &["Host: h:443"], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
@@ -666,7 +670,7 @@ async fn strict_http_leaves_socks5_untouched() {
     timeout(Duration::from_secs(10), async {
         // Anonymous is enabled: the no-auth client offers method 0 only, the
         // password client method 2 only, which is never selected.
-        let opts = options(true, true).strict_http(true);
+        let opts = anon_options(true).strict_http(true);
 
         // (a) No-auth SOCKS5.
         let (mut peer, mut server) = duplex(4096);

@@ -1,20 +1,23 @@
-//! Inbound user authentication: secure auth (SOCKS5 method 0x80, see
-//! `resocks5_net::secure_auth`). The password never crosses the wire and is
-//! never stored: `resocks5.users.ktav` keeps, per user, the Argon2id salt,
+//! Inbound user authentication: ONE stored secret per user verifies BOTH
+//! methods. `resocks5.users.ktav` keeps, per user, the Argon2id salt,
 //! parameters and the derived key `K` (an Argon2id v19 PHC string, see
-//! `secret`), and a login is a mutual HMAC challenge-response over `K`.
-//! Hashes written by earlier versions are exactly such strings, so existing
-//! accounts keep working; the client derives `K` (Argon2) once per login, the
-//! server only computes HMACs.
+//! `secret`).
 //!
-//! A user stored as `init` is enrolled by its first client: the client sends
-//! `K` sealed under an ephemeral X25519 key exchange, the server stores it
-//! (once, atomically, also across processes) and from then on the account is
-//! a normal one.
+//! - Secure auth (SOCKS5 method 0x80, HTTP `Resocks5-Secure`, see
+//!   `resocks5_net::secure_auth`): a mutual HMAC challenge-response over
+//!   `K`. The password never crosses the wire and is never stored.
+//! - Clear text (SOCKS5 0x02 RFC 1929 UNAME/PASSWD, HTTP Basic): the
+//!   client sends the password, the server derives
+//!   Argon2id(password, salt, params) and constant-time compares it to
+//!   the stored `K`. Clear text is ALWAYS accepted by default; with
+//!   `auth.secure_only: true` only the secure method is served.
 //!
-//! Clear-text passwords (SOCKS5 UNAME/PASSWD, HTTP Basic) are never accepted
-//! from clients. Unknown, disabled and IP-filtered users are answered with a
-//! decoy that fails exactly like a wrong password.
+//! A user stored as `init` is enrolled by its first successful login over
+//! EITHER method: the secret is stored (once, atomically, also across
+//! processes) and from then on the account is a normal one.
+//!
+//! Unknown, disabled and IP-filtered users are answered with a decoy in
+//! both paths that fails exactly like a wrong password.
 
 pub mod compute_hash;
 pub(crate) mod params;

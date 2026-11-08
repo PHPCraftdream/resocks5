@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, Result};
-use resocks5_net::secure_auth::{DecoyKey, KdfParams, StoredUser};
+use resocks5_net::secure_auth::{DecoyKey, DerivationLimiter, KdfParams, StoredUser};
 use tokio::sync::Semaphore;
 
 use crate::auth::params::enrollment_floor;
@@ -11,7 +11,7 @@ use crate::auth::secret::parse_secret;
 use crate::config::{AuthConfig, User, UsersConfig};
 
 mod claim;
-pub(crate) mod gssapi;
+mod password_cache;
 mod store;
 
 pub(crate) use claim::INIT_HASH;
@@ -31,7 +31,7 @@ struct UserEntry {
 
 /// Server-side auth bundle, built once at startup and shared with each
 /// connection-handling task via `Arc<AuthState>`: the users list as loaded
-/// from disk, the policy flag, and the decoy key for unknown names. Each
+/// from disk, the policy flags, and the decoy key for unknown names. Each
 /// connection authenticates through a [`PeerStore`] (`peer_store`), which
 /// adds the user's `allowed_clients` rule for that peer.
 ///
@@ -68,6 +68,10 @@ pub struct AuthState {
     /// (and serves HTTP without Proxy-Authorization); when `false`, only
     /// authenticated clients are accepted.
     pub allow_anonymous: bool,
+    /// Mirrors `auth.secure_only` from `resocks5.main.ktav` — when
+    /// `true`, only the secure method is offered (no clear text, no
+    /// anonymous).
+    pub secure_only: bool,
     /// Answers unknown, disabled and filtered names like a wrong password.
     decoy: DecoyKey,
     /// The cheapest derivation an enrollment may use.
@@ -75,9 +79,16 @@ pub struct AuthState {
     /// Path to `resocks5.users.ktav` (parameter so tests can point at a
     /// temp file). Used only by enrollment.
     users_path: String,
-    /// GSSAPI acceptor, when `auth.gssapi_service` is set.
-    #[cfg(feature = "gssapi")]
-    gssapi: Option<resocks5_net::gssapi::GssAcceptor>,
+    /// Verified-credential cache for the clear-text login path: tags only
+    /// (see `password_cache`), so no password or key is ever stored.
+    password_cache: password_cache::PasswordCache,
+    /// Caps the Argon2id derivations of cache misses: the SDK's process-wide
+    /// server-side limiter in production, a private one per state in tests
+    /// (so saturation tests never disturb a test running beside them).
+    limiter: Arc<DerivationLimiter>,
+    /// Test-only: real stored-user derivations issued by the clear-text path.
+    #[cfg(test)]
+    derive_counter: std::sync::atomic::AtomicU64,
 }
 
 impl AuthState {
@@ -111,22 +122,31 @@ impl AuthState {
             });
         }
         warn_unusable_secrets(&users.users, &users_path);
-        #[cfg(feature = "gssapi")]
-        let gssapi = gssapi::configured_acceptor(auth_cfg)?;
-        #[cfg(not(feature = "gssapi"))]
-        gssapi::refuse_without_support(auth_cfg)?;
+        let password_cache = password_cache::PasswordCache::generate()
+            .map_err(|e| anyhow!("password cache master key: {e}"))?;
         Ok(Self {
             users: RwLock::new(users.users.clone()),
             claim_lock: Mutex::new(()),
             entries,
             claim_slots: Arc::new(Semaphore::new(2)),
             allow_anonymous: auth_cfg.allow_anonymous,
+            secure_only: auth_cfg.secure_only,
             decoy: DecoyKey::generate().map_err(|e| anyhow!("decoy key: {e}"))?,
             enrollment_floor: enrollment_floor(),
             users_path,
-            #[cfg(feature = "gssapi")]
-            gssapi,
+            password_cache,
+            limiter: Arc::clone(resocks5_net::secure_auth::derivation_limiter()),
+            #[cfg(test)]
+            derive_counter: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Test-only: how many real stored-user derivations the clear-text path
+    /// has issued.
+    #[cfg(test)]
+    pub(crate) fn derive_count(&self) -> u64 {
+        self.derive_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// True when no users are configured.
@@ -188,26 +208,33 @@ impl AuthState {
     }
 }
 
-/// Startup notice for accounts no client can log in to: a stored value that
-/// is not a usable secret, or one derived more cheaply than a default client
-/// accepts. Names only, never the values.
+/// Why an enabled user's stored value is not usable by any client: a
+/// parse failure, or derivation below the client floor. Names only, never
+/// the values.
+pub(crate) fn unusable_secret_reason(hash: &str) -> Option<String> {
+    let KdfParams {
+        memory_kib,
+        iterations,
+        parallelism,
+    } = KdfParams::DEFAULT;
+    let floor = format!("m={memory_kib},t={iterations},p={parallelism}");
+    match parse_secret(hash) {
+        Err(e) => Some(format!(
+            "stored hash unusable ({e}); reset it with `resocks5 user set-password`"
+        )),
+        Ok(secret) if !secret.params.at_least(&KdfParams::DEFAULT) => Some(format!(
+            "secret derived below the client default ({floor}); \
+             default clients refuse it — reset it with `resocks5 user set-password`"
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// Startup notice for accounts no client can log in to.
 fn warn_unusable_secrets(users: &[User], users_path: &str) {
-    for user in users
-        .iter()
-        .filter(|u| u.is_enabled && u.hash != INIT_HASH && u.hash != gssapi::GSSAPI_HASH)
-    {
-        match parse_secret(&user.hash) {
-            Err(e) => eprintln!(
-                "{users_path}: user {:?}: stored hash unusable ({e}); \
-                 reset it with `resocks5 user set-password`",
-                user.name
-            ),
-            Ok(secret) if !secret.params.at_least(&KdfParams::DEFAULT) => eprintln!(
-                "{users_path}: user {:?}: secret derived below the client default \
-                 (m=19456,t=2,p=1); default clients refuse it — reset it with `resocks5 user set-password`",
-                user.name
-            ),
-            Ok(_) => {}
+    for user in users.iter().filter(|u| u.is_enabled && u.hash != INIT_HASH) {
+        if let Some(reason) = unusable_secret_reason(&user.hash) {
+            eprintln!("{users_path}: user {:?}: {reason}", user.name);
         }
     }
 }

@@ -383,11 +383,11 @@ async fn secure_auth_modes_report_exact_errors_over_memory() {
             mock.connect_in_memory(),
             "auth.test",
             443,
-            Socks5Auth::Strong(crate::connect::handshake_over_stream::Strong {
-                #[cfg(feature = "gssapi")]
-                gssapi: None,
+            Socks5Auth {
                 secure: Some(&credentials),
-            }),
+                cleartext: None,
+                secure_only: false,
+            },
             deadline,
             "mock:0",
             Duration::from_secs(60),
@@ -412,11 +412,11 @@ async fn secure_auth_modes_report_exact_errors_over_memory() {
             mock.connect_in_memory(),
             "auth.test",
             443,
-            Socks5Auth::Strong(crate::connect::handshake_over_stream::Strong {
-                #[cfg(feature = "gssapi")]
-                gssapi: None,
+            Socks5Auth {
                 secure: Some(&credentials),
-            }),
+                cleartext: None,
+                secure_only: false,
+            },
             deadline,
             "mock:0",
             Duration::from_secs(60),
@@ -476,4 +476,221 @@ async fn http_secure_auth_modes_reject_with_407() {
             }
         ));
     }
+}
+
+/// Cheap derivation cost matching the client's default KDF floor
+/// ([`KdfParams::DEFAULT`]): anything cheaper is rejected by
+/// `SecureCredentials::new` before the exchange even starts.
+#[cfg(feature = "secure-auth")]
+const CHEAP: crate::secure_auth::KdfParams = crate::secure_auth::KdfParams {
+    memory_kib: 4096,
+    iterations: 1,
+    parallelism: 1,
+};
+
+/// The secure mock answers an offer of [0x80, 0x02] with secure auth: the
+/// dial succeeds and the CONNECT is recorded.
+/// Mutation: offering clear text first (or dropping 0x80) changes the greeting bytes.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn the_secure_mock_picks_secure_over_cleartext() {
+    use crate::connect::handshake_over_stream::{socks5_handshake_bounded, Socks5Auth};
+    use crate::secure_auth::{SecureCredentials, UserSecret};
+
+    let mock = MockUpstream::socks5()
+        .auth(MockAuth::Secure {
+            user: "alice".into(),
+            secret: UserSecret::from_password("pw", CHEAP).unwrap(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let proxy = mock.proxy().with_auth("alice", "pw");
+    assert_echo(dial(&proxy).await.unwrap()).await;
+    assert_eq!(mock.targets(), ["example.test:443"]);
+
+    // Greeting bytes over a raw duplex: 2 methods, strongest first.
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let creds = SecureCredentials::new("alice", "pw");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let task = tokio::spawn(async move {
+        socks5_handshake_bounded(
+            client,
+            "greet.test",
+            443,
+            Socks5Auth {
+                secure: Some(&creds),
+                cleartext: Some(("alice", "pw")),
+                secure_only: false,
+            },
+            deadline,
+            "mem:0",
+            Duration::from_secs(10),
+        )
+        .await
+    });
+    let mut greeting = [0u8; 4];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x02, 0x80, 0x02]);
+    task.abort();
+}
+
+/// The cleartext mock answers an offer of [0x80, 0x02] with RFC 1929 and
+/// verifies the exact sub-negotiation bytes.
+/// Mutation: sending a wrong status byte fails the dial with ConnectError::AuthFailed.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn the_cleartext_mock_upgrades_the_client_to_0x02() {
+    use crate::connect::handshake_over_stream::{socks5_handshake_bounded, Socks5Auth};
+    use crate::secure_auth::SecureCredentials;
+
+    let mock = MockUpstream::socks5()
+        .auth(MockAuth::Cleartext {
+            user: "bob".into(),
+            password: "bpw".into(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let proxy = mock.proxy().with_auth("bob", "bpw");
+    assert_echo(dial(&proxy).await.unwrap()).await;
+    assert_eq!(mock.targets(), ["example.test:443"]);
+
+    // Raw variant: observe the greeting and the exact RFC 1929 request.
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let creds = SecureCredentials::new("bob", "bpw");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let task = tokio::spawn(async move {
+        socks5_handshake_bounded(
+            client,
+            "greet.test",
+            443,
+            Socks5Auth {
+                secure: Some(&creds),
+                cleartext: Some(("bob", "bpw")),
+                secure_only: false,
+            },
+            deadline,
+            "mem:0",
+            Duration::from_secs(10),
+        )
+        .await
+    });
+    let mut greeting = [0u8; 4];
+    peer.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x02, 0x80, 0x02]);
+    peer.write_all(&[0x05, 0x02]).await.unwrap();
+    let mut sub = [0u8; 9];
+    peer.read_exact(&mut sub).await.unwrap();
+    assert_eq!(sub, [1, 3, b'b', b'o', b'b', 3, b'b', b'p', b'w']);
+    peer.write_all(&[1, 0]).await.unwrap();
+    let mut head = [0u8; 4];
+    peer.read_exact(&mut head).await.unwrap();
+    assert_eq!(head, [0x05, 0x01, 0x00, 0x03]);
+    let mut rest = [0u8; 13]; // len + "greet.test" + port
+    peer.read_exact(&mut rest).await.unwrap();
+    peer.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// A `secure_only` entry never falls back to RFC 1929: the pre-flight
+/// refuses before any byte.
+/// Mutation: falling back to 0x02 makes the dial succeed.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn secure_only_client_refuses_a_cleartext_only_upstream() {
+    let mock = MockUpstream::socks5()
+        .auth(MockAuth::Cleartext {
+            user: "bob".into(),
+            password: "bpw".into(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let proxy = mock.proxy().with_auth("bob", "bpw").secure_only();
+    let error = dial(&proxy).await.unwrap_err();
+    assert!(
+        matches!(error, ConnectError::SecureAuthUnsupported),
+        "{error:?}"
+    );
+    assert!(mock.targets().is_empty());
+}
+
+/// HTTP clear text against the mock: a user/password entry sends Basic in its
+/// first CONNECT and the mock tunnels it.
+/// Mutation: rejecting a Basic first request (answering only a probe) strands
+/// the client — the 0.4.x single-round behaviour is what this pins.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn http_cleartext_upgrade_against_the_mock() {
+    use crate::connect::http_connect_handshake;
+    let mock = MockUpstream::http()
+        .auth(MockAuth::Cleartext {
+            user: "carol".into(),
+            password: "cpw".into(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let mut peer = mock.connect_in_memory();
+    let proxy = mock.proxy().with_auth("carol", "cpw");
+    http_connect_handshake(&mut peer, "upgrade.test:443", &proxy)
+        .await
+        .unwrap();
+    assert_eq!(mock.targets(), ["upgrade.test:443"]);
+}
+
+/// A `secure_only` HTTP entry refuses a Basic-only 407 before any password
+/// byte.
+/// Mutation: falling back to Basic makes the handshake succeed.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn http_secure_only_refuses_without_resocks5_secure() {
+    use crate::connect::http_connect_handshake;
+    let mock = MockUpstream::http()
+        .auth(MockAuth::Cleartext {
+            user: "carol".into(),
+            password: "cpw".into(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let mut peer = mock.connect_in_memory();
+    let proxy = mock.proxy().with_auth("carol", "cpw").secure_only();
+    let error = http_connect_handshake(&mut peer, "upgrade.test:443", &proxy)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ConnectError::SecureAuthUnsupported),
+        "{error:?}"
+    );
+    assert!(mock.targets().is_empty());
+}
+
+/// The HTTP secure upgrade runs the real exchange against the mock's
+/// secure-auth store, including the final-token verification of the 200.
+/// Mutation: skipping the final-token verification (or answering the bare
+/// probe with a closing 407) fails this handshake.
+#[cfg(feature = "secure-auth")]
+#[tokio::test]
+async fn http_secure_upgrade_runs_the_real_exchange() {
+    use crate::connect::http_connect_handshake;
+    let mock = MockUpstream::http()
+        .auth(MockAuth::Secure {
+            user: "alice".into(),
+            secret: crate::secure_auth::UserSecret::from_password("pw", CHEAP).unwrap(),
+        })
+        .spawn()
+        .await
+        .unwrap();
+    let mut peer = mock.connect_in_memory();
+    // `secure_only`: a plain `with_auth` entry sends Basic first (the mock
+    // would accept it) and never reaches the secure rounds.
+    let proxy = mock.proxy().with_auth("alice", "pw").secure_only();
+    http_connect_handshake(&mut peer, "secure.test:443", &proxy)
+        .await
+        .unwrap();
+    assert_eq!(mock.targets(), ["secure.test:443"]);
 }

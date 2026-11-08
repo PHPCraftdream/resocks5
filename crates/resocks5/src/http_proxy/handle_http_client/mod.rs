@@ -3,10 +3,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use regex::RegexSet;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use tokio_rustls::TlsConnector;
 
+use crate::auth::AuthState;
 use crate::config::{NetworkConfig, TlsFragmentConfig};
 use crate::logger::Logger;
 use crate::server;
@@ -26,6 +28,7 @@ use recovery::{ipv4_literal_port, recover_and_tunnel_http};
 pub async fn handle_http_client(
     mut client_stream: TcpStream,
     mut req: IncomingRequest,
+    auth: &Arc<AuthState>,
     gate_rotator: &Arc<GateLevels>,
     v6_rotator: &Option<Arc<ProxyRotator>>,
     v4_rotator: &Option<Arc<ProxyRotator>>,
@@ -35,23 +38,49 @@ pub async fn handle_http_client(
     frag: &Arc<TlsFragmentConfig>,
     network: &Arc<NetworkConfig>,
     tls_connector: Option<&TlsConnector>,
+    direct_limiter: &Arc<Semaphore>,
     client_deadline: Instant,
 ) -> Result<()> {
     let pipeline = req.take_pipeline();
     let target_addr = req.target();
-    // Over HTTP the SDK serves anonymous clients only (a Proxy-Authorization
-    // header is a 407, see `http_requests_accepted_by_the_app_never_carry_an_identity`),
-    // so there is no account here and no direct-routing privilege: HTTP always
-    // goes through the pool.
     let client_user = req.username();
 
+    // If the authenticated user has direct=true, bypass the pool and
+    // connect straight to the target. Anonymous clients NEVER take the
+    // direct path. Over HTTP the identity arrives via Basic or
+    // `Resocks5-Secure`, exactly like SOCKS5.
+    let is_direct = client_user.is_some_and(|user| auth.is_direct(user));
+
+    // Acquire a direct-limiter permit when taking the bypass path.
+    // Held until this function returns so it covers the full tunnel
+    // lifetime. `None` for the pool path.
+    let _direct_permit = if is_direct {
+        let user_owned = client_user.expect("is_direct implies a named user");
+        match direct_limiter.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                let cap = network.max_concurrent_direct;
+                logger.connection_error(|| {
+                    format!(
+                        "Direct cap reached ({}) — dropping client={} target={}",
+                        cap, user_owned, target_addr
+                    )
+                });
+                let _ = req.reply(&mut client_stream, Reply::Overloaded).await;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     // ── SNI/Host recovery ───────────────────────────────────────────
-    // When the CONNECT target is a bare IPv4 literal and recovery is
-    // enabled, recover the intended hostname from the client's first
-    // record (pipelined ClientHello, or the first read) and address the
-    // upstream by that domain. See `recover_host_from_payload` in
-    // NetworkConfig.
-    if network.recover_host_from_payload {
+    // Pool-routed clients only (never direct). When the CONNECT target
+    // is a bare IPv4 literal and recovery is enabled, recover the
+    // intended hostname from the client's first record (pipelined
+    // ClientHello, or the first read) and address the upstream by that
+    // domain. See `recover_host_from_payload` in NetworkConfig.
+    if !is_direct && network.recover_host_from_payload {
         if let Some(port) = ipv4_literal_port(target_addr) {
             return recover_and_tunnel_http(
                 client_stream,
@@ -75,29 +104,47 @@ pub async fn handle_http_client(
         }
     }
 
-    let proxy_stream = match server::establish_connection(
-        target_addr,
-        gate_rotator,
-        v6_rotator,
-        v4_rotator,
-        logger,
-        banned,
-        pool,
-        network,
-        client_user,
-        tls_connector,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let resp = if banned.is_match(target_addr) {
-                Reply::Forbidden
-            } else {
-                Reply::UpstreamUnavailable
-            };
-            let _ = req.reply(&mut client_stream, resp).await;
-            return Err(e);
+    let proxy_stream = if is_direct {
+        let user_owned = client_user.expect("is_direct implies a named user");
+        match crate::server::establish_direct(target_addr, banned, logger, network, user_owned)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let resp = if banned.is_match(target_addr) {
+                    Reply::Forbidden
+                } else {
+                    Reply::UpstreamUnavailable
+                };
+                let _ = req.reply(&mut client_stream, resp).await;
+                return Err(e);
+            }
+        }
+    } else {
+        match server::establish_connection(
+            target_addr,
+            gate_rotator,
+            v6_rotator,
+            v4_rotator,
+            logger,
+            banned,
+            pool,
+            network,
+            client_user,
+            tls_connector,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let resp = if banned.is_match(target_addr) {
+                    Reply::Forbidden
+                } else {
+                    Reply::UpstreamUnavailable
+                };
+                let _ = req.reply(&mut client_stream, resp).await;
+                return Err(e);
+            }
         }
     };
 

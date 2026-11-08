@@ -31,6 +31,7 @@ pub use main::FileLogConfig;
 pub use main::MainConfig;
 pub use main::NetworkConfig;
 pub use main::TlsFragmentConfig;
+pub use main::UpstreamAuthConfig;
 pub use main::{HEALTH_PATH, MAIN_PATH};
 pub use proxy_list::ProxyListConfig;
 pub use proxy_list::PROXY_LIST_PATH;

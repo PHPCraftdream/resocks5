@@ -15,14 +15,6 @@ publish = false
 [features]
 # Counters #208 are enabled only in unit tests; the production API is unchanged.
 test-instrumentation = ["resocks5-net/test-instrumentation"]
-# GSSAPI (Kerberos) authentication of inbound clients and of SOCKS5 upstreams:
-# the protocol and the account mapping. Without a backend (below) a server
-# configured for GSSAPI refuses to start.
-gssapi = ["resocks5-net/gssapi"]
-# The system Kerberos backend (MIT Kerberos / Heimdal through libgssapi); needs
-# the platform GSS-API library and its headers to build. Not in the release
-# binaries.
-gssapi-system = ["gssapi", "resocks5-net/gssapi-system"]
 
 [dependencies]
 # `version` is what a registry build would resolve from crates.io (`path` is
@@ -41,6 +33,11 @@ argon2.workspace = true
 clap.workspace = true
 rpassword.workspace = true
 ktav.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

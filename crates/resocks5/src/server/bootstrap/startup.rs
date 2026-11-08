@@ -51,59 +51,52 @@ pub(crate) fn has_usable_route(has_v4_rotator: bool, has_v6_rotator: bool) -> bo
 /// dropped because it failed to parse. The warning names the list and the
 /// 1-based line number only — never the line's text, which can carry
 /// `user:pass` credentials.
-fn parse_proxy_list(list_name: &str, list: &[String], proto: ProxyProtocol) -> Vec<ProxyConfig> {
-    let (parsed, failed) = parse_proxy_list_checked(list, proto);
+///
+/// Entries keep their parsed `user`/`password`. A SOCKS5 entry upgrades
+/// automatically (method 0x80 offered first, 0x02 after it, the upstream
+/// picks); an HTTP/HTTPS entry sends Basic in its first request, as 0.4.x
+/// did. `;secure_only` on an entry — or the global
+/// `upstream_auth.secure_only` switch — forces our-method-only for it.
+fn parse_proxy_list(
+    list_name: &str,
+    list: &[String],
+    proto: ProxyProtocol,
+    upstream_secure_only: bool,
+) -> Vec<ProxyConfig> {
+    let (parsed, failed) = parse_proxy_list_checked(list, proto, upstream_secure_only);
     for line_no in &failed {
+        // A malformed `;secure_only` flag gets its own message; everything
+        // else is the generic parse failure. Both redact the entry.
+        if let Some(line) = list.get(line_no - 1) {
+            if split_secure_only_option(line).is_err() {
+                println!(
+                    "warning: {list_name}[{line_no}]: malformed `;secure_only` option — \
+                     line skipped (entry redacted)"
+                );
+                continue;
+            }
+        }
         println!("{}", skipped_line_message(list_name, *line_no));
     }
     parsed
-        .into_iter()
-        .map(|config| {
-            if cleartext_upstream_credentials(&config) {
-                println!("{}", cleartext_upstream_message(list_name, &config));
-            }
-            secure_upstream_auth(config)
-        })
-        .collect()
-}
-
-/// Credentials are stored as written, but never sent in clear text: a SOCKS5
-/// upstream with a user and password authenticates with secure auth (method
-/// 0x80), so the password stays in this process. HTTPS upstreams send Basic
-/// inside TLS and are left as they are.
-pub(super) fn secure_upstream_auth(config: ProxyConfig) -> ProxyConfig {
-    let credentials = match (&config.user, &config.password) {
-        (Some(user), Some(password)) if config.protocol == ProxyProtocol::Socks5 => Some(
-            resocks5_net::secure_auth::SecureCredentials::new(user.as_str(), password.as_str()),
-        ),
-        _ => None,
-    };
-    match credentials {
-        Some(credentials) => config.with_secure_auth(credentials),
-        None => config,
-    }
-}
-
-/// Plain HTTP upstream with credentials: Basic would cross the network in
-/// clear text, so the dial refuses it. Use an `https` upstream or SOCKS5.
-pub(super) fn cleartext_upstream_credentials(config: &ProxyConfig) -> bool {
-    config.protocol == ProxyProtocol::Http && config.user.is_some() && config.password.is_some()
-}
-
-/// Names the list and host only, never the credentials.
-pub(super) fn cleartext_upstream_message(list_name: &str, config: &ProxyConfig) -> String {
-    format!(
-        "warning: {list_name}: http upstream {}:{} has credentials but would send them in clear          text — its dials are refused; use an https or socks5 upstream",
-        config.host, config.port
-    )
 }
 
 /// Pure part of [`parse_proxy_list`]: parsed configs plus the 1-based
 /// numbers of dropped lines. `#` comment lines are skipped silently (the
 /// parser rejects them by design).
+///
+/// A parsed entry keeps its `user`/`password`. A SOCKS5 entry upgrades
+/// automatically (0x80 offered first, 0x02 after it); an HTTP/HTTPS entry
+/// sends Basic in its first request, as 0.4.x did. The per-entry
+/// `;secure_only` flag or the global `upstream_secure_only` switch forces
+/// our-method-only (`ProxyConfig::secure_only()`): the dial then fails
+/// before any password byte when the upstream offers nothing but clear
+/// text. A 0.4.x `;gssapi=` entry is dropped with a warning (GSSAPI was
+/// removed in 0.5.0).
 pub(super) fn parse_proxy_list_checked(
     list: &[String],
     proto: ProxyProtocol,
+    upstream_secure_only: bool,
 ) -> (Vec<ProxyConfig>, Vec<usize>) {
     let mut parsed = Vec::with_capacity(list.len());
     let mut failed = Vec::new();
@@ -111,60 +104,71 @@ pub(super) fn parse_proxy_list_checked(
         if line.starts_with('#') {
             continue;
         }
-        let (entry, service) = split_gssapi_option(line);
+        // 0.4.x GSSAPI entries cannot be honored any more (GSSAPI was
+        // removed in 0.5.0): drop them with a clear warning. The old
+        // `;gssapi=` guard applies: non-empty right side without `:`.
+        if let Some((entry, service)) = line.rsplit_once(";gssapi=") {
+            if !service.is_empty() && !service.contains(':') {
+                match parse_proxy_str(entry, proto) {
+                    Ok(config) => {
+                        println!(
+                            "warning: upstream {}:{}: `;gssapi=` is no longer supported \
+                             (GSSAPI was removed in 0.5.0) — entry dropped",
+                            config.host, config.port
+                        );
+                        failed.push(idx + 1);
+                    }
+                    // The generic skipped-line message covers it.
+                    Err(_) => failed.push(idx + 1),
+                }
+                continue;
+            }
+        }
+        let (entry, secure_only) = match split_secure_only_option(line) {
+            Ok(split) => split,
+            // Fail-closed: an entry whose auth policy we cannot parse
+            // must not be dialed.
+            Err(()) => {
+                failed.push(idx + 1);
+                continue;
+            }
+        };
         match parse_proxy_str(entry, proto) {
-            Ok(config) => match attach_gssapi(config, service) {
-                Some(config) => parsed.push(config),
-                None => failed.push(idx + 1),
-            },
+            Ok(config) => parsed.push(apply_upstream_auth(
+                config,
+                secure_only,
+                upstream_secure_only,
+            )),
             Err(_) => failed.push(idx + 1),
         }
     }
     (parsed, failed)
 }
 
-/// An entry may end in `;gssapi=<service@host>`: the SOCKS5 upstream is then
-/// authenticated with GSSAPI (Kerberos) as that host-based service, strongest
-/// method first, falling back to secure auth when the entry also has
-/// credentials and the upstream prefers it. Splits the option off the entry.
-pub(super) fn split_gssapi_option(line: &str) -> (&str, Option<&str>) {
-    match line.rsplit_once(";gssapi=") {
-        // A service name is `service@host`: never empty, no `:` (a credential
-        // or a port after the marker means it was not the option).
-        Some((entry, service)) if !service.is_empty() && !service.contains(':') => {
-            (entry, Some(service))
-        }
-        _ => (line, None),
+/// Split the trailing `;secure_only` flag off a proxy-list line. Anything
+/// following the flag is malformed (`;secure_only=yes`): the auth policy
+/// cannot be parsed, so the entry must be dropped.
+pub(super) fn split_secure_only_option(line: &str) -> Result<(&str, bool), ()> {
+    match line.rsplit_once(";secure_only") {
+        Some((entry, "")) => Ok((entry, true)),
+        Some(_) => Err(()),
+        None => Ok((line, false)),
     }
 }
 
-/// Apply the `;gssapi=` option to a parsed entry; `None` drops the entry (with
-/// a warning that names no credentials): GSSAPI needs a SOCKS5 upstream and a
-/// build with the `gssapi-system` backend.
-fn attach_gssapi(config: ProxyConfig, service: Option<&str>) -> Option<ProxyConfig> {
-    let Some(service) = service else {
-        return Some(config);
-    };
-    if config.protocol != ProxyProtocol::Socks5 {
-        println!(
-            "warning: upstream {}:{}: `;gssapi=` applies to SOCKS5 upstreams only — entry skipped",
-            config.host, config.port
-        );
-        return None;
-    }
-    #[cfg(feature = "gssapi-system")]
-    {
-        let backend = resocks5_net::gssapi::system::SystemBackend::new().shared();
-        Some(config.with_gssapi(resocks5_net::gssapi::GssCredentials::new(backend, service)))
-    }
-    #[cfg(not(feature = "gssapi-system"))]
-    {
-        let _ = service;
-        println!(
-            "warning: upstream {}:{}: `;gssapi=` needs a build with the `gssapi-system` feature — entry skipped",
-            config.host, config.port
-        );
-        None
+/// Resolve the outbound auth policy: the per-entry `;secure_only` flag and
+/// the global `upstream_auth.secure_only` switch both force
+/// our-method-only; otherwise the entry keeps its parsed credentials and
+/// the SDK upgrades it automatically.
+pub(super) fn apply_upstream_auth(
+    config: ProxyConfig,
+    entry_secure_only: bool,
+    global_secure_only: bool,
+) -> ProxyConfig {
+    if entry_secure_only || global_secure_only {
+        config.secure_only()
+    } else {
+        config
     }
 }
 
@@ -302,6 +306,42 @@ fn warn_obsolete_cb_keys() {
     }
 }
 
+/// `gssapi_*` key names found in the raw main-config text, in file order.
+/// Pure so the detection is unit-testable; matching is deliberately textual
+/// (ktav drops unknown keys during deserialize without reporting them): a
+/// key line starts (after indentation) with `gssapi_service:` or
+/// `gssapi_protection:` and contains `:`.
+pub(super) fn obsolete_gssapi_keys(text: &str) -> Vec<String> {
+    const PREFIXES: [&str; 2] = ["gssapi_service", "gssapi_protection"];
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            PREFIXES.iter().find_map(|prefix| {
+                trimmed
+                    .strip_prefix(prefix)?
+                    .starts_with(':')
+                    .then(|| (*prefix).to_string())
+            })
+        })
+        .collect()
+}
+
+/// Startup warning for settings this binary no longer understands.
+fn warn_obsolete_gssapi_keys() {
+    let Ok(text) = std::fs::read_to_string(crate::config::MAIN_PATH) else {
+        return;
+    };
+    let ignored = obsolete_gssapi_keys(&text);
+    if !ignored.is_empty() {
+        println!(
+            "warning: {} contains settings this version ignores: {}\n\
+             GSSAPI support was removed in 0.5.0; remove these keys from the `auth:` section.",
+            crate::config::MAIN_PATH,
+            ignored.join(", ")
+        );
+    }
+}
+
 /// Single validation point for allowed_clients at startup: compiling
 /// the global rule and AuthState::build (including each user's rules).
 /// Called in `run_server_inner` BEFORE the route-bailout and
@@ -325,6 +365,38 @@ pub(crate) fn validate_allowed_clients(
     Ok((allowed_clients, auth))
 }
 
+/// Admission sanity at startup: refuse to serve a configuration that no
+/// client could ever enter — no users configured AND anonymous access off
+/// (either because `allow_anonymous` is false or because `secure_only`
+/// silences it).
+pub(crate) fn validate_admission(auth: &crate::auth::AuthState) -> anyhow::Result<()> {
+    let admits_anonymous = auth.allow_anonymous && !auth.secure_only;
+    if !admits_anonymous && auth.is_empty() {
+        anyhow::bail!(
+            "no users are configured and anonymous access is off, so no client could ever \
+             connect (auth.allow_anonymous: {}{}).\n\
+             \n\
+             Create a user with `resocks5 users add <name>` (or `resocks5 users add-init <name>`),\n\
+             or set `auth.allow_anonymous: true` in `{}` (and unset `auth.secure_only`\
+             if you need anonymous access).",
+            auth.allow_anonymous,
+            if auth.secure_only {
+                ", auth.secure_only: true"
+            } else {
+                ""
+            },
+            crate::config::MAIN_PATH
+        );
+    }
+    Ok(())
+}
+
+/// `auth.secure_only` silences anonymous access: the combination is legal
+/// but the anonymous setting has no effect, so warn.
+pub(super) fn secure_only_conflict(auth: &crate::auth::AuthState) -> bool {
+    auth.secure_only && auth.allow_anonymous
+}
+
 /// Previous `#[tokio::main]` body, unchanged apart from the name: all
 /// runtime-dependent work stays here so `run_server` alone owns
 /// runtime creation and the bounded teardown.
@@ -338,6 +410,18 @@ pub(super) async fn run_server_inner() -> Result<()> {
     let (allowed_clients, auth) = validate_allowed_clients(cfg_main, &configs.users)?;
 
     warn_obsolete_cb_keys();
+    warn_obsolete_gssapi_keys();
+
+    // Admission + auth-policy sanity: bail before any listener exists if
+    // no client could ever connect. The secure_only conflict is printed
+    // first so it is not masked by the bail.
+    if secure_only_conflict(&auth) {
+        println!(
+            "warning: auth.secure_only is true — auth.allow_anonymous is ignored \
+             (no anonymous access is served)"
+        );
+    }
+    validate_admission(&auth)?;
 
     // Compile all banned patterns into one DFA — single-pass match per
     // connection regardless of how many patterns are configured.
@@ -350,31 +434,44 @@ pub(super) async fn run_server_inner() -> Result<()> {
         println!("Banned pattern: {}", pattern);
     }
 
+    let upstream_secure_only = cfg_main.upstream_auth.secure_only;
     let pl = &configs.proxy_list;
-    let mut all_v6: Vec<ProxyConfig> =
-        parse_proxy_list("socks5_v6", &pl.socks5_v6, ProxyProtocol::Socks5);
+    let mut all_v6: Vec<ProxyConfig> = parse_proxy_list(
+        "socks5_v6",
+        &pl.socks5_v6,
+        ProxyProtocol::Socks5,
+        upstream_secure_only,
+    );
     all_v6.extend(parse_proxy_list(
         "http_v6",
         &pl.http_v6,
         ProxyProtocol::Http,
+        upstream_secure_only,
     ));
     all_v6.extend(parse_proxy_list(
         "https_v6",
         &pl.https_v6,
         ProxyProtocol::Https,
+        upstream_secure_only,
     ));
 
-    let mut all_v4: Vec<ProxyConfig> =
-        parse_proxy_list("socks5_v4", &pl.socks5_v4, ProxyProtocol::Socks5);
+    let mut all_v4: Vec<ProxyConfig> = parse_proxy_list(
+        "socks5_v4",
+        &pl.socks5_v4,
+        ProxyProtocol::Socks5,
+        upstream_secure_only,
+    );
     all_v4.extend(parse_proxy_list(
         "http_v4",
         &pl.http_v4,
         ProxyProtocol::Http,
+        upstream_secure_only,
     ));
     all_v4.extend(parse_proxy_list(
         "https_v4",
         &pl.https_v4,
         ProxyProtocol::Https,
+        upstream_secure_only,
     ));
 
     let (v6_proxies, v4_proxies, gate_proxies) = partition_proxy_groups(all_v6, all_v4);

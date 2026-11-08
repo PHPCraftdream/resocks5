@@ -33,10 +33,9 @@ async fn serve_one(
     auth: Arc<crate::auth::AuthState>,
 ) -> anyhow::Result<(String, Option<String>)> {
     let (mut stream, peer) = listener.accept().await?;
-    let options = resocks5_net::server::ServerOptions::new(
+    let options = crate::server::handle::handle_client::server_options(
         tokio::time::Instant::now() + CLAIM_TEST_BUDGET,
-        auth.allow_anonymous,
-        !auth.is_empty(),
+        &auth,
     );
     let store = auth.peer_store(Some(peer.ip()));
     let req =
@@ -782,9 +781,8 @@ pub(super) async fn recovery_request() -> resocks5_net::server::IncomingRequest 
         &mut stream,
         &resocks5_net::server::ServerOptions::new(
             tokio::time::Instant::now() + Duration::from_secs(5),
-            true,
-            false,
-        ),
+        )
+        .allow_anonymous(true),
     )
     .await
     .unwrap()

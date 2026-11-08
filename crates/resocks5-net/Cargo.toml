@@ -67,17 +67,6 @@ secure-auth = [
     "dep:x25519-dalek",
     "dep:chacha20poly1305",
 ]
-# GSSAPI authentication for SOCKS5 (RFC 1961, method 0x01): the context
-# exchange, protection-level negotiation and message protection are
-# implemented here over the `gssapi::GssBackend` trait; no password and no
-# credential ever crosses the wire. Needs a backend: the test mock ships with
-# `test-instrumentation`, a Kerberos one with `gssapi-system`. Implies
-# `secure-auth` (the server negotiates between the two strong methods).
-gssapi = ["secure-auth"]
-# Kerberos 5 through the system GSS-API (MIT Kerberos, Heimdal, Apple GSS) as the
-# `gssapi` backend (`gssapi::system::SystemBackend`). Not in the default set:
-# it links the platform library and needs its headers and libclang to build.
-gssapi-system = ["gssapi", "dep:libgssapi"]
 # Wipe secrets from memory when they are dropped: secure-auth credentials, the
 # retained user name of `server::IncomingRequest`; adds `ProxyConfig::wipe_credentials`.
 # Off by default.
@@ -90,11 +79,6 @@ zeroize = ["dep:zeroize"]
 [[example]]
 name = "connect_through_proxy"
 required-features = ["rotator", "pool"]
-
-# One-connection GSSAPI server the Kerberos CI job points curl at.
-[[example]]
-name = "gssapi_interop_server"
-required-features = ["gssapi-system"]
 
 # Doctests are forbidden in this repository: examples in rustdoc are
 # `text` blocks, behaviour is covered by ordinary tests (tests/doc_examples.rs).
@@ -113,7 +97,6 @@ webpki-roots = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
-libgssapi = { version = "0.11", optional = true }
 argon2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 hkdf = { workspace = true, optional = true }

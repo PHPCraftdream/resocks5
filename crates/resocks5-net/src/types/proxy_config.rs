@@ -55,12 +55,15 @@ pub struct ProxyConfig {
     /// the wire. Set with [`ProxyConfig::with_secure_auth`].
     #[cfg(feature = "secure-auth")]
     pub secure_auth: Option<Arc<crate::secure_auth::SecureCredentials>>,
-    /// GSSAPI credentials (SOCKS5 method 0x01, RFC 1961). When set (alone or
-    /// with `secure_auth`) the greeting offers the strong methods — GSSAPI
-    /// first — and the server picks; no password crosses the wire. Set with
-    /// [`ProxyConfig::with_gssapi`].
-    #[cfg(feature = "gssapi")]
-    pub gssapi: Option<Arc<crate::gssapi::GssCredentials>>,
+    /// Whether clear-text authentication (SOCKS5 0x02 / HTTP Basic) may be
+    /// used for this upstream. Default true. HTTPS never counts as clear
+    /// text: its Basic travels inside TLS.
+    pub allow_cleartext: bool,
+    /// Demand secure auth only (SOCKS5 0x80 / HTTP `Resocks5-Secure`): the
+    /// dial never offers 0x02, Basic or anonymous, and an upstream without
+    /// secure auth fails with [`crate::ConnectError::SecureAuthUnsupported`]
+    /// before any credential byte is sent. Default false.
+    pub secure_only: bool,
     /// The number of leading `*` markers; 0 denotes an ordinary/exit proxy.
     /// `is_gate == (gate_level > 0)`.
     pub gate_level: u8,
@@ -90,8 +93,8 @@ impl ProxyConfig {
             password: None,
             #[cfg(feature = "secure-auth")]
             secure_auth: None,
-            #[cfg(feature = "gssapi")]
-            gssapi: None,
+            allow_cleartext: true,
+            secure_only: false,
             is_gate: false,
             gate_level: 0,
             gate: None,
@@ -124,15 +127,6 @@ impl ProxyConfig {
         self
     }
 
-    /// Authenticate to this SOCKS5 proxy with GSSAPI (method 0x01, RFC 1961).
-    /// Can be combined with [`ProxyConfig::with_secure_auth`]: both are offered,
-    /// GSSAPI first, and the server chooses.
-    #[cfg(feature = "gssapi")]
-    pub fn with_gssapi(mut self, credentials: crate::gssapi::GssCredentials) -> Self {
-        self.gssapi = Some(Arc::new(credentials));
-        self
-    }
-
     /// Overwrite the clear-text `user` and `password` with zeros and clear
     /// them, here and at every gate this value solely owns; drop the
     /// secure-auth credentials (their password is wiped when the last copy
@@ -149,10 +143,6 @@ impl ProxyConfig {
             #[cfg(feature = "secure-auth")]
             {
                 node.secure_auth = None;
-                #[cfg(feature = "gssapi")]
-                {
-                    node.gssapi = None;
-                }
             }
             match node.gate.as_mut() {
                 None => return true,
@@ -164,10 +154,46 @@ impl ProxyConfig {
         }
     }
 
-    /// Set username and password.
+    /// Set username and password. With feature `secure-auth` this is all a
+    /// caller needs: the SDK derives secure-auth credentials from the same
+    /// password (`SecureCredentials::new`), so the SOCKS5 greeting offers
+    /// method 0x80 and (while `allow_cleartext` is on) RFC 1929, and the
+    /// HTTP connector upgrades through the proxy's 407 challenge. A pair
+    /// with an empty member never derives credentials and is refused by
+    /// [`ProxyConfig::validate`]/[`ProxyConfig::try_with_auth`].
     pub fn with_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
-        self.user = Some(user.into());
-        self.password = Some(password.into());
+        let user = user.into();
+        let password = password.into();
+        #[cfg(feature = "secure-auth")]
+        if !user.is_empty() && !password.is_empty() {
+            self.secure_auth = Some(std::sync::Arc::new(
+                crate::secure_auth::SecureCredentials::new(user.clone(), password.clone()),
+            ));
+        }
+        self.user = Some(user);
+        self.password = Some(password);
+        self
+    }
+
+    /// Allow or refuse clear-text authentication (SOCKS5 0x02, HTTP Basic)
+    /// for this upstream. Default true. Ignored in `secure_only` mode, which
+    /// never offers clear text at all.
+    #[must_use]
+    pub fn allow_cleartext(mut self, allow: bool) -> Self {
+        self.allow_cleartext = allow;
+        self
+    }
+
+    /// Demand secure auth only for this upstream: the SOCKS5 greeting offers
+    /// method 0x80 and nothing else, HTTP(S) uses only `Resocks5-Secure`
+    /// (even Basic inside TLS is refused), and an upstream that does not
+    /// support it fails with
+    /// [`ConnectError::SecureAuthUnsupported`](crate::ConnectError::SecureAuthUnsupported)
+    /// before any password byte is sent. Implies `allow_cleartext(false)`.
+    #[must_use]
+    pub fn secure_only(mut self) -> Self {
+        self.secure_only = true;
+        self.allow_cleartext = false;
         self
     }
 
@@ -208,17 +234,46 @@ impl ProxyConfig {
         parse_proxy_uri(uri, options)
     }
 
-    /// Would using this entry send its credentials in clear text? SOCKS5
-    /// UNAME/PASSWD would; HTTP Basic does unless the proxy is reached over
-    /// TLS (`https`).
-    pub(crate) fn sends_cleartext_credentials(&self) -> bool {
-        self.user.is_some() && self.password.is_some() && self.protocol != ProxyProtocol::Https
+    /// A `Some` pair of non-empty credentials: what the clear-text methods
+    /// would actually send. A half-set or empty pair behaves like no
+    /// credentials at all.
+    pub(crate) fn usable_pair(&self) -> Option<(&str, &str)> {
+        let (Some(user), Some(password)) = (self.user.as_deref(), self.password.as_deref()) else {
+            return None;
+        };
+        (!user.is_empty() && !password.is_empty()).then_some((user, password))
     }
 
-    /// Refuse an entry that would have to send credentials in clear text: this
-    /// crate never does (no RFC 1929, no Basic over plain HTTP).
-    pub(crate) fn refuse_cleartext(&self) -> Result<(), crate::ConnectError> {
-        if self.sends_cleartext_credentials() {
+    /// The pre-dial authentication policy check, before any byte reaches the
+    /// upstream: `secure_only` needs secure credentials to be possible at
+    /// all, and a credentials-carrying entry whose ONLY possible method is
+    /// clear text is refused while `allow_cleartext` is off
+    /// ([`ConnectError::CleartextCredentialsRefused`]). HTTPS never refuses
+    /// here: its Basic travels inside TLS, which is not clear text on the
+    /// wire. Whether the upstream actually supports a strong method is
+    /// discovered at dial time (SOCKS5 greeting / HTTP 407 schemes).
+    pub(crate) fn preflight_auth(&self) -> Result<(), crate::ConnectError> {
+        #[cfg(feature = "secure-auth")]
+        let strong_possible = self.secure_auth.is_some();
+        #[cfg(not(feature = "secure-auth"))]
+        let strong_possible = false;
+        if self.secure_only {
+            // Only 0x80 / Resocks5-Secure is acceptable; without secure
+            // credentials this entry could never authenticate.
+            if !strong_possible {
+                return Err(crate::ConnectError::SecureAuthUnsupported);
+            }
+            return Ok(());
+        }
+        if self.protocol == ProxyProtocol::Https {
+            return Ok(());
+        }
+        if self.usable_pair().is_none() || strong_possible {
+            return Ok(());
+        }
+        if !self.allow_cleartext {
+            // Clear text is the only possible method and it is disallowed;
+            // refuse before connecting instead of after a rejected handshake.
             return Err(crate::ConnectError::CleartextCredentialsRefused);
         }
         Ok(())
@@ -279,6 +334,8 @@ impl fmt::Debug for NodeDebug<'_> {
             .field("port", &self.0.port)
             .field("user", &self.0.user.as_ref().map(|_| REDACTED))
             .field("password", &self.0.password.as_ref().map(|_| REDACTED))
+            .field("allow_cleartext", &self.0.allow_cleartext)
+            .field("secure_only", &self.0.secure_only)
             .field("gate_level", &self.0.gate_level)
             .field("is_gate", &self.0.is_gate)
             .finish()
@@ -309,6 +366,8 @@ impl fmt::Debug for ProxyConfig {
             .field("port", &self.port)
             .field("user", &self.user.as_ref().map(|_| REDACTED))
             .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("allow_cleartext", &self.allow_cleartext)
+            .field("secure_only", &self.secure_only)
             .field("gate_level", &self.gate_level)
             .field("is_gate", &self.is_gate)
             .field("gate", &GateChainDebug(self))
@@ -539,5 +598,115 @@ mod tests {
         handle
             .join()
             .expect("Debug of a 64-node chain must not overflow");
+    }
+
+    /// `with_auth` keeps `user`/`password` and (feature `secure-auth`)
+    /// derives `secure_auth` from the same password, but never from a pair
+    /// with an empty member. Mutation: deriving from the fields (or not
+    /// screening empty) breaks the assertions.
+    #[test]
+    fn with_auth_derives_secure_credentials() {
+        let c = ProxyConfig::socks5("h", 1).with_auth("u", "p");
+        assert_eq!(c.user.as_deref(), Some("u"));
+        assert_eq!(c.password.as_deref(), Some("p"));
+        #[cfg(feature = "secure-auth")]
+        assert!(c.secure_auth.is_some());
+
+        for (user, password) in [("", "p"), ("u", "")] {
+            let c = ProxyConfig::socks5("h", 1).with_auth(user, password);
+            assert_eq!(c.user.as_deref(), Some(user));
+            assert_eq!(c.password.as_deref(), Some(password));
+            #[cfg(feature = "secure-auth")]
+            assert!(c.secure_auth.is_none());
+        }
+    }
+
+    /// Pre-dial policy over protocol × credential shape. Mutation: flipping
+    /// any branch of `preflight_auth` (Https exemption, secure_only,
+    /// allow_cleartext refusal) breaks a row.
+    #[test]
+    fn preflight_matrix() {
+        use crate::ConnectError;
+        fn creds_only(mut c: ProxyConfig) -> ProxyConfig {
+            c.user = Some("u".into());
+            c.password = Some("p".into());
+            c
+        }
+        // `ConnectError` is not `PartialEq`: compare the verdict's kind.
+        fn kind(verdict: Result<(), ConnectError>) -> &'static str {
+            match verdict {
+                Ok(()) => "ok",
+                Err(ConnectError::CleartextCredentialsRefused) => "cleartext-refused",
+                Err(ConnectError::SecureAuthUnsupported) => "secure-unsupported",
+                Err(_) => "other",
+            }
+        }
+        type Build = fn(&str, u16) -> ProxyConfig;
+        let builders: [(ProxyProtocol, Build); 3] = [
+            (ProxyProtocol::Socks5, |h, p| ProxyConfig::socks5(h, p)),
+            (ProxyProtocol::Http, |h, p| ProxyConfig::http(h, p)),
+            (ProxyProtocol::Https, |h, p| ProxyConfig::https(h, p)),
+        ];
+        for (protocol, build) in builders {
+            // Anonymous entry is always fine.
+            assert_eq!(kind(build("h", 1).preflight_auth()), "ok");
+            // Plain credentials with defaults are fine.
+            assert_eq!(
+                kind(build("h", 1).with_auth("u", "p").preflight_auth()),
+                "ok"
+            );
+            // Credentials + clear text disallowed + no strong method.
+            let refused = creds_only(build("h", 1)).allow_cleartext(false);
+            let expected = if protocol == ProxyProtocol::Https {
+                "ok"
+            } else {
+                "cleartext-refused"
+            };
+            assert_eq!(kind(refused.preflight_auth()), expected, "{protocol:?}");
+            // Strong auth possible: clear text is no longer the only method.
+            #[cfg(feature = "secure-auth")]
+            {
+                let strong = build("h", 1)
+                    .with_secure_auth(crate::secure_auth::SecureCredentials::new("u", "p"))
+                    .allow_cleartext(false);
+                assert_eq!(kind(strong.preflight_auth()), "ok", "{protocol:?}");
+            }
+            // secure_only with secure credentials is fine.
+            #[cfg(feature = "secure-auth")]
+            {
+                let ok = build("h", 1)
+                    .with_secure_auth(crate::secure_auth::SecureCredentials::new("u", "p"))
+                    .secure_only();
+                assert_eq!(kind(ok.preflight_auth()), "ok", "{protocol:?}");
+            }
+            // secure_only WITHOUT secure credentials (fields set directly, so
+            // `with_auth` cannot derive) can never authenticate.
+            let no_strong = creds_only(build("h", 1)).secure_only();
+            assert_eq!(
+                kind(no_strong.preflight_auth()),
+                "secure-unsupported",
+                "{protocol:?}"
+            );
+            #[cfg(feature = "secure-auth")]
+            assert!(no_strong.secure_auth.is_none());
+        }
+    }
+
+    /// `usable_pair` accepts exactly a full non-empty pair; empty or
+    /// half-set fields behave like no credentials. Mutation: dropping an
+    /// emptiness (or presence) screen breaks an assertion.
+    #[test]
+    fn usable_pair_screens_empty_and_half_set() {
+        let mut c = ProxyConfig::socks5("h", 1);
+        assert!(c.usable_pair().is_none());
+        c.user = Some("u".into());
+        assert!(c.usable_pair().is_none());
+        c.password = Some(String::new());
+        assert!(c.usable_pair().is_none());
+        c.user = Some(String::new());
+        c.password = Some("p".into());
+        assert!(c.usable_pair().is_none());
+        c.user = Some("u".into());
+        assert_eq!(c.usable_pair(), Some(("u", "p")));
     }
 }

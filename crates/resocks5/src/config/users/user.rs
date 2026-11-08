@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct User {
     pub name: String,
     /// The user's secret as an Argon2id v19 PHC string, e.g.
-    /// `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<key>`: parameters, per-user
+    /// `$argon2id$v=19$m=4096,t=1,p=1$<salt>$<key>`: parameters, per-user
     /// salt and the derived key the secure-auth exchange proves (never the
     /// password). `init` until the first client enrolls. Written by
     /// `auth::compute_hash` or an enrollment, read by `auth::secret`.

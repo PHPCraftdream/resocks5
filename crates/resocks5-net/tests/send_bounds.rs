@@ -197,11 +197,8 @@ fn into_prefixed_inside_spawned_task_is_spawnable() {
 
     spawnable(async move {
         let (client, mut server) = tokio::io::duplex(1024);
-        let opts = ServerOptions::new(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            true,
-            false,
-        );
+        let opts = ServerOptions::new(tokio::time::Instant::now() + Duration::from_secs(1))
+            .allow_anonymous(true);
         let request = accept(&mut server, &opts).await;
         if let Ok(req) = request {
             let mut prefixed = req.into_prefixed(server);
@@ -217,15 +214,43 @@ fn requests_stay_send() {
     assert_send::<IncomingRequest>();
 }
 
-/// The `accept` future with `strict_http(true)` stays `Send`.
+/// The `accept` future with `secure_only` + `strict_http(true)` stays `Send`
+/// (also compile-checks the builder chain).
 #[allow(dead_code)]
 fn strict_http_accept_future_is_send() {
     let (mut duplex, _) = tokio::io::duplex(1024);
-    let opts = ServerOptions::new(
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        false,
-        true,
-    )
-    .strict_http(true);
+    let opts = ServerOptions::new(tokio::time::Instant::now() + Duration::from_secs(1))
+        .secure_only()
+        .strict_http(true);
     future_is_send(resocks5_net::server::accept(&mut duplex, &opts));
+}
+
+/// The `accept_secure`/`accept_with` futures stay `Send` for any
+/// `SecretStore` (feature `secure-auth`); nothing here runs.
+#[cfg(feature = "secure-auth")]
+#[test]
+fn accept_futures_are_send() {
+    use resocks5_net::secure_auth::{DecoyKey, SecretStore};
+    use resocks5_net::server::{accept_secure, accept_with, AuthMethods};
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    #[allow(dead_code)]
+    fn assert_send<F: Future + Send>(_: F) {}
+
+    #[allow(dead_code)]
+    fn accepts_are_send<S, T: SecretStore>(
+        stream: &mut S,
+        options: &resocks5_net::server::ServerOptions,
+        store: &T,
+        decoy: &DecoyKey,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        assert_send(accept_secure(stream, options, store, decoy));
+        assert_send(accept_with(
+            stream,
+            options,
+            &AuthMethods::secure(store, decoy),
+        ));
+    }
 }
