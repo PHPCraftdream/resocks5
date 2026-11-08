@@ -48,7 +48,7 @@ async fn an_entry_marked_secure_only_refuses_a_cleartext_only_upstream() {
     .err()
     .expect("secure-only entry must refuse a cleartext-only upstream");
     assert!(
-        matches!(error, ConnectError::CleartextCredentialsRefused),
+        matches!(error, ConnectError::SecureAuthUnsupported),
         "{error:?}"
     );
     assert!(
@@ -114,7 +114,7 @@ async fn the_global_secure_only_switch_forces_the_secure_mode() {
     .err()
     .expect("global secure_only must refuse a cleartext-only upstream");
     assert!(
-        matches!(error, ConnectError::CleartextCredentialsRefused),
+        matches!(error, ConnectError::SecureAuthUnsupported),
         "{error:?}"
     );
     assert!(

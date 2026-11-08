@@ -640,7 +640,7 @@ async fn strict_http_options_chain_deadline_and_copy() {
         let opts = anon_options(false).strict_http(true);
         assert!(opts.strict_http);
         assert!(!opts.anonymous);
-        assert!(opts.cleartext);
+        assert!(!opts.cleartext, "anon_options turns clear text off");
 
         // Copy semantics: reading through both after the copy compiles only for Copy.
         let copy = opts;

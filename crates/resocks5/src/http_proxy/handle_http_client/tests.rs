@@ -858,7 +858,7 @@ async fn http_basic_request_carries_an_identity_into_the_app() {
         )
         .unwrap(),
     );
-    let store = auth.peer_store(None);
+    let store = auth.peer_store(Some("127.0.0.1".parse().unwrap()));
     let decoy = auth.decoy();
 
     // Anonymous: served, but with no identity.

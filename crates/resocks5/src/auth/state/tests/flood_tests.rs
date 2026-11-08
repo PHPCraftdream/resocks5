@@ -23,7 +23,7 @@ fn with_private_limiter(mut state: Arc<AuthState>, capacity: usize) -> Arc<AuthS
 async fn a_cache_hit_survives_a_saturated_derivation_limiter() {
     let (state, path) = build_state_with_disk_file(vec![make_user("alice", "pw", true)]);
     let state = with_private_limiter(state, 1);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     // Populate the cache before any slot is held.
     assert!(matches!(
         store.check_password("alice", "pw").await,
@@ -60,7 +60,7 @@ async fn a_cache_hit_survives_a_saturated_derivation_limiter() {
 async fn a_flood_of_failed_clear_text_logins_caches_nothing_and_stays_bounded() {
     let (state, path) = build_state_with_disk_file(vec![make_user("alice", "pw", true)]);
     let state = with_private_limiter(state, 2);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     for i in 0..500 {
         let (user, password) = if i % 2 == 0 {
             ("alice".to_string(), format!("wrong-{i}"))
@@ -103,7 +103,7 @@ async fn a_concurrent_first_logins_of_an_init_user_produce_exactly_one_claim() {
     use crate::auth::secret::parse_secret;
     let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)]);
     let state = with_private_limiter(state, 4);
-    let store = Arc::new(state.peer_store(None));
+    let store = Arc::new(state.peer_store(ip("127.0.0.1")));
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..100 {
         let store = Arc::clone(&store);

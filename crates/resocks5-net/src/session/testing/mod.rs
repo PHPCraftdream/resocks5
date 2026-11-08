@@ -762,6 +762,7 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
     }
     for _ in 0..=crate::http_auth::MAX_ROUNDS {
         let head = read_head(&mut stream).await?;
+        #[cfg_attr(not(feature = "secure-auth"), allow(unused_variables))]
         let (target, authorization) = parse_head(&head);
         #[cfg(feature = "secure-auth")]
         {

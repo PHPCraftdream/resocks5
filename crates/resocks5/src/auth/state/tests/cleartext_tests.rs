@@ -27,7 +27,7 @@ fn cleanup(path: &str) {
 async fn check_password_verifies_the_same_stored_secret() {
     use resocks5_net::secure_auth::PasswordCheck;
     let (state, path) = build_state_with_disk_file(vec![make_user("alice", "pw", true)]);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     assert!(matches!(
         store.check_password("alice", "pw").await,
         PasswordCheck::Accepted
@@ -51,7 +51,7 @@ async fn check_password_verifies_the_same_stored_secret() {
 async fn a_clear_text_login_claims_init_and_the_secret_works_over_secure_auth() {
     use resocks5_net::secure_auth::{derive_key, PasswordCheck};
     let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)]);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     assert!(matches!(
         store.check_password("bob", "first-pw").await,
         PasswordCheck::Claimed
@@ -75,7 +75,7 @@ async fn a_clear_text_login_claims_init_and_the_secret_works_over_secure_auth() 
 async fn an_empty_clear_text_password_is_rejected_and_never_claims() {
     use resocks5_net::secure_auth::PasswordCheck;
     let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)]);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     assert!(matches!(
         store.check_password("bob", "").await,
         PasswordCheck::Rejected
@@ -115,7 +115,7 @@ async fn an_unusable_stored_hash_fails_clear_text_like_secure() {
         ..make_user("alice", "unused", true)
     };
     let (state, path) = build_state_with_disk_file(vec![user]);
-    let store = state.peer_store(None);
+    let store = state.peer_store(ip("127.0.0.1"));
     assert!(matches!(
         store.check_password("alice", "unused").await,
         PasswordCheck::Rejected

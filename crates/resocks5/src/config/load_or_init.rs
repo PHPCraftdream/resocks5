@@ -22,13 +22,21 @@ banned_patterns: []
 allowed_clients: "*"
 
 auth: {
+    ## true: serve SOCKS5 without a name/password and HTTP CONNECT without
+    ## Proxy-Authorization. Default true (as in 0.4.x).
     allow_anonymous: true
-    ## true: only our method (0x80 / Resocks5-Secure); ignores allow_anonymous
+    ## true: accept ONLY our own secure method (SOCKS5 0x80 / HTTP
+    ## Resocks5-Secure); clear-text passwords (0x02, Basic) and anonymous
+    ## access are refused. Optional, default false.
     secure_only: false
 }
 
-## true: upstreams authenticate only with our secure method
+## Outbound policy: how upstreams authenticate when an entry has user:password.
 upstream_auth: {
+    ## true: use ONLY our own secure method for every upstream with
+    ## credentials; an upstream that offers nothing else is refused before
+    ## the password is sent. Optional, default false. One list entry can opt
+    ## in with the line suffix `;secure_only`.
     secure_only: false
 }
 
@@ -331,7 +339,7 @@ auth: { allow_anonymous: true }
 
         let lines: Vec<&str> = DEFAULT_MAIN_TEMPLATE
             .lines()
-            .filter(|l| l.starts_with('#'))
+            .filter(|l| l.trim_start().starts_with('#'))
             .collect();
         assert!(
             lines.iter().any(|l| l.contains("secure_only")),
@@ -416,7 +424,7 @@ auth: { allow_anonymous: true }
         assert!(
             serialized
                 .lines()
-                .any(|l| l.starts_with('#') && l.contains("secure_only")),
+                .any(|l| l.trim_start().starts_with('#') && l.contains("secure_only")),
             "template must contain a # comment line mentioning secure_only"
         );
 

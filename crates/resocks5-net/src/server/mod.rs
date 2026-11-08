@@ -6,7 +6,7 @@
 //! supports, in this order: secure auth (SOCKS5 method 0x80 / HTTP
 //! `Resocks5-Secure`), clear text (SOCKS5 method 0x02 / HTTP `Basic`, subject
 //! to `ServerOptions::allow_cleartext`, verified against the same
-//! [`SecretStore`](crate::secure_auth::SecretStore) that secures the strong
+//! `SecretStore` that secures the strong
 //! method — one secret per user, any protocol, any method), and anonymous
 //! (SOCKS5 0x00 / HTTP without credentials, only when
 //! `ServerOptions::allow_anonymous`, default off). [`accept`] serves
@@ -49,7 +49,7 @@ pub use secure::{accept_secure, accept_with, AuthMethods, NoSecrets};
 /// The host-supplied absolute deadline and the admission policy.
 ///
 /// `allow_anonymous` is OFF by default and `allow_cleartext` is ON by
-/// default; users exist exactly when an [`AuthMethods`](secure::AuthMethods)
+/// default; users exist exactly when an `AuthMethods`
 /// is handed to `accept_with`/`accept_secure`.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {

@@ -138,7 +138,7 @@ impl DerivationLimiter {
         self.granted.load(Ordering::Relaxed)
     }
 
-    /// One slot, waiting at most [`DERIVATION_WAIT`] for it. `None` when the
+    /// One slot, waiting at most one second for it. `None` when the
     /// limiter stays saturated: the caller must not derive. Drop the permit
     /// when the derivation has finished.
     pub async fn acquire(&self) -> Option<DerivationPermit> {

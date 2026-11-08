@@ -191,6 +191,18 @@ async fn failed_secure_exchanges_cost_zero_argon2_derivations() {
     let enrolled = Arc::new(Store::with("alice", "right"));
     let empty = Arc::new(Store::empty());
 
+    // Warm the client key cache one exchange at a time: the 500 concurrent
+    // exchanges below then do no client-side derivation, so they cannot
+    // starve each other (or a test running beside this one) of the shared
+    // client limiter.
+    for (credentials, store) in [(&wrong_alice, &enrolled), (&ghost, &empty)] {
+        let (mut client, mut server) = duplex(4096);
+        let _ = tokio::join!(
+            client_authenticate(&mut client, credentials),
+            server_authenticate(&mut server, &**store, decoy()),
+        );
+    }
+
     let run = async {
         let mut tasks = Vec::new();
         for i in 0..500 {

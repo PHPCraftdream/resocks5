@@ -34,7 +34,7 @@ where
 }
 
 /// SOCKS5 (RFC 1928) CONNECT handshake over an existing stream. The greeting
-/// depends on the [`Socks5Auth`] given: the no-auth entry points of this
+/// depends on the `Socks5Auth` given: the no-auth entry points of this
 /// module offer exactly method 0x00 (`[5, 1, 0]`). `host` is unbracketed:
 /// an IPv4/IPv6 literal sends ATYP 1/4, anything else a domain (ATYP 3).
 ///
@@ -94,7 +94,7 @@ impl<'a> Socks5Auth<'a> {
 /// whatever sub-negotiation the upstream's choice demands: every configured
 /// method is offered strongest first (secure auth 0x80, RFC 1929 0x02,
 /// anonymous 0x00; `secure_only` offers 0x80 alone), the server picks, and
-/// [`Socks5Auth`] must be able to speak it.
+/// `Socks5Auth` must be able to speak it.
 ///
 /// On success the stream sits right after the method-selection (or
 /// auth-status) reply, ready for [`socks5_connect_request`]. A stall in

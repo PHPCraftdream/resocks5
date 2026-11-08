@@ -504,7 +504,7 @@ where
     };
     result.map_err(|error| match error {
         crate::SecureAuthError::Io(kind) => ConnectError::Io {
-            stage: Stage::Handshake,
+            stage: crate::error::Stage::Handshake,
             endpoint: None,
             source: std::io::Error::from(kind),
         },
