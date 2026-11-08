@@ -41,12 +41,22 @@ resocks5
 
 Print the full configuration reference with `resocks5 config`.
 
-## Ограничение клиентов по IP
+## Restricting clients by IP
 
-Полем `allowed_clients` (глобально в `resocks5.main.ktav` и опционально
-у каждого пользователя в `resocks5.users.ktav`) можно разрешить
-подключения только с указанных IP (по умолчанию `"*"` — все). Подробности
-и синтаксис — в `resocks5 config`.
+The `allowed_clients` field (globally in `resocks5.main.ktav` and optionally
+per user in `resocks5.users.ktav`) lets only the listed IPs connect (the
+default `"*"` allows everyone). Details and syntax are in `resocks5 config`.
+
+## Authentication
+
+One port serves SOCKS5 and HTTP CONNECT; the server picks the strongest
+method the client offers: our secure auth (SOCKS5 0x80 / HTTP
+`Resocks5-Secure`), then a clear-text password (SOCKS5 0x02 / HTTP Basic),
+then anonymous access (`auth.allow_anonymous`, on by default). One Argon2id
+secret per user verifies every method. `auth.secure_only: true` and
+`upstream_auth.secure_only: true` (both optional, default `false`) accept
+only our own method on the inbound and the outbound side. See the project
+README and `resocks5 config`.
 
 ## More
 

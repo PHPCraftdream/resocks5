@@ -47,7 +47,7 @@ Advisory unless you ask to remain anonymous.
 - The `resocks5` binary and the `resocks5-net` library, from a checkout of this
   repository or a release artifact we ship.
 - Anything in the request path: protocol detection (SOCKS5 / HTTP CONNECT),
-  authentication (Argon2id verify + the HMAC verify-cache), upstream selection,
+  authentication (secure auth over SOCKS5 0x80 and HTTP `Resocks5-Secure`, clear-text 0x02 / Basic against the same stored secret, init claims), upstream selection,
   the TCP pool, tunnel forwarding, TLS ClientHello fragmentation.
 - Bypass of the safety rails: `max_concurrent_clients`, `max_per_upstream`,
   the protocol timeouts, or the banned-pattern filter.
@@ -92,6 +92,52 @@ These aren't vulnerabilities, they're defaults worth knowing about:
   require a restart.
 - `direct: true` users leak the **server's real IP** and the server's DNS
   resolver to every target they contact. Reserve it for trusted internal use.
-- `resocks5.*.ktav` files contain the auth salt, upstream credentials, and
-  Argon2 hashes. They are git-ignored; never commit them, never world-read
-  them.
+- `resocks5.*.ktav` files contain upstream credentials and the users'
+  Argon2id keys; a stored key logs its user in like the password does. They
+  are git-ignored; never commit them, never world-read them.
+
+## Authentication model and its limits
+
+One port serves SOCKS5 and HTTP CONNECT and the server picks the strongest
+method the client offers: our secure auth (SOCKS5 0x80, HTTP `Resocks5-Secure`),
+then a clear-text password (SOCKS5 0x02, HTTP Basic), then anonymous access.
+All of them verify against **one Argon2id secret per user**, so switching
+protocol or method never breaks an account, and a `hash: init` account is
+claimed by the first successful login by any of them. What this does and does
+not protect:
+
+- **Secure auth** never sends the password and the server never stores it; the
+  stored key `K` is a credential, though (it logs its user in, and it is what
+  an offline guess is checked against). Guard `resocks5.users.ktav`.
+- **Clear text** (0x02, Basic) puts the password on the wire as is. There is no
+  TLS on the listener. On an untrusted network set `auth.secure_only: true`
+  (inbound: only our own method; standard clients can no longer log in) or put
+  the port behind a protected transport such as a VPN or an SSH tunnel.
+  `upstream_auth.secure_only: true`, or a `;secure_only` suffix on one list
+  entry, does the same for upstream hops. Both flags are optional and default
+  to `false`, so existing configs behave exactly as before.
+- **Argon2id cost is configurable**: new secrets use the cost set by
+  `auth.argon2` (default 19 MiB, 2 passes, 1 lane — the OWASP minimum and what
+  0.4.x used; `KdfParams::DEFAULT` in the SDK). A lower cost makes guessing a
+  password from a stolen users file, or from a captured secure-auth exchange
+  (the exchange is an offline-guessing oracle at the cost of one derivation),
+  proportionally cheaper, and at small sizes the memory-hardness gives no ASIC
+  or GPU resistance. **Use random passwords of at least 22 characters (128
+  bits)**: for those the cost is irrelevant. Secrets stored earlier keep the
+  parameters written with them, so changing the setting never breaks a users
+  file. A PAKE (OPAQUE, SRP) would remove the offline-guessing oracle; it is not
+  part of this release.
+- **Flood protection**: a flood of false logins cannot take the server down.
+  Secure auth costs the server HMACs only; clear-text checks share a
+  process-wide limit on concurrent derivations (half of the cores, at least
+  one), wait at most a second for a slot and are refused rather than queued;
+  an unknown, disabled or filtered name derives nothing (a short fixed pause
+  keeps its timing close to a real check); successful logins are cached
+  (HMAC tags only, never the password or the key; 4096 entries, 300 s, dropped
+  when the stored secret changes), so clients that send Basic with every
+  request do not re-derive. A sustained flood can still make clear-text
+  logins of new clients fail while it lasts; `auth.secure_only` removes that
+  surface completely.
+- **First-login claim**: whoever knows an `init` account's name and reaches the
+  port first claims it. Restrict that window with `allowed_clients`; a filtered
+  peer is answered like a wrong password and can never claim.
