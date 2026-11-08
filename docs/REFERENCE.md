@@ -183,6 +183,7 @@ use the firewall/network policies of the OS.
 |-------|------|---------|---------|
 | `auth.allow_anonymous` | bool | true | Allow SOCKS5 without a name/password and HTTP CONNECT without Proxy-Authorization. The presence of users does not by itself disable anonymous access. |
 | `auth.secure_only` | bool | false | Accept only our own secure method (SOCKS5 0x80, HTTP `Resocks5-Secure`): clear-text passwords (0x02, Basic) and anonymous access are disabled and `auth.allow_anonymous` is ignored. An optional field: when absent it is `false`, so old configs behave as before. |
+| `auth.argon2` | section | `{memory_kib: 19456, iterations: 2, parallelism: 1}` | Argon2id cost of NEW user secrets and the floor of an `init` enrollment; optional, see the three fields below. Stored secrets keep their own cost. |
 | `auth.argon2.memory_kib` | u32 | 19456 | Argon2id memory cost, in KiB, of NEW user secrets (`users add`, `users set-password`, the claim of an `init` account) and the floor of an `init` enrollment. An optional section: when absent, or partly given, the missing fields keep their defaults. The default (19 MiB) is the OWASP minimum and what 0.4.x used. Valid range: from `8 * parallelism` to 262144; an out-of-range value stops the server at startup. Existing secrets keep the cost stored with them. |
 | `auth.argon2.iterations` | u32 | 2 | Argon2id passes over the memory (1..=16). |
 | `auth.argon2.parallelism` | u32 | 1 | Argon2id lanes (1..=16). |
