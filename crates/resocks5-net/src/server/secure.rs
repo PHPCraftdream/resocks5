@@ -22,7 +22,9 @@ const AUTH_FAILURE: &[u8] = &[1, 1];
 /// the server picks the strongest it has enabled, then anonymous access if
 /// `options` allow it.
 pub struct AuthMethods<'a, T: SecretStore> {
-    pub(super) secure: Option<(&'a T, &'a DecoyKey)>,
+    pub(super) store: &'a T,
+    /// `Some` enables the strong method; `None` leaves clear text only.
+    pub(super) decoy: Option<&'a DecoyKey>,
 }
 
 /// A [`SecretStore`] with no users: every name is unknown, every login fails
@@ -46,8 +48,21 @@ impl<'a, T: SecretStore> AuthMethods<'a, T> {
     /// accepted against the same store while `options.allow_cleartext` is on.
     pub fn secure(store: &'a T, decoy: &'a DecoyKey) -> Self {
         Self {
-            secure: Some((store, decoy)),
+            store,
+            decoy: Some(decoy),
         }
+    }
+
+    /// Clear text only (SOCKS5 0x02 / HTTP Basic), checked by
+    /// [`SecretStore::check_password`] of `store`; the strong method is not
+    /// offered, so a client that lists 0x80 together with 0x02 is served with
+    /// 0x02 and an HTTP `407` names only `Basic`. This is the mode for a host
+    /// that verifies passwords itself (an overridden `check_password`) and
+    /// keeps no `UserSecret` for [`SecretStore::lookup`] to return.
+    /// [`ServerOptions::allow_cleartext`] still applies: with it off (and
+    /// anonymous access off) nothing is acceptable.
+    pub fn cleartext_only(store: &'a T) -> Self {
+        Self { store, decoy: None }
     }
 }
 
@@ -162,11 +177,11 @@ where
     let nmethods = stream.read_u8().await?;
     let mut offered = vec![0; usize::from(nmethods)];
     stream.read_exact(&mut offered).await?;
-    let strong = methods.secure.is_some();
+    let strong = methods.decoy.is_some();
     // The strongest method both sides have, in the server's order.
     let chosen = if strong && offered.contains(&crate::secure_auth::METHOD) {
         crate::secure_auth::METHOD
-    } else if strong && options.cleartext && offered.contains(&2) {
+    } else if options.cleartext && offered.contains(&2) {
         2
     } else if options.anonymous && offered.contains(&0) {
         0
@@ -181,8 +196,8 @@ where
     stream.write_all(&[5, chosen]).await?;
     stream.flush().await?;
     if chosen == crate::secure_auth::METHOD {
-        let (store, decoy) = methods.secure.expect("chosen only when enabled");
-        let user = server_authenticate(stream, store, decoy)
+        let decoy = methods.decoy.expect("chosen only when enabled");
+        let user = server_authenticate(stream, methods.store, decoy)
             .await
             .map_err(auth_error)?;
         return socks_request(stream, Who::Secure(user)).await;
@@ -206,7 +221,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: SecretStore,
 {
-    let (store, _decoy) = methods.secure.expect("chosen only when enabled");
+    let store = methods.store;
     let mut header = [0; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != 1 {

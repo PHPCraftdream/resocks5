@@ -366,6 +366,20 @@ sleep, so the store never reveals which names exist.
 feature above). `NoSecrets` is a store with no users, for hosts that only
 want the policy plumbing.
 
+A host that verifies passwords itself (its own hashes, its own first-use
+rules) overrides `check_password` and builds the methods with
+`AuthMethods::cleartext_only(&store)` instead of `AuthMethods::secure`: the
+strong method is not offered, so a client that lists 0x80 with 0x02 is served
+with 0x02 (and the HTTP `407` names only `Basic`) rather than being refused by
+a decoy for a user the store holds no `UserSecret` for. `lookup` and `claim`
+can then be stubs (`None`, `false`). Run slow hashing inside
+`tokio::task::spawn_blocking` within the returned future, and, to tie
+per-login state (an admission proof, say) to the exact check that passed,
+give each accepted connection its own small store value that records the
+verdict in `check_password`. `allow_cleartext(false)` with `cleartext_only`
+leaves nothing acceptable. Fields that are not UTF-8 are refused before
+`check_password` runs.
+
 ```text
 use resocks5_net::server::{accept_with, AuthMethod, AuthMethods};
 

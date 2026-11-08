@@ -35,12 +35,12 @@ fn challenge<T: SecretStore>(
             head.push_str("\r\n");
         }
         None => {
-            if methods.secure.is_some() {
+            if methods.decoy.is_some() {
                 head.push_str("Proxy-Authenticate: ");
                 head.push_str(SECURE);
                 head.push_str("\r\n");
             }
-            if methods.secure.is_some() && options.cleartext {
+            if options.cleartext {
                 head.push_str("Proxy-Authenticate: Basic realm=\"resocks5\"\r\n");
             }
         }
@@ -151,13 +151,10 @@ where
             Some(value) => {
                 let value = value.to_owned();
                 let (scheme, _) = split_credentials(&value);
-                if scheme.eq_ignore_ascii_case(SECURE) && methods.secure.is_some() {
+                if scheme.eq_ignore_ascii_case(SECURE) && methods.decoy.is_some() {
                     return secure_rounds(stream, request, options, methods).await;
                 }
-                if scheme.eq_ignore_ascii_case(BASIC)
-                    && methods.secure.is_some()
-                    && options.cleartext
-                {
+                if scheme.eq_ignore_ascii_case(BASIC) && options.cleartext {
                     return basic(stream, request, &value, options, methods).await;
                 }
                 let message = if scheme.eq_ignore_ascii_case(BASIC) {
@@ -182,7 +179,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: SecretStore,
 {
-    let (store, decoy) = methods.secure.expect("chosen only when enabled");
+    let (store, decoy) = (
+        methods.store,
+        methods.decoy.expect("chosen only when enabled"),
+    );
     let Some(token) = request
         .authorization
         .as_deref()
@@ -242,7 +242,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: SecretStore,
 {
-    let (store, _decoy) = methods.secure.expect("Basic chosen only when enabled");
+    let store = methods.store;
     let (user, password) = match parse_basic(value) {
         Ok(pair) => pair,
         Err(message) => return refuse(stream, methods, options, message).await,
