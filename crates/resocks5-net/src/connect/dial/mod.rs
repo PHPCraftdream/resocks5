@@ -254,6 +254,9 @@ async fn dial_inner(
     tls_connector: Option<&TlsConnector>,
     on_tcp: impl FnOnce(),
 ) -> Result<AnyUpstream, ConnectError> {
+    // Before the TCP connect: nothing reaches the upstream, and the auth
+    // policy is checked.
+    proxy.preflight_auth()?;
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -298,7 +301,7 @@ async fn dial_inner(
                 stream,
                 host,
                 port,
-                socks5_auth(proxy),
+                socks5_auth(proxy)?,
                 deadline_after(hs),
                 &format!("{}:{}", proxy.host, proxy.port),
                 hs,

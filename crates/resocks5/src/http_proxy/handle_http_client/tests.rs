@@ -1,4 +1,5 @@
 use super::*;
+use crate::auth::AuthState;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -572,6 +573,7 @@ async fn handle_client_hands_partial_http_pipeline_to_recovery_losslessly() {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig { users: Vec::new() },
                 "unused-handoff",
@@ -709,6 +711,7 @@ async fn delayed_handle_client_rejects_expired_accept_deadline_without_consumpti
         AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: false,
+                ..Default::default()
             },
             &crate::config::UsersConfig {
                 users: vec![crate::config::User {
@@ -820,113 +823,95 @@ pub(super) async fn recovery_request() -> IncomingRequest {
         &mut stream,
         &resocks5_net::server::ServerOptions::new(
             tokio::time::Instant::now() + Duration::from_secs(5),
-            true,
-            false,
-        ),
-        |_| async { false },
+        )
+        .allow_anonymous(true),
     )
     .await
     .unwrap()
 }
 
-/// A real request whose accept callback admitted the user `alice`.
-async fn request_as_alice() -> IncomingRequest {
-    let (mut peer, mut stream) = tokio::io::duplex(256);
-    peer.write_all(
-        b"CONNECT 203.0.113.9:443 HTTP/1.1
-Proxy-Authorization: Basic YWxpY2U6cHc=
-
-",
-    )
-    .await
-    .unwrap();
-    resocks5_net::server::accept(
-        &mut stream,
-        &resocks5_net::server::ServerOptions::new(
-            tokio::time::Instant::now() + Duration::from_secs(5),
-            false,
-            true,
-        ),
-        |_| async { true },
-    )
-    .await
-    .unwrap()
-}
-
-/// A direct account at its direct-connection cap gets 503 and one log line
-/// that names the client and the target (built from borrowed values).
-/// Mutation: dropping or reordering a value in the line, or answering
-/// something other than Overloaded, fails here.
+/// An HTTP request DOES carry an identity into the handler: anonymous
+/// CONNECT stays anonymous, Basic for a real account yields a named
+/// `Cleartext` identity, and a wrong password is refused with 407.
+/// Mutation: reverting Basic to an unconditional 407 fails the identity
+/// asserts.
 #[tokio::test]
-async fn direct_cap_overload_replies_503_and_logs_client_and_target() {
+async fn http_basic_request_carries_an_identity_into_the_app() {
+    use resocks5_net::server::{accept_secure, AuthMethod, ServerError};
+
     let auth = Arc::new(
         AuthState::build(
             &crate::config::AuthConfig {
                 allow_anonymous: true,
+                ..Default::default()
             },
             &crate::config::UsersConfig {
                 users: vec![crate::config::User {
                     name: "alice".into(),
-                    hash: "init".into(),
+                    hash: crate::auth::compute_hash("pw").unwrap(),
                     is_enabled: true,
                     direct: true,
                     allowed_clients: None,
                 }],
             },
-            "unused-direct-cap",
+            "unused-http-identity",
         )
         .unwrap(),
     );
-    let request = request_as_alice().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut peer = TcpStream::connect(listener.local_addr().unwrap())
+    let store = auth.peer_store(Some("127.0.0.1".parse().unwrap()));
+    let decoy = auth.decoy();
+
+    // Anonymous: served, but with no identity.
+    let (mut peer, mut stream) = tokio::io::duplex(1024);
+    peer.write_all(b"CONNECT 203.0.113.9:443 HTTP/1.1\r\n\r\n")
         .await
         .unwrap();
-    let (socket, _) = listener.accept().await.unwrap();
-    let (log_tx, mut logs) = tokio::sync::mpsc::channel(8);
-    let logger = Arc::new(crate::logger::Logger::new(
-        log_tx,
-        crate::logger::LogConfig::default(),
-    ));
-    let network = Arc::new(NetworkConfig::default());
-    handle_http_client(
-        socket,
-        request,
+    let options = crate::server::handle_client::server_options(
+        tokio::time::Instant::now() + Duration::from_secs(5),
         &auth,
-        &Arc::new(GateLevels::default()),
-        &None,
-        &None,
-        &logger,
-        &Arc::new(RegexSet::empty()),
-        &Arc::new(ProxyPool::new(
-            Default::default(),
-            Duration::from_secs(1),
-            1,
-        )),
-        &Arc::new(TlsFragmentConfig::default()),
-        &network,
-        None,
-        &Arc::new(Semaphore::new(0)),
-        Instant::now() + Duration::from_secs(5),
+    );
+    let request = accept_secure(&mut stream, &options, &store, decoy)
+        .await
+        .unwrap();
+    assert_eq!(request.username(), None);
+    assert_eq!(request.auth_method(), AuthMethod::Anonymous);
+
+    // Basic alice:pw — a named Cleartext identity.
+    let (mut peer, mut stream) = tokio::io::duplex(1024);
+    peer.write_all(
+        b"CONNECT 203.0.113.9:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6cHc=\r\n\r\n",
     )
     .await
     .unwrap();
-    let mut response = Vec::new();
-    peer.read_to_end(&mut response).await.unwrap();
-    assert!(
-        response.starts_with(b"HTTP/1.1 503 "),
-        "{:?}",
-        String::from_utf8_lossy(&response)
+    let options = crate::server::handle_client::server_options(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        &auth,
     );
-    match logs.try_recv().unwrap() {
-        crate::logger::ELog::Error(line) => assert_eq!(
-            line,
-            format!(
-                "Direct cap reached ({}) — dropping client=alice target=203.0.113.9:443",
-                network.max_concurrent_direct
-            )
-        ),
-        crate::logger::ELog::Log(line) => panic!("unexpected plain log entry: {line}"),
-    }
-    assert!(logs.try_recv().is_err(), "exactly one line");
+    let request = accept_secure(&mut stream, &options, &store, decoy)
+        .await
+        .unwrap();
+    assert_eq!(request.username(), Some("alice"));
+    assert_eq!(request.auth_method(), AuthMethod::Cleartext);
+
+    // Basic with a WRONG password: refused with 407 on the wire.
+    let (mut peer, mut stream) = tokio::io::duplex(1024);
+    peer.write_all(
+        b"CONNECT 203.0.113.9:443 HTTP/1.1\r\nProxy-Authorization: Basic YWxpY2U6YmFk\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let options = crate::server::handle_client::server_options(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        &auth,
+    );
+    let refused = accept_secure(&mut stream, &options, &store, decoy).await;
+    assert!(
+        matches!(refused, Err(ServerError::Authentication(_))),
+        "wrong Basic password must be refused"
+    );
+    drop(stream);
+    let mut reply = Vec::new();
+    peer.read_to_end(&mut reply).await.unwrap();
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("HTTP/1.1 407 "), "{reply:?}");
 }

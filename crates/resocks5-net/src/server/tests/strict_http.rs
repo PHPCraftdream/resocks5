@@ -243,16 +243,10 @@ fn strict_validate_table_rejects_and_accepts_per_rule() {
 async fn strict_reject(
     frame: &[u8],
     opts: ServerOptions,
-    calls: &Arc<AtomicUsize>,
 ) -> (Result<IncomingRequest, ServerError>, Vec<u8>) {
     let (mut peer, mut server) = duplex(4096);
     peer.write_all(frame).await.unwrap();
-    let counted = Arc::clone(calls);
-    let result = accept(&mut server, &opts, move |_| async move {
-        counted.fetch_add(1, Ordering::SeqCst);
-        true
-    })
-    .await;
+    let result = accept(&mut server, &opts).await;
     drop(server);
     let mut response = Vec::new();
     peer.read_to_end(&mut response).await.unwrap();
@@ -267,216 +261,179 @@ async fn strict_reject(
 #[tokio::test]
 async fn strict_end_to_end_rejects_per_rule_class() {
     timeout(Duration::from_secs(10), async {
-        let opts = || options(false, true).strict_http(true);
-        let token = general_purpose::STANDARD.encode("user:pass");
+        let opts = || anon_options(false).strict_http(true);
+        let token = "dXNlcjpwYXNz"; // base64("user:pass")
 
         // (1) Malformed request line (two spaces).
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT  h:1 HTTP/1.1", &[], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: malformed request line");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (2) Malformed HTTP-version.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT h:1 HTTP/garbage", &["Host: h"], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: malformed HTTP-version");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (3) Unsupported HTTP-version answers 505 (no reason text).
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT h:1 HTTP/2.0", &["Host: h"], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: unsupported HTTP-version");
         assert_eq!(response, EXPECT_HTTP_505);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (4) Bare IPv6 authority.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT ::1:443 HTTP/1.1", &["Host: h"], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: bare IPv6 authority");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (5) Invalid authority port.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT h:0 HTTP/1.1", &["Host: h"], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid authority port");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (6) Missing Host despite a VALID Proxy-Authorization: never authenticated.
-        let calls = Arc::new(AtomicUsize::new(0));
         let auth = format!("Proxy-Authorization: Basic {token}");
         let frame = http_req("CONNECT h:443 HTTP/1.1", &[auth.as_str()], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: missing Host header");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (7) Duplicate Host.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req("CONNECT h:443 HTTP/1.1", &["Host: h:1", "Host: h:1"], b"");
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: duplicate Host header");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (8) Obsolete line folding.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:443", " X-Opaque: v"],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: obsolete line folding");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (9) Duplicate Proxy-Authorization (valid token twice): never authenticated.
-        let calls = Arc::new(AtomicUsize::new(0));
         let auth = format!("Proxy-Authorization: Basic {token}");
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:443", auth.as_str(), auth.as_str()],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(
             err.to_string(),
             "strict HTTP: duplicate Proxy-Authorization header"
         );
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     })
     .await
     .expect("bounded strict_end_to_end_rejects_per_rule_class");
 }
 
 /// Case B: authority-grammar and field-value violations answer 400 before any
-/// authentication, and the grammar's accept set authenticates end to end.
+/// authentication, and the grammar's accept set is served end to end.
 #[tokio::test]
 async fn strict_end_to_end_authority_grammar_and_field_values() {
     timeout(Duration::from_secs(10), async {
-        let opts = || options(false, true).strict_http(true);
-        let token = general_purpose::STANDARD.encode("user:pass");
+        let opts = || anon_options(false).strict_http(true);
+        let token = "dXNlcjpwYXNz"; // base64("user:pass")
         let auth = format!("Proxy-Authorization: Basic {token}");
 
         // (1) Path inside the authority: 400, never authenticated.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req(
             "CONNECT example.com/path:443 HTTP/1.1",
             &[auth.as_str()],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid authority host");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (2) userinfo-style '@' inside the authority.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req(
             "CONNECT user@example.com:443 HTTP/1.1",
             &[auth.as_str()],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid authority host");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (3) NUL in a field value despite a VALID auth header.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:443", auth.as_str(), "X-Evil: a\u{0}b"],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (4) 0x1F inside the Host value despite a VALID auth header.
-        let calls = Arc::new(AtomicUsize::new(0));
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &["Host: a\u{1f}b", auth.as_str()],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // (5) 0x7F inside the Proxy-Authorization value itself.
-        let calls = Arc::new(AtomicUsize::new(0));
         let evil_auth = format!("Proxy-Authorization: Basic {token}\u{7f}");
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &["Host: h:443", evil_auth.as_str()],
             b"",
         );
-        let (result, response) = strict_reject(&frame, opts(), &calls).await;
+        let (result, response) = strict_reject(&frame, opts()).await;
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "strict HTTP: invalid header field value");
         assert_eq!(response, EXPECT_HTTP_400);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // (6) Accept: IPv4 and reg-name authorities authenticate, target intact.
+        // (6) Accept: IPv4 and reg-name authorities are served, target intact.
         for target in ["192.0.2.1:443", "a-b_c.example:443"] {
             let frame = http_req(
                 &format!("CONNECT {target} HTTP/1.1"),
-                &[&format!("Host: {target}"), auth.as_str()],
+                &[&format!("Host: {target}")],
                 b"",
             );
             let (mut peer, mut server) = duplex(4096);
             peer.write_all(&frame).await.unwrap();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&calls);
-            let result = accept(&mut server, &opts(), move |c| async move {
-                assert_eq!(c.username(), "user");
-                assert_eq!(c.password(), "pass");
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            })
-            .await;
+            let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
             drop(server);
             peer.read_to_end(&mut Vec::new()).await.unwrap();
             let req = result.expect("strict authority accepted");
             assert_eq!(req.target(), target);
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
         }
 
         // (7) Accept: HTAB inside a field value stays legal end to end.
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
-            &["Host: h:443", auth.as_str(), "X-T: a\u{9}b"],
+            &["Host: h:443", "X-T: a\u{9}b"],
             b"",
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &opts(), |_| async move { true }).await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         assert_eq!(result.expect("HTAB value accepted").target(), "h:443");
@@ -485,19 +442,15 @@ async fn strict_end_to_end_authority_grammar_and_field_values() {
     .expect("bounded strict_end_to_end_authority_grammar_and_field_values");
 }
 
-/// Case C: browser-like and curl-like strict requests authenticate and connect.
+/// Case C: browser-like and curl-like strict requests connect anonymously.
 #[tokio::test]
-async fn strict_on_accepts_browser_and_curl_with_basic_auth() {
+async fn strict_on_accepts_browser_and_curl_requests() {
     timeout(Duration::from_secs(10), async {
-        let token = general_purpose::STANDARD.encode("user:pass");
-        let auth = format!("Proxy-Authorization: Basic {token}");
-
         // Browser-like frame.
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
             &[
                 "Host: h:443",
-                auth.as_str(),
                 "User-Agent: test",
                 "Proxy-Connection: keep-alive",
             ],
@@ -505,52 +458,26 @@ async fn strict_on_accepts_browser_and_curl_with_basic_auth() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(
-            &mut server,
-            &options(false, true).strict_http(true),
-            move |c| async move {
-                assert_eq!(c.username(), "user");
-                assert_eq!(c.password(), "pass");
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            },
-        )
-        .await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("browser-like strict request accepted");
-        assert_eq!(req.username(), Some("user"));
+        assert_eq!(req.username(), None);
         assert_eq!(req.target(), "h:443");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         // Curl-like frame (HTTP/1.0: Host is optional).
-        let frame = http_req("CONNECT h:443 HTTP/1.0", &[auth.as_str()], b"");
+        let frame = http_req("CONNECT h:443 HTTP/1.0", &[], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(
-            &mut server,
-            &options(false, true).strict_http(true),
-            move |c| async move {
-                assert_eq!(c.username(), "user");
-                assert_eq!(c.password(), "pass");
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            },
-        )
-        .await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("curl-like strict request accepted");
-        assert_eq!(req.username(), Some("user"));
+        assert_eq!(req.username(), None);
         assert_eq!(req.target(), "h:443");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     })
     .await
-    .expect("bounded strict_on_accepts_browser_and_curl_with_basic_auth");
+    .expect("bounded strict_on_accepts_browser_and_curl_requests");
 }
 
 /// Case C: strict anonymous acceptance keeps the pipelined payload intact.
@@ -568,21 +495,10 @@ async fn strict_on_anonymous_and_pipelined_payload() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(
-            &mut server,
-            &options(true, false).strict_http(true),
-            move |_| async move {
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            },
-        )
-        .await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let mut req = result.expect("anonymous strict request accepted");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(req.username(), None);
         assert_eq!(req.pipeline(), b"PIPE-STRICT-1");
         assert_eq!(req.take_pipeline(), b"PIPE-STRICT-1");
@@ -598,31 +514,20 @@ async fn strict_on_keeps_bracketed_ipv6_target() {
         let frame = http_req("CONNECT [::1]:443 HTTP/1.1", &["Host: [::1]:443"], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
         // Anonymous access is allowed, so a request with no credentials passes.
-        let result = accept(
-            &mut server,
-            &options(true, true).strict_http(true),
-            move |_| async move {
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            },
-        )
-        .await;
+        let result = accept(&mut server, &anon_options(true).strict_http(true)).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         let req = result.expect("bracketed IPv6 strict request accepted");
         assert_eq!(req.target(), "[::1]:443");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     })
     .await
     .expect("bounded strict_on_keeps_bracketed_ipv6_target");
 }
 
-/// Case C: with credentials required, a strict request without them still gets 407.
+/// Case C: without anonymous access, a strict request without credentials gets 407.
 #[tokio::test]
-async fn strict_on_still_answers_407_when_credentials_missing() {
+async fn strict_on_still_answers_407_when_anonymous_is_not_allowed() {
     timeout(Duration::from_secs(10), async {
         let frame = http_req(
             "CONNECT h:443 HTTP/1.1",
@@ -635,26 +540,16 @@ async fn strict_on_still_answers_407_when_credentials_missing() {
         );
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(
-            &mut server,
-            &options(false, true).strict_http(true),
-            move |_| async move {
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            },
-        )
-        .await;
+        let result = accept(&mut server, &anon_options(false).strict_http(true)).await;
         drop(server);
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         assert!(matches!(result, Err(ServerError::Authentication(_))));
-        assert_eq!(response, EXPECT_HTTP_407);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // No scheme is enabled on this server: the bare closing 407.
+        assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     })
     .await
-    .expect("bounded strict_on_still_answers_407_when_credentials_missing");
+    .expect("bounded strict_on_still_answers_407_when_anonymous_is_not_allowed");
 }
 
 /// Case D: with strict off (the default) the lenient behaviours stay pinned.
@@ -662,17 +557,12 @@ async fn strict_on_still_answers_407_when_credentials_missing() {
 async fn strict_off_default_keeps_lenient_behaviour() {
     timeout(Duration::from_secs(10), async {
         // White-box: the flag defaults off and strict_http(false) matches the default.
-        assert!(!options(false, true).strict_http);
-        assert!(!ServerOptions::new(Instant::now(), true, true).strict_http);
-        let off = options(false, true).strict_http(false);
+        assert!(!anon_options(false).strict_http);
+        assert!(!ServerOptions::new(Instant::now()).strict_http);
+        let off = anon_options(false).strict_http(false);
         assert!(!off.strict_http);
-        assert_eq!(
-            off.retain_credentials,
-            options(false, true).retain_credentials
-        );
-        assert_eq!(off.raw_credentials, options(false, true).raw_credentials);
-        assert_eq!(off.anonymous, options(false, true).anonymous);
-        assert_eq!(off.password, options(false, true).password);
+        assert_eq!(off.anonymous, anon_options(false).anonymous);
+        assert_eq!(off.cleartext, anon_options(false).cleartext);
 
         // Lenient pins, all with the flag off.
         let lenient = [
@@ -694,96 +584,47 @@ async fn strict_off_default_keeps_lenient_behaviour() {
                 http_req("CONNECT h:443 HTTP/1.1", &["X: a\u{0}b"], b""),
                 "h:443",
             ),
+            // no Host header is required — pinned current behaviour.
+            (http_req("CONNECT h:1 HTTP/1.1", &[], b""), "h:1"),
+            // a header line without a colon is skipped — pinned current behaviour.
+            (
+                http_req("CONNECT h:1 HTTP/1.1", &["X-Opaque v"], b""),
+                "h:1",
+            ),
+            // whitespace before the colon is tolerated — pinned current behaviour.
+            (
+                http_req("CONNECT h:1 HTTP/1.1", &["Host : h:1"], b""),
+                "h:1",
+            ),
+            // duplicate Host headers are ignored — pinned current behaviour.
+            (
+                http_req("CONNECT h:1 HTTP/1.1", &["Host: a:1", "Host: b:2"], b""),
+                "h:1",
+            ),
         ];
         for (frame, want_target) in lenient {
             let (mut peer, mut server) = duplex(4096);
             peer.write_all(&frame).await.unwrap();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&calls);
-            let result = accept(&mut server, &options(true, false), move |_| async move {
-                counted.fetch_add(1, Ordering::SeqCst);
-                true
-            })
-            .await;
+            let result = accept(&mut server, &anon_options(true)).await;
             drop(server);
             peer.read_to_end(&mut Vec::new()).await.unwrap();
             let req = result.expect("lenient request accepted");
             assert_eq!(req.target(), want_target, "{frame:?}");
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
 
-        // no Host header is required — pinned current behaviour.
-        let frame = http_req("CONNECT h:1 HTTP/1.1", &[], b"");
+        // Duplicate Proxy-Authorization headers: any Proxy-Authorization is a
+        // 407 (never authenticated) in lenient mode too.
+        let first = "Proxy-Authorization: Basic dXNlcjE6cGFzczE=";
+        let second = "Proxy-Authorization: Basic dXNlcjI6cGFzczI=";
+        let frame = http_req("CONNECT h:1 HTTP/1.1", &[first, second], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(&mut server, &options(true, false), move |_| async move {
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .await;
+        let result = accept(&mut server, &anon_options(true)).await;
         drop(server);
-        peer.read_to_end(&mut Vec::new()).await.unwrap();
-        assert_eq!(result.expect("lenient request accepted").target(), "h:1");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-
-        // a header line without a colon is skipped — pinned current behaviour.
-        let frame = http_req("CONNECT h:1 HTTP/1.1", &["X-Opaque v"], b"");
-        let (mut peer, mut server) = duplex(4096);
-        peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false), |_| async move { true }).await;
-        drop(server);
-        peer.read_to_end(&mut Vec::new()).await.unwrap();
-        assert_eq!(result.expect("lenient request accepted").target(), "h:1");
-
-        // whitespace before the colon is tolerated — pinned current behaviour.
-        let frame = http_req("CONNECT h:1 HTTP/1.1", &["Host : h:1"], b"");
-        let (mut peer, mut server) = duplex(4096);
-        peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false), |_| async move { true }).await;
-        drop(server);
-        peer.read_to_end(&mut Vec::new()).await.unwrap();
-        assert_eq!(result.expect("lenient request accepted").target(), "h:1");
-
-        // duplicate Host headers are ignored — pinned current behaviour.
-        let frame = http_req("CONNECT h:1 HTTP/1.1", &["Host: a:1", "Host: b:2"], b"");
-        let (mut peer, mut server) = duplex(4096);
-        peer.write_all(&frame).await.unwrap();
-        let result = accept(&mut server, &options(true, false), |_| async move { true }).await;
-        drop(server);
-        peer.read_to_end(&mut Vec::new()).await.unwrap();
-        assert_eq!(result.expect("lenient request accepted").target(), "h:1");
-
-        // FIRST-WINS Proxy-Authorization in lenient mode.
-        let first = format!(
-            "Proxy-Authorization: Basic {}",
-            general_purpose::STANDARD.encode("user1:pass1")
-        );
-        let second = format!(
-            "Proxy-Authorization: Basic {}",
-            general_purpose::STANDARD.encode("user2:pass2")
-        );
-        let frame = http_req(
-            "CONNECT h:1 HTTP/1.1",
-            &[first.as_str(), second.as_str()],
-            b"",
-        );
-        let (mut peer, mut server) = duplex(4096);
-        peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(&mut server, &options(false, true), move |c| async move {
-            assert_eq!(c.username(), "user1");
-            assert_eq!(c.password(), "pass1");
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .await;
-        drop(server);
-        peer.read_to_end(&mut Vec::new()).await.unwrap();
-        assert_eq!(result.expect("lenient request accepted").target(), "h:1");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response).await.unwrap();
+        assert!(matches!(result, Err(ServerError::Authentication(_))));
+        assert_eq!(response, EXPECT_HTTP_407_BARE_CLOSE);
     })
     .await
     .expect("bounded strict_off_default_keeps_lenient_behaviour");
@@ -794,41 +635,30 @@ async fn strict_off_default_keeps_lenient_behaviour() {
 async fn strict_http_options_chain_deadline_and_copy() {
     timeout(Duration::from_secs(10), async {
         // White-box: default off.
-        assert!(!options(false, true).strict_http);
+        assert!(!anon_options(false).strict_http);
 
-        let opts = options(false, true)
-            .retain_credentials(true)
-            .raw_credentials(true)
-            .strict_http(true);
-        assert!(opts.retain_credentials);
-        assert!(opts.raw_credentials);
+        let opts = anon_options(false).strict_http(true);
         assert!(opts.strict_http);
         assert!(!opts.anonymous);
-        assert!(opts.password);
+        assert!(!opts.cleartext, "anon_options turns clear text off");
 
         // Copy semantics: reading through both after the copy compiles only for Copy.
         let copy = opts;
         assert!(copy.strict_http);
         assert!(opts.strict_http);
-        assert!(copy.retain_credentials);
-        assert!(opts.retain_credentials);
 
         // An expired deadline refuses BEFORE any strict check.
-        let expired = ServerOptions::new(Instant::now(), true, true).strict_http(true);
+        let expired = ServerOptions::new(Instant::now())
+            .allow_anonymous(true)
+            .allow_cleartext(true)
+            .strict_http(true);
         let frame = http_req("CONNECT h:443 HTTP/1.1", &["Host: h:443"], b"");
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(&mut server, &expired, move |_| async move {
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .await;
+        let result = accept(&mut server, &expired).await;
         drop(server);
         peer.read_to_end(&mut Vec::new()).await.unwrap();
         assert!(matches!(result, Err(ServerError::Deadline)));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     })
     .await
     .expect("bounded strict_http_options_chain_deadline_and_copy");
@@ -838,50 +668,36 @@ async fn strict_http_options_chain_deadline_and_copy() {
 #[tokio::test]
 async fn strict_http_leaves_socks5_untouched() {
     timeout(Duration::from_secs(10), async {
-        // Anonymous AND password methods are enabled: the no-auth client
-        // offers method 0 only, the password client method 2 only.
-        let opts = options(true, true).strict_http(true);
+        // Anonymous is enabled: the no-auth client offers method 0 only, the
+        // password client method 2 only, which is never selected.
+        let opts = anon_options(true).strict_http(true);
 
         // (a) No-auth SOCKS5.
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&socks_request(b"h")).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(&mut server, &opts, move |_| async move {
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .await;
+        let result = accept(&mut server, &opts).await;
         drop(server);
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
         let req = result.expect("no-auth socks accepted under strict_http");
         assert_eq!(req.target(), "h:443");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(response, [5, 0]);
 
-        // (b) Password SOCKS5.
+        // (b) Password SOCKS5 is refused: method 2 does not exist here.
         let mut frame = [5u8, 1, 2].to_vec();
-        frame.extend_from_slice(&subneg(b"socks-user", b"socks-pass"));
+        frame.extend_from_slice(&[1, 10]);
+        frame.extend_from_slice(b"socks-user");
+        frame.extend_from_slice(&[10]);
+        frame.extend_from_slice(b"socks-pass");
         frame.extend_from_slice(&socks_request(b"h")[3..]);
         let (mut peer, mut server) = duplex(4096);
         peer.write_all(&frame).await.unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let result = accept(&mut server, &opts, move |c| async move {
-            assert_eq!(c.username(), "socks-user");
-            assert_eq!(c.password(), "socks-pass");
-            counted.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .await;
+        let result = accept(&mut server, &opts).await;
         drop(server);
         let mut response = Vec::new();
         peer.read_to_end(&mut response).await.unwrap();
-        let req = result.expect("password socks accepted under strict_http");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(req.username(), Some("socks-user"));
-        assert_eq!(response, [5, 2, 1, 0]);
+        assert!(matches!(result, Err(ServerError::Authentication(_))));
+        assert_eq!(response, [5, 255]);
     })
     .await
     .expect("bounded strict_http_leaves_socks5_untouched");

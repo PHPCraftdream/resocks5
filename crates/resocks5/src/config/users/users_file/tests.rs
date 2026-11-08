@@ -33,6 +33,27 @@ fn cleanup(path: &Path) {
     let _ = fs::remove_file(sibling_path(path, ".lock"));
 }
 
+/// `write_atomic_text` lands the exact bytes owner-only with no `.tmp`
+/// left behind. Mutation: a text path that skips the private-temp
+/// creation (plain `fs::write`) fails the owner-only assertion.
+#[test]
+fn write_atomic_text_lands_content_owner_only_without_a_temp_file() {
+    let path = unique_path("text_atomic");
+    let text = "port: 20082\n## comment\nauth: { allow_anonymous: true }\n";
+    write_atomic_text(&path, text).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a brand-new text file must be owner-only");
+    }
+    #[cfg(windows)]
+    test_support::assert_owner_only_dacl(&path);
+    assert!(!sibling_path(&path, ".tmp").exists());
+    cleanup(&path);
+}
+
 #[test]
 fn write_atomic_replaces_existing_file() {
     let path = unique_path("replace");

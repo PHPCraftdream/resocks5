@@ -52,7 +52,7 @@ fn err(kind: ErrorKind) -> ConnectError {
             endpoint: "proxy:1080".into(),
             after: Duration::from_secs(1),
         },
-        ErrorKind::Auth => ConnectError::AuthFailed { status: 1 },
+        ErrorKind::Auth => ConnectError::SecureAuth(crate::SecureAuthError::Denied),
         ErrorKind::Protocol => {
             ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
         }

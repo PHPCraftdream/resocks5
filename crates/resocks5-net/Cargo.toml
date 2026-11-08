@@ -43,7 +43,7 @@ rating = []
 # per-target sticky cache, driven by the rating model. Implies `rating`.
 rotator = ["rating"]
 # Today's behaviour for anyone who does not opt out.
-default = ["pool", "tls", "serde", "rating", "rotator"]
+default = ["pool", "tls", "serde", "rating", "rotator", "secure-auth"]
 # Test-only instrumentation for cross-crate test observability: exposes
 # the rotator's `pick_order_calls()` diagnostic counter. The counter
 # lives inside the rotator, so the feature implies `rotator`. Dependents
@@ -52,8 +52,24 @@ default = ["pool", "tls", "serde", "rating", "rotator"]
 # a default feature, so ordinary release builds compile the counter
 # to nothing.
 test-instrumentation = ["rotator"]
-# Wipe inbound credentials (`server::Credentials`, the retained username of
-# `server::IncomingRequest`) from memory when they are dropped. Off by default.
+# Password authentication that never puts the password on the wire: SOCKS5
+# method 0x80, a mutual HMAC-SHA256 challenge-response keyed by an Argon2id-derived
+# key (`secure_auth`). The server stores the derived key (not the password); the
+# client derives it from the password and proves knowledge of it.
+secure-auth = [
+    "dep:argon2",
+    "dep:hmac",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:getrandom",
+    "dep:zeroize",
+    "dep:x25519-dalek",
+    "dep:chacha20poly1305",
+]
+# Wipe secrets from memory when they are dropped: secure-auth credentials, the
+# retained user name of `server::IncomingRequest`; adds `ProxyConfig::wipe_credentials`.
+# Off by default.
 zeroize = ["dep:zeroize"]
 
 # The README-mirrored example rotates through `ProxyRotator` and dials via
@@ -81,6 +97,14 @@ webpki-roots = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
 crossbeam-queue = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -420,6 +420,7 @@ async fn hop(
         endpoint: format!("{}:{}", node.host, node.port),
         after: hs,
     };
+    node.preflight_auth()?;
     match node.protocol {
         ProxyProtocol::Socks5 => {
             let parsed = HostPort::parse(target)
@@ -429,7 +430,7 @@ async fn hop(
                 stream,
                 parsed.host,
                 parsed.port,
-                socks5_auth(node),
+                socks5_auth(node)?,
                 deadline_after(hs),
                 &format!("{}:{}", node.host, node.port),
                 hs,

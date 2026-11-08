@@ -1,4 +1,7 @@
-//! HTTP `CONNECT` upstream connector.
+//! HTTP `CONNECT` upstream connector: one credential-less CONNECT first, then
+//! the authentication the proxy's `407` names (`Resocks5-Secure` beats
+//! `Basic`; `Basic` inside TLS is always allowed, on plain HTTP only while
+//! `allow_cleartext` is on).
 
 use std::fmt::Write as _;
 #[cfg(feature = "pool")]
@@ -41,7 +44,9 @@ pub async fn connect_http_proxy(
 }
 
 /// The HTTP CONNECT half of [`connect_http_proxy`] on a socket already
-/// taken from the pool, bounded by `handshake_timeout`.
+/// taken from the pool, bounded by `handshake_timeout`. All HTTP rounds
+/// (the credential-less probe and any authentication rounds) count toward
+/// the same deadline.
 #[cfg(feature = "pool")]
 pub(crate) async fn http_on_acquired(
     mut stream: UpstreamStream,
@@ -69,7 +74,9 @@ pub(crate) async fn http_on_acquired(
 }
 
 /// HTTP CONNECT core for a plain upstream socket: no deadline, no pool.
-/// Peeks to consume exactly the response head.
+/// One credential-less CONNECT first; on a 407 the offered schemes pick the
+/// authentication (`Resocks5-Secure` beats `Basic`); the exchange completes
+/// on this connection. See [`http_connect_handshake`] for the full contract.
 ///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
 pub(crate) async fn http_connect_on_tcp(
@@ -77,8 +84,67 @@ pub(crate) async fn http_connect_on_tcp(
     target_addr: &str,
     proxy: &ProxyConfig,
 ) -> Result<(), ConnectError> {
-    write_connect_request(stream, target_addr, proxy).await?;
-    read_connect_response_tcp(stream).await
+    http_connect_dance(stream, target_addr, proxy).await
+}
+
+/// The authentication dance shared by the plain-TCP and generic paths.
+///
+/// A user/password entry sends `Basic` in the FIRST request, exactly as
+/// 0.4.x did: proxies such as 3proxy answer an unauthenticated CONNECT with
+/// `407` and close the connection, so a probe-then-retry could never reach
+/// them. The probe (a credential-less CONNECT, then the scheme its `407`
+/// names) runs only when Basic cannot or must not be sent first:
+/// `secure_only` entries, plain-HTTP entries with clear text disallowed, and
+/// entries with secure credentials but no user/password pair.
+///
+/// cancel-safe: NO.
+async fn http_connect_dance<S>(
+    stream: &mut S,
+    target_addr: &str,
+    proxy: &ProxyConfig,
+) -> Result<(), ConnectError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    proxy.preflight_auth()?;
+    if let Some((user, password)) = proxy.usable_pair() {
+        let https = proxy.protocol == ProxyProtocol::Https;
+        if !proxy.secure_only && (proxy.allow_cleartext || https) {
+            let head = send_connect(
+                stream,
+                target_addr,
+                Some(basic_authorization(user, password)),
+            )
+            .await?;
+            return if head.status() / 100 == 2 {
+                Ok(())
+            } else {
+                Err(rejected(&head))
+            };
+        }
+    }
+    let head = send_connect(stream, target_addr, None).await?;
+    if head.status() / 100 == 2 {
+        return Ok(());
+    }
+    if head.status() != 407 {
+        return Err(rejected(&head));
+    }
+    #[cfg(feature = "secure-auth")]
+    if head.has_scheme(crate::http_auth::SECURE) && proxy.secure_auth.is_some() {
+        let credentials = proxy.secure_auth.as_deref().expect("checked above");
+        return secure_http_rounds(stream, target_addr, credentials).await;
+    }
+    if proxy.secure_only {
+        // Only our method is acceptable; the upstream offered none.
+        return Err(ConnectError::SecureAuthUnsupported);
+    }
+    if proxy.usable_pair().is_some() && head.has_scheme(crate::http_auth::BASIC) {
+        // Clear text is the only method on offer and it is disallowed here;
+        // refuse before the password is sent.
+        return Err(ConnectError::CleartextCredentialsRefused);
+    }
+    Err(rejected(&head))
 }
 
 /// Perform the HTTP `CONNECT` handshake for one tunnel hop on an
@@ -88,10 +154,29 @@ pub(crate) async fn http_connect_on_tcp(
 /// HTTP hop over any stream (plain, TLS, or TLS-in-TLS), not just
 /// [`UpstreamStream`].
 ///
+/// The dance: one CONNECT without credentials first. A `2xx` finishes the
+/// hop (an upstream that does not require authentication tunnels this entry
+/// anonymously). A `407` names the accepted schemes in `Proxy-Authenticate`;
+/// the strongest one this entry can speak is then used ON THE SAME
+/// CONNECTION: `Resocks5-Secure` (feature `secure-auth`) runs the
+/// `secure_auth` exchange one message per round, base64 in
+/// `Proxy-Authorization`, and the tunnel's `200` carries the server's last
+/// token in `Proxy-Authenticate`, which is verified before the hop is
+/// accepted; `Basic` is sent once the upstream asked for it — plain HTTP
+/// only while `allow_cleartext` is on (`CleartextCredentialsRefused`
+/// otherwise, before the password is sent), inside TLS always. In
+/// `secure_only` mode ONLY `Resocks5-Secure` is acceptable: a `407` without
+/// it fails with `ConnectError::SecureAuthUnsupported` before any password
+/// byte. Without usable credentials a `407` is a plain `ProxyRejected` —
+/// unless secure credentials are present, in which case the secure exchange
+/// runs regardless of any pair.
+/// Any other well-formed status is `ProxyRejected` as before.
+///
 /// # Errors
 ///
 /// Returns [`ConnectError`] when the request cannot be written, the
-/// response cannot be read/parsed, or the proxy rejects the CONNECT.
+/// response cannot be read/parsed, the proxy rejects the CONNECT, or the
+/// negotiated authentication fails (`SecureAuth` variants).
 ///
 /// cancel-safe: NO — a cancelled handshake must close the stream.
 pub async fn http_connect_handshake<S>(
@@ -102,36 +187,17 @@ pub async fn http_connect_handshake<S>(
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    write_connect_request(stream, target_addr, proxy).await?;
-    let mut head = ResponseHead::new();
-    loop {
-        let filled = head.filled;
-        let suffix = &head.buf[..filled];
-        let remaining = if suffix.ends_with(b"\r\n\r") {
-            1
-        } else if suffix.ends_with(b"\r\n") {
-            2
-        } else if suffix.ends_with(b"\r") {
-            3
-        } else {
-            4
-        };
-        let limit = remaining.min(head.remaining()?);
-        // TLS buffers decrypted records internally. Stop exactly at the header.
-        let n = stream.read(&mut head.buf[filled..filled + limit]).await?;
-        if head.advance(n)? {
-            return Ok(());
-        }
-    }
+    http_connect_dance(stream, target_addr, proxy).await
 }
 
 /// [`http_connect_handshake`] bounded by an ABSOLUTE `deadline`, with a typed
-/// timeout: [`ConnectError::Timeout`] (stage [`Stage::Handshake`], kind
-/// [`TimeoutKind::HttpHandshake`], or [`TimeoutKind::HttpsConnectHandshake`]
+/// timeout: [`ConnectError::Timeout`] (stage [`Stage::Handshake`](crate::error::Stage::Handshake), kind
+/// [`TimeoutKind::HttpHandshake`](crate::error::TimeoutKind::HttpHandshake), or [`TimeoutKind::HttpsConnectHandshake`](crate::error::TimeoutKind::HttpsConnectHandshake)
 /// when `proxy` is an HTTPS upstream), the `host:port` of `proxy` as the
 /// endpoint and the time left at the call as `after`. HTTP has no separate
-/// greeting phase, so there is no finer kind than "the CONNECT reply did not
-/// arrive".
+/// greeting phase; every round of the authentication dance counts toward
+/// the same deadline, so there is no finer kind than "the CONNECT reply did
+/// not arrive".
 ///
 /// On error or timeout the stream is in an unspecified state: drop it.
 ///
@@ -167,10 +233,43 @@ where
     }
 }
 
+/// Write one CONNECT round and read the complete response head.
+///
+/// cancel-safe: NO.
+async fn send_connect<S>(
+    stream: &mut S,
+    target_addr: &str,
+    authorization: Option<String>,
+) -> Result<ResponseHead, ConnectError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    write_connect_request(stream, target_addr, authorization).await?;
+    read_response_head(stream).await
+}
+
+/// `Basic` header value for a `user:password` pair (RFC 7617; the pair was
+/// screened non-empty by `usable_pair`).
+fn basic_authorization(user: &str, password: &str) -> String {
+    format!(
+        "Basic {}",
+        general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
+
+/// The typed rejection for a completed non-2xx head.
+fn rejected(head: &ResponseHead) -> ConnectError {
+    ConnectError::ProxyRejected {
+        protocol: ProxyProtocol::Http,
+        code: Some(head.status()),
+        response: head.status_line(),
+    }
+}
+
 async fn write_connect_request<S>(
     stream: &mut S,
     target_addr: &str,
-    proxy: &ProxyConfig,
+    authorization: Option<String>,
 ) -> Result<(), ConnectError>
 where
     S: AsyncWriteExt + Unpin,
@@ -188,9 +287,8 @@ where
         target_addr, target_addr
     );
 
-    if let (Some(user), Some(pass)) = (&proxy.user, &proxy.password) {
-        let creds = general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
-        write!(req, "Proxy-Authorization: Basic {}\r\n", creds).expect("String write cannot fail");
+    if let Some(value) = authorization {
+        write!(req, "Proxy-Authorization: {}\r\n", value).expect("String write cannot fail");
     }
 
     req.push_str("\r\n");
@@ -199,22 +297,32 @@ where
     Ok(())
 }
 
+/// The generic capped-read loop: read until the head is complete, preserving
+/// any coalesced payload past it (TCP and TLS alike).
+///
 /// cancel-safe: NO — cancellation must discard the partially read stream.
-async fn read_connect_response_tcp(stream: &mut UpstreamStream) -> Result<(), ConnectError> {
+async fn read_response_head<S>(stream: &mut S) -> Result<ResponseHead, ConnectError>
+where
+    S: AsyncReadExt + Unpin,
+{
     let mut head = ResponseHead::new();
     loop {
         let filled = head.filled;
-        let remaining = head.remaining()?;
-        let n = stream
-            .as_tcp()
-            .peek(&mut head.buf[filled..filled + remaining])
-            .await?;
-        let scan_from = filled.saturating_sub(3);
-        let consume_to = find_header_end(&head.buf[scan_from..filled + n])
-            .map_or(filled + n, |pos| scan_from + pos + 4);
-        stream.read_exact(&mut head.buf[filled..consume_to]).await?;
-        if head.advance(consume_to - filled)? {
-            return Ok(());
+        let suffix = &head.buf[..filled];
+        let remaining = if suffix.ends_with(b"\r\n\r") {
+            1
+        } else if suffix.ends_with(b"\r\n") {
+            2
+        } else if suffix.ends_with(b"\r") {
+            3
+        } else {
+            4
+        };
+        let limit = remaining.min(head.remaining()?);
+        // TLS buffers decrypted records internally. Stop exactly at the header.
+        let n = stream.read(&mut head.buf[filled..filled + limit]).await?;
+        if head.advance(n)? {
+            return Ok(head);
         }
     }
 }
@@ -244,6 +352,9 @@ impl ResponseHead {
         Ok(remaining)
     }
 
+    /// Feed `n` freshly read bytes; `Ok(true)` once a final head is complete.
+    /// A well-formed non-2xx status (a `407` included) completes too — the
+    /// caller interprets it. Informational `1xx` heads reset the buffer.
     fn advance(&mut self, n: usize) -> Result<bool, ConnectError> {
         if n == 0 {
             return Err(ConnectError::Protocol(ProtocolViolation::HttpClosedEarly));
@@ -261,7 +372,7 @@ impl ResponseHead {
             && (first_line.starts_with(b"HTTP/1.1 ") || first_line.starts_with(b"HTTP/1.0 "))
             && first_line[9..12].iter().all(u8::is_ascii_digit)
             && first_line[12] == b' ';
-        if valid && first_line[9] == b'2' {
+        if valid && first_line[9] != b'1' {
             return Ok(true);
         }
         if valid && first_line[9] == b'1' && &first_line[9..12] != b"101" {
@@ -270,22 +381,135 @@ impl ResponseHead {
         }
         Err(ConnectError::ProxyRejected {
             protocol: ProxyProtocol::Http,
-            code: valid
-                .then(|| {
-                    first_line[9..12]
-                        .iter()
-                        .fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0'))
-                        .try_into()
-                        .ok()
-                })
-                .flatten(),
+            code: None,
             response: String::from_utf8_lossy(first_line).into_owned(),
         })
     }
+
+    /// The status code of the completed head (valid per `advance`).
+    fn status(&self) -> u16 {
+        self.first_line()[9..12]
+            .iter()
+            .fold(0u16, |acc, &d| acc * 10 + u16::from(d - b'0'))
+    }
+
+    /// The raw status line of the completed head.
+    fn status_line(&self) -> String {
+        String::from_utf8_lossy(self.first_line()).into_owned()
+    }
+
+    /// The bytes up to the first `\r` of the completed head.
+    fn first_line(&self) -> &[u8] {
+        self.buf[..self.filled]
+            .split(|&b| b == b'\r')
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// Every `Proxy-Authenticate` header value of the completed head, with
+    /// the name matched case-insensitively. Non-UTF-8 headers (or a non-UTF-8
+    /// head) yield nothing: they can never match a scheme.
+    fn authenticate_headers(&self) -> Vec<String> {
+        let text = String::from_utf8_lossy(&self.buf[..self.filled]);
+        text.lines()
+            .filter_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                header
+                    .trim()
+                    .eq_ignore_ascii_case("proxy-authenticate")
+                    .then(|| value.trim().to_owned())
+            })
+            .collect()
+    }
+
+    /// Every `(scheme, rest)` of every `Proxy-Authenticate` header,
+    /// comma-separated parts included.
+    fn schemes(&self) -> Vec<(String, String)> {
+        self.authenticate_headers()
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(|part| {
+                let (scheme, rest) = crate::http_auth::split_credentials(part);
+                (scheme.to_owned(), rest.to_owned())
+            })
+            .collect()
+    }
+
+    /// Whether `scheme` was offered (case-insensitive).
+    fn has_scheme(&self, scheme: &str) -> bool {
+        self.schemes()
+            .iter()
+            .any(|(offered, _)| offered.eq_ignore_ascii_case(scheme))
+    }
+
+    /// The decoded token of `scheme` in the challenge, if any.
+    #[cfg(feature = "secure-auth")]
+    fn token(&self, scheme: &str) -> Option<Vec<u8>> {
+        self.authenticate_headers()
+            .iter()
+            .flat_map(|value| value.split(','))
+            .find_map(|part| crate::http_auth::decode_token(part, scheme))
+    }
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+/// `Resocks5-Secure` over HTTP rounds: the exchange runs over an in-memory
+/// pipe (see `crate::http_auth`), every flushed message becomes one CONNECT
+/// round's `Proxy-Authorization` token, every challenge's token is fed back,
+/// and the `200`'s final token is verified by the exchange itself — a
+/// token-less answer is an EOF for the exchange (`close_input`), never a
+/// silently accepted hop.
+///
+/// cancel-safe: NO.
+#[cfg(feature = "secure-auth")]
+async fn secure_http_rounds<S>(
+    stream: &mut S,
+    target_addr: &str,
+    credentials: &crate::secure_auth::SecureCredentials,
+) -> Result<(), ConnectError>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    use crate::http_auth::Pipe;
+    let pipe = Pipe::new();
+    let mut end = pipe.end();
+    let exchange = crate::secure_auth::client_authenticate(&mut end, credentials);
+    tokio::pin!(exchange);
+    let mut rounds = 0usize;
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut exchange => break result,
+            message = pipe.next_message() => {
+                if rounds >= crate::http_auth::MAX_ROUNDS {
+                    return Err(ConnectError::SecureAuth(
+                        crate::SecureAuthError::Refused,
+                    ));
+                }
+                let value = crate::http_auth::encode_token(crate::http_auth::SECURE, &message);
+                let head = send_connect(stream, target_addr, Some(value)).await?;
+                rounds += 1;
+                let status = head.status();
+                if status != 407 && status / 100 != 2 {
+                    // A rejection mid-exchange: surface it, not an I/O error.
+                    return Err(rejected(&head));
+                }
+                match head.token(crate::http_auth::SECURE) {
+                    Some(token) => pipe.push(&token),
+                    // A token-less close ends the exchange with an EOF, so a
+                    // silent proxy cannot fake acceptance.
+                    None => pipe.close_input(),
+                }
+            }
+        }
+    };
+    result.map_err(|error| match error {
+        crate::SecureAuthError::Io(kind) => ConnectError::Io {
+            stage: crate::error::Stage::Handshake,
+            endpoint: None,
+            source: std::io::Error::from(kind),
+        },
+        other => ConnectError::SecureAuth(other),
+    })
 }
 
 #[cfg(test)]
@@ -406,6 +630,110 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod first_request_tests {
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    use super::http_connect_handshake;
+    #[cfg(feature = "secure-auth")]
+    use crate::error::ConnectError;
+    use crate::types::ProxyConfig;
+
+    /// One request head (up to the blank line) as text.
+    async fn read_head(upstream: &mut DuplexStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            upstream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).unwrap()
+    }
+
+    #[cfg(feature = "secure-auth")]
+    const CLOSING_BASIC_407: &[u8] = b"HTTP/1.0 407 Proxy Authentication Required\r\n\
+        Proxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n";
+
+    /// 0.4.x compatibility: a user/password entry puts Basic in the FIRST
+    /// CONNECT, so an upstream that answers an unauthenticated request with
+    /// `407` + `Connection: close` (3proxy does) is still reachable.
+    /// Mutation: probing first makes the first request carry no
+    /// `Proxy-Authorization`, and the closing `407` strands the client.
+    #[tokio::test]
+    async fn a_credentialed_entry_sends_basic_in_the_first_request() {
+        let (mut client, mut upstream) = duplex(4096);
+        let proxy = ProxyConfig::http("localhost", 8080).with_auth("u", "p");
+        let server = async {
+            let head = read_head(&mut upstream).await;
+            assert!(
+                head.contains("Proxy-Authorization: Basic dTpw\r\n"),
+                "{head}"
+            );
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let (_, result) = tokio::join!(
+            server,
+            http_connect_handshake(&mut client, "example.com:443", &proxy)
+        );
+        result.unwrap();
+    }
+
+    /// A `secure_only` entry never sends Basic: its first request is the
+    /// credential-less probe, and a Basic-only `407` ends in
+    /// `SecureAuthUnsupported`. Mutation: sending Basic first would hand the
+    /// password to a clear-text-only upstream. Needs secure credentials (without
+    /// them `secure_only` refuses before any byte is written).
+    #[cfg(feature = "secure-auth")]
+    #[tokio::test]
+    async fn a_secure_only_entry_probes_without_credentials() {
+        let (mut client, mut upstream) = duplex(4096);
+        let proxy = ProxyConfig::http("localhost", 8080)
+            .with_auth("u", "p")
+            .secure_only();
+        let server = async {
+            let head = read_head(&mut upstream).await;
+            assert!(!head.contains("Proxy-Authorization"), "{head}");
+            upstream.write_all(CLOSING_BASIC_407).await.unwrap();
+        };
+        let (_, result) = tokio::join!(
+            server,
+            http_connect_handshake(&mut client, "example.com:443", &proxy)
+        );
+        assert!(
+            matches!(result, Err(ConnectError::SecureAuthUnsupported)),
+            "{result:?}"
+        );
+    }
+
+    /// With clear text disallowed on plain HTTP the entry probes and refuses a
+    /// Basic-only `407` BEFORE any password byte. Mutation: sending Basic
+    /// anyway puts `Proxy-Authorization` in the first request.
+    #[cfg(feature = "secure-auth")]
+    #[tokio::test]
+    async fn disallowed_clear_text_refuses_before_sending_the_password() {
+        let (mut client, mut upstream) = duplex(4096);
+        let proxy = ProxyConfig::http("localhost", 8080)
+            .with_auth("u", "p")
+            .allow_cleartext(false);
+        let server = async {
+            let head = read_head(&mut upstream).await;
+            assert!(!head.contains("Proxy-Authorization"), "{head}");
+            upstream.write_all(CLOSING_BASIC_407).await.unwrap();
+        };
+        let (_, result) = tokio::join!(
+            server,
+            http_connect_handshake(&mut client, "example.com:443", &proxy)
+        );
+        assert!(
+            matches!(result, Err(ConnectError::CleartextCredentialsRefused)),
+            "{result:?}"
+        );
     }
 }
 

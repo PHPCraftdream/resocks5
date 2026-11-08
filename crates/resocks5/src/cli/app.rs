@@ -35,7 +35,7 @@ TCP keepalive, pre-connect pool, recovery SNI/Host, TLS fragmentation и лог�
   resocks5 users --help               все операции с аккаунтами
 
 --help показывает полный справочник, -h — краткую справку.
-Наличие пользователей не отключает anonymous: задайте auth.allow_anonymous=false.
+По умолчанию anonymous разрешён (auth.allow_anonymous=true); auth.secure_only=true разрешает только наш метод (0x80 / Resocks5-Secure).
 После изменения конфигов/аккаунтов нужен перезапуск. Паролей в CLI-флагах нет.",
     after_long_help = DOCS
 )]

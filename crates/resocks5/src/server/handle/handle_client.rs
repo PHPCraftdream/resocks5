@@ -89,6 +89,27 @@ fn global_allowed(stream: &TcpStream, rule: &Option<Arc<AllowedClients>>) -> any
     }
 }
 
+/// Map the app's auth config onto the SDK server options.
+///
+/// `secure_only` means "our method only": secure auth (SOCKS5 0x80 /
+/// HTTP `Resocks5-Secure`) is the only accepted method — no anonymous, no
+/// clear text. Otherwise clear text (0x02 / Basic) is always offered
+/// against the same stored secret, and anonymous access follows the
+/// `allow_anonymous` config flag. The server always selects the strongest
+/// method the client supports.
+pub(crate) fn server_options(
+    deadline: Instant,
+    auth: &AuthState,
+) -> resocks5_net::server::ServerOptions {
+    if auth.secure_only {
+        resocks5_net::server::ServerOptions::new(deadline).secure_only()
+    } else {
+        resocks5_net::server::ServerOptions::new(deadline)
+            .allow_anonymous(auth.allow_anonymous)
+            .allow_cleartext(true)
+    }
+}
+
 /// Parse/authenticate once under the listener-supplied accept deadline, then route egress.
 ///
 /// cancel-safe: NO — owns the client stream and closes it on failure/cancellation;
@@ -117,27 +138,16 @@ pub async fn handle_client(
     let peer_ip = client_stream.peer_addr().ok().map(|a| a.ip());
     #[cfg(test)]
     stage_probe::emit("client_handler_started");
-    let options = resocks5_net::server::ServerOptions::new(
-        client_deadline,
-        auth.allow_anonymous,
-        !auth.is_empty(),
-    );
-    let auth_state = auth.clone();
-    let req = resocks5_net::server::accept(
-        &mut client_stream,
-        &options,
-        move |credentials| async move {
-            // Пользовательский фильтр ДО verify_async: запрещённый IP
-            // не доходит до Argon2/cache/init-claim/persistence.
-            if !auth_state.client_ip_allowed(credentials.username(), peer_ip) {
-                return false;
-            }
-            auth_state
-                .verify_async(credentials.username(), credentials.password())
-                .await
-        },
-    )
-    .await?;
+    let options = server_options(client_deadline, auth);
+    // One per-connection store serves the secure method (0x80 /
+    // Resocks5-Secure) AND — unless `secure_only` — the clear-text method
+    // (0x02 / Basic), both checked against the SAME stored secret. The
+    // store also applies the user's allowed_clients rule: a filtered peer
+    // is answered like a wrong password and can never claim an init
+    // account.
+    let store = auth.peer_store(peer_ip);
+    let methods = resocks5_net::server::AuthMethods::secure(&store, auth.decoy());
+    let req = resocks5_net::server::accept_with(&mut client_stream, &options, &methods).await?;
     match req.protocol() {
         resocks5_net::server::Protocol::Socks5 => {
             handle_socks5_client(
@@ -245,6 +255,7 @@ mod tests {
             crate::auth::AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig { users: Vec::new() },
                 "unused",
@@ -690,6 +701,7 @@ mod tests {
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig {
                     users: vec![crate::config::User {
@@ -847,15 +859,15 @@ mod tests {
         .unwrap();
     }
 
-    /// The user filter in the accept callback: a valid password from a
-    /// forbidden IP yields an ORDINARY auth failure ([1,1]) — and
-    /// verify_async (Argon2/cache/claim) is never reached.
+    /// The user filter in the secure-auth store: a correct password from
+    /// a forbidden IP yields an ORDINARY failure (decoy, Denied) — same as a wrong one.
     #[tokio::test]
-    async fn user_allowed_clients_denies_before_verify() {
+    async fn user_allowed_clients_denies_like_a_wrong_password() {
         let auth = Arc::new(
             AuthState::build(
                 &crate::config::AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &crate::config::UsersConfig {
                     users: vec![crate::config::User {
@@ -918,26 +930,26 @@ mod tests {
         };
         let peer = async {
             let mut socket = TcpStream::connect(address).await.unwrap();
-            socket.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
-            let mut method = [0u8; 2];
-            socket.read_exact(&mut method).await.unwrap();
-            assert_eq!(method, [0x05, 0x02]);
-            // subnegotiation: alice / pw — valid credentials.
             socket
-                .write_all(&[0x01, 5, b'a', b'l', b'i', b'c', b'e', 2, b'p', b'w'])
+                .write_all(&[0x05, 0x01, resocks5_net::secure_auth::METHOD])
                 .await
                 .unwrap();
-            let mut verdict = [0u8; 2];
-            socket.read_exact(&mut verdict).await.unwrap();
-            assert_eq!(verdict, [0x01, 0x01], "auth must fail without hashing");
+            let mut method = [0u8; 2];
+            socket.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [0x05, resocks5_net::secure_auth::METHOD]);
+            // alice / pw — valid credentials, but the IP is outside the rule.
+            let error = resocks5_net::secure_auth::client_authenticate(
+                &mut socket,
+                &crate::auth::test_support::creds("alice", "pw"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, resocks5_net::SecureAuthError::Denied);
         };
         timeout(Duration::from_secs(8), async {
             tokio::join!(host, peer);
         })
         .await
         .unwrap();
-        // Подтверждение «до verify_async»: закешированного пароля нет —
-        // успешный verify положил бы его в cache.
-        assert!(!auth.cache_contains("alice"));
     }
 }

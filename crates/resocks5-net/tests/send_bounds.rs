@@ -15,7 +15,7 @@ use resocks5_net::connect::{
     connect_proxy_once, dial, dial_chain, dial_plain, handshake_over_stream, socks5_handshake,
     AnyUpstream, ChainError, DialOptions, UpstreamStream,
 };
-use resocks5_net::server::{accept, Credentials, IncomingRequest, Prefixed, ServerOptions};
+use resocks5_net::server::{accept, IncomingRequest, Prefixed, ServerOptions};
 use resocks5_net::types::{ChainConfigError, ProxyConfig, ProxyConfigError};
 use resocks5_net::ConnectError;
 use tokio::io::DuplexStream;
@@ -133,9 +133,9 @@ fn dial_inside_spawned_task_is_spawnable() {
 fn handshake_and_tunnel_futures_are_send() {
     // SOCKS5 over a caller-provided stream (by value, as `Send` streams).
     let (a, b): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
-    future_is_send(socks5_handshake(a, "example.com", 80, None));
+    future_is_send(socks5_handshake(a, "example.com", 80));
     let (c, d) = tokio::io::duplex(64);
-    future_is_send(handshake_over_stream(c, "example.com:80", None));
+    future_is_send(handshake_over_stream(c, "example.com:80"));
     future_is_send(tunnel_with_timeouts(
         b,
         d,
@@ -197,12 +197,9 @@ fn into_prefixed_inside_spawned_task_is_spawnable() {
 
     spawnable(async move {
         let (client, mut server) = tokio::io::duplex(1024);
-        let opts = ServerOptions::new(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            true,
-            false,
-        );
-        let request = accept(&mut server, &opts, |_| async { true }).await;
+        let opts = ServerOptions::new(tokio::time::Instant::now() + Duration::from_secs(1))
+            .allow_anonymous(true);
+        let request = accept(&mut server, &opts).await;
         if let Ok(req) = request {
             let mut prefixed = req.into_prefixed(server);
             use tokio::io::AsyncWriteExt;
@@ -213,63 +210,47 @@ fn into_prefixed_inside_spawned_task_is_spawnable() {
 }
 
 #[test]
-fn credentials_and_requests_stay_send() {
-    assert_send::<Credentials>();
+fn requests_stay_send() {
     assert_send::<IncomingRequest>();
 }
 
-/// The `accept` future with `retain_credentials(true)` stays `Send` when the closure is.
-#[allow(dead_code)]
-fn retained_credentials_accept_future_is_send() {
-    let (mut duplex, _) = tokio::io::duplex(1024);
-    let opts = ServerOptions::new(
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        false,
-        true,
-    )
-    .retain_credentials(true);
-    future_is_send(resocks5_net::server::accept(
-        &mut duplex,
-        &opts,
-        |credentials| async move {
-            credentials.username() == "user" && credentials.password() == "password"
-        },
-    ));
-}
-
-/// The `accept` future with `raw_credentials(true)` stays `Send` when the closure is.
-#[allow(dead_code)]
-fn raw_credentials_accept_future_is_send() {
-    let (mut duplex, _) = tokio::io::duplex(1024);
-    let opts = ServerOptions::new(
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        false,
-        true,
-    )
-    .raw_credentials(true);
-    future_is_send(resocks5_net::server::accept(
-        &mut duplex,
-        &opts,
-        |credentials| async move {
-            credentials.username_bytes() == b"user".as_slice()
-                && credentials.password_bytes() == b"password".as_slice()
-        },
-    ));
-}
-
-/// The `accept` future with `strict_http(true)` stays `Send` when the closure is.
+/// The `accept` future with `secure_only` + `strict_http(true)` stays `Send`
+/// (also compile-checks the builder chain).
 #[allow(dead_code)]
 fn strict_http_accept_future_is_send() {
     let (mut duplex, _) = tokio::io::duplex(1024);
-    let opts = ServerOptions::new(
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        false,
-        true,
-    )
-    .strict_http(true);
-    future_is_send(resocks5_net::server::accept(
-        &mut duplex,
-        &opts,
-        |credentials| async move { credentials.username() == "user" },
-    ));
+    let opts = ServerOptions::new(tokio::time::Instant::now() + Duration::from_secs(1))
+        .secure_only()
+        .strict_http(true);
+    future_is_send(resocks5_net::server::accept(&mut duplex, &opts));
+}
+
+/// The `accept_secure`/`accept_with` futures stay `Send` for any
+/// `SecretStore` (feature `secure-auth`); nothing here runs.
+#[cfg(feature = "secure-auth")]
+#[test]
+fn accept_futures_are_send() {
+    use resocks5_net::secure_auth::{DecoyKey, SecretStore};
+    use resocks5_net::server::{accept_secure, accept_with, AuthMethods};
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    #[allow(dead_code)]
+    fn assert_send<F: Future + Send>(_: F) {}
+
+    #[allow(dead_code)]
+    fn accepts_are_send<S, T: SecretStore>(
+        stream: &mut S,
+        options: &resocks5_net::server::ServerOptions,
+        store: &T,
+        decoy: &DecoyKey,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        assert_send(accept_secure(stream, options, store, decoy));
+        assert_send(accept_with(
+            stream,
+            options,
+            &AuthMethods::secure(store, decoy),
+        ));
+    }
 }

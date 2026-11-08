@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use resocks5_net::secure_auth::KdfParams;
 
 use crate::auth;
 use crate::cli::UserAction;
@@ -62,10 +63,11 @@ impl std::fmt::Debug for UserOp {
 pub fn run_user_command(action: UserAction) -> Result<()> {
     let users = config::load_or_init::load_or_init_users_at(Path::new(config::USERS_PATH))?;
 
+    let cost = || config::cost_for_cli(Path::new(config::MAIN_PATH));
     let op = match action {
-        UserAction::Add { name } => add_user(&users, &name)?,
+        UserAction::Add { name } => add_user(&users, &name, cost())?,
         UserAction::AddInit { name } => add_init_user(&users, &name)?,
-        UserAction::SetPassword { name } => set_password(&users, &name)?,
+        UserAction::SetPassword { name } => set_password(&users, &name, cost())?,
         UserAction::Remove { name, yes } => match remove_user(&users, &name, yes)? {
             Some(op) => op,
             None => return Ok(()), // interactive confirmation declined
@@ -80,13 +82,13 @@ pub fn run_user_command(action: UserAction) -> Result<()> {
     commit_op_to(Path::new(config::USERS_PATH), &op)
 }
 
-fn add_user(users: &UsersConfig, name: &str) -> Result<UserOp> {
+fn add_user(users: &UsersConfig, name: &str, cost: KdfParams) -> Result<UserOp> {
     validate_name(name)?;
     if users.users.iter().any(|u| u.name == name) {
         bail!("user '{}' already exists", name);
     }
     let password = read_new_password()?;
-    let hash = auth::compute_hash(&password)?;
+    let hash = auth::compute_hash_with(&password, cost)?;
     Ok(UserOp::Add(build_added_user(name, hash)))
 }
 
@@ -117,12 +119,12 @@ fn add_init_user(users: &UsersConfig, name: &str) -> Result<UserOp> {
     }))
 }
 
-fn set_password(users: &UsersConfig, name: &str) -> Result<UserOp> {
+fn set_password(users: &UsersConfig, name: &str, cost: KdfParams) -> Result<UserOp> {
     // Early existence check so the prompt is not wasted on a typo'd
     // name; re-validated against fresh disk state at commit time.
     find_user(users, name)?;
     let password = read_new_password()?;
-    let hash = auth::compute_hash(&password)?;
+    let hash = auth::compute_hash_with(&password, cost)?;
     Ok(UserOp::SetPassword {
         name: name.to_string(),
         hash,
@@ -145,7 +147,7 @@ fn remove_user(users: &UsersConfig, name: &str, skip_confirm: bool) -> Result<Op
 
 fn list_users(users: &UsersConfig) -> Result<()> {
     if users.users.is_empty() {
-        println!("(no users configured — server runs without authentication)");
+        println!("(no users configured — anonymous clients are admitted only while auth.allow_anonymous is true)");
         return Ok(());
     }
     println!("{:<24} {:<10} {:<6}", "NAME", "STATUS", "MODE");

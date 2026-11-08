@@ -45,13 +45,23 @@
 // isn't noisy — only `cargo doc` surfaces it.
 #![warn(missing_docs)]
 
-pub use error::{socks5_rep_description, ConnectError, ProtocolViolation, Stage, TimeoutKind};
+pub use error::{
+    socks5_rep_description, ConnectError, ProtocolViolation, SecureAuthError, Stage, TimeoutKind,
+};
 
 #[cfg(feature = "rotator")]
 #[path = "session/chain/mod.rs"]
 pub mod chain;
 pub mod connect;
 pub mod error;
+/// HTTP proxy-header authentication shared by the inbound server and the
+/// upstream HTTP connector: the header-value helpers (always built) and,
+/// for feature `secure-auth`, the `Resocks5-Secure` scheme (one
+/// `secure_auth` protocol message per round, base64-encoded) with the
+/// in-memory [`Pipe`] that runs a stream-oriented exchange over those
+/// rounds.
+#[path = "session/auth/http_auth.rs"]
+mod http_auth;
 #[cfg(feature = "pool")]
 #[path = "session/pool/mod.rs"]
 pub mod pool;
@@ -63,6 +73,9 @@ pub mod rating;
 #[cfg(feature = "rotator")]
 #[path = "session/rotator/mod.rs"]
 pub mod rotator;
+#[cfg(feature = "secure-auth")]
+#[path = "session/auth/secure_auth/mod.rs"]
+pub mod secure_auth;
 pub mod server;
 #[cfg(feature = "test-instrumentation")]
 #[path = "session/testing/mod.rs"]
@@ -75,9 +88,6 @@ mod perf;
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "session/testing/perf_cases.rs"]
 mod perf_cases;
-#[cfg(all(test, feature = "test-instrumentation"))]
-#[path = "session/testing/perf_credentials.rs"]
-mod perf_credentials;
 
 #[cfg(all(test, feature = "test-instrumentation"))]
 #[path = "session/testing/perf_cow.rs"]

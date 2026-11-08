@@ -49,12 +49,13 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - [Why resocks5](#why-resocks5)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Самостоятельный прокси без upstream](#самостоятельный-прокси-без-upstream)
-- [Подробная справка и все возможности](#подробная-справка-и-все-возможности)
-- [Полный справочник полей и команд](docs/REFERENCE.md)
+- [Standalone proxy without upstreams](#standalone-proxy-without-upstreams)
+- [Detailed reference and all features](#detailed-reference-and-all-features)
+- [Full reference of fields and commands](docs/REFERENCE.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
-- [Список допуска клиентов по IP (allowed_clients)](#список-допуска-клиентов-по-ip-allowed_clients)
+- [Authentication](#authentication)
+- [Client IP allow-list (allowed_clients)](#client-ip-allow-list-allowed_clients)
 - [Use as a library](#use-as-a-library)
 - [User management](#user-management)
 - [Repository layout](#repository-layout)
@@ -80,8 +81,18 @@ demoting any that fail via the sand-rating model instead of dropping them.
 - **Optional pre-warmed TCP pool** to cut connection latency.
 - **TLS fragmentation:** splits the ClientHello across TCP segments to defeat
   SNI-based DPI blocking.
-- **Authentication:** Argon2id password hashing, with an optional
-  init-on-first-login mode.
+- **Authentication:** one port, one account, three methods; the server picks
+  the strongest the client offers. Our own **secure auth** (SOCKS5 method
+  0x80, HTTP scheme `Resocks5-Secure`) never sends the password and never
+  stores it (an Argon2id-derived key and a mutual HMAC challenge-response).
+  Standard clients (browsers, curl) connect with the clear-text methods
+  (SOCKS5 0x02, HTTP Basic), verified against the same stored secret, or
+  anonymously where allowed. One secret per user works for every method and
+  protocol, and a `hash: init` account is claimed by the first successful
+  login by any of them. Two optional switches harden a deployment:
+  `auth.secure_only` (inbound) and `upstream_auth.secure_only` (outbound)
+  accept only our own method. Upstream `user:pass` entries upgrade
+  automatically on SOCKS5.
 - **Safety rails:** idle/lifetime tunnel timeouts, TCP keepalive, a
   max-concurrent-clients cap, and regex-based banned-target patterns.
 - **Configurable logging** by category, with optional non-blocking file output.
@@ -111,7 +122,7 @@ upstream is probed for free because its weight never hits zero.
 | Front end | SOCKS5 + HTTP CONNECT (auto) | many | many | many |
 | Rotation model | sand-rating soft-weight, self-recovering | round-robin / parent | chaining-first | failover |
 | Per-target stickiness | yes | — | — | — |
-| Auth | Argon2id + verify-cache (пароль в памяти) | basic | basic | basic |
+| Auth | secure auth (password never sent or stored) plus Basic / RFC 1929 | basic | basic | basic |
 | TLS ClientHello fragmentation | yes | no | no | no |
 | Single-port dual-protocol | yes | — | — | — |
 
@@ -142,31 +153,32 @@ to keep flowing when they misbehave," that's the case resocks5 is built for.
 
 ## Install
 
-### Последний релиз: Linux, macOS и Windows
+### Latest release: Linux, macOS and Windows
 
-Установщики скачивают **последний стабильный GitHub Release**, а не собирают
-код из `main`. Rust и C-компилятор для этого не нужны. Тег определяется один
-раз; архив и `sha256sums.txt` загружаются из одного релиза, SHA-256 проверяется
-до установки. Проверка защищает от повреждения загрузки, но не заменяет
-доверие к издателю релиза.
+The installers download the **latest stable GitHub Release**; they do not
+build the code from `main`. Neither Rust nor a C compiler is needed. The tag
+is resolved once; the archive and `sha256sums.txt` are downloaded from the
+same release, and the SHA-256 is verified before installing. The check
+protects against a damaged download but does not replace trust in the
+release publisher.
 
-| ОС | Архитектура | Установщик | Каталог по умолчанию |
-|----|-------------|------------|---------------------|
-| Linux (любой дистрибутив, glibc и musl/Alpine) | x86_64, arm64 | `sh` | `~/.local/bin` |
+| OS | Architecture | Installer | Default directory |
+|----|--------------|-----------|-------------------|
+| Linux (any distribution, glibc and musl/Alpine) | x86_64, arm64 | `sh` | `~/.local/bin` |
 | macOS | Intel x86_64, Apple Silicon arm64 | `sh` | `~/.local/bin` |
 | Windows | x86_64 | PowerShell 5.1+ | `%LOCALAPPDATA%\resocks5\bin` |
 
-Linux-архивы — полностью статические (musl), без зависимостей от системных
-библиотек; Windows-бинарник собран со статическим CRT и не требует
-Visual C++ Redistributable. Статические Linux-архивы и arm64 выпускаются
-начиная с 0.4.0; в 0.3.0 и ранее был только glibc-архив x86_64
-(установщик сам выберет подходящий архив релиза, на musl/Alpine старый релиз
-не поддерживается).
+The Linux archives are fully static (musl) and depend on no system
+libraries; the Windows binary is built with a static CRT and does not need
+the Visual C++ Redistributable. Static Linux archives and arm64 are
+published starting with 0.4.0; 0.3.0 and earlier had only the glibc x86_64
+archive (the installer picks the matching release archive by itself; an old
+release is not supported on musl/Alpine).
 
-Для остальных платформ (Windows ARM64) нативные архивы пока не выпускаются:
-установщик завершится с ошибкой, без попытки собрать проект.
+For other platforms (Windows ARM64) native archives are not published yet:
+the installer fails with an error and does not try to build the project.
 
-**Linux / macOS** — нужны `curl`, `tar` и `sha256sum` либо `shasum`:
+**Linux / macOS** — needs `curl`, `tar` and `sha256sum` or `shasum`:
 
 ```sh
 (
@@ -179,13 +191,13 @@ Visual C++ Redistributable. Статические Linux-архивы и arm64 �
   sh "$installer_dir/install.sh"
 )
 
-# Для текущего терминала; для постоянной настройки добавьте в ~/.profile
-# или файл конфигурации своего shell:
+# For the current terminal; for a permanent setup add it to ~/.profile
+# or your shell's configuration file:
 export PATH="$HOME/.local/bin:$PATH"
 resocks5 --version
 ```
 
-**Windows** — выполните в PowerShell, права администратора не нужны:
+**Windows** — run in PowerShell; administrator rights are not needed:
 
 ```powershell
 $installerDir = Join-Path ([IO.Path]::GetTempPath()) ("resocks5-script-" + [guid]::NewGuid().ToString('N'))
@@ -194,50 +206,51 @@ try {
     $script = Join-Path $installerDir 'install.ps1'
     Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/PHPCraftdream/resocks5/main/.github/scripts/install.ps1' -OutFile $script -ErrorAction Stop
     powershell -NoProfile -ExecutionPolicy Bypass -File $script
-    if ($LASTEXITCODE -ne 0) { throw 'Установка не выполнена.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Installation failed.' }
 }
 finally {
     Remove-Item -LiteralPath $installerDir -Recurse -Force
 }
 
-# Для текущего терминала:
+# For the current terminal:
 $env:Path = "$env:LOCALAPPDATA\resocks5\bin;$env:Path"
 resocks5 --version
 ```
 
-Для постоянной настройки Windows добавьте `%LOCALAPPDATA%\resocks5\bin`
-в пользовательскую переменную `Path` через параметры среды и откройте новый
-терминал. `-ExecutionPolicy Bypass` действует только для запущенного процесса,
-системная политика не меняется. Обе команды выполняют скрипт из этого
-репозитория; перед запуском можно просмотреть скачанный файл.
+For a permanent Windows setup add `%LOCALAPPDATA%\resocks5\bin` to the user
+`Path` variable in the environment settings and open a new terminal.
+`-ExecutionPolicy Bypass` applies only to the launched process; the system
+policy is not changed. Both commands run the script from this repository;
+you can inspect the downloaded file before running it.
 
-Другой каталог можно передать как `sh install.sh /путь/к/bin` либо
+Another directory can be passed as `sh install.sh /path/to/bin` or
 `powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -InstallDir 'D:\apps\resocks5'`.
-Установщики не меняют `PATH`, не запускают сервер и не трогают конфиги.
-Повторный запуск обновляет только бинарник, **останавливать работающий
-`resocks5` не требуется**. Установщик не перезапускает процесс: существующий
-сервер продолжает работать на старой версии, новые запуски используют новую.
+The installers do not change `PATH`, do not start the server and do not
+touch the configs. Running again updates only the binary, **a running
+`resocks5` does not need to be stopped**. The installer does not restart the
+process: an existing server keeps running the old version, new launches use
+the new one.
 
-- **Linux/macOS:** новый файл атомарно переименовывается поверх старого.
-  Старый inode остаётся доступен работающему процессу; ОС освобождает его
-  после завершения процесса. Резервные имена не создаются.
-- **Windows:** старый файл переименовывается в `.resocks5-old-<GUID>.exe`,
-  затем новый получает имя `resocks5.exe`. При ошибке второго шага установщик
-  пытается восстановить прежнее имя. Каждая успешная установка удаляет
-  неиспользуемые старые копии; занятые процессами, заблокированные или
-  недоступные файлы сохраняются с предупреждением. После завершения старого
-  процесса его копия будет удалена при следующей успешной установке.
-  Удаляются только резервные имена этого установщика, не произвольные `.exe`.
-  Файл `.resocks5-install.lock` предотвращает одновременное изменение каталога
-  несколькими установщиками; само наличие файла не означает активную блокировку.
+- **Linux/macOS:** the new file is atomically renamed over the old one. The
+  old inode stays available to the running process; the OS frees it when the
+  process ends. No backup names are created.
+- **Windows:** the old file is renamed to `.resocks5-old-<GUID>.exe`, then
+  the new one gets the name `resocks5.exe`. If the second step fails, the
+  installer tries to restore the previous name. Every successful install
+  deletes unused old copies; files that are busy, locked or inaccessible are
+  kept with a warning. After the old process ends its copy is deleted by the
+  next successful install. Only this installer's backup names are deleted,
+  never arbitrary `.exe` files. The `.resocks5-install.lock` file prevents
+  several installers from changing the directory at once; the mere presence
+  of the file does not mean an active lock.
 
-### Откуда берутся настройки после установки
+### Where the settings come from after installing
 
-`resocks5` читает и создаёт `resocks5.main.ktav`, `resocks5.proxy_list.ktav`
-и `resocks5.users.ktav` **в текущем рабочем каталоге запуска**, а не рядом
-с установленным бинарником. Это относится и к `resocks5 users …`.
-Каталог должен быть доступен для записи; установка в `PATH` это правило
-не меняет. Например, на Linux/macOS:
+`resocks5` reads and creates `resocks5.main.ktav`, `resocks5.proxy_list.ktav`
+and `resocks5.users.ktav` **in the current working directory of the launch**,
+not next to the installed binary. This applies to `resocks5 users …` as well.
+The directory must be writable; installing into `PATH` does not change this
+rule. For example, on Linux/macOS:
 
 ```sh
 mkdir -p my-proxy
@@ -245,7 +258,7 @@ cd my-proxy
 resocks5
 ```
 
-На Windows в PowerShell:
+On Windows in PowerShell:
 
 ```powershell
 $null = New-Item -ItemType Directory -Path 'my-proxy' -Force
@@ -253,11 +266,12 @@ Set-Location 'my-proxy'
 resocks5
 ```
 
-Запуски из разных каталогов используют независимые наборы настроек.
-Первый запуск создаёт отсутствующие файлы в выбранном каталоге; для работы
-затем настройте upstream-прокси или direct-пользователей, как описано ниже.
+Launches from different directories use independent sets of settings. The
+first launch creates the missing files in the chosen directory; to get a
+working proxy afterwards configure upstream proxies or direct users, as
+described below.
 
-### Сборка из исходников
+### Build from source
 
 Requires a recent stable Rust toolchain. The dependency tree (rustls 0.23,
 rpassword 7) sets the floor at **Rust 1.88+**, declared as `rust-version` in
@@ -357,13 +371,13 @@ Restart the server after applying these settings. Adding users alone leaves
 anonymous access enabled when `allow_anonymous` is `true`. Apply both settings
 before changing `listen_host` to a public interface.
 
-## Самостоятельный прокси без upstream
+## Standalone proxy without upstreams
 
-`resocks5` может сам обслуживать SOCKS5 и HTTP CONNECT, подключаясь к цели
-с IP сервера. Это **настройка аккаунта `direct: true`**, не глобальный режим
-и не автоматический fallback при отказе upstream.
+`resocks5` can serve SOCKS5 and HTTP CONNECT itself, connecting to the
+target from the server's IP. This is the **`direct: true` account setting**,
+not a global mode and not an automatic fallback when an upstream refuses.
 
-В рабочем каталоге экземпляра создайте пользователя и включите direct:
+In the instance's working directory create a user and enable direct:
 
 ```sh
 resocks5 users add alice
@@ -371,61 +385,69 @@ resocks5 users direct alice
 resocks5
 ```
 
-В `resocks5.main.ktav` задайте `auth: { allow_anonymous: false }`, чтобы
-требовать пароль. Все шесть upstream-массивов могут оставаться пустыми:
-достаточно одного включённого direct-пользователя. После изменения аккаунта
-или конфигов перезапустите сервер. Вернуть аккаунт к upstream-маршрутизации:
-`resocks5 users pool alice`.
+Set `auth: { allow_anonymous: false }` in `resocks5.main.ktav` to require a
+password. All six upstream arrays may stay empty: a single enabled direct
+user is enough. After changing an account or the configs restart the server.
+To return an account to upstream routing: `resocks5 users pool alice`.
 
-Anonymous direct-доступ не получает. Цель видит IP сервера, DNS разрешается
-сервером; IP-фильтры, banned_patterns, таймауты и лимиты продолжают действовать.
-Подробности и команды клиентов: [полный справочник](docs/REFERENCE.md).
+An anonymous client gets no direct access. The target sees the server's IP,
+DNS is resolved by the server; IP filters, banned_patterns, timeouts and
+limits still apply. Details and client commands: the
+[full reference](docs/REFERENCE.md).
 
-## Подробная справка и все возможности
+## Detailed reference and all features
 
 ```sh
-resocks5 -h                         # краткая справка
-resocks5 --help                     # полный встроенный справочник
-resocks5 config                     # тот же справочник без запуска сервера
-resocks5 users --help               # управление аккаунтами
-resocks5 users add-init --help      # первый вход задаёт пароль: ограничения и риски
-resocks5 users direct --help        # самостоятельный proxy по аккаунту
+resocks5 -h                         # short help
+resocks5 --help                     # the full embedded reference
+resocks5 config                     # the same reference without starting the server
+resocks5 users --help               # account management
+resocks5 users add-init --help      # the first login sets the password: limits and risks
+resocks5 users direct --help        # a standalone proxy per account
 ```
 
-**[docs/REFERENCE.md](docs/REFERENCE.md)** — единый полный справочник,
-встроенный в бинарник: все команды, все поля трёх конфигов, типы, defaults,
-особые значения, примеры, ограничения и диагностика. `--help` и `config`
-работают без интернета; `config` не читает и не создаёт конфиги.
+**[docs/REFERENCE.md](docs/REFERENCE.md)** is the single full reference
+embedded in the binary: all commands, all fields of the three configs,
+types, defaults, special values, examples, limits and diagnostics. `--help`
+and `config` work without internet; `config` neither reads nor creates
+configs.
 
-| Возможность | Настройка / управление |
-|-------------|------------------------|
-| SOCKS5 и HTTP CONNECT на одном порту | `listen_host`, `port`; TCP CONNECT, без SOCKS5 UDP/BIND и обычного HTTP forward GET |
-| Самостоятельный прокси | `users direct/pool`, `users[].direct`; только именные enabled-аккаунты |
-| Пароли, disabled, первый вход | `users add/add-init/set-password/enable/disable/remove/list`, `auth.allow_anonymous` |
-| Допуск IP клиента | `allowed_clients`, `users[].allowed_clients`: пересечение правил, loopback и маски |
-| Запрет целей | `banned_patterns`: regex по `host:port`, не автоматическая фильтрация DNS-адресов |
-| Upstream SOCKS5/HTTP/HTTPS | Шесть массивов в proxy_list, credentials, IPv6 и `*`-gates |
-| Ротация и привязка цели | Sand-rating и ограниченный sticky cache, не жёсткий circuit breaker |
-| Предварительные TCP-соединения | `pool.enabled`, `spare_per_proxy`, `max_session_age_sec`; не путать с pool-аккаунтом |
-| Защита от зависаний и перегрузки | Все `network.*`: connect/handshake/client/tunnel deadlines, idle, keepalive и лимиты |
-| SNI / Host recovery | `network.recover_host_from_payload`: pool + буквальный IPv4, возможен ранний ответ CONNECT |
-| ClientHello fragmentation | `tls_fragment.*`: дробление первого распознанного ClientHello, без обещания обхода DPI |
-| Журналирование | Все `log.*`, `file_log.*`; файл append, без автоматической ротации |
-| Установка и обновление | Последний GitHub Release, SHA-256, Windows rename/cleanup и Unix atomic rename |
-| Отдельные экземпляры | Конфиги из cwd, снимок на старте, перезапуск для применения изменений |
-| Контейнер и остановка | Docker amd64/arm64, UID 65532, writable volume; Ctrl+C/SIGTERM и bounded drain |
-| Безопасность и диагностика | Не открывать anonymous наружу; входной TCP не шифрует пароль; см. [SECURITY.md](SECURITY.md) |
+| Capability | Setting / management |
+|------------|----------------------|
+| SOCKS5 and HTTP CONNECT on one port | `listen_host`, `port`; TCP CONNECT, no SOCKS5 UDP/BIND and no ordinary HTTP forward GET |
+| Standalone proxy | `users direct/pool`, `users[].direct`; named enabled accounts only |
+| Passwords, disabled accounts, first login | `users add/add-init/set-password/enable/disable/remove/list`, `auth.allow_anonymous` |
+| Authentication methods | Secure auth (0x80 / `Resocks5-Secure`), clear text (0x02 / Basic) and anonymous; `auth.secure_only`, `upstream_auth.secure_only`, `;secure_only` per upstream entry |
+| Client IP admission | `allowed_clients`, `users[].allowed_clients`: rule intersection, loopback and masks |
+| Target bans | `banned_patterns`: a regex over `host:port`, not automatic filtering of DNS addresses |
+| SOCKS5/HTTP/HTTPS upstreams | Six arrays in proxy_list, credentials, IPv6 and `*` gates |
+| Rotation and target stickiness | Sand-rating and a bounded sticky cache, not a hard circuit breaker |
+| Pre-opened TCP connections | `pool.enabled`, `spare_per_proxy`, `max_session_age_sec`; not to be confused with a pool account |
+| Protection against hangs and overload | All `network.*`: connect/handshake/client/tunnel deadlines, idle, keepalive and limits |
+| SNI / Host recovery | `network.recover_host_from_payload`: pool + a literal IPv4, an early CONNECT reply is possible |
+| ClientHello fragmentation | `tls_fragment.*`: splitting the first recognized ClientHello, no promise of DPI bypass |
+| Logging | All `log.*`, `file_log.*`; the file is append-only, no automatic rotation |
+| Install and upgrade | Latest GitHub Release, SHA-256, Windows rename/cleanup and Unix atomic rename |
+| Separate instances | Configs from the cwd, a snapshot at startup, a restart to apply changes |
+| Container and shutdown | Docker amd64/arm64, UID 65532, a writable volume; Ctrl+C/SIGTERM and a bounded drain |
+| Safety and diagnostics | Do not expose anonymous access; clear-text passwords cross the network and the tunnel is not encrypted — see [SECURITY.md](SECURITY.md) |
 
-Настройки, допустимые значения и практические ограничения каждой строки
-раскрыты в справочнике, а устройство реализации — в [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The settings, allowed values and practical limits of every row are covered
+in the reference, and the implementation in
+[ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
 For each accepted connection:
 
 1. **Protocol detect** — the first bytes decide SOCKS5 vs HTTP CONNECT.
-2. **Authenticate** — credentials are checked against the user table (Argon2id).
-   Anonymous clients are accepted only when `auth.allow_anonymous` is `true`.
+2. **Authenticate** — the server picks the strongest method the client
+   offers. Secure auth (SOCKS5 method 0x80, HTTP `Resocks5-Secure`) proves the
+   password against the stored Argon2id key without sending it; standard
+   clients (browsers, curl) use SOCKS5 username/password or HTTP Basic, which
+   the server verifies against the same stored secret (unless
+   `auth.secure_only` is on). Anonymous clients are accepted only when
+   `auth.allow_anonymous` is `true`.
 3. **Pick an upstream** — if this target was reached before, reuse the sticky
    upstream that last worked; otherwise draw one with sand-rating's
    weighted-random order. IPv6 targets prefer the IPv6 upstream set.
@@ -448,7 +470,7 @@ the working directory, all auto-created on first launch:
 | `resocks5.main.ktav` | server settings: port, auth, logging, pool, network/sand-rating, TLS fragmentation, banned patterns, `allowed_clients` |
 | `resocks5.proxy_list.ktav` | upstream proxies, grouped by transport and IP family |
 | `resocks5.health.ktav` | written by the server, not by hand: which upstreams were dead, so a restart goes straight to background probes instead of rediscovering them (`network.health_save_sec`, `0` = off) |
-| `resocks5.users.ktav` | Пользователи: пароли и флаги — через `resocks5 users …`; `allowed_clients` — вручную при остановленном сервере |
+| `resocks5.users.ktav` | users: passwords and flags go through `resocks5 users …`; `allowed_clients` is edited by hand while the server is stopped |
 
 Print the **full field reference** — every option, its default, and behaviour
 notes — with:
@@ -457,8 +479,9 @@ notes — with:
 resocks5 config
 ```
 
-> **Security:** these files hold secrets — the auth salt, upstream proxy
-> credentials, and Argon2 user hashes. They are git-ignored; never commit them.
+> **Security:** these files hold secrets — upstream proxy credentials and
+> the users' Argon2id keys (a key logs its user in, like a password). They
+> are git-ignored; never commit them.
 
 ### Upstream proxy list
 
@@ -472,10 +495,21 @@ socks5_v4: [
   alice:s3cret@198.51.100.7:1080
   *gateuser:gatepass@203.0.113.9:1080
 ]
-http_v4:  [ user:pass@198.51.100.20:8080 ]
+http_v4:  [ 198.51.100.20:8080 ]
 https_v4: [ user:pass@198.51.100.30:443 ]
 ## …and the corresponding *_v6 arrays for IPv6 upstreams.
 ```
+
+Credentials stay in this file. A SOCKS5 upstream with `user:pass` upgrades
+automatically: secure auth (0x80) is offered first and clear text (0x02)
+after it, and the upstream picks. An HTTP or HTTPS upstream gets Basic in the
+first CONNECT, as in 0.4.x (many upstreams, 3proxy among them, close the
+connection after a `407`, so the client does not probe first; Basic inside
+TLS is not clear text on the wire). To use only our own secure method for
+one upstream append `;secure_only` to its entry, or set
+`upstream_auth: { secure_only: true }` in `resocks5.main.ktav` for all of
+them: an upstream that offers nothing but a clear-text password is then
+refused before the password is sent.
 
 One node at each rank contributes one gate, ordered from highest to lowest,
 then one ordinary exit and the target. Missing ranks are allowed. One star
@@ -502,48 +536,105 @@ h4:1080
 
 The route is server -> h1 -> h3 -> h4 -> target.
 
-## Список допуска клиентов по IP (allowed_clients)
+## Authentication
 
-Глобальная строка `allowed_clients` в `resocks5.main.ktav` (по умолчанию
-`"*"` — все) ограничивает, с каких IP клиентов вообще можно подключаться.
-Проверка выполняется по **реальному TCP-адресу пира** до чтения любых
-байтов протокола; отклонённому пиру соединение закрывается без ответа.
-Невалидное правило валит старт сервера (fail-closed), включая правила,
-прикреплённые к disabled- и дублирующимся пользователям. Изменения
-требуют рестарта: правило компилируется один раз в снапшот на старте.
+One dual-protocol port serves SOCKS5 and HTTP CONNECT, and the client picks
+the method: the server takes the **strongest one the client offers**.
 
-Каждый пользователь в `resocks5.users.ktav` может нести опциональную
-строку `allowed_clients`. Итоговая проверка — **И глобального правила,
-и правила пользователя** (поле пользователя добавляет ограничение только
-если задано); элементы внутри одного списка — альтернативы **ИЛИ**.
-Фильтр пользователя выполняется **до проверки пароля**, поэтому
-отклонённый IP получает обычный отказ аутентификации (SOCKS5 `[1,1]` /
-HTTP 407) без работы Argon2, без попадания в кеш паролей и без записи
-init-claim на диск. К anonymous-клиентам он не применяется вообще
-(они подчиняются только глобальному правилу); direct-пользователи
-подчиняются ему как все.
+| Order | Method | SOCKS5 | HTTP | Needs |
+|-------|--------|--------|------|-------|
+| 1 | Our secure auth: the password never crosses the network | method `0x80` | scheme `Resocks5-Secure` over `407` rounds | a client that speaks it (`resocks5-net`, another resocks5) |
+| 2 | Clear-text password | `0x02` (RFC 1929) | `Basic` | any standard client (browsers, curl); off with `auth.secure_only` |
+| 3 | Anonymous | `0x00` | no credentials | `auth.allow_anonymous: true` (the default) |
 
-Поддерживаемые формы (через запятую; элементы обрезаются по пробелам):
+**One secret per user, for every method and protocol.** `users.ktav` stores
+an Argon2id key (salt, parameters and key in a PHC string). Secure auth
+proves knowledge of it with a mutual HMAC (the client does the Argon2 work);
+a clear-text password is verified by deriving the same key on the server and
+comparing in constant time. So an account that enrolled over SOCKS5 secure
+auth logs in later over HTTP Basic, and the other way round — switching
+protocol or method never breaks an account.
 
-- точный IP: `127.0.0.1`, `::1`, `2001:db8::1` — только стандартный
-  синтаксис std;
-- `loopback` — `127.0.0.0/8` и `::1` (не любой адрес интерфейса и не
-  замена аутентификации);
-- wildcard `*` — весь список (`*`) или ровно один октет IPv4-маски
-  (ровно 4 октета): `192.168.*.*`, либо ровно одна hex-группа
-  IPv6-маски (ровно 8 групп): `2001:db8:*:*:*:*:*:*`. `::` может
-  встречаться один раз и означает **только** нулевые группы:
-  `2001:db8::*` — это `2001:db8:0:0:0:0:0:*`, а не /64.
+**`hash: init` registration** works over every protocol and method: the
+first successful login claims the account atomically (one winner), either by
+secure enrollment or by a clear-text login (the server derives the secret
+from the presented password). Guard that first window, for example with
+`allowed_clients`, because whoever knows the name can claim it first.
 
-При проверке IPv6-маской IPv4-адрес рассматривается как
-`::ffff:a.b.c.d`; совместимые с IPv4 адреса (`::a.b.c.d` без ffff) не
-разворачиваются. Пример: маска `::ffff:7f00:*` совпадает с `127.0.0.1`
-и `127.0.255.255`, но НЕ с `127.1.0.1`. Отвергаемые формы — имена
-хостов, CIDR, порты, частичные звёзды (`1*.2.3.4`), пустые элементы
-(`a,,b`) — делают всю строку невалидной.
+**Two optional switches** (both default to `false`; a config without them
+loads silently, and a freshly generated config writes them explicitly with
+comments):
 
-Альтернативные значения KTAV — выберите одно, заменив существующий ключ.
-Строки пишутся без кавычек: кавычки станут частью значения, а не снимутся.
+```text
+auth: { allow_anonymous: true, secure_only: false }
+upstream_auth: { secure_only: false }
+```
+
+- `auth.secure_only: true` — inbound accepts only our own method; clear text
+  and anonymous access are refused (standard clients can no longer log in).
+- `upstream_auth.secure_only: true` — outbound uses only our own method for
+  every upstream with credentials; one entry can opt in with a `;secure_only`
+  suffix in `resocks5.proxy_list.ktav`. An upstream that offers nothing else
+  is refused before the password is sent.
+
+Old configs behave exactly as before: `allow_anonymous` still defaults to
+`true` and clear text is accepted. For an untrusted network turn
+`auth.secure_only` on or wrap the port in a protected transport.
+
+**Cost and flood protection.** New secrets use Argon2id at the cost set by
+`auth.argon2` (default: 19 MiB, 2 passes, 1 lane — the OWASP minimum and what
+0.4.x used). Raise or lower `memory_kib`, `iterations` and `parallelism` to
+fit the machine; stored secrets keep the cost they were written with, so an
+update or a change never breaks a users file. The cost gives no ASIC/GPU
+resistance: use random passwords of 22+ characters. Floods of false logins
+cannot take the server down: secure auth costs the server one HMAC;
+clear-text checks share a limit on concurrent derivations (half of the
+cores) and are refused rather than queued; unknown names derive nothing; and
+successful logins are cached (HMAC tags only, 4096 entries, 300 s), so
+clients that send Basic on every request do not re-derive. See
+[SECURITY.md](SECURITY.md) and [docs/REFERENCE.md](docs/REFERENCE.md).
+
+## Client IP allow-list (allowed_clients)
+
+The global `allowed_clients` string in `resocks5.main.ktav` (default `"*"`,
+everyone) restricts which client IPs may connect at all. The check uses the
+**real TCP address of the peer**, before any protocol byte is read; a
+rejected peer's connection is closed without a reply. An invalid rule fails
+the server start (fail-closed), including rules attached to disabled and
+duplicate users. Changes need a restart: the rule is compiled once into a
+snapshot at startup.
+
+Every user in `resocks5.users.ktav` can carry an optional `allowed_clients`
+string. The final check is the **AND of the global rule and the user's
+rule** (the user's field adds a restriction only when set); the elements
+inside one list are **OR** alternatives. The user's filter is applied when
+the secret is looked up, so a rejected IP gets the same refusal as a wrong
+password (secure auth `Denied`, or the clear-text refusal) and cannot claim
+an init account. It does not apply to anonymous clients at all (they obey
+only the global rule); direct users obey it like everyone else.
+
+Supported forms (comma-separated; elements are trimmed of spaces):
+
+- an exact IP: `127.0.0.1`, `::1`, `2001:db8::1` — standard std syntax
+  only;
+- `loopback` — `127.0.0.0/8` and `::1` (not any interface address and not a
+  replacement for authentication);
+- wildcard `*` — the whole list (`*`) or exactly one octet of an IPv4 mask
+  (exactly 4 octets): `192.168.*.*`, or exactly one hex group of an IPv6
+  mask (exactly 8 groups): `2001:db8:*:*:*:*:*:*`. `::` may appear once and
+  means **only** zero groups: `2001:db8::*` is `2001:db8:0:0:0:0:0:*`, not
+  a /64.
+
+When checked against an IPv6 mask an IPv4 address is treated as
+`::ffff:a.b.c.d`; IPv4-compatible addresses (`::a.b.c.d` without ffff) are
+not expanded. Example: the mask `::ffff:7f00:*` matches `127.0.0.1` and
+`127.0.255.255`, but NOT `127.1.0.1`. The rejected forms — host names, CIDR,
+ports, partial stars (`1*.2.3.4`), empty elements (`a,,b`) — make the whole
+string invalid.
+
+Alternative KTAV values — pick one, replacing the existing key. Strings are
+written without quotes: quotes become part of the value and are not
+stripped.
 
 ```text
 allowed_clients: *
@@ -553,9 +644,9 @@ allowed_clients: 192.168.*.*
 allowed_clients: 2001:db8:*:*:*:*:*:*
 ```
 
-Пир — это фактический адрес TCP-источника, как его видит сервер: за NAT
-или обратным прокси пиром будет адрес прокси — `X-Forwarded-For`
-НЕ учитывается.
+The peer is the actual TCP source address as the server sees it: behind NAT
+or a reverse proxy the peer is the proxy's address — `X-Forwarded-For` is
+NOT consulted.
 
 ## Use as a library
 
@@ -564,9 +655,9 @@ The networking core is published as a separate crate,
 connectors, the TCP pool, sand-rating, rotation and TLS fragmentation. Credential
 storage, logging and routing policy stay in the host application.
 Add it from crates.io (the inbound `server` module needs 0.3 or newer, chain dialing over an
-existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate` and the
-opt-in inbound options need 0.5.0), or as a
-git dependency to follow unreleased changes:
+existing stream, `dial_chain_over`, needs 0.4.1; `ProxyConfig::validate`, the
+opt-in inbound options, secure auth and method negotiation need 0.5.0),
+or as a git dependency to follow `main`:
 
 ```toml
 [dependencies]
@@ -638,41 +729,47 @@ the top-level modules include `server`, `connect`, `error`, `progress`, `pool`,
 
 ### Embed a SOCKS5 + HTTP CONNECT listener
 
-The unconditional `resocks5_net::server` module works without default features:
+The `resocks5_net::server` module is available without default features; with
+the default `secure-auth` feature it also authenticates users against a
+store you provide (our secure method, plus clear-text SOCKS5 0x02 / HTTP
+Basic verified against the same stored secret):
 
 ```text
-let options = resocks5_net::server::ServerOptions::new(accept_deadline, false, true);
-let mut req = resocks5_net::server::accept(&mut client, &options, move |credentials| async move {
-    host_auth.verify_async(credentials.username(), credentials.password()).await
-}).await?;
+let options = resocks5_net::server::ServerOptions::new(accept_deadline)
+    .allow_anonymous(false); // clear text stays on; `.secure_only()` turns it off too
+let decoy = resocks5_net::secure_auth::DecoyKey::generate()?;
+let methods = resocks5_net::server::AuthMethods::secure(&store, &decoy);
+let mut req = resocks5_net::server::accept_with(&mut client, &options, &methods).await?;
 // Host-owned destination policy and real egress connection happen here.
 // Only after egress is ready:
 req.reply(&mut client, resocks5_net::server::Reply::Established).await?;
 let prefix = req.take_pipeline(); // send exactly once before relaying unread bytes
 ```
 
-The snippet's stream, deadline, authentication state and egress are supplied by the
-host, not fabricated by the parser. See the [complete API contracts and usage](crates/resocks5-net/README.md#inbound-server-api)
-and the [finite local-egress example](crates/resocks5-net/examples/serve_local.rs).
-The example requires a separately running local echo target, actually dials it,
-and accepts two clients on one smart port; it sends success only after that dial.
+The snippet's stream, deadline, user store (`store`, a `SecretStore`) and
+egress are supplied by the host, not fabricated by the parser. See the
+[complete API contracts and usage](crates/resocks5-net/README.md#inbound-server-api).
 
-`accept` returns an unresolved destination, verified username (`None` for anonymous)
-and owned pipeline bytes. It bounds detection/auth/framing with one absolute Tokio
-deadline; the application anchors this at listener acceptance before task spawning.
-HTTP headers are byte-parsed, accept unused obs-text, and have a delimiter-inclusive
-16KiB cap independent of tunneled payload size. On cancellation/error discard the
-stream; admitted authentication persistence can still finish. Routing, gates,
-SNI/Host recovery, logs and egress/tunnel budgets remain host-owned. After early
-recovery success, failure closes the tunnel instead of sending a second reply.
-External authentication and Tor egress can use the same closure-based API; the Tor
-proxy [tor-socks5](https://github.com/PHPCraftdream/tor-socks5) embeds its listener
-this way.
+`accept_with` returns an unresolved destination, the verified username
+(`None` for anonymous), the method that authenticated it and owned pipeline
+bytes. It bounds detection/auth/framing with one absolute Tokio deadline;
+the application anchors this at listener acceptance before task spawning.
+HTTP headers are byte-parsed, accept unused obs-text, and have a
+delimiter-inclusive 16KiB cap independent of tunneled payload size. On
+cancellation/error discard the stream; admitted authentication persistence
+can still finish. Routing, gates, SNI/Host recovery, logs and egress/tunnel
+budgets remain host-owned. After early recovery success, failure closes the
+tunnel instead of sending a second reply. A host with its own user database
+implements `SecretStore` (the default clear-text check derives under a
+process-wide limiter; override `check_password` to add a verified-credential
+cache); the Tor proxy
+[tor-socks5](https://github.com/PHPCraftdream/tor-socks5) embeds its
+listener through the same module.
 
 ## User management
 
 ```bash
-resocks5 users add <name>            # add a user (interactive password)
+resocks5 users add <name>            # add a user (interactive password; one secret for every method)
 resocks5 users add-init <name>       # claim-on-first-login placeholder
 resocks5 users set-password <name>   # change a password
 resocks5 users list                  # list users (never hashes)
@@ -696,7 +793,7 @@ This is a Cargo workspace with two crates:
 | Crate | Role |
 |-------|------|
 | [`resocks5-net`](crates/resocks5-net) | Reusable proxy networking toolkit — SOCKS5/HTTP/HTTPS upstream connectors, a pre-connect TCP pool, a sand-rating soft-weight rotator with exponential decay, and TLS ClientHello fragmentation. |
-| [`resocks5`](crates/resocks5) | The CLI proxy server binary — wires `resocks5-net` together with KTAV configuration, Argon2 user auth, logging, and the SOCKS5/HTTP listener. |
+| [`resocks5`](crates/resocks5) | The CLI proxy server binary — wires `resocks5-net` together with KTAV configuration, secure-auth users, logging, and the SOCKS5/HTTP listener. |
 
 ```bash
 cargo test --workspace      # run the test suite
