@@ -17,20 +17,20 @@ workflow; более ранние этапы подтверждены локал
 
 | Кандидат | Статус | Коммит | Доказательство | Счётчики до → после | Не покрыто |
 |---|---|---|---|---|---|
-| DT-03: `mark_dead` | сделано: один Clone вместо двух | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | первый вызов 10 → 5 alloc, 402 → 211 B; повтор 9 → 4 | другие распределения capacity HashSet |
-| `ChainKey::hash` собирал Vec | сделано: стековый буфер до 64 узлов | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16/64 узла: 1 → 0 alloc (16 и 64 узла: ещё 2/4 realloc → 0) | CPU не измерялся; цепочки длиннее 64 идут прежней Vec-веткой |
-| P02: двойная materialization `pick.config()` | сделано: один Clone корня | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16 узлов: 4/16/64 → 3 alloc | частота пути в реальном трафике |
-| Три Arc на туннель | сделано: одна Arc-аллокация | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | создание 3 → 1 alloc, 72 → 40 B | contention атомарных полей |
-| Предварительный log formatting | сделано: отключённые категории не форматируют | `dc67806` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | report с выключенными категориями 2/1 → 0/0 | остальные места логирования |
-| DT-04 / GA-04: gate label | сделано: один буфер | `dc67806` | [gate-formatter](perf208/reports/gate-formatter.md) | depth16: 18 alloc + 16 realloc → 1 / 0; 1987 → 659 B | частота cached failures; end-to-end dial |
-| CC-06: pool key | сделано: borrowed lookup | `dc67806` | [pool](perf208/reports/pool.md) | warm lookup 1 → 0 alloc; checkout + reserve 2 → 0; cold insert без изменений | живые spares, DNS, конкуренция |
-| Cached resolve | сделано: индекс по identity | `dc67806` | [resolve](perf208/reports/resolve.md) | N=256, last/miss: 256 → 1/0 сравнений | несколько gate levels и exit groups |
-| Полный weighted order при малом бюджете | сделано: внутренний lazy-план; публичный `pick_order` остался контрольным | `dc67806` | [weighted](perf208/reports/weighted.md) | N=256, первый кандидат: 1042 → 12 alloc, 2138 → 255 сравнений; полный drain: 2138 → 5018 сравнений | ускорение полного drain не заявляется |
-| Raw credentials | снято: код `Credentials`, разбор Basic/UNAME и тесты `wire/*`, `credentials/*` удалены вместе с clear-text путями | `dc67806`, удаление — ветка `chore/remove-cleartext` | [credentials](perf208/reports/credentials.md) (историческая) | Basic retain 11 → 10 alloc; plain 8 → 7 (до удаления) | — |
-| `mark_dead` и singleton при росте числа ротаторов | только счётчики, оптимизаций продукта нет | `dc67806` | [mark-dead](perf208/reports/mark-dead.md) | R=256, непересекающиеся: 0 сравнений против 32640 у eager-эталона | большие декартовы планы проверяются выборочно |
-| Dial-путь: singleton route key, `ChainPick::config_arc`, borrowed `link_proxy`, общий hedge target | сделано | `f0928df`, счётчики `fb7b644` | CI-baseline ниже | см. таблицу CI-baseline | hedge target проверен тестом, строк PERF208 нет |
-| Прямой путь: порядок кандидатов по мере потребления | сделано: `ProxyRotator::pick_iter` | `cacf0d0` | CI-baseline ниже | 1 из 256: 2138 → 255 сравнений | ускорение полного drain не заявляется |
-| `ProxyConfig::chain_arc` для ключей `ChainPlan`, `percent_decode` без копии | сделано | `5fa5716` | CI-baseline ниже | 1 узел: 6 → 0 alloc; 4 узла: 18 → 12 | `percent_decode` проверен тестами borrowed/owned, строк PERF208 нет |
+| DT-03: `mark_dead` | сделано: один Clone вместо двух | `14ee842` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | первый вызов 10 → 5 alloc, 402 → 211 B; повтор 9 → 4 | другие распределения capacity HashSet |
+| `ChainKey::hash` собирал Vec | сделано: стековый буфер до 64 узлов | `14ee842` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16/64 узла: 1 → 0 alloc (16 и 64 узла: ещё 2/4 realloc → 0) | CPU не измерялся; цепочки длиннее 64 идут прежней Vec-веткой |
+| P02: двойная materialization `pick.config()` | сделано: один Clone корня | `14ee842` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | 1/4/16 узлов: 4/16/64 → 3 alloc | частота пути в реальном трафике |
+| Три Arc на туннель | сделано: одна Arc-аллокация | `14ee842` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | создание 3 → 1 alloc, 72 → 40 B | contention атомарных полей |
+| Предварительный log formatting | сделано: отключённые категории не форматируют | `14ee842` | [PERF208-RESULTS.json](PERF208-RESULTS.json) | report с выключенными категориями 2/1 → 0/0 | остальные места логирования |
+| DT-04 / GA-04: gate label | сделано: один буфер | `14ee842` | [gate-formatter](perf208/reports/gate-formatter.md) | depth16: 18 alloc + 16 realloc → 1 / 0; 1987 → 659 B | частота cached failures; end-to-end dial |
+| CC-06: pool key | сделано: borrowed lookup | `14ee842` | [pool](perf208/reports/pool.md) | warm lookup 1 → 0 alloc; checkout + reserve 2 → 0; cold insert без изменений | живые spares, DNS, конкуренция |
+| Cached resolve | сделано: индекс по identity | `14ee842` | [resolve](perf208/reports/resolve.md) | N=256, last/miss: 256 → 1/0 сравнений | несколько gate levels и exit groups |
+| Полный weighted order при малом бюджете | сделано: внутренний lazy-план; публичный `pick_order` остался контрольным | `14ee842` | [weighted](perf208/reports/weighted.md) | N=256, первый кандидат: 1042 → 12 alloc, 2138 → 255 сравнений; полный drain: 2138 → 5018 сравнений | ускорение полного drain не заявляется |
+| Raw credentials | снято: код `Credentials`, разбор Basic/UNAME и тесты `wire/*`, `credentials/*` удалены вместе с clear-text путями | `14ee842`, удаление — ветка `chore/remove-cleartext` | [credentials](perf208/reports/credentials.md) (историческая) | Basic retain 11 → 10 alloc; plain 8 → 7 (до удаления) | — |
+| `mark_dead` и singleton при росте числа ротаторов | только счётчики, оптимизаций продукта нет | `14ee842` | [mark-dead](perf208/reports/mark-dead.md) | R=256, непересекающиеся: 0 сравнений против 32640 у eager-эталона | большие декартовы планы проверяются выборочно |
+| Dial-путь: singleton route key, `ChainPick::config_arc`, borrowed `link_proxy`, общий hedge target | сделано | `736f709`, счётчики `d285826` | CI-baseline ниже | см. таблицу CI-baseline | hedge target проверен тестом, строк PERF208 нет |
+| Прямой путь: порядок кандидатов по мере потребления | сделано: `ProxyRotator::pick_iter` | `e63c735` | CI-baseline ниже | 1 из 256: 2138 → 255 сравнений | ускорение полного drain не заявляется |
+| `ProxyConfig::chain_arc` для ключей `ChainPlan`, `percent_decode` без копии | сделано | `014c500` | CI-baseline ниже | 1 узел: 6 → 0 alloc; 4 узла: 18 → 12 | `percent_decode` проверен тестами borrowed/owned, строк PERF208 нет |
 | Снимок health в Arc | отклонено: холодный путь, риск в конкурентной зоне | — | — | — | — |
 | Пароль как `Arc<str>` | отклонено: ломает `wipe_credentials` и zeroize | — | — | — | — |
 
@@ -108,7 +108,7 @@ Allocator — обёртка над `std::alloc::System`, без собстве�
 мёртвого узла, capacity, сохранение credentials. Они не заменяют
 функциональные и конкурентные тесты.
 
-## Историческое локальное A/B (Windows, Rust 1.97, до `dc67806`)
+## Историческое локальное A/B (Windows, Rust 1.97, до `14ee842`)
 
 Окружение: rustc/Cargo 1.97.0, target `x86_64-pc-windows-msvc`, allocator
 `System`, профиль `test` с `opt-level=0`, `RUSTFLAGS=-D warnings`, incremental
