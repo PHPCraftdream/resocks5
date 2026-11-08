@@ -509,10 +509,13 @@ async fn http_tampered_final_token_fails_the_client() {
         accept_with(&mut server, &opts, &AuthMethods::secure(&store, decoy()))
             .await
             .unwrap();
-        // Hand-written 200 whose token the store's key cannot verify.
+        // Hand-written 200 whose final message (`[version, status]` + proof)
+        // carries a proof the store's key cannot verify.
+        let mut message = vec![1u8, 0];
+        message.extend_from_slice(&[0xAA; 32]);
         let head = format!(
             "HTTP/1.1 200 Connection Established\r\nProxy-Authenticate: {}\r\n\r\n",
-            crate::http_auth::encode_token(crate::http_auth::SECURE, &[0xAA; 32])
+            crate::http_auth::encode_token(crate::http_auth::SECURE, &message)
         );
         server.write_all(head.as_bytes()).await.unwrap();
     };

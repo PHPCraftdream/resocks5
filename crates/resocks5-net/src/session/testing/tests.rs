@@ -595,8 +595,9 @@ async fn the_cleartext_mock_upgrades_the_client_to_0x02() {
     task.await.unwrap().unwrap();
 }
 
-/// A `secure_only` entry never falls back to RFC 1929: the pre-flight
-/// refuses before any byte.
+/// A `secure_only` SOCKS5 entry offers only 0x80 and never falls back to
+/// RFC 1929: a clear-text-only upstream answers `[5, 0xFF]` and the dial fails
+/// with `MethodUnsupported` before any password byte.
 /// Mutation: falling back to 0x02 makes the dial succeed.
 #[cfg(feature = "secure-auth")]
 #[tokio::test]
@@ -612,7 +613,13 @@ async fn secure_only_client_refuses_a_cleartext_only_upstream() {
     let proxy = mock.proxy().with_auth("bob", "bpw").secure_only();
     let error = dial(&proxy).await.unwrap_err();
     assert!(
-        matches!(error, ConnectError::SecureAuthUnsupported),
+        matches!(
+            error,
+            ConnectError::MethodUnsupported {
+                got: 0xFF,
+                with_auth: true
+            }
+        ),
         "{error:?}"
     );
     assert!(mock.targets().is_empty());

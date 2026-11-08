@@ -638,6 +638,7 @@ mod first_request_tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::http_connect_handshake;
+    #[cfg(feature = "secure-auth")]
     use crate::error::ConnectError;
     use crate::types::ProxyConfig;
 
@@ -652,6 +653,7 @@ mod first_request_tests {
         String::from_utf8(head).unwrap()
     }
 
+    #[cfg(feature = "secure-auth")]
     const CLOSING_BASIC_407: &[u8] = b"HTTP/1.0 407 Proxy Authentication Required\r\n\
         Proxy-Authenticate: Basic realm=\"proxy\"\r\nConnection: close\r\n\r\n";
 
@@ -685,7 +687,9 @@ mod first_request_tests {
     /// A `secure_only` entry never sends Basic: its first request is the
     /// credential-less probe, and a Basic-only `407` ends in
     /// `SecureAuthUnsupported`. Mutation: sending Basic first would hand the
-    /// password to a clear-text-only upstream.
+    /// password to a clear-text-only upstream. Needs secure credentials (without
+    /// them `secure_only` refuses before any byte is written).
+    #[cfg(feature = "secure-auth")]
     #[tokio::test]
     async fn a_secure_only_entry_probes_without_credentials() {
         let (mut client, mut upstream) = duplex(4096);
