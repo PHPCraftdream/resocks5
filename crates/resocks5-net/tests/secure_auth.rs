@@ -282,11 +282,11 @@ async fn secure_only_options_refuse_cleartext_on_accept_secure() {
                     String::from_utf8_lossy(&answer)
                 );
                 assert!(
-                    answer.windows(17).any(|w| w == b"Resocks5-Secure"),
+                    contains(&answer, b"Resocks5-Secure"),
                     "the strong scheme must still be offered"
                 );
                 assert!(
-                    !answer.windows(5).any(|w| w == b"Basic"),
+                    !contains(&answer, b"Basic"),
                     "no Basic challenge: {:?}",
                     String::from_utf8_lossy(&answer)
                 );

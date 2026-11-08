@@ -311,7 +311,7 @@ Content-Length: 0\r\n\r\n";
         timeout(Duration::from_secs(20), async {
             let store = Store::enrolled("alice", "pw");
             let options = ServerOptions::new(deadline()).allow_anonymous(true);
-            let (port, server) = serve_once(store, options, true).await;
+            let (port, server) = serve_once(store, options, false).await;
             let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             client.write_all(&socks_connect(&[0])).await.unwrap();
             let mut pick = [0u8; 2];
@@ -535,8 +535,8 @@ Content-Length: 0\r\n\r\n";
         timeout(Duration::from_secs(30), async {
             let store = Store::waiting("eve");
             let options = ServerOptions::new(deadline());
-            let (port_a, server_a) = serve_once(Arc::clone(&store), options, true).await;
-            let (port_b, server_b) = serve_once(Arc::clone(&store), options, true).await;
+            let (port_a, server_a) = serve_once(Arc::clone(&store), options, false).await;
+            let (port_b, server_b) = serve_once(Arc::clone(&store), options, false).await;
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
             let socks = tokio::spawn({
@@ -550,8 +550,14 @@ Content-Length: 0\r\n\r\n";
                     barrier.wait().await;
                     client.write_all(&rfc1929("eve", "eves-pw")).await.unwrap();
                     let mut status = [0u8; 2];
-                    client.read_exact(&mut status).await.unwrap();
-                    status == [1, 0]
+                    if client.read_exact(&mut status).await.is_err() || status != [1, 0] {
+                        return false;
+                    }
+                    // The winner's server still waits for the CONNECT request.
+                    client.write_all(&socks_connect(&[2])[3..]).await.unwrap();
+                    let mut rest = Vec::new();
+                    let _ = client.read_to_end(&mut rest).await;
+                    true
                 }
             });
             let basic = tokio::spawn({
@@ -652,7 +658,7 @@ mod client_side {
 
     /// A raw SOCKS5 upstream that speaks ONLY clear text (method 0x02):
     /// offers `[5, 255]` unless the client offered 0x02, accepts any
-    /// UNAME/PASSWD pair (recording it), tunnels CONNECT and echoes
+    /// UNAME/PASSWD pair (recording it), answers CONNECT and echoes
     /// `pong:` + payload. Serves up to four connections.
     async fn socks02_stub() -> (u16, Arc<Recorded>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -676,6 +682,7 @@ mod client_side {
                     continue;
                 }
                 stream.write_all(&[5, 2]).await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), 1, "RFC 1929 version");
                 let ulen = stream.read_u8().await.unwrap();
                 let mut user = vec![0u8; usize::from(ulen)];
                 stream.read_exact(&mut user).await.unwrap();
@@ -688,6 +695,19 @@ mod client_side {
                     String::from_utf8_lossy(&password)
                 ));
                 stream.write_all(&[1, 0]).await.unwrap();
+                let mut request = [0u8; 4];
+                stream.read_exact(&mut request).await.unwrap();
+                let address = match request[3] {
+                    1 => 4,
+                    4 => 16,
+                    _ => usize::from(stream.read_u8().await.unwrap()),
+                };
+                let mut rest = vec![0u8; address + 2];
+                stream.read_exact(&mut rest).await.unwrap();
+                stream
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
                 tunnel(&mut stream).await;
             }
         });
