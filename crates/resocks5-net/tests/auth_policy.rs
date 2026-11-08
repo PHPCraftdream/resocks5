@@ -149,6 +149,13 @@ mod server_side {
         (port, task)
     }
 
+    /// SOCKS5 greeting offering `methods` alone. A refusal test sends only this:
+    /// bytes the server never reads make its close a TCP reset, and Windows
+    /// then drops the `[5, 255]` answer the client has not read yet.
+    fn socks_greeting(methods: &[u8]) -> Vec<u8> {
+        socks_connect(methods)[..2 + methods.len()].to_vec()
+    }
+
     /// SOCKS5 greeting offering `methods`, then a CONNECT to `example.test:443`.
     fn socks_connect(methods: &[u8]) -> Vec<u8> {
         let mut bytes = vec![5, u8::try_from(methods.len()).unwrap()];
@@ -327,7 +334,7 @@ Content-Length: 0\r\n\r\n";
             let store = Store::enrolled("alice", "pw");
             let (port, server) = serve_once(store, ServerOptions::new(deadline()), false).await;
             let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            client.write_all(&socks_connect(&[0])).await.unwrap();
+            client.write_all(&socks_greeting(&[0])).await.unwrap();
             let mut answer = Vec::new();
             let _ = client.read_to_end(&mut answer).await;
             assert_eq!(answer, [5, 255]);
@@ -350,7 +357,7 @@ Content-Length: 0\r\n\r\n";
                 let store = Store::enrolled("alice", "pw");
                 let (port, server) = serve_once(store, options, false).await;
                 let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-                client.write_all(&socks_connect(greeting)).await.unwrap();
+                client.write_all(&socks_greeting(greeting)).await.unwrap();
                 let mut answer = Vec::new();
                 let _ = client.read_to_end(&mut answer).await;
                 assert_eq!(answer, [5, 255], "greeting {greeting:?}");
