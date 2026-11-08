@@ -201,9 +201,15 @@ impl DecoyKey {
     /// A key from fixed bytes (for tests).
     #[cfg(test)]
     pub(crate) fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self::from_bytes_with(bytes, KdfParams::MIN)
+    }
+
+    /// Like [`Self::from_bytes`], advertising `params` (for tests).
+    #[cfg(test)]
+    pub(crate) fn from_bytes_with(bytes: [u8; KEY_LEN], params: KdfParams) -> Self {
         Self {
             key: Zeroizing::new(bytes),
-            params: KdfParams::MIN,
+            params,
         }
     }
 

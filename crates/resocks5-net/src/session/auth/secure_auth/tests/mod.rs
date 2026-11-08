@@ -100,7 +100,7 @@ fn creds(user: &str, password: &str) -> SecureCredentials {
 
 fn decoy() -> &'static DecoyKey {
     static KEY: std::sync::OnceLock<DecoyKey> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| DecoyKey::from_bytes([7u8; KEY_LEN]))
+    KEY.get_or_init(|| DecoyKey::from_bytes_with([7u8; KEY_LEN], WEAK))
 }
 
 /// A client and a server end joined by a relay that records every byte that
