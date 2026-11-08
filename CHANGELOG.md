@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.0] - 2026-11-07
+## [0.5.0] - 2026-11-08
 
 ### Added
 
@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`UserSecret`, behind the `SecretStore` trait); a login is a mutual HMAC-SHA256
   challenge-response over `K` with fresh nonces on both sides, so a recorded
   exchange cannot be replayed and a server without `K` cannot pass. Unknown users
-  get a decoy (`DecoyKey`) indistinguishable from a wrong password; the client
+  get a decoy (`DecoyKey::generate()`, or `generate_with(KdfParams)` so decoys
+  advertise the cost the host stores its secrets at) indistinguishable from a
+  wrong password; the client
   can demand a minimum cost from a server (`SecureCredentials::with_min_kdf`,
   `ProxyConfig::with_min_kdf`; nothing is refused by default, `KdfParams::MIN`)
   and refuses parameters above hard limits (256 MiB, 16 passes, 16 lanes; `secure_auth::MAX_MEMORY_KIB`).
@@ -228,6 +230,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submitted username, and `Debug` of `IncomingRequest` no longer prints the
   username or the pipeline bytes (`has_username` and
   `pipeline_len` instead).
+- `resocks5`: the `ktav` dependency is `0.8.1`: uppercase `0X`/`0O`/`0B` prefixes
+  stay strings and a file with an explicit root left open at EOF is rejected;
+  well-formed config and users files read as before.
 - `resocks5-net`: `ProxyRotator` (and every constructor) now deduplicates identical
   upstreams (same endpoint, protocol, account and gate level) at construction,
   keeping the first occurrence; `len()` and `all_proxies()` describe unique

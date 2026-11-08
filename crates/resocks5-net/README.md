@@ -189,7 +189,7 @@ an upstream without our method fails with
 
 ```text
 use resocks5_net::connect::{dial_plain, DialOptions};
-use resocks5_net::server::{accept_with, ServerOptions};
+use resocks5_net::server::{accept_with, AuthMethods, ServerOptions};
 use resocks5_net::types::ProxyConfig;
 
 // Inbound: strong methods plus clear text, anonymous refused.
