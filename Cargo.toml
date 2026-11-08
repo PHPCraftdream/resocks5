@@ -51,7 +51,7 @@ subtle = "2.6"
 argon2 = "0.5"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
-ktav = "0.8.0"
+ktav = "0.8.1"
 
 [profile.dev]
 opt-level = 0
