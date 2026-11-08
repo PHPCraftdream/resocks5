@@ -150,6 +150,7 @@ async fn a_concurrent_first_logins_of_an_init_user_produce_exactly_one_claim() {
     assert_eq!(matches.len(), 1, "exactly one candidate is the winner");
     let winner = matches[0].clone();
 
+    assert_eq!(state.password_cache.len(), 0, "`Claimed` is never cached");
     assert!(matches!(
         store.check_password("bob", &winner).await,
         PasswordCheck::Accepted
@@ -158,7 +159,11 @@ async fn a_concurrent_first_logins_of_an_init_user_produce_exactly_one_claim() {
         store.check_password("bob", "claim-not-the-winner").await,
         PasswordCheck::Rejected
     ));
-    assert_eq!(state.password_cache.len(), 0, "`Claimed` is never cached");
+    assert_eq!(
+        state.password_cache.len(),
+        1,
+        "only the later `Accepted` login is cached"
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.lock"));
 }

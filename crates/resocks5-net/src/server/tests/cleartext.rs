@@ -86,6 +86,12 @@ fn b64(text: &str) -> String {
 
 const BARE_REQUEST: &[u8] = b"CONNECT h:443 HTTP/1.1\r\nHost: h\r\n\r\n";
 
+/// What `serve_http` reads back for a refused retry: the keep-alive challenge
+/// answering the bare probe, then the closing refusal.
+fn probe_then_close() -> Vec<u8> {
+    [EXPECT_HTTP_407_CHALLENGE, CHALLENGE_CLOSE].concat()
+}
+
 fn request_with(value: &str) -> Vec<u8> {
     format!("CONNECT h:443 HTTP/1.1\r\nHost: h\r\nProxy-Authorization: {value}\r\n\r\n")
         .into_bytes()
@@ -103,7 +109,7 @@ async fn serve_socks(
     bytes.extend_from_slice(subnegotiation);
     // A successful login continues into a CONNECT frame; failure rows never
     // reach it, so the trailer is harmless there.
-    bytes.extend_from_slice(&socks_request(b"h"));
+    bytes.extend_from_slice(&socks_request(b"h")[3..]);
     let (mut peer, mut server) = duplex(64 * 1024);
     peer.write_all(&bytes).await.unwrap();
     peer.shutdown().await.unwrap();
@@ -200,9 +206,9 @@ async fn basic_header_parsing_is_strict() {
             let req = result.unwrap_or_else(|e| panic!("{header:?}: {e}"));
             assert_eq!(req.auth_method(), AuthMethod::Cleartext, "{header:?}");
             assert_eq!(req.username(), Some("user"), "{header:?}");
-            assert!(written.is_empty(), "{header:?}");
+            assert_eq!(written, EXPECT_HTTP_407_CHALLENGE, "{header:?}");
         } else {
-            assert_eq!(written, CHALLENGE_CLOSE, "{header:?}");
+            assert_eq!(written, probe_then_close(), "{header:?}");
             assert!(
                 matches!(result, Err(ServerError::Authentication(_))),
                 "{header:?}"
@@ -224,7 +230,7 @@ async fn empty_and_control_rejections_never_claim() {
     ] {
         let store = Store::init("carol");
         let (result, written) = serve_http(&header, &store).await;
-        assert_eq!(written, CHALLENGE_CLOSE, "{header:?}");
+        assert_eq!(written, probe_then_close(), "{header:?}");
         assert!(
             matches!(result, Err(ServerError::Authentication(_))),
             "{header:?}"

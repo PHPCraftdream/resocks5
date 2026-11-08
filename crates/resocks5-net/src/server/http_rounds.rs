@@ -76,6 +76,7 @@ where
 /// `scheme` token.
 async fn next_token<S, T>(
     stream: &mut S,
+    carry: Vec<u8>,
     options: &ServerOptions,
     methods: &AuthMethods<'_, T>,
     scheme: &str,
@@ -84,7 +85,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: SecretStore,
 {
-    let request = read_http_request(stream, None, options).await?;
+    let request = read_http_request(stream, carry, options).await?;
     match request
         .authorization
         .as_deref()
@@ -118,7 +119,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     T: SecretStore,
 {
-    let mut request = read_http_request(stream, Some(first), options).await?;
+    let mut request = read_http_request(stream, vec![first], options).await?;
     let mut rounds = 1usize;
     loop {
         match request.authorization.as_deref() {
@@ -143,7 +144,8 @@ where
                 // A standard client first asks without credentials and retries
                 // on this connection with a scheme from the challenge.
                 send(stream, &challenge(methods, options, None, false)).await?;
-                request = read_http_request(stream, None, options).await?;
+                request = read_http_request(stream, std::mem::take(&mut request.pipeline), options)
+                    .await?;
                 rounds += 1;
             }
             Some(value) => {
@@ -203,7 +205,8 @@ where
                     return refuse(stream, methods, options, "too many authentication rounds").await;
                 }
                 send(stream, &challenge(methods, options, Some((SECURE, &message)), false)).await?;
-                let (next, token) = next_token(stream, options, methods, SECURE).await?;
+                let carry = std::mem::take(&mut request.pipeline);
+                let (next, token) = next_token(stream, carry, options, methods, SECURE).await?;
                 request = next;
                 pipe.push(&token);
                 rounds += 1;

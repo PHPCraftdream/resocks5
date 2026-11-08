@@ -685,9 +685,16 @@ async fn over_https_tls_handshake_failure_is_typed() {
 #[tokio::test]
 async fn over_cleartext_refusal_never_discloses_any_node_credentials() {
     let (client, mut peer) = tokio::io::duplex(4096);
-    let proxy = ProxyConfig::http("exit.test", 2)
-        .with_auth("cred-user-7", "secret-pass")
-        .with_gate(ProxyConfig::http("outer.test", 1).with_auth("cred-user-7", "secret-pass"));
+    // Clear text disallowed and no secure credentials (the fields are set by
+    // hand, so `with_auth` could not derive them): the only possible method
+    // is refused before any byte is written to the first hop.
+    let mut outer = ProxyConfig::http("outer.test", 1).allow_cleartext(false);
+    outer.user = Some("cred-user-7".into());
+    outer.password = Some("secret-pass".into());
+    let mut exit = ProxyConfig::http("exit.test", 2).allow_cleartext(false);
+    exit.user = Some("cred-user-7".into());
+    exit.password = Some("secret-pass".into());
+    let proxy = exit.with_gate(outer);
     let err = timeout(
         GUARD,
         dial_chain_over(client, &proxy, "target.test", 80, &opts(), None),

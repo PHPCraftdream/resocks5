@@ -133,6 +133,7 @@ async fn selection(offered: &[u8], options: &ServerOptions, store: &Store) -> Ve
 /// Independent wire oracles for the closing refusals (never derived from
 /// production code).
 const CHALLENGE_CLOSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nProxy-Authenticate: Basic realm=\"resocks5\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+const SECURE_ONLY_CLOSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Resocks5-Secure\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 fn b64(text: &str) -> String {
     STANDARD.encode(text)
@@ -146,12 +147,11 @@ fn request_with(value: &str) -> Vec<u8> {
 }
 
 fn secure_proxy(user: &str, password: &str) -> ProxyConfig {
-    // `usable_pair` gates the dance, so the clear-text pair is set too; the
-    // secure path wins the challenge and the password is never sent.
-    let mut proxy = ProxyConfig::http("proxy.test", 1)
-        .with_secure_auth(SecureCredentials::new(user, password).with_min_kdf(WEAK));
-    proxy.password = Some(password.to_owned());
-    proxy
+    // Secure credentials only, no user/password pair: the client probes with a
+    // bare CONNECT, sees `Resocks5-Secure` in the 407 and runs the exchange (an
+    // entry with a clear-text pair would send Basic in its first request).
+    ProxyConfig::http("proxy.test", 1)
+        .with_secure_auth(SecureCredentials::new(user, password).with_min_kdf(WEAK))
 }
 
 /// The SOCKS5 method-selection matrix: the strongest enabled method wins,
@@ -173,7 +173,7 @@ async fn socks_negotiation_matrix() {
         (&[0x00], true, false, Some(0x00)),
         (&[0x00], false, true, None),
         (&[0x00, 0x02], true, true, Some(0x02)), // 0x02 beats 0x00
-        (&[0x02, 0x00], false, true, Some(0x00)),
+        (&[0x02, 0x00], true, true, Some(0x02)), // offer order is irrelevant
         (&[], false, true, None),  // empty offer
         (&[], true, true, None),
         (&[0x63], false, true, None), // garbage methods
@@ -222,7 +222,7 @@ async fn socks_secure_method_completes_end_to_end() {
         assert_eq!(chosen, [5, METHOD]);
         let credentials = SecureCredentials::new("alice", "pw").with_min_kdf(WEAK);
         client_authenticate(&mut peer, &credentials).await.unwrap();
-        peer.write_all(&socks_request(b"h")).await.unwrap();
+        peer.write_all(&socks_request(b"h")[3..]).await.unwrap();
     })
     .await;
     let req = result.unwrap();
@@ -253,7 +253,7 @@ async fn socks_cleartext_completes_and_claims_an_init_user() {
         let mut status = [0; 2];
         peer.read_exact(&mut status).await.unwrap();
         assert_eq!(status, [1, 0]);
-        peer.write_all(&socks_request(b"h")).await.unwrap();
+        peer.write_all(&socks_request(b"h")[3..]).await.unwrap();
     })
     .await;
     let req = result.unwrap();
@@ -268,7 +268,7 @@ async fn socks_cleartext_completes_and_claims_an_init_user() {
         assert_eq!(chosen, [5, METHOD]);
         let credentials = SecureCredentials::new("dave", "daves-pw").with_min_kdf(WEAK);
         client_authenticate(&mut peer, &credentials).await.unwrap();
-        peer.write_all(&socks_request(b"h")).await.unwrap();
+        peer.write_all(&socks_request(b"h")[3..]).await.unwrap();
     })
     .await;
     assert_eq!(result.unwrap().username(), Some("dave"));
@@ -334,7 +334,7 @@ async fn http_negotiation_matrix() {
         /// Authenticated via Basic (true) or served anonymously (false).
         Accept(bool),
         Challenge(&'static [u8]),
-        Refuse(&'static [u8]),
+        Refuse,
     }
     let good = format!("Basic {}", b64("user:pw"));
     let wrong = format!("Basic {}", b64("user:bad"));
@@ -343,16 +343,35 @@ async fn http_negotiation_matrix() {
         (None, true, true, Outcome::Accept(false)),
         (None, false, true, Outcome::Challenge(EXPECT_HTTP_407_CHALLENGE)),
         (Some(good.clone()), false, true, Outcome::Accept(true)),
-        (Some(wrong), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some("Basic !!!".into()), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some(format!("Basic {}", b64("nocolon"))), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some(format!("Basic {}", b64(":pw"))), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some(format!("Basic {}", b64("user:"))), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some(format!("Basic {}", b64("u\u{0}:p"))), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some("Negotiate a b".into()), false, true, Outcome::Refuse(CHALLENGE_CLOSE)),
-        (Some(good.clone()), false, false, Outcome::Refuse(CHALLENGE_CLOSE)), // cleartext off
+        (Some(wrong), false, true, Outcome::Refuse),
+        (Some("Basic !!!".into()), false, true, Outcome::Refuse),
+        (Some(format!("Basic {}", b64("nocolon"))), false, true, Outcome::Refuse),
+        (Some(format!("Basic {}", b64(":pw"))), false, true, Outcome::Refuse),
+        (Some(format!("Basic {}", b64("user:"))), false, true, Outcome::Refuse),
+        (Some(format!("Basic {}", b64("u\u{0}:p"))), false, true, Outcome::Refuse),
+        (Some("Negotiate a b".into()), false, true, Outcome::Refuse),
+        (Some(good.clone()), false, false, Outcome::Refuse), // cleartext off
     ];
     let store = Store::with("user", "pw");
+    // A bare probe is challenged first (keep-alive) unless anonymous access is
+    // on; the scheme list follows the clear-text knob, and so does the closing
+    // refusal that follows a rejected retry.
+    let probe_for = |anonymous: bool, cleartext: bool| -> Vec<u8> {
+        if anonymous {
+            Vec::new()
+        } else if cleartext {
+            EXPECT_HTTP_407_CHALLENGE.to_vec()
+        } else {
+            EXPECT_HTTP_407_SECURE_ONLY.to_vec()
+        }
+    };
+    let close_for = |cleartext: bool| {
+        if cleartext {
+            CHALLENGE_CLOSE
+        } else {
+            SECURE_ONLY_CLOSE
+        }
+    };
     for (header, anonymous, cleartext, outcome) in &rows {
         let mut bytes = BARE_REQUEST.to_vec();
         if let Some(value) = header {
@@ -360,6 +379,7 @@ async fn http_negotiation_matrix() {
         }
         let opts = options(soon(), *anonymous, *cleartext);
         let (result, written) = serve(&bytes, &opts, &store).await;
+        let mut want = probe_for(*anonymous, *cleartext);
         match outcome {
             Outcome::Accept(via_basic) => {
                 let req = result.unwrap_or_else(|e| panic!("{header:?}: {e}"));
@@ -370,14 +390,15 @@ async fn http_negotiation_matrix() {
                     assert_eq!(req.auth_method(), AuthMethod::Anonymous, "{header:?}");
                     assert_eq!(req.username(), None, "{header:?}");
                 }
-                assert!(written.is_empty(), "{header:?}");
+                assert_eq!(written, want, "{header:?}");
             }
             Outcome::Challenge(oracle) => {
                 assert_eq!(written, *oracle, "{header:?}");
                 assert!(result.is_err(), "{header:?}");
             }
-            Outcome::Refuse(oracle) => {
-                assert_eq!(written, *oracle, "{header:?}");
+            Outcome::Refuse => {
+                want.extend_from_slice(close_for(*cleartext));
+                assert_eq!(written, want, "{header:?}");
                 assert!(
                     matches!(result, Err(ServerError::Authentication(_))),
                     "{header:?}"
@@ -391,7 +412,13 @@ async fn http_negotiation_matrix() {
     let (result, written) = serve(BARE_REQUEST, &opts, &store).await;
     assert_eq!(written, EXPECT_HTTP_407_SECURE_ONLY);
     assert!(result.is_err());
-    let (result, written) = serve(BARE_REQUEST, &anon_options(false), &store).await;
+    let (mut peer, mut server) = duplex(64 * 1024);
+    peer.write_all(BARE_REQUEST).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let result = accept(&mut server, &anon_options(false)).await;
+    drop(server);
+    let mut written = Vec::new();
+    peer.read_to_end(&mut written).await.unwrap();
     assert_eq!(written, EXPECT_HTTP_407_BARE_CLOSE);
     assert!(matches!(result, Err(ServerError::Authentication(_))));
     // A disabled clear-text scheme never claims an Init user.
@@ -411,7 +438,10 @@ async fn http_negotiation_matrix() {
     let second = format!("Basic {}", b64("user:other"));
     let bytes = [BARE_REQUEST, request_with(&second).as_slice()].concat();
     let (result, written) = serve(&bytes, &opts, &init).await;
-    assert_eq!(written, CHALLENGE_CLOSE);
+    assert_eq!(
+        written,
+        [EXPECT_HTTP_407_CHALLENGE, CHALLENGE_CLOSE].concat()
+    );
     assert!(matches!(result, Err(ServerError::Authentication(_))));
 }
 

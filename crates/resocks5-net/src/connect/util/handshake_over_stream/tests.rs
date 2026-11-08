@@ -411,7 +411,6 @@ async fn rfc1929_client_subnegotiation_sends_fields_and_maps_errors() {
         peer.read_exact(&mut sub).await.unwrap();
         assert_eq!(sub, [0x01, 1, b'u', 1, b'p']);
         peer.write_all(&reply).await.unwrap();
-        let result = task.await.unwrap();
         if reply == [1, 0] {
             let mut head = [0u8; 8]; // head + len + 'g' + port
             peer.read_exact(&mut head).await.unwrap();
@@ -421,6 +420,7 @@ async fn rfc1929_client_subnegotiation_sends_fields_and_maps_errors() {
                 .await
                 .unwrap();
         }
+        let result = task.await.unwrap();
         result.map(|_| ())
     }
 

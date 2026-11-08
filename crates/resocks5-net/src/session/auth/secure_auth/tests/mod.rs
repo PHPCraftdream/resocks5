@@ -364,7 +364,10 @@ async fn the_client_floor_is_pinned_at_the_new_default() {
             server.write_all(&offer).await.unwrap();
             // Accept any proof, reply with a made-up proof of our own.
             let mut proof = [0u8; 1 + 32];
-            server.read_exact(&mut proof).await.unwrap();
+            // A refused offer (below the floor) ends in EOF with no proof.
+            if server.read_exact(&mut proof).await.is_err() {
+                return;
+            }
             let mut ok = vec![1, 0];
             ok.extend_from_slice(&[0xAA; 32]);
             server.write_all(&ok).await.unwrap();
@@ -372,6 +375,7 @@ async fn the_client_floor_is_pinned_at_the_new_default() {
         let error = client_authenticate(&mut client, &credentials)
             .await
             .unwrap_err();
+        drop(client);
         rogue.await.unwrap();
         error
     }

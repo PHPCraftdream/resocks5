@@ -182,13 +182,21 @@ async fn socks5_bracketed_ipv6() {
     assert_eq!(&req[20..], &443u16.to_be_bytes());
 }
 
+/// A `secure_only` entry whose secure credentials are missing (the fields were
+/// set by hand, so `with_auth` could not derive them) can never authenticate:
+/// the dial is refused before the upstream is even contacted.
+/// Mutation: connecting first (or falling back to clear text) makes the listener
+/// accept, or the error a different one.
 #[tokio::test]
-async fn socks5_bare_password_is_refused_before_any_connection() {
+async fn socks5_secure_only_without_secure_credentials_is_refused_before_any_connection() {
     let (l, port) = bind().await;
-    let proxy = ProxyConfig::socks5("127.0.0.1", port).with_auth("u", "p");
+    let mut proxy = ProxyConfig::socks5("127.0.0.1", port);
+    proxy.user = Some("u".into());
+    proxy.password = Some("p".into());
+    let proxy = proxy.secure_only();
     let err = dial_err(&proxy, "1.2.3.4", 80, &opts()).await;
     assert!(
-        matches!(err, ConnectError::CleartextCredentialsRefused),
+        matches!(err, ConnectError::SecureAuthUnsupported),
         "{err:?}"
     );
     // The upstream was never contacted.

@@ -432,7 +432,7 @@ async fn http_anonymous<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let request = read_http_request(stream, Some(first), options).await?;
+    let request = read_http_request(stream, vec![first], options).await?;
     if request.authorization.is_some() {
         return http_fail(
             stream,
@@ -583,30 +583,28 @@ pub(super) struct HttpRequest {
     pub(super) pipeline: Vec<u8>,
 }
 
-/// Read and validate one CONNECT request head; `first` is its first byte
-/// when detection already consumed it. Malformed requests are answered
-/// (400, 431, 501, 505) and fail; authentication is the caller's.
+/// Read and validate one CONNECT request head. `carry` holds bytes already
+/// consumed from the stream that belong to this request: the first byte when
+/// detection took it, or the pipelined bytes the previous request of a `407`
+/// round over-read (a client may send its retry before it reads the
+/// challenge). Malformed requests are answered (400, 431, 501, 505) and
+/// fail; authentication is the caller's.
 ///
 /// cancel-safe: NO — consumed header/pipeline bytes are future-owned and
 /// replies may be partial.
 pub(super) async fn read_http_request<S>(
     stream: &mut S,
-    first: Option<u8>,
+    carry: Vec<u8>,
     options: &ServerOptions,
 ) -> Result<HttpRequest, ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = Vec::with_capacity(2048);
-    buf.extend(first);
+    let mut buf = carry;
+    buf.reserve(2048);
     let mut tmp = [0; 1024];
+    let mut scan_from = 0;
     let header_end = loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(ServerError::Closed);
-        }
-        let scan_from = buf.len().saturating_sub(3);
-        buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = buf[scan_from..].windows(4).position(|w| w == b"\r\n\r\n") {
             let end = scan_from + pos + 4;
             if end > MAX_HEADER_BYTES {
@@ -617,6 +615,12 @@ where
         if buf.len() > MAX_HEADER_BYTES {
             return http_fail(stream, 431, ServerError::HeaderTooLarge).await;
         }
+        scan_from = buf.len().saturating_sub(3);
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(ServerError::Closed);
+        }
+        buf.extend_from_slice(&tmp[..n]);
     };
     let pipeline = buf.split_off(header_end);
     let mut lines = ByteLines {
