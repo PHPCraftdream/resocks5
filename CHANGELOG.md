@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net`: `server::AuthMethods::cleartext_only(store)`: serve clear text
+  (SOCKS5 0x02 / HTTP Basic) only, checked by `SecretStore::check_password`,
+  without offering the strong method. A host that verifies passwords itself
+  (an overridden `check_password`, `lookup` returning `None`) no longer has
+  clients that list 0x80 with 0x02 refused by a decoy: they are served with
+  0x02, and the HTTP `407` names only `Basic`.
+
 ## [0.5.0] - 2026-11-08
 
 ### Added

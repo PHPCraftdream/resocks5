@@ -324,3 +324,111 @@ fn try_new_refuses_empty_fields() {
     );
     SecureCredentials::try_new("u", "p").unwrap();
 }
+
+/// A host that checks passwords itself and keeps no stored secrets.
+struct OwnVerifier;
+
+impl SecretStore for OwnVerifier {
+    async fn lookup(&self, _user: &str) -> Option<StoredUser> {
+        None
+    }
+
+    async fn claim(&self, _user: &str, _secret: UserSecret) -> bool {
+        false
+    }
+
+    fn check_password(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> impl std::future::Future<Output = PasswordCheck> + Send {
+        let ok = user == "alice" && password == "pw";
+        async move {
+            if ok {
+                PasswordCheck::Accepted
+            } else {
+                PasswordCheck::Rejected
+            }
+        }
+    }
+}
+
+const BASIC_ONLY_CHALLENGE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\"\r\nContent-Length: 0\r\n\r\n";
+const BASIC_ONLY_CLOSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+async fn serve_cleartext_only(
+    bytes: &[u8],
+    options: &ServerOptions,
+) -> (Result<IncomingRequest, ServerError>, Vec<u8>) {
+    let (mut peer, mut server) = duplex(64 * 1024);
+    peer.write_all(bytes).await.unwrap();
+    peer.shutdown().await.unwrap();
+    let result = accept_with(
+        &mut server,
+        options,
+        &AuthMethods::cleartext_only(&OwnVerifier),
+    )
+    .await;
+    drop(server);
+    let mut written = Vec::new();
+    peer.read_to_end(&mut written).await.unwrap();
+    (result, written)
+}
+
+/// With `cleartext_only` the strong method is not offered: a SOCKS5 client
+/// that lists 0x80 together with 0x02 is served with 0x02, verified by the
+/// host's own `check_password` (no stored secret exists), and a wrong
+/// password fails with the RFC 1929 status. A client that offers only 0x80
+/// gets `[5, 0xFF]`. Mutation: choosing 0x80 whenever it is offered answers
+/// a decoy and refuses the right password.
+#[tokio::test]
+async fn cleartext_only_socks_uses_the_host_check_not_the_strong_method() {
+    let options = options(soon(), false, true);
+    let good = [&[5u8, 2, 0x80, 2][..], &[1, 5], b"alice", &[2], b"pw"].concat();
+    let tail = socks_request(b"h")[3..].to_vec();
+    let (result, written) = serve_cleartext_only(&[good, tail.clone()].concat(), &options).await;
+    let req = result.unwrap();
+    assert_eq!(req.auth_method(), AuthMethod::Cleartext);
+    assert_eq!(req.username(), Some("alice"));
+    assert_eq!(written, [5, 2, 1, 0]);
+
+    let bad = [&[5u8, 2, 0x80, 2][..], &[1, 5], b"alice", &[5], b"wrong"].concat();
+    let (result, written) = serve_cleartext_only(&[bad, tail].concat(), &options).await;
+    assert!(matches!(result, Err(ServerError::Authentication(_))));
+    assert_eq!(written, [5, 2, 1, 1]);
+
+    let (result, written) = serve_cleartext_only(&[5, 1, 0x80], &options).await;
+    assert!(matches!(result, Err(ServerError::Authentication(_))));
+    assert_eq!(written, [5, 255]);
+}
+
+/// The HTTP challenge of `cleartext_only` names Basic only, Basic is checked
+/// by the host, and a `Resocks5-Secure` attempt is refused like any other
+/// unsupported scheme. Mutation: listing or accepting `Resocks5-Secure`
+/// without a decoy, or dropping the Basic path, fails a leg.
+#[tokio::test]
+async fn cleartext_only_http_names_basic_only() {
+    let options = options(soon(), false, true);
+    let basic = format!("Basic {}", b64("alice:pw"));
+    let bytes = [BARE_REQUEST, request_with(&basic).as_slice()].concat();
+    let (result, written) = serve_cleartext_only(&bytes, &options).await;
+    let req = result.unwrap();
+    assert_eq!(req.auth_method(), AuthMethod::Cleartext);
+    assert_eq!(req.username(), Some("alice"));
+    assert_eq!(written, BASIC_ONLY_CHALLENGE);
+
+    let wrong = format!("Basic {}", b64("alice:nope"));
+    let bytes = [BARE_REQUEST, request_with(&wrong).as_slice()].concat();
+    let (result, written) = serve_cleartext_only(&bytes, &options).await;
+    assert!(matches!(result, Err(ServerError::Authentication(_))));
+    assert_eq!(written, [BASIC_ONLY_CHALLENGE, BASIC_ONLY_CLOSE].concat());
+
+    let bytes = [
+        BARE_REQUEST,
+        request_with("Resocks5-Secure AAAA").as_slice(),
+    ]
+    .concat();
+    let (result, written) = serve_cleartext_only(&bytes, &options).await;
+    assert!(matches!(result, Err(ServerError::Authentication(_))));
+    assert_eq!(written, [BASIC_ONLY_CHALLENGE, BASIC_ONLY_CLOSE].concat());
+}
