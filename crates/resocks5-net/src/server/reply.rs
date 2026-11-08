@@ -2,7 +2,10 @@
 
 use super::Protocol;
 
-const RESP_407: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"resocks5\", charset=\"UTF-8\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+/// A 407 that lists no scheme: used when no authentication scheme is enabled
+/// (feature-less `accept`), or when a request cannot even be parsed.
+const RESP_407_BARE: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// Fallback for a status no caller sends today: a well-formed 500 head.
 /// Callers use private fixed statuses, so this arm is unreachable now — a
@@ -39,7 +42,7 @@ pub(super) fn http_error(status: u16) -> &'static [u8] {
     match status {
         400 => b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         403 => b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-        407 => RESP_407,
+        407 => RESP_407_BARE,
         431 => b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         501 => b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
         502 => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",

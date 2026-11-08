@@ -75,12 +75,6 @@ pub enum ProtocolViolation {
         /// The version byte the proxy sent.
         got: u8,
     },
-    /// The first byte of an RFC 1929 username/password reply was not
-    /// `0x01`.
-    Socks5BadAuthVersion {
-        /// The sub-negotiation version byte the proxy sent.
-        got: u8,
-    },
     /// The ATYP byte of a SOCKS5 CONNECT reply was not 1/3/4.
     Socks5UnknownAddressType {
         /// The ATYP byte the proxy sent.
@@ -98,8 +92,13 @@ pub enum ProtocolViolation {
         /// Domain length in bytes.
         len: usize,
     },
-    /// SOCKS5 username/password credentials exceeded the 255-byte
-    /// per-field RFC 1929 limit.
+    /// The RFC 1929 auth sub-negotiation reply carried an unexpected
+    /// version byte (must be 1).
+    Socks5BadAuthVersion {
+        /// The version byte the proxy sent.
+        got: u8,
+    },
+    /// The RFC 1929 UNAME or PASSWD exceeded the 255-byte limit.
     Socks5CredentialsTooLong {
         /// Username length in bytes.
         username_len: usize,
@@ -121,9 +120,6 @@ impl fmt::Display for ProtocolViolation {
             ProtocolViolation::Socks5BadVersion { .. } => {
                 write!(f, "[SOCKS5] Invalid proxy response version")
             }
-            ProtocolViolation::Socks5BadAuthVersion { .. } => {
-                write!(f, "[SOCKS5] Invalid authentication response version")
-            }
             ProtocolViolation::Socks5UnknownAddressType { .. } => {
                 write!(f, "[SOCKS5] Unknown address type in response")
             }
@@ -136,8 +132,11 @@ impl fmt::Display for ProtocolViolation {
             ProtocolViolation::Socks5DomainTooLong { .. } => {
                 write!(f, "[SOCKS5] Domain name too long")
             }
+            ProtocolViolation::Socks5BadAuthVersion { .. } => {
+                write!(f, "[SOCKS5] invalid auth sub-negotiation version")
+            }
             ProtocolViolation::Socks5CredentialsTooLong { .. } => {
-                write!(f, "[SOCKS5] Username or password too long")
+                write!(f, "[SOCKS5] username or password too long")
             }
             ProtocolViolation::HttpInvalidConnectTarget => {
                 write!(f, "[HTTP] invalid CONNECT target")
@@ -151,6 +150,58 @@ impl fmt::Display for ProtocolViolation {
         }
     }
 }
+
+/// Why a secure-auth exchange (SOCKS5 method 0x80, see `secure_auth`) failed.
+/// Never carries a user name, a password or key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecureAuthError {
+    /// A message had an unexpected version or status byte.
+    BadVersion,
+    /// A field length was out of range (empty or oversized user name, salt).
+    BadLength,
+    /// The offered KDF parameters are outside the hard limits.
+    KdfOutOfRange,
+    /// The offered KDF parameters are weaker than the client's floor.
+    KdfTooWeak,
+    /// The key derivation (or the OS random source) failed.
+    Kdf,
+    /// The server's proof did not verify: it does not hold the user's key.
+    ServerProofMismatch,
+    /// The server rejected the proof (wrong password, or an unknown user).
+    Denied,
+    /// The server refused the exchange outright.
+    Refused,
+    /// The server asked for a first-time enrollment but this client was not
+    /// told to enroll (a man in the middle could otherwise pose as the server).
+    EnrollmentNotAllowed,
+    /// A sealed enrollment did not decrypt or the key exchange was degenerate.
+    Crypto,
+    /// The stream failed or ended during the exchange.
+    Io(io::ErrorKind),
+}
+
+impl fmt::Display for SecureAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BadVersion => "[SECURE-AUTH] unexpected version or status",
+            Self::BadLength => "[SECURE-AUTH] field length out of range",
+            Self::KdfOutOfRange => "[SECURE-AUTH] key-derivation parameters out of range",
+            Self::KdfTooWeak => "[SECURE-AUTH] key-derivation parameters below the client's floor",
+            Self::Kdf => "[SECURE-AUTH] key derivation failed",
+            Self::ServerProofMismatch => "[SECURE-AUTH] the server did not prove it holds the key",
+            Self::Denied => "[SECURE-AUTH] authentication denied",
+            Self::Refused => "[SECURE-AUTH] exchange refused by the server",
+            Self::EnrollmentNotAllowed => {
+                "[SECURE-AUTH] the server asked for an enrollment this client does not allow"
+            }
+            Self::Crypto => "[SECURE-AUTH] enrollment decryption or key exchange failed",
+            Self::Io(_) => "[SECURE-AUTH] I/O error during the exchange",
+        })
+    }
+}
+
+impl std::error::Error for SecureAuthError {}
 
 /// The typed error returned by every public connect/pool entry point.
 #[derive(Debug)]
@@ -195,18 +246,19 @@ pub enum ConnectError {
         /// The raw status line for HTTP (`response`), empty for SOCKS5.
         response: String,
     },
-    /// SOCKS5 username/password sub-negotiation failed.
-    AuthFailed {
-        /// The status byte the proxy returned.
-        status: u8,
-    },
     /// The proxy refused the requested SOCKS5 authentication method.
     MethodUnsupported {
         /// The method byte the proxy returned.
         got: u8,
-        /// Whether we had asked for username/password auth (`true`) or
-        /// no-auth (`false`) — the two legacy messages differ.
+        /// Whether the greeting offered authentication methods (`true`) or only
+        /// no-auth (`false`) — the two messages differ.
         with_auth: bool,
+    },
+    /// The upstream rejected the RFC 1929 username/password sub-negotiation:
+    /// the status byte after our UNAME/PASSWD was not 0.
+    AuthFailed {
+        /// The status byte the upstream returned.
+        status: u8,
     },
     /// Protocol violation with the offending detail carried in a
     /// [`ProtocolViolation`] variant (bad version, unknown ATYP, domain
@@ -215,6 +267,17 @@ pub enum ConnectError {
     Protocol(ProtocolViolation),
     /// The target address could not be parsed into a SOCKS5 request.
     InvalidTarget(String),
+    /// The upstream is configured with a user name and password that this
+    /// crate would have to send in clear text (SOCKS5 UNAME/PASSWD, or HTTP
+    /// Basic to a plain-HTTP proxy); it never does.
+    /// Raised before the first byte of the handshake; nothing was sent.
+    CleartextCredentialsRefused,
+    /// `secure_only` mode: the upstream did not offer secure auth (SOCKS5
+    /// method 0x80 or HTTP `Resocks5-Secure`), so this crate refuses to fall
+    /// back to any weaker method. Raised before any credential byte is sent.
+    SecureAuthUnsupported,
+    /// The secure-auth exchange (SOCKS5 method 0x80) with the upstream failed.
+    SecureAuth(SecureAuthError),
     /// An HTTPS upstream was requested but the crate was built without
     /// the `tls` feature.
     TlsFeatureMissing {
@@ -320,14 +383,11 @@ impl fmt::Display for ConnectError {
                     write!(f, "[HTTP] upstream proxy rejected CONNECT: {}", response)
                 }
             },
-            ConnectError::AuthFailed { status } => {
-                write!(f, "[SOCKS5] Authentication failed (status {:02x})", status)
-            }
             ConnectError::MethodUnsupported { got, with_auth } => {
                 if *with_auth {
                     write!(
                         f,
-                        "[SOCKS5] Proxy does not support username/password authentication (received: {:02x})",
+                        "[SOCKS5] Proxy does not support the offered strong authentication methods (received: {:02x})",
                         got
                     )
                 } else {
@@ -338,6 +398,10 @@ impl fmt::Display for ConnectError {
                     )
                 }
             }
+            ConnectError::AuthFailed { status } => write!(
+                f,
+                "[SOCKS5] proxy rejected the username/password authentication (status {status:#04x})"
+            ),
             ConnectError::Protocol(violation) => write!(f, "{}", violation),
             ConnectError::InvalidTarget(target) => {
                 write!(f, "[SOCKS5] Invalid target address format: {}", target)
@@ -353,6 +417,13 @@ impl fmt::Display for ConnectError {
             ConnectError::Tls { message, .. } => write!(f, "{}", message),
             #[cfg(feature = "pool")]
             ConnectError::AtCapacity(cap) => write!(f, "{}", cap),
+            ConnectError::SecureAuth(error) => write!(f, "{}", error),
+            ConnectError::CleartextCredentialsRefused => f.write_str(
+                "refusing to send credentials in clear text (use secure auth or an https proxy)",
+            ),
+            ConnectError::SecureAuthUnsupported => f.write_str(
+                "secure-only mode: the upstream does not support secure auth (SOCKS5 0x80 / HTTP Resocks5-Secure); refusing any weaker method",
+            ),
         }
     }
 }

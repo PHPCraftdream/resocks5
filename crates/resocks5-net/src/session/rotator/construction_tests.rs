@@ -7,6 +7,10 @@ fn make_proxy(host: &str, port: u16) -> ProxyConfig {
         port,
         user: None,
         password: None,
+        #[cfg(feature = "secure-auth")]
+        secure_auth: None,
+        allow_cleartext: true,
+        secure_only: false,
         is_gate: false,
         gate_level: 0,
         gate: None,

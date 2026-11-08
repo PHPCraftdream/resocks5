@@ -18,32 +18,13 @@ async fn bind() -> (TcpListener, u16) {
 }
 
 /// SOCKS5 stub; returns the captured CONNECT request (head + addr + port).
-/// `auth_status` is `Some` when the client must offer user/pass auth.
-fn socks5_stub(l: TcpListener, auth_status: Option<u8>, ver: u8, rep: u8) -> JoinHandle<Vec<u8>> {
+fn socks5_stub(l: TcpListener, ver: u8, rep: u8) -> JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
         let (mut s, _) = l.accept().await.unwrap();
         let mut greeting = [0u8; 3];
         s.read_exact(&mut greeting).await.unwrap();
-        if let Some(status) = auth_status {
-            assert_eq!(greeting, [0x05, 0x01, 0x02]);
-            s.write_all(&[0x05, 0x02]).await.unwrap();
-            let mut head = [0u8; 2];
-            s.read_exact(&mut head).await.unwrap();
-            let mut uname = vec![0u8; head[1] as usize];
-            s.read_exact(&mut uname).await.unwrap();
-            let plen = s.read_u8().await.unwrap();
-            let mut passwd = vec![0u8; plen as usize];
-            s.read_exact(&mut passwd).await.unwrap();
-            assert_eq!(uname, b"u");
-            assert_eq!(passwd, b"p");
-            s.write_all(&[0x01, status]).await.unwrap();
-            if status != 0 {
-                return Vec::new();
-            }
-        } else {
-            assert_eq!(greeting, [0x05, 0x01, 0x00]);
-            s.write_all(&[0x05, 0x00]).await.unwrap();
-        }
+        assert_eq!(greeting, [0x05, 0x01, 0x00]);
+        s.write_all(&[0x05, 0x00]).await.unwrap();
         let mut req = vec![0u8; 4];
         s.read_exact(&mut req).await.unwrap();
         let rest = match req[3] {
@@ -162,7 +143,7 @@ fn options_defaults_and_builders() {
 #[tokio::test]
 async fn socks5_domain() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let up = dial_guarded(&proxy, "example.com", 443, &opts())
         .await
@@ -178,7 +159,7 @@ async fn socks5_domain() {
 #[tokio::test]
 async fn socks5_ipv4() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let up = dial_guarded(&proxy, "1.2.3.4", 80, &opts()).await.unwrap();
     expect_ok_payload(up).await;
@@ -191,7 +172,7 @@ async fn socks5_ipv4() {
 #[tokio::test]
 async fn socks5_bracketed_ipv6() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let up = dial_guarded(&proxy, "[::1]", 443, &opts()).await.unwrap();
     expect_ok_payload(up).await;
@@ -201,27 +182,26 @@ async fn socks5_bracketed_ipv6() {
     assert_eq!(&req[20..], &443u16.to_be_bytes());
 }
 
+/// A `secure_only` entry whose secure credentials are missing (the fields were
+/// set by hand, so `with_auth` could not derive them) can never authenticate:
+/// the dial is refused before the upstream is even contacted.
+/// Mutation: connecting first (or falling back to clear text) makes the listener
+/// accept, or the error a different one.
 #[tokio::test]
-async fn socks5_auth_ok() {
+async fn socks5_secure_only_without_secure_credentials_is_refused_before_any_connection() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, Some(0), 0x05, 0);
-    let proxy = ProxyConfig::socks5("127.0.0.1", port).with_auth("u", "p");
-    let up = dial_guarded(&proxy, "1.2.3.4", 80, &opts()).await.unwrap();
-    expect_ok_payload(up).await;
-    stub.await.unwrap();
-}
-
-#[tokio::test]
-async fn socks5_auth_rejected() {
-    let (l, port) = bind().await;
-    let stub = socks5_stub(l, Some(0x01), 0x05, 0);
-    let proxy = ProxyConfig::socks5("127.0.0.1", port).with_auth("u", "p");
+    let mut proxy = ProxyConfig::socks5("127.0.0.1", port);
+    proxy.user = Some("u".into());
+    proxy.password = Some("p".into());
+    let proxy = proxy.secure_only();
     let err = dial_err(&proxy, "1.2.3.4", 80, &opts()).await;
     assert!(
-        matches!(err, ConnectError::AuthFailed { status: 1 }),
+        matches!(err, ConnectError::SecureAuthUnsupported),
         "{err:?}"
     );
-    stub.await.unwrap();
+    // The upstream was never contacted.
+    let accepted = tokio::time::timeout(std::time::Duration::from_millis(100), l.accept()).await;
+    assert!(accepted.is_err());
 }
 
 /// Dial skips validation entirely: a config with only a username set is
@@ -229,7 +209,7 @@ async fn socks5_auth_rejected() {
 #[tokio::test]
 async fn socks5_half_credentials_dial_anonymously() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let mut proxy = ProxyConfig::socks5("127.0.0.1", port);
     proxy.user = Some("only-user".to_string());
     assert_eq!(
@@ -244,7 +224,7 @@ async fn socks5_half_credentials_dial_anonymously() {
 #[tokio::test]
 async fn socks5_rep_nonzero_is_proxy_rejected() {
     let (l, port) = bind().await;
-    let _stub = socks5_stub(l, None, 0x05, 0x05);
+    let _stub = socks5_stub(l, 0x05, 0x05);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let err = dial_err(&proxy, "1.2.3.4", 80, &opts()).await;
     assert!(
@@ -263,7 +243,7 @@ async fn socks5_rep_nonzero_is_proxy_rejected() {
 #[tokio::test]
 async fn socks5_bad_version_is_protocol() {
     let (l, port) = bind().await;
-    let _stub = socks5_stub(l, None, 0x04, 0);
+    let _stub = socks5_stub(l, 0x04, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let err = dial_err(&proxy, "1.2.3.4", 80, &opts()).await;
     assert!(
@@ -375,7 +355,7 @@ async fn unrepresentable_handshake_budget_does_not_panic() {
 #[tokio::test]
 async fn dial_plain_socks5_matches_dial_with_none() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let up = dial_plain_guarded(&proxy, "example.com", 443, &opts())
         .await
@@ -474,7 +454,7 @@ async fn total_timeout_elapses_as_total_stage() {
 #[tokio::test]
 async fn total_timeout_not_hit_on_success() {
     let (l, port) = bind().await;
-    let _stub = socks5_stub(l, None, 0x05, 0);
+    let _stub = socks5_stub(l, 0x05, 0);
     let o = opts().with_total_timeout(Duration::from_secs(5));
     let proxy = ProxyConfig::socks5("127.0.0.1", port);
     let up = dial_guarded(&proxy, "1.2.3.4", 80, &o).await.unwrap();
@@ -647,7 +627,7 @@ async fn dial_tcp_returns_the_tunnel_socket() {
             )
         } else {
             (
-                socks5_stub(l, None, 0x05, 0),
+                socks5_stub(l, 0x05, 0),
                 ProxyConfig::socks5("127.0.0.1", port),
             )
         };
@@ -694,7 +674,7 @@ async fn dial_tcp_refuses_https_without_connecting() {
 async fn socket_options_reach_the_proxy_socket() {
     for set in [false, true] {
         let (l, port) = bind().await;
-        let stub = socks5_stub(l, None, 0x05, 0);
+        let stub = socks5_stub(l, 0x05, 0);
         let mut options = opts();
         if set {
             options = options
@@ -739,7 +719,7 @@ async fn socket_options_reach_the_proxy_socket() {
 #[tokio::test]
 async fn keepalive_interval_alone_does_not_enable_keepalive() {
     let (l, port) = bind().await;
-    let stub = socks5_stub(l, None, 0x05, 0);
+    let stub = socks5_stub(l, 0x05, 0);
     let options = opts().with_keepalive_interval(Duration::from_secs(5));
     let tcp = dial_tcp_guarded(&ProxyConfig::socks5("127.0.0.1", port), &options)
         .await

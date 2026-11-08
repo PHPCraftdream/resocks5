@@ -47,7 +47,8 @@ pub async fn handle_http_client(
 
     // If the authenticated user has direct=true, bypass the pool and
     // connect straight to the target. Anonymous clients NEVER take the
-    // direct path.
+    // direct path. Over HTTP the identity arrives via Basic or
+    // `Resocks5-Secure`, exactly like SOCKS5.
     let is_direct = client_user.is_some_and(|user| auth.is_direct(user));
 
     // Acquire a direct-limiter permit when taking the bypass path.
@@ -74,11 +75,11 @@ pub async fn handle_http_client(
     };
 
     // ── SNI/Host recovery ───────────────────────────────────────────
-    // Pool-routed clients only. When the CONNECT target is a bare IPv4
-    // literal and recovery is enabled, recover the intended hostname
-    // from the client's first record (pipelined ClientHello, or the
-    // first read) and address the upstream by that domain. See
-    // `recover_host_from_payload` in NetworkConfig.
+    // Pool-routed clients only (never direct). When the CONNECT target
+    // is a bare IPv4 literal and recovery is enabled, recover the
+    // intended hostname from the client's first record (pipelined
+    // ClientHello, or the first read) and address the upstream by that
+    // domain. See `recover_host_from_payload` in NetworkConfig.
     if !is_direct && network.recover_host_from_payload {
         if let Some(port) = ipv4_literal_port(target_addr) {
             return recover_and_tunnel_http(

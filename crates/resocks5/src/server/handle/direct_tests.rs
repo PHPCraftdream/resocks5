@@ -1,21 +1,28 @@
-//! A direct account relays data without an upstream; the other policies still hold.
+//! Direct accounts relay data without any upstream; the other policies
+//! still hold. The password arrives via secure auth (SOCKS5 0x80) or —
+//! per policy — clear text (SOCKS5 0x02 / HTTP Basic); the direct branch
+//! works over both protocols identically.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Instant};
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+
 use super::handle_client::handle_client;
+use crate::auth::test_support::creds;
 use crate::auth::AuthState;
 use crate::config::{AuthConfig, NetworkConfig, TlsFragmentConfig, User, UsersConfig};
 use crate::logger::{LogConfig, Logger};
 use resocks5_net::chain::GateLevels;
 use resocks5_net::pool::ProxyPool;
+use resocks5_net::secure_auth::{client_authenticate, METHOD};
+use resocks5_net::SecureAuthError;
 
 const PAYLOAD: &[u8] = b"direct request\x00\xff";
 const RESPONSE: &[u8] = b"direct response\xff\x00";
@@ -63,22 +70,18 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
     };
     match protocol {
         Protocol::Socks5 => {
-            let method = if anonymous { 0 } else { 2 };
+            let method = if anonymous { 0 } else { METHOD };
             stream.write_all(&[5, 1, method]).await.unwrap();
             let mut selected = [0; 2];
             stream.read_exact(&mut selected).await.unwrap();
             assert_eq!(selected, [5, method]);
             if !anonymous {
-                let mut auth = vec![1, 5, b'a', b'l', b'i', b'c', b'e'];
-                auth.push(u8::try_from(password.len()).unwrap());
-                auth.extend_from_slice(password.as_bytes());
-                stream.write_all(&auth).await.unwrap();
-                let mut verdict = [0; 2];
-                stream.read_exact(&mut verdict).await.unwrap();
-                assert_eq!(verdict, [1, u8::from(case.auth_failure())]);
+                let verdict = client_authenticate(&mut stream, &creds("alice", password)).await;
                 if case.auth_failure() {
+                    assert_eq!(verdict, Err(SecureAuthError::Denied));
                     return;
                 }
+                verdict.unwrap();
             }
             let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
             request.extend_from_slice(&port.to_be_bytes());
@@ -100,8 +103,10 @@ async fn client(mut stream: TcpStream, protocol: Protocol, case: Case, port: u16
         Protocol::Http => {
             let mut request = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n");
             if !anonymous {
-                let credentials = STANDARD.encode(format!("alice:{password}"));
-                request.push_str(&format!("Proxy-Authorization: Basic {credentials}\r\n"));
+                request.push_str(&format!(
+                    "Proxy-Authorization: Basic {}\r\n",
+                    B64.encode(format!("alice:{password}"))
+                ));
             }
             request.push_str("\r\n");
             let mut bytes = request.into_bytes();
@@ -140,6 +145,7 @@ async fn exercise(protocol: Protocol, case: Case) {
             AuthState::build(
                 &AuthConfig {
                     allow_anonymous: true,
+                    ..Default::default()
                 },
                 &UsersConfig {
                     users: vec![User {
@@ -270,30 +276,39 @@ async fn exercise(protocol: Protocol, case: Case) {
 
 #[tokio::test]
 async fn direct_account_relays_bytes_without_any_upstream() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        exercise(protocol, Case::Direct).await;
-    }
+    exercise(Protocol::Socks5, Case::Direct).await;
 }
 
 #[tokio::test]
 async fn direct_is_not_a_fallback_for_pool_or_anonymous_clients() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        for case in [Case::Pool, Case::Anonymous] {
-            exercise(protocol, case).await;
-        }
+    for case in [Case::Pool, Case::Anonymous] {
+        exercise(Protocol::Socks5, case).await;
     }
+    exercise(Protocol::Http, Case::Anonymous).await;
 }
 
 #[tokio::test]
 async fn direct_preserves_auth_bans_and_concurrency_limits() {
-    for protocol in [Protocol::Socks5, Protocol::Http] {
-        for case in [
-            Case::Disabled,
-            Case::WrongPassword,
-            Case::Banned,
-            Case::AtCapacity,
-        ] {
-            exercise(protocol, case).await;
-        }
+    for case in [
+        Case::Disabled,
+        Case::WrongPassword,
+        Case::Banned,
+        Case::AtCapacity,
+    ] {
+        exercise(Protocol::Socks5, case).await;
     }
+}
+
+/// Mutation: removing the HTTP direct branch — HTTP pool-only — fails the
+/// payload relay.
+#[tokio::test]
+async fn a_direct_account_works_over_http_basic() {
+    exercise(Protocol::Http, Case::Direct).await;
+}
+
+/// Mutation: an acceptor that trusts Basic without verifying logs the
+/// attacker in.
+#[tokio::test]
+async fn a_wrong_http_basic_password_is_refused() {
+    exercise(Protocol::Http, Case::WrongPassword).await;
 }

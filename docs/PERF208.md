@@ -26,7 +26,7 @@ workflow; более ранние этапы подтверждены локал
 | CC-06: pool key | сделано: borrowed lookup | `dc67806` | [pool](perf208/reports/pool.md) | warm lookup 1 → 0 alloc; checkout + reserve 2 → 0; cold insert без изменений | живые spares, DNS, конкуренция |
 | Cached resolve | сделано: индекс по identity | `dc67806` | [resolve](perf208/reports/resolve.md) | N=256, last/miss: 256 → 1/0 сравнений | несколько gate levels и exit groups |
 | Полный weighted order при малом бюджете | сделано: внутренний lazy-план; публичный `pick_order` остался контрольным | `dc67806` | [weighted](perf208/reports/weighted.md) | N=256, первый кандидат: 1042 → 12 alloc, 2138 → 255 сравнений; полный drain: 2138 → 5018 сравнений | ускорение полного drain не заявляется |
-| Raw credentials | сделано в успешной Basic-ветке; `Credentials::duplicate` остаётся по контракту | `dc67806` | [credentials](perf208/reports/credentials.md) | Basic retain 11 → 10 alloc; plain 8 → 7; UTF-8/raw/Basic duplicate: 2/4/3 owning-копии | очистка всех копий компилятора и хоста |
+| Raw credentials | снято: код `Credentials`, разбор Basic/UNAME и тесты `wire/*`, `credentials/*` удалены вместе с clear-text путями | `dc67806`, удаление — ветка `chore/remove-cleartext` | [credentials](perf208/reports/credentials.md) (историческая) | Basic retain 11 → 10 alloc; plain 8 → 7 (до удаления) | — |
 | `mark_dead` и singleton при росте числа ротаторов | только счётчики, оптимизаций продукта нет | `dc67806` | [mark-dead](perf208/reports/mark-dead.md) | R=256, непересекающиеся: 0 сравнений против 32640 у eager-эталона | большие декартовы планы проверяются выборочно |
 | Dial-путь: singleton route key, `ChainPick::config_arc`, borrowed `link_proxy`, общий hedge target | сделано | `f0928df`, счётчики `fb7b644` | CI-baseline ниже | см. таблицу CI-baseline | hedge target проверен тестом, строк PERF208 нет |
 | Прямой путь: порядок кандидатов по мере потребления | сделано: `ProxyRotator::pick_iter` | `cacf0d0` | CI-baseline ниже | 1 из 256: 2138 → 255 сравнений | ускорение полного drain не заявляется |
@@ -186,7 +186,7 @@ Workflow `.github/workflows/perf.yml` запускает только тесты
 
 Workflow сохраняет исходный вывод `PERF208` в artifact `perf208-counters`.
 Ожидаемое число строк задано в `EXPECTED_ROWS` файла `tests/perf208/run.py`
-(сейчас 209 строк SDK и 24 приложения); проверка защищает от пустого или
+(сейчас 199 строк SDK и 24 приложения); проверка защищает от пустого или
 случайно суженного фильтра. Runner проверяет exit code каждого бинарника и
 непустой успешный libtest summary, включая дополнительные функциональные
 фильтры. Upload с `always()` сохраняет доступные свидетельства ошибки; наличие

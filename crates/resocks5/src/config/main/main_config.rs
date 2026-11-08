@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AuthConfig, FileLogConfig, NetworkConfig, TlsFragmentConfig};
+use crate::config::{
+    AuthConfig, FileLogConfig, NetworkConfig, TlsFragmentConfig, UpstreamAuthConfig,
+};
 use crate::logger::LogConfig;
 use resocks5_net::pool::PoolConfig;
 
@@ -16,6 +18,11 @@ pub struct MainConfig {
     #[serde(default)]
     pub banned_patterns: Vec<String>,
     pub auth: AuthConfig,
+    /// Outbound (upstream) authentication policy — see `UpstreamAuthConfig`.
+    /// Optional section; defaults to clear-text fallback
+    /// (`secure_only: false`) so existing proxy lists behave as before.
+    #[serde(default)]
+    pub upstream_auth: UpstreamAuthConfig,
     /// Per-event-type log flags. Defaults via `LogConfig::default()`
     /// when the section is missing — `serde(default)` here covers the
     /// field, each flag inside has its own per-field default.

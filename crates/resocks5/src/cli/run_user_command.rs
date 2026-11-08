@@ -145,7 +145,7 @@ fn remove_user(users: &UsersConfig, name: &str, skip_confirm: bool) -> Result<Op
 
 fn list_users(users: &UsersConfig) -> Result<()> {
     if users.users.is_empty() {
-        println!("(no users configured — server runs without authentication)");
+        println!("(no users configured — anonymous clients are admitted only while auth.allow_anonymous is true)");
         return Ok(());
     }
     println!("{:<24} {:<10} {:<6}", "NAME", "STATUS", "MODE");

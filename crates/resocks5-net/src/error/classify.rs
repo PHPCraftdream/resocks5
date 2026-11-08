@@ -20,11 +20,11 @@ impl ConnectError {
                     | TimeoutKind::Socks5Greeting
             ),
             ConnectError::Io { stage, .. } => matches!(stage, Stage::Connect),
-            ConnectError::AuthFailed { .. } | ConnectError::MethodUnsupported { .. } => true,
-            ConnectError::Protocol(
-                ProtocolViolation::Socks5BadVersion { .. }
-                | ProtocolViolation::Socks5BadAuthVersion { .. },
-            ) => true,
+            ConnectError::MethodUnsupported { .. }
+            | ConnectError::AuthFailed { .. }
+            | ConnectError::SecureAuthUnsupported
+            | ConnectError::SecureAuth(_) => true,
+            ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { .. }) => true,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => true,
             _ => false,
@@ -42,12 +42,12 @@ impl ConnectError {
     /// | SOCKS5 `ProxyRejected` REP 2 / 3 / 4 / 5 / 6 | `Forbidden` / `NetworkUnreachable` / `UpstreamUnavailable` / `ConnectionRefused` / `TimedOut` |
     /// | HTTP(S) `ProxyRejected` 403 / 504 / 502, 503 | `Forbidden` / `TimedOut` / `UpstreamUnavailable` |
     /// | other `ProxyRejected` (REP 1, 7, 8, other statuses, malformed) | `GeneralFailure` |
-    /// | HTTP 407, SOCKS5 [`AuthFailed`](ConnectError::AuthFailed) / [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream) | `GeneralFailure` |
+    /// | HTTP 407, SOCKS5 [`MethodUnsupported`](ConnectError::MethodUnsupported) (our credentials to the upstream), secure-auth exchange errors | `GeneralFailure` |
     /// | [`Io`](ConnectError::Io) timed out | `TimedOut` |
     /// | other [`Io`](ConnectError::Io) at [`Stage::Connect`] (the upstream itself is unreachable) | `UpstreamUnavailable` |
     /// | other [`Io`](ConnectError::Io) | `GeneralFailure` |
     /// | TLS failure | `UpstreamUnavailable` |
-    /// | [`Protocol`](ConnectError::Protocol), [`InvalidTarget`](ConnectError::InvalidTarget), missing TLS feature | `GeneralFailure` |
+    /// | [`Protocol`](ConnectError::Protocol), [`InvalidTarget`](ConnectError::InvalidTarget), [`CleartextCredentialsRefused`](ConnectError::CleartextCredentialsRefused), missing TLS feature | `GeneralFailure` |
     /// | per-upstream cap hit (`AtCapacity`) | `Overloaded` |
     ///
     /// Only the destination's own verdict (a `ProxyRejected` code) selects a
@@ -86,10 +86,13 @@ impl ConnectError {
                 }
                 _ => Reply::GeneralFailure,
             },
-            ConnectError::AuthFailed { .. }
-            | ConnectError::MethodUnsupported { .. }
+            ConnectError::MethodUnsupported { .. }
             | ConnectError::Protocol(_)
             | ConnectError::InvalidTarget(_)
+            | ConnectError::CleartextCredentialsRefused
+            | ConnectError::SecureAuth(_)
+            | ConnectError::AuthFailed { .. }
+            | ConnectError::SecureAuthUnsupported
             | ConnectError::TlsFeatureMissing { .. } => Reply::GeneralFailure,
             #[cfg(feature = "tls")]
             ConnectError::Tls { .. } => Reply::UpstreamUnavailable,
@@ -104,6 +107,10 @@ impl ConnectError {
     pub fn counts_against_upstream(&self) -> bool {
         #[cfg(feature = "pool")]
         if matches!(self, ConnectError::AtCapacity(_)) {
+            return false;
+        }
+        // Our own configuration, not the upstream's behaviour.
+        if matches!(self, ConnectError::CleartextCredentialsRefused) {
             return false;
         }
         true
@@ -156,26 +163,24 @@ mod tests {
         assert!(io_error(Stage::Connect).is_upstream_down());
         assert!(!io_error(Stage::Handshake).is_upstream_down());
         assert!(!io_error(Stage::Total).is_upstream_down());
-        assert!(ConnectError::AuthFailed { status: 1 }.is_upstream_down());
         assert!(ConnectError::MethodUnsupported {
             got: 0xff,
             with_auth: false
         }
         .is_upstream_down());
+        assert!(ConnectError::AuthFailed { status: 1 }.is_upstream_down());
+        assert!(ConnectError::SecureAuthUnsupported.is_upstream_down());
         assert!(
             ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 })
-                .is_upstream_down()
-        );
-        assert!(
-            ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 })
                 .is_upstream_down()
         );
         for violation in [
             ProtocolViolation::Socks5UnknownAddressType { got: 9 },
             ProtocolViolation::Socks5DomainTooLong { len: 256 },
+            ProtocolViolation::Socks5BadAuthVersion { got: 9 },
             ProtocolViolation::Socks5CredentialsTooLong {
                 username_len: 256,
-                password_len: 0,
+                password_len: 256,
             },
             ProtocolViolation::HttpInvalidConnectTarget,
             ProtocolViolation::HttpResponseTooLarge,
@@ -242,7 +247,6 @@ mod tests {
             (io_error(Stage::Connect), true, true),
             (io_error(Stage::Handshake), false, true),
             (io_error(Stage::Total), false, true),
-            (ConnectError::AuthFailed { status: 1 }, true, true),
             (
                 ConnectError::MethodUnsupported {
                     got: 0xff,
@@ -251,13 +255,10 @@ mod tests {
                 true,
                 true,
             ),
+            (ConnectError::AuthFailed { status: 1 }, true, true),
+            (ConnectError::SecureAuthUnsupported, true, true),
             (
                 ConnectError::Protocol(ProtocolViolation::Socks5BadVersion { got: 4 }),
-                true,
-                true,
-            ),
-            (
-                ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 }),
                 true,
                 true,
             ),
@@ -272,9 +273,14 @@ mod tests {
                 true,
             ),
             (
+                ConnectError::Protocol(ProtocolViolation::Socks5BadAuthVersion { got: 2 }),
+                false,
+                true,
+            ),
+            (
                 ConnectError::Protocol(ProtocolViolation::Socks5CredentialsTooLong {
                     username_len: 256,
-                    password_len: 0,
+                    password_len: 256,
                 }),
                 false,
                 true,
@@ -505,16 +511,21 @@ mod tests {
                 Reply::GeneralFailure,
             ),
             (
-                "auth failed",
-                ConnectError::AuthFailed { status: 1 },
-                Reply::GeneralFailure,
-            ),
-            (
                 "method unsupported",
                 ConnectError::MethodUnsupported {
                     got: 0xff,
                     with_auth: true,
                 },
+                Reply::GeneralFailure,
+            ),
+            (
+                "auth failed",
+                ConnectError::AuthFailed { status: 1 },
+                Reply::GeneralFailure,
+            ),
+            (
+                "secure auth unsupported",
+                ConnectError::SecureAuthUnsupported,
                 Reply::GeneralFailure,
             ),
             (

@@ -1,16 +1,17 @@
 # Architecture
 
-Полный пользовательский справочник: [REFERENCE.md](REFERENCE.md). Он встроен
-в `resocks5 --help` и `resocks5 config`; содержит все команды, поля, defaults
-и ограничения. README даёт быстрые сценарии, этот документ — устройство кода.
+The full user reference is [REFERENCE.md](REFERENCE.md). It is embedded in
+`resocks5 --help` and `resocks5 config` and covers every command, field,
+default and limit. The README has quick scenarios; this document describes
+how the code is put together.
 
-Самостоятельный proxy уже является политикой аккаунта `direct: true`:
-оба входных протокола вызывают `establish_direct`, не обращаясь к rotator.
-Запуск без upstream разрешён при наличии включённого direct-пользователя;
-anonymous и pool-пользователи автоматически direct-доступ не получают.
-Глобальный `allowed_clients` проверяется до handshake, пользовательский —
-до проверки пароля и init-claim; оба правила пересекаются. Настройки — снимок
-из cwd, изменение требует перезапуска.
+A standalone proxy is already an account policy, `direct: true`: both
+inbound protocols call `establish_direct` without touching the rotator.
+Starting without upstreams is allowed when an enabled direct user exists;
+anonymous and pool users never get direct access automatically. The global
+`allowed_clients` is checked before the handshake, the per-user one when the
+secret is looked up (before an init claim); the two rules intersect. The
+settings are a snapshot from the cwd, and changing them requires a restart.
 
 This document explains how `resocks5` is put together — the request-flow,
 the upstream-selection model, the safety nets, and where each concern lives
@@ -43,9 +44,9 @@ client TCP                                          target host
 └────────────────────┬──────────────────────────┘
                      ▼
 ┌───────────────────────────────────────────────┐
-│ 2. Authenticate                               │   Argon2id verify + verify-cache (password
-│    (auth/state/, both handlers)               │   server_secret ⨁ name ⨁ password) for
-│                                               │   O(1) re-auth without re-Argon2
+│ 2. Authenticate                               │   secure auth (0x80 / Resocks5-Secure), else
+│    (auth/state/, both handlers)               │   clear text (0x02 / Basic), else anonymous;
+│                                               │   one stored Argon2id secret for all methods
 └────────────────────┬──────────────────────────┘
                      │
               ┌──────┴──────┐
@@ -262,7 +263,7 @@ Tor), connected to `ProxyConfig::outermost()`. All three attribute errors by
 or an empty bound domain is a `ProtocolViolation` counted against the upstream.
 
 Inbound framing lives in the SDK too (`server::accept`, used by both listeners).
-Its opt-in `ServerOptions` (`strict_http`, `raw_credentials`, `retain_credentials`)
+Its opt-in `ServerOptions::strict_http`
 default to the permissive behaviour the application relies on and the application
 does not enable them; hosts such as pluggable-transport front ends do.
 
@@ -339,27 +340,90 @@ Defaults are picked conservatively; `resocks5 config` documents each one.
 - The pool refill tasks are one per unique `(host, port)`, spawned at
   startup. They use a `Notify` so they wake the instant a slot frees up.
 
-## Auth and the verify-cache
+## Auth
 
-`resocks5` uses Argon2id with per-user PHC strings. To avoid running Argon2
-on every request:
+`handle_client` builds `ServerOptions` from the config (`auth.allow_anonymous`,
+`auth.secure_only`) and calls `server::accept_with` with
+`AuthMethods::secure(&peer_store, decoy)`. The server picks the strongest
+method the client offers:
 
-- On the first successful verify, we keep the presented password in a
-  `DashMap` keyed by name — plaintext in process memory by design, wiped
-  when the entry is replaced or dropped, never persisted.
-- Subsequent verifies for the same name compare the presented password with
-  it in constant time (content; the length is not hidden). Hit → success
-  without touching Argon2 and without recomputing anything.
+1. **Secure auth** (`resocks5_net::secure_auth`): SOCKS5 method 0x80, or the
+   HTTP scheme `Resocks5-Secure` — the same messages, one per `407` round on
+   a kept-alive connection, base64 in `Proxy-Authorization` /
+   `Proxy-Authenticate`. The server's last token rides on the `200` as
+   `Proxy-Authenticate: Resocks5-Secure <b64>` so the client completes the
+   mutual proof. A `Pipe` (flush-delimited, in-memory duplex) runs the same
+   stream-oriented exchange over the HTTP rounds, capped at `MAX_ROUNDS`.
+2. **Clear text**: SOCKS5 0x02 (RFC 1929), HTTP Basic, while
+   `allow_cleartext` is on (it is off under `auth.secure_only`). The password
+   is verified through `SecretStore::check_password`.
+3. **Anonymous**: SOCKS5 0x00 / HTTP without credentials, only with
+   `auth.allow_anonymous`. `auth.secure_only` overrides it.
+
+A client with no acceptable method gets `[5, 0xFF]` or a keep-alive `407`
+listing the enabled schemes (`Resocks5-Secure`, then `Basic realm="resocks5"`
+when clear text is on); a refusal or the round cap is a `407` with
+`Connection: close`. Status 403 stays an access denial, not a challenge
+(RFC 9110 §15.5.8).
+
+### One secret per user
+
+- `users[].hash` is an Argon2id v19 PHC string: salt, parameters and the
+  32-byte key `K = Argon2id(password, salt)`. New secrets use
+  `KdfParams::DEFAULT` (4 MiB, 1 pass, 1 lane), deliberately below the OWASP
+  minimum; stored secrets keep their own parameters.
+- Secure auth: the server sends salt, parameters and a nonce; the client
+  derives K and returns an HMAC proof; the server answers with its own proof.
+  The server never runs Argon2 for it and never sees the password.
+- Clear text: the server derives `Argon2id(password, salt, params)` and
+  compares it with K in constant time. The same stored secret therefore
+  serves both, over SOCKS5 and over HTTP, and switching protocol or method
+  never breaks an account.
+- `AuthState::peer_store(ip)` is the per-connection `SecretStore`: it applies
+  the user's `allowed_clients` rule, so a filtered, unknown or disabled name
+  is answered like a wrong password (the secure path with a process-local
+  decoy, the clear-text path without deriving) and can never claim an init
+  account.
 - Password and policy changes are not hot-applied: users are a startup
   snapshot, so a CLI or users-file change requires a server restart. The
-  only runtime update is the init-claim below; it swaps the hash in the
-  running process, after which old passwords fail, the cache miss falls
-  through to Argon2, and the remembered password is replaced.
+  only runtime update is the init claim below.
 
-The `hash == "init"` sentinel implements claim-on-first-login: the first
-authenticated connect for that username records the password and writes
-the file under a write-lock. Concurrent claims with different passwords
-serialize cleanly — exactly one winner.
+### Flood bounds
+
+- Secure auth costs the server HMACs only; the client pays for Argon2.
+- `PeerStore::check_password` overrides the SDK default: a verified-credential
+  cache (HMAC tags under a per-process key; 4096 entries, 300 s TTL; only
+  `Accepted` inserts; invalidated when the stored secret changes) sits in
+  front of the derivation, so clients that send Basic on every request do
+  not re-derive.
+- A miss that derives takes a slot from the process-wide server-side
+  `DerivationLimiter` (half of the cores, at least one), waits at most a
+  second and is refused (`Rejected`) instead of queued when none frees up.
+  The secure client side has its own limiter, so a flood of inbound
+  clear-text checks cannot starve outbound derivations.
+- An unknown, disabled or filtered name derives nothing: a short fixed sleep
+  keeps its timing in the order of a real check.
+
+### Init claim
+
+The `hash == "init"` sentinel implements claim-on-first-login, by any method
+and over any protocol. Secure enrollment: the first client seals its K under
+an ephemeral X25519 exchange. Clear text: the server derives a fresh secret
+from the presented password (an empty password never claims). Either way the
+server re-checks the sentinel under `claim_lock`, merges the secret into the
+current users file under the cross-process lock, and publishes it.
+Concurrent claims serialize — exactly one winner, the others are denied.
+
+### Upstream authentication
+
+A SOCKS5 entry with `user:password` offers `[0x80, 0x02]` and the upstream
+picks; `secure_only` (entry suffix `;secure_only` or
+`upstream_auth.secure_only`) offers only 0x80. An HTTP/HTTPS entry sends
+Basic in its first CONNECT, as 0.4.x did (3proxy answers an unauthenticated
+CONNECT with `407` + `Connection: close`, so probing first would never reach
+it); a `secure_only` HTTP entry sends a credential-less probe, requires
+`Resocks5-Secure` among the offered schemes and runs the exchange over the
+same kept-alive connection, verifying the final token of the `200`.
 
 ## Config files
 
