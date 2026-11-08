@@ -1,0 +1,60 @@
+name: yank
+
+# Yank (or un-yank) one published version of the `resocks5-net` SDK on
+# crates.io. Manual only: run it from the Actions tab or with
+# `gh workflow run yank.yml -f version=0.5.0`.
+#
+# crates.io does not accept the short-lived trusted-publishing token of
+# release.yml for yanking, so this needs a normal API token with the `yank`
+# scope, stored as the repository secret CRATES_IO_YANK_TOKEN. Create it on
+# https://crates.io/settings/tokens limited to the `resocks5-net` crate with
+# only the `yank` scope and a short expiry. The secret is read by this job
+# alone; nothing is built or checked out here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'resocks5-net version to yank, e.g. 0.5.0'
+        required: true
+        type: string
+      undo:
+        description: 'Un-yank the version instead'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  yank:
+    name: yank resocks5-net
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ inputs.version }}
+      UNDO: ${{ inputs.undo }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_YANK_TOKEN }}
+    steps:
+      - name: Check the version and the token
+        run: |
+          printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::version must look like 0.5.0, got '$VERSION'"
+            exit 1
+          }
+          [ -n "$CARGO_REGISTRY_TOKEN" ] || {
+            echo "::error::the CRATES_IO_YANK_TOKEN secret is not set (an API token with the yank scope; the trusted-publishing token cannot yank)"
+            exit 1
+          }
+      - name: Yank
+        run: |
+          if [ "$UNDO" = true ]; then
+            cargo yank --undo "resocks5-net@$VERSION"
+          else
+            cargo yank "resocks5-net@$VERSION"
+          fi
+      - name: Confirm on crates.io
+        run: |
+          curl -fsS -A 'resocks5-yank-workflow' "https://crates.io/api/v1/crates/resocks5-net/$VERSION" |
+            python3 -c 'import json,sys; v=json.load(sys.stdin)["version"]; print("resocks5-net", v["num"], "yanked =", v["yanked"])'
