@@ -11,7 +11,7 @@ use crate::connect::connect_proxy::TlsConnector;
 use crate::connect::connect_socks5_proxy::socks5_auth;
 use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 use crate::connect::host_port::HostPort;
-use crate::connect::tcp_dial::{apply_socket_options, tcp_dial};
+use crate::connect::tcp_dial::{apply_socket_options, tcp_dial, Budget};
 use crate::connect::{AnyUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::types::{ProxyConfig, ProxyProtocol};
@@ -37,7 +37,11 @@ pub struct DialOptions {
     /// Bound on the protocol exchange (SOCKS5; HTTP CONNECT; for HTTPS the
     /// TLS handshake plus CONNECT together).
     pub handshake_timeout: Duration,
-    /// Optional bound on the whole call, connect plus handshake.
+    /// Optional bound on the whole call, connect plus handshake. Every stage
+    /// is also limited to what is left of it: when this budget is the binding
+    /// limit (equal to or tighter than the stage's own bound) the error is
+    /// always [`Stage::Total`], never a stage error, whichever timer fires
+    /// first; a stage error means the stage's own bound was strictly tighter.
     pub total_timeout: Option<Duration>,
     /// Set `TCP_NODELAY` on the socket to the proxy.
     pub nodelay: bool,
@@ -83,7 +87,9 @@ impl DialOptions {
         self
     }
 
-    /// Set the whole-call bound.
+    /// Set the whole-call bound. It wins every tie with a stage bound: with
+    /// `connect_timeout` or `handshake_timeout` at or above it the dial fails
+    /// with [`Stage::Total`] (SOCKS5 REP 6), deterministically.
     #[must_use]
     pub fn with_total_timeout(mut self, d: Duration) -> Self {
         self.total_timeout = Some(d);
@@ -137,7 +143,8 @@ impl DialOptions {
 /// - `Timeout` with [`Stage::Connect`] when the TCP connect exceeds
 ///   `connect_timeout`; with [`Stage::Handshake`] when the protocol
 ///   exchange exceeds `handshake_timeout`; with [`Stage::Total`]
-///   ([`TimeoutKind::Total`]) when `total_timeout` elapses first.
+///   ([`TimeoutKind::Total`]) when `total_timeout` is exhausted, including
+///   when a stage bound reaches or exceeds what is left of it.
 /// - `Io` for socket failures, `ProxyRejected`, `AuthFailed`,
 ///   `MethodUnsupported`, `Protocol` for proxy-side refusals and
 ///   violations.
@@ -165,18 +172,27 @@ pub async fn dial(
     opts: &DialOptions,
     tls_connector: Option<&TlsConnector>,
 ) -> Result<AnyUpstream, ConnectError> {
-    let run = dial_inner(proxy, host, port, opts, tls_connector, || {});
+    let budget = Budget::start(opts.total_timeout);
+    let run = dial_inner(proxy, host, port, opts, tls_connector, &budget, || {});
     match opts.total_timeout {
         None => run.await,
         Some(total) => match timeout(total, run).await {
+            Ok(Err(ConnectError::Timeout {
+                stage: Stage::Connect | Stage::Handshake,
+                ..
+            })) if budget.total_won() => Err(total_timeout_error(proxy, total)),
             Ok(r) => r,
-            Err(_) => Err(ConnectError::Timeout {
-                stage: Stage::Total,
-                kind: TimeoutKind::Total,
-                endpoint: format!("{}:{}", proxy.host, proxy.port),
-                after: total,
-            }),
+            Err(_) => Err(total_timeout_error(proxy, total)),
         },
+    }
+}
+
+fn total_timeout_error(proxy: &ProxyConfig, total: Duration) -> ConnectError {
+    ConnectError::Timeout {
+        stage: Stage::Total,
+        kind: TimeoutKind::Total,
+        endpoint: format!("{}:{}", proxy.host, proxy.port),
+        after: total,
     }
 }
 
@@ -252,6 +268,7 @@ async fn dial_inner(
     port: u16,
     opts: &DialOptions,
     tls_connector: Option<&TlsConnector>,
+    budget: &Budget,
     on_tcp: impl FnOnce(),
 ) -> Result<AnyUpstream, ConnectError> {
     // Before the TCP connect: nothing reaches the upstream, and the auth
@@ -280,11 +297,11 @@ async fn dial_inner(
         None
     };
 
-    let tcp = tcp_dial(proxy, opts.connect_timeout).await?;
+    let tcp = tcp_dial(proxy, budget.stage(opts.connect_timeout)).await?;
     apply_socket_options(&tcp, proxy, opts)?;
     let mut stream = UpstreamStream::from_tcp(tcp);
     on_tcp();
-    let hs = opts.handshake_timeout;
+    let hs = budget.stage(opts.handshake_timeout);
     let hs_timeout = |kind| ConnectError::Timeout {
         stage: Stage::Handshake,
         kind,

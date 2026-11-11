@@ -728,3 +728,157 @@ async fn keepalive_interval_alone_does_not_enable_keepalive() {
     drop(tcp);
     stub.await.unwrap();
 }
+
+// The whole-call budget against the stage bounds: when the budget is the
+// binding limit the error is always the total deadline, whichever timer the
+// runtime wakes first; a stage error needs a strictly tighter stage bound.
+
+fn is_total(error: &ConnectError) -> bool {
+    matches!(
+        error,
+        ConnectError::Timeout {
+            stage: Stage::Total,
+            kind: TimeoutKind::Total,
+            ..
+        }
+    )
+}
+
+/// An in-memory SOCKS5 peer: serves the first `served` nested tunnels, each
+/// after `delay`, then reads the next greeting and stays silent.
+fn scripted_peer(served: usize, delay: Duration) -> (tokio::io::DuplexStream, JoinHandle<()>) {
+    let (client, mut peer) = tokio::io::duplex(1024);
+    let task = tokio::spawn(async move {
+        for _ in 0..served {
+            let mut greeting = [0u8; 3];
+            peer.read_exact(&mut greeting).await.unwrap();
+            tokio::time::sleep(delay).await;
+            peer.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut head = [0u8; 4];
+            peer.read_exact(&mut head).await.unwrap();
+            let len = usize::from(peer.read_u8().await.unwrap());
+            let mut rest = vec![0u8; len + 2];
+            peer.read_exact(&mut rest).await.unwrap();
+            peer.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        }
+        let mut greeting = [0u8; 3];
+        peer.read_exact(&mut greeting).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    (client, task)
+}
+
+fn budget_opts(handshake: Duration, total: Duration) -> DialOptions {
+    DialOptions::new()
+        .with_handshake_timeout(handshake)
+        .with_total_timeout(total)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handshake_bound_at_or_above_the_total_reports_the_total() {
+    let proxy = ProxyConfig::socks5("outer.test", 1);
+    for handshake in [500, 501, 5_000] {
+        let (client, _peer) = scripted_peer(0, Duration::ZERO);
+        let o = budget_opts(Duration::from_millis(handshake), Duration::from_millis(500));
+        let err = dial_chain_over(client, &proxy, "x", 80, &o, None)
+            .await
+            .err()
+            .expect("silent peer");
+        assert!(is_total(err.error()), "handshake {handshake} ms: {err:?}");
+        assert_eq!(
+            err.error().suggested_reply(),
+            crate::server::Reply::TimedOut,
+            "REP 6, never the greeting's REP 4"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tighter_handshake_bound_still_reports_the_stage() {
+    let proxy = ProxyConfig::socks5("outer.test", 1);
+    let (client, _peer) = scripted_peer(0, Duration::ZERO);
+    let o = budget_opts(Duration::from_millis(499), Duration::from_millis(500));
+    let err = dial_chain_over(client, &proxy, "x", 80, &o, None)
+        .await
+        .err()
+        .expect("silent peer");
+    assert!(
+        matches!(
+            err.error(),
+            ConnectError::Timeout {
+                stage: Stage::Handshake,
+                kind: TimeoutKind::Socks5Greeting,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.error().suggested_reply(),
+        crate::server::Reply::UpstreamUnavailable
+    );
+}
+
+/// What an earlier hop has already spent counts: after 300 ms of a 1000 ms
+/// budget the second hop has 700 ms left, so a 700 ms bound is the budget
+/// (total), a 600 ms bound is the stage.
+#[tokio::test(start_paused = true)]
+async fn the_budget_left_after_an_earlier_hop_decides() {
+    let proxy =
+        ProxyConfig::socks5("inner.test", 1080).with_gate(ProxyConfig::socks5("outer.test", 1));
+    let total = Duration::from_millis(1_000);
+    let slow_first_hop = Duration::from_millis(300);
+
+    let (client, _peer) = scripted_peer(1, slow_first_hop);
+    let o = budget_opts(Duration::from_millis(700), total);
+    let err = dial_chain_over(client, &proxy, "x", 80, &o, None)
+        .await
+        .err()
+        .expect("silent second hop");
+    assert!(is_total(err.error()), "{err:?}");
+
+    let (client, _peer) = scripted_peer(1, slow_first_hop);
+    let o = budget_opts(Duration::from_millis(600), total);
+    let err = dial_chain_over(client, &proxy, "x", 80, &o, None)
+        .await
+        .err()
+        .expect("silent second hop");
+    assert!(
+        matches!(
+            err.error(),
+            ConnectError::Timeout {
+                stage: Stage::Handshake,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// Real sockets, real clock: equal bounds used to race (`dial` armed the
+/// total first and the stage a moment later, both landing in one timer tick).
+#[tokio::test]
+async fn equal_stage_and_total_bounds_never_race_over_tcp() {
+    for _ in 0..12 {
+        let (l, port) = bind().await;
+        let _silent = tokio::spawn(async move {
+            let (_s, _) = l.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let proxy = ProxyConfig::socks5("127.0.0.1", port);
+        let bound = Duration::from_millis(120);
+        let o = budget_opts(bound, bound);
+        let err = dial(&proxy, "example.com", 80, &o, None)
+            .await
+            .err()
+            .expect("silent proxy");
+        assert!(is_total(&err), "{err:?}");
+        let chained = dial_chain(&proxy, "example.com", 80, &o, None)
+            .await
+            .err()
+            .expect("silent proxy");
+        assert!(is_total(chained.error()), "{chained:?}");
+    }
+}
