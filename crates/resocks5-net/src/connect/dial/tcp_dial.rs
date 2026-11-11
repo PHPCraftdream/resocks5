@@ -33,7 +33,8 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    /// No whole-call limit.
+    /// No whole-call limit (the pool-backed chain dial has none).
+    #[cfg(feature = "pool")]
     pub(crate) fn unbounded() -> Self {
         Self::start(None)
     }
@@ -210,7 +211,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_budget_cuts_a_stage_only_when_it_binds() {
-        let unbounded = Budget::unbounded();
+        let unbounded = Budget::start(None);
         assert_eq!(
             unbounded.stage(Duration::from_secs(9)),
             Duration::from_secs(9)
