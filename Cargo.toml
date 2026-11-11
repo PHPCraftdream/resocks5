@@ -25,7 +25,7 @@ repository = "https://github.com/PHPCraftdream/resocks5"
 tokio = { version = "1.43.0", default-features = false }
 anyhow = "1.0.95"
 serde = { version = "1", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 socket2 = "0.6"
 # `ring` crypto provider (not the default `aws-lc-rs`) so building needs
 # no cmake / C toolchain — pure-Rust-ish build for contributors and CI.
@@ -38,17 +38,17 @@ webpki-roots = "0.26"
 dashmap = "6"
 crossbeam-queue = "0.3"
 zeroize = "1"
-hmac = "0.12"
-hkdf = "0.12"
-x25519-dalek = { version = "2", default-features = false, features = ["getrandom", "zeroize"] }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hmac = "0.13"
+hkdf = "0.13"
+x25519-dalek = { version = "3", default-features = false, features = ["getrandom", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 # Application-only.
 chrono = "0.4"
 regex = "1.11.1"
-getrandom = "0.2"
-sha2 = "0.10"
+getrandom = "0.4"
+sha2 = "0.11"
 subtle = "2.6"
-argon2 = "0.5"
+argon2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 ktav = "0.8.1"

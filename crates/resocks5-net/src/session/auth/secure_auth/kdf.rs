@@ -257,7 +257,7 @@ impl UserSecret {
     /// fails.
     pub fn from_password(password: &str, params: KdfParams) -> Result<Self, SecureAuthError> {
         let mut salt = vec![0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt).map_err(|_| SecureAuthError::Kdf)?;
+        getrandom::fill(&mut salt).map_err(|_| SecureAuthError::Kdf)?;
         let key = derive_key(password.as_bytes(), &salt, &params)?;
         Ok(Self { salt, params, key })
     }

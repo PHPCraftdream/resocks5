@@ -7,7 +7,7 @@
 //! by earlier versions have exactly this shape, so existing accounts keep
 //! working unchanged.
 
-use argon2::password_hash::PasswordHash;
+use argon2::password_hash::phc::{Error as PhcError, PasswordHash};
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine as _;
 use resocks5_net::secure_auth::{KdfParams, UserSecret, KEY_LEN};
@@ -45,7 +45,11 @@ impl std::fmt::Display for SecretError {
 ///
 /// [`SecretError`] naming what is wrong; the value itself is never echoed.
 pub fn parse_secret(stored: &str) -> Result<UserSecret, SecretError> {
-    let phc = PasswordHash::new(stored).map_err(|_| SecretError::Format)?;
+    let phc = PasswordHash::new(stored).map_err(|error| match error {
+        // The PHC parser enforces the 8..=48 byte salt range itself.
+        PhcError::SaltTooShort | PhcError::SaltTooLong => SecretError::Salt,
+        _ => SecretError::Format,
+    })?;
     if phc.algorithm != argon2::ARGON2ID_IDENT || phc.version.is_some_and(|v| v != 0x13) {
         return Err(SecretError::Algorithm);
     }
@@ -68,13 +72,7 @@ pub fn parse_secret(stored: &str) -> Result<UserSecret, SecretError> {
         iterations,
         parallelism,
     };
-    let mut salt_buf = [0u8; 64];
-    let salt = phc
-        .salt
-        .ok_or(SecretError::Salt)?
-        .decode_b64(&mut salt_buf)
-        .map_err(|_| SecretError::Salt)?
-        .to_vec();
+    let salt = phc.salt.ok_or(SecretError::Salt)?.to_vec();
     let key: [u8; KEY_LEN] = phc
         .hash
         .ok_or(SecretError::Key)?
@@ -104,7 +102,7 @@ pub fn encode_secret(secret: &UserSecret) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::PasswordHasher;
     use argon2::{Algorithm, Argon2, Params, Version};
     use resocks5_net::secure_auth::derive_key;
 
@@ -136,14 +134,13 @@ mod tests {
     /// as its base64 text instead of its bytes derives another key.
     #[test]
     fn an_old_password_hash_is_the_secure_auth_key() {
-        let salt = SaltString::encode_b64(b"0123456789abcdef").unwrap();
         let argon = Argon2::new(
             Algorithm::Argon2id,
             Version::V0x13,
             Params::new(64, 1, 1, None).unwrap(),
         );
         let old = argon
-            .hash_password(b"legacy-password", &salt)
+            .hash_password_with_salt(b"legacy-password", b"0123456789abcdef")
             .unwrap()
             .to_string();
         let secret = parse_secret(&old).unwrap();

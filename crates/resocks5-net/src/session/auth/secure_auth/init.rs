@@ -60,6 +60,11 @@ fn aead_key(shared: &[u8; 32], t: &Transcript<'_>) -> Zeroizing<[u8; 32]> {
     okm
 }
 
+/// The AEAD key as the cipher's key type (a view of `key`, no copy).
+fn cipher_key(key: &Zeroizing<[u8; 32]>) -> &Key {
+    <&Key>::try_from(key.as_slice()).expect("a 32-byte key")
+}
+
 fn aad(t: &Transcript<'_>) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AEAD_LABEL.len() + 1 + t.user.len() + 2 * NONCE_LEN);
     aad.extend_from_slice(AEAD_LABEL);
@@ -82,9 +87,9 @@ pub(crate) fn seal(
     plain.extend_from_slice(&secret.salt);
     plain.extend_from_slice(&encode_params(&secret.params));
     plain.extend_from_slice(secret.key());
-    ChaCha20Poly1305::new(Key::from_slice(key.as_slice()))
+    ChaCha20Poly1305::new(cipher_key(&key))
         .encrypt(
-            Nonce::from_slice(&[0u8; 12]),
+            &Nonce::default(),
             Payload {
                 msg: &plain,
                 aad: &aad(transcript),
@@ -103,9 +108,9 @@ pub(crate) fn open(
 ) -> Result<UserSecret, SecureAuthError> {
     let key = aead_key(shared, transcript);
     let plain = Zeroizing::new(
-        ChaCha20Poly1305::new(Key::from_slice(key.as_slice()))
+        ChaCha20Poly1305::new(cipher_key(&key))
             .decrypt(
-                Nonce::from_slice(&[0u8; 12]),
+                &Nonce::default(),
                 Payload {
                     msg: sealed,
                     aad: &aad(transcript),

@@ -175,14 +175,13 @@ async fn every_rejection_looks_like_a_wrong_password() {
 /// re-deriving with other parameters than the stored ones fails the login.
 #[tokio::test]
 async fn an_old_argon2_hash_logs_in_unchanged() {
-    use argon2::password_hash::{PasswordHasher, SaltString};
-    let salt = SaltString::encode_b64(&[3u8; 16]).unwrap();
+    use argon2::password_hash::PasswordHasher;
     let old = argon2::Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
         argon2::Params::new(64, 1, 1, None).unwrap(),
     )
-    .hash_password(b"old-password", &salt)
+    .hash_password_with_salt(b"old-password", &[3u8; 16])
     .unwrap()
     .to_string();
     let state = build_state(
@@ -375,9 +374,9 @@ fn counts_include_init_placeholders() {
 fn phc_at(params: resocks5_net::secure_auth::KdfParams) -> String {
     use resocks5_net::secure_auth::{UserSecret, KEY_LEN};
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).unwrap();
+    getrandom::fill(&mut salt).unwrap();
     let mut key = [0u8; KEY_LEN];
-    getrandom::getrandom(&mut key).unwrap();
+    getrandom::fill(&mut key).unwrap();
     let secret = UserSecret::from_parts(salt.to_vec(), params, key).unwrap();
     crate::auth::secret::encode_secret(&secret)
 }
