@@ -500,6 +500,13 @@ let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 # }
 ```
 
+`total_timeout` is a budget shared by every stage: each stage's timer
+(`connect_timeout`, each hop's `handshake_timeout`) is cut to what is left of
+it. When the budget is the binding limit (a stage bound equal to or above what
+is left), the failure is always `Stage::Total` (`suggested_reply()` → REP 6),
+never a stage error; a stage error means the stage's own bound was strictly
+tighter. There is no need to shorten the stage bounds yourself.
+
 ### Over an existing stream
 
 `dial_chain_over` runs the hops of a chain over a stream you already own, for
