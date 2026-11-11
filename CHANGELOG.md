@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `resocks5-net`: `ProxyUriOptions::validate_auth(bool)` (off by default): the
+  decoded user name and password of a URI are checked for the scheme's
+  protocol, as `ProxyConfig::try_with_auth` does (SOCKS5: 1..=255 bytes each;
+  HTTP/HTTPS: no `:` in the user name, no control characters). A bad pair is
+  `ProxyUriError::InvalidCredentials(ProxyConfigError)`, which names the rule
+  and the field, never the value. No URI that parses today stops parsing.
+
+### Fixed
+
+- `resocks5-net`: the total deadline now always wins over an equal or looser
+  stage bound. `dial`, `dial_plain`, `dial_tcp`, `dial_chain` and
+  `dial_chain_over` cut every stage timer (TCP connect, each hop's handshake,
+  TLS) to what is left of `total_timeout`; when that cut is the binding limit
+  (a tie counts) the failure is `Stage::Total` (`suggested_reply()` → REP 6).
+  Before, a stage bound equal to or above the total made the result a coin
+  toss between the stage error (REP 4 for a silent SOCKS5 greeting) and the
+  total deadline, so callers shortened the stage bound by hand. A stage error
+  is returned only when its own bound was strictly tighter.
+
+### Changed
+
+- Dependencies move to the `digest` 0.11 RustCrypto generation: `hmac` 0.13,
+  `hkdf` 0.13, `sha2` 0.11, `x25519-dalek` 3 (`curve25519-dalek` 5,
+  `rand_core` 0.10), `chacha20poly1305` 0.11 (`cipher` 0.5), `argon2` 0.6
+  (`password-hash` 0.6), `getrandom` 0.4 and `base64` 0.23, in both crates.
+  A consumer that also builds Arti 0.48 no longer carries a second copy of
+  `digest`, `cipher`, `curve25519-dalek`, `rand_core` and `base64`;
+  `getrandom` 0.2 remains only through the `ring` provider of `rustls`. None
+  of these types is part of the public API, and the secure-auth wire format
+  and KDF parameters are unchanged (pinned by known-answer tests computed with
+  an independent implementation, see `secure_auth/tests/gen_vectors.py`).
+
+### Tests
+
+- `resocks5-net`: known-answer vectors for secure-auth (Argon2id keys,
+  parameter encoding, both proofs, decoy derivation, X25519, the enrollment
+  envelope, and the documented byte layout against the real server) and for the
+  base64 dialect of `Proxy-Authorization` tokens.
+
 ## [0.5.1] - 2026-11-08
 
 ### Added
