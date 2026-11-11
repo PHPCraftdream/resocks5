@@ -763,3 +763,4 @@ async fn tampered_or_degenerate_enrollments_are_refused() {
 
 mod cost;
 mod limiter;
+mod vectors;

@@ -207,6 +207,26 @@ mod tests {
         assert_eq!(decode_token("Resocks5-Secure !!", SECURE), None);
     }
 
+    /// The base64 dialect on the wire: standard alphabet, padding required,
+    /// canonical trailing bits, no blanks inside. Pinned so a base64 upgrade
+    /// cannot loosen what a proxy accepts (or tighten what a peer sent).
+    #[test]
+    fn the_base64_dialect_is_strict_standard() {
+        assert_eq!(encode_token(BASIC, b"user:pass"), "Basic dXNlcjpwYXNz");
+        assert_eq!(encode_token(BASIC, b"a"), "Basic YQ==");
+        assert_eq!(encode_token(BASIC, b"\xfb\xff"), "Basic +/8=");
+        assert_eq!(decode_token("Basic YQ==", BASIC), Some(b"a".to_vec()));
+        assert_eq!(
+            decode_token("Basic +/8=", BASIC),
+            Some(b"\xfb\xff".to_vec())
+        );
+        // Missing padding, non-canonical trailing bits, URL-safe alphabet,
+        // an embedded blank and surplus padding are all refused.
+        for bad in ["YQ", "YQ=", "YR==", "-_8=", "YW Jj", "YQ==="] {
+            assert_eq!(decode_token(&format!("Basic {bad}"), BASIC), None, "{bad}");
+        }
+    }
+
     /// Flushes delimit messages; a read waits for pushed input and sees EOF
     /// after `close_input`. Mutation: delivering writes before the flush (or
     /// merging two flushed messages) changes the observed messages.
