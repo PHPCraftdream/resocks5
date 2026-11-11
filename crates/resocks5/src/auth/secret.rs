@@ -21,7 +21,7 @@ pub enum SecretError {
     Algorithm,
     /// Missing, unknown or out-of-range `m`/`t`/`p` parameters.
     Params,
-    /// A salt outside 8..=64 bytes.
+    /// A salt outside 8..=48 bytes (the PHC string format's range).
     Salt,
     /// A key that is not 32 bytes long.
     Key,
@@ -33,7 +33,7 @@ impl std::fmt::Display for SecretError {
             Self::Format => "not an Argon2id PHC string",
             Self::Algorithm => "not Argon2id v19",
             Self::Params => "unsupported Argon2 parameters",
-            Self::Salt => "salt outside 8..=64 bytes",
+            Self::Salt => "salt outside 8..=48 bytes",
             Self::Key => "key is not 32 bytes",
         })
     }
