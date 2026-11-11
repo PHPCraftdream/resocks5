@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::chain::{check_tls, run_chain_hops, ChainError, ChainStage};
 use crate::connect::connect_proxy::{connect_proxy_on, TlsConnector};
 use crate::connect::host_port::HostPort;
+use crate::connect::tcp_dial::Budget;
 use crate::connect::{AnyUpstream, BoxedUpstream};
 use crate::error::ConnectError;
 use crate::pool::ProxyPool;
@@ -81,6 +82,7 @@ pub async fn connect_chain(
         &HostPort::format(target.host, target.port),
         base,
         handshake_timeout,
+        &Budget::unbounded(),
         tls_connector,
         |_| {},
     )

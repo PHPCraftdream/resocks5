@@ -1,7 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 use crate::connect::DialOptions;
 use crate::error::{ConnectError, Stage, TimeoutKind};
@@ -14,6 +15,57 @@ use crate::types::ProxyConfig;
 #[cfg(any(feature = "pool", feature = "tls"))]
 pub(crate) fn upstream_endpoint(proxy: &ProxyConfig) -> String {
     format!("{}:{}", proxy.host, proxy.port)
+}
+
+/// The whole-call budget of one dial (`DialOptions::total_timeout`), shared by
+/// every stage so that the classification of a timeout never depends on which
+/// timer the runtime happens to wake first.
+///
+/// Each stage asks [`Budget::stage`] for its own timer length: the stage's
+/// bound, cut down to what is left of the budget. When the budget is the
+/// binding limit (left <= the stage bound, so an equal pair counts as the
+/// budget) the stage's expiry is the total deadline, and [`Budget::total_won`]
+/// says so; a stage error is only reported when its own bound was strictly
+/// tighter.
+pub(crate) struct Budget {
+    deadline: Option<Instant>,
+    binding: AtomicBool,
+}
+
+impl Budget {
+    /// No whole-call limit.
+    pub(crate) fn unbounded() -> Self {
+        Self::start(None)
+    }
+
+    /// Start the clock now. A budget too large to represent is no limit.
+    pub(crate) fn start(total: Option<Duration>) -> Self {
+        Self {
+            deadline: total.and_then(|t| Instant::now().checked_add(t)),
+            binding: AtomicBool::new(false),
+        }
+    }
+
+    /// The timer length for a stage that starts now and is bounded by `bound`.
+    pub(crate) fn stage(&self, bound: Duration) -> Duration {
+        let Some(deadline) = self.deadline else {
+            return bound;
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let binding = left <= bound;
+        self.binding.store(binding, Ordering::Relaxed);
+        if binding {
+            left
+        } else {
+            bound
+        }
+    }
+
+    /// Whether the stage that ran last was cut by the budget: its timeout is
+    /// the total deadline.
+    pub(crate) fn total_won(&self) -> bool {
+        self.binding.load(Ordering::Relaxed)
+    }
 }
 
 /// Plain TCP dial to the proxy under `connect_timeout`.
@@ -154,5 +206,41 @@ mod tests {
             } => assert!(err.to_string().contains("203.0.113.1:1080")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_cuts_a_stage_only_when_it_binds() {
+        let unbounded = Budget::unbounded();
+        assert_eq!(
+            unbounded.stage(Duration::from_secs(9)),
+            Duration::from_secs(9)
+        );
+        assert!(!unbounded.total_won());
+
+        let budget = Budget::start(Some(Duration::from_secs(10)));
+        assert_eq!(budget.stage(Duration::from_secs(4)), Duration::from_secs(4));
+        assert!(!budget.total_won());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        // 6 s left: a 6 s stage is the budget (a tie goes to the total) ...
+        assert_eq!(budget.stage(Duration::from_secs(6)), Duration::from_secs(6));
+        assert!(budget.total_won());
+        // ... a 5 s stage is its own, and the flag follows the stage that ran last.
+        assert_eq!(budget.stage(Duration::from_secs(5)), Duration::from_secs(5));
+        assert!(!budget.total_won());
+        assert_eq!(
+            budget.stage(Duration::from_secs(60)),
+            Duration::from_secs(6)
+        );
+        assert!(budget.total_won());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(budget.stage(Duration::from_secs(1)), Duration::ZERO);
+        assert!(budget.total_won());
+    }
+
+    #[test]
+    fn a_budget_too_large_to_represent_is_no_limit() {
+        let budget = Budget::start(Some(Duration::MAX));
+        assert_eq!(budget.stage(Duration::from_secs(3)), Duration::from_secs(3));
+        assert!(!budget.total_won());
     }
 }

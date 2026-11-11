@@ -17,7 +17,7 @@ use crate::connect::connect_socks5_proxy::socks5_auth;
 use crate::connect::handshake_over_stream::{deadline_after, socks5_handshake_bounded};
 use crate::connect::host_port::HostPort;
 use crate::connect::http_connect_handshake;
-use crate::connect::tcp_dial::{apply_socket_options, tcp_dial};
+use crate::connect::tcp_dial::{apply_socket_options, tcp_dial, Budget};
 use crate::connect::{AnyUpstream, BoxedUpstream, UpstreamStream};
 use crate::error::{ConnectError, Stage, TimeoutKind};
 use crate::progress::ProgressReportingWriter;
@@ -144,14 +144,16 @@ pub async fn dial_chain(
     tls_connector: Option<&TlsConnector>,
 ) -> Result<AnyUpstream, ChainError> {
     let progress = AtomicUsize::new(ChainStage::Connect.encode());
-    let run = chain_inner(proxy, host, port, opts, tls_connector, &progress);
-    with_total_timeout(proxy, opts, &progress, run, false).await
+    let budget = Budget::start(opts.total_timeout);
+    let run = chain_inner(proxy, host, port, opts, tls_connector, &progress, &budget);
+    with_total_timeout(proxy, opts, &progress, &budget, run, false).await
 }
 
 async fn with_total_timeout<F>(
     proxy: &ProxyConfig,
     opts: &DialOptions,
     progress: &AtomicUsize,
+    budget: &Budget,
     run: F,
     fail_if_elapsed: bool,
 ) -> Result<AnyUpstream, ChainError>
@@ -165,6 +167,18 @@ where
                 return Err(total_timeout_error(proxy, progress, total));
             }
             match timeout(total, run).await {
+                Ok(Err(e))
+                    if budget.total_won()
+                        && matches!(
+                            e.error,
+                            ConnectError::Timeout {
+                                stage: Stage::Connect | Stage::Handshake,
+                                ..
+                            }
+                        ) =>
+                {
+                    Err(total_timeout_error(proxy, progress, total))
+                }
                 Ok(r) => r,
                 Err(_) => Err(total_timeout_error(proxy, progress, total)),
             }
@@ -208,6 +222,7 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let progress = AtomicUsize::new(ChainStage::Connect.encode());
+    let budget = Budget::start(opts.total_timeout);
     let run = async {
         let nodes = proxy.nodes();
         check_tls(&nodes, tls_connector).map_err(|e| ChainError::new(ChainStage::Connect, e))?;
@@ -221,6 +236,7 @@ where
             &HostPort::format(host, port),
             stream,
             opts.handshake_timeout,
+            &budget,
             tls_connector,
             |stage| progress.store(stage.encode(), Ordering::Relaxed),
         )
@@ -228,7 +244,7 @@ where
         .map_err(|(stage, error)| ChainError::new(stage, error))?;
         Ok(AnyUpstream::Gate(stream))
     };
-    with_total_timeout(proxy, opts, &progress, run, true).await
+    with_total_timeout(proxy, opts, &progress, &budget, run, true).await
 }
 
 // The mutex makes a non-Sync transport usable by the erased Sync wrapper; it is never contended.
@@ -300,12 +316,13 @@ async fn chain_inner(
     opts: &DialOptions,
     tls_connector: Option<&TlsConnector>,
     progress: &AtomicUsize,
+    budget: &Budget,
 ) -> Result<AnyUpstream, ChainError> {
     if proxy.gate.is_none() {
         // TCP acquired: a total expiry from here on reports the target
         // handshake, not the connect.
         let on_tcp = || progress.store(ChainStage::Target.encode(), Ordering::Relaxed);
-        return dial_inner(proxy, host, port, opts, tls_connector, on_tcp)
+        return dial_inner(proxy, host, port, opts, tls_connector, budget, on_tcp)
             .await
             .map_err(|e| {
                 let stage = if matches!(
@@ -336,7 +353,7 @@ async fn chain_inner(
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
-    let tcp = tcp_dial(nodes[0], opts.connect_timeout)
+    let tcp = tcp_dial(nodes[0], budget.stage(opts.connect_timeout))
         .await
         .map_err(|e| ChainError::new(ChainStage::Connect, e))?;
     apply_socket_options(&tcp, nodes[0], opts)
@@ -351,6 +368,7 @@ async fn chain_inner(
         &HostPort::format(host, port),
         stream,
         opts.handshake_timeout,
+        budget,
         tls_connector,
         |stage| progress.store(stage.encode(), Ordering::Relaxed),
     )
@@ -364,6 +382,7 @@ pub(super) async fn run_chain_hops(
     target: &str,
     mut stream: BoxedUpstream,
     hs: Duration,
+    budget: &Budget,
     tls_connector: Option<&TlsConnector>,
     mut progress: impl FnMut(ChainStage),
 ) -> Result<BoxedUpstream, (ChainStage, ConnectError)> {
@@ -373,7 +392,7 @@ pub(super) async fn run_chain_hops(
             None => (target.to_owned(), ChainStage::Target),
         };
         progress(stage);
-        stream = hop(stream, node, &next_target, hs, tls_connector)
+        stream = hop(stream, node, &next_target, budget.stage(hs), tls_connector)
             .await
             .map_err(|e| (stage, e))?;
     }
