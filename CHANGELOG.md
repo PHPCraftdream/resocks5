@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   toss between the stage error (REP 4 for a silent SOCKS5 greeting) and the
   total deadline, so callers shortened the stage bound by hand. A stage error
   is returned only when its own bound was strictly tighter.
+- `resocks5`: a first-login enrollment whose secret would not load again is
+  refused instead of stored. A client may seal a salt of up to 64 bytes, the
+  PHC string in `users.ktav` holds at most 48; such a claim used to succeed
+  and leave the account with a hash no login could use. The stored-secret
+  error text now names the real range (`salt outside 8..=48 bytes`).
 
 ### Changed
 

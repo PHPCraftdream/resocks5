@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use resocks5_net::secure_auth::UserSecret;
 
 use super::AuthState;
-use crate::auth::secret::encode_secret;
+use crate::auth::secret::{encode_secret, parse_secret};
 use crate::config::users_file::{write_atomic, UsersFileLock};
 use crate::config::{User, UsersConfig};
 
@@ -37,6 +37,11 @@ impl AuthState {
             return false;
         };
         let stored = encode_secret(&secret);
+        // Never persist what would not load again: the PHC form holds a salt
+        // of at most 48 bytes, the wire allows a client to seal up to 64.
+        if parse_secret(&stored).is_err() {
+            return false;
+        }
         let state = Arc::clone(self);
         let name = name.to_owned();
         tokio::task::spawn_blocking(move || {

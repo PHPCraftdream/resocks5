@@ -279,3 +279,26 @@ async fn a_failed_write_leaves_the_file_and_the_sentinel() {
     assert_ne!(disk_hash(&path, "bob"), INIT_HASH);
     cleanup(&path);
 }
+
+/// A secret whose stored form would not load again is refused, not
+/// persisted: a client may seal a salt of up to 64 bytes, the PHC string
+/// holds 48. Mutation: storing it leaves bob with a hash no login can use.
+#[tokio::test]
+async fn a_secret_that_would_not_load_again_is_not_claimed() {
+    use resocks5_net::secure_auth::{UserSecret, KEY_LEN};
+    let params = KdfParams {
+        memory_kib: 64,
+        iterations: 1,
+        parallelism: 1,
+    };
+    let (state, path) = build_state_with_disk_file(vec![make_init_user("bob", true)]);
+    let too_long = UserSecret::from_parts(vec![1u8; 49], params, [7u8; KEY_LEN]).unwrap();
+    assert!(!state.claim_secret("bob", too_long).await);
+    assert_eq!(memory_hash(&state, "bob"), "init");
+    assert_eq!(disk_hash(&path, "bob"), "init");
+
+    let longest = UserSecret::from_parts(vec![1u8; 48], params, [7u8; KEY_LEN]).unwrap();
+    assert!(state.claim_secret("bob", longest).await);
+    assert!(parse_secret(&disk_hash(&path, "bob")).is_ok());
+    cleanup(&path);
+}
