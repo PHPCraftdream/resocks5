@@ -194,7 +194,7 @@ impl DecoyKey {
             return Err(SecureAuthError::KdfOutOfRange);
         }
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        getrandom::getrandom(key.as_mut_slice()).map_err(|_| SecureAuthError::Kdf)?;
+        getrandom::fill(key.as_mut_slice()).map_err(|_| SecureAuthError::Kdf)?;
         Ok(Self { key, params })
     }
 

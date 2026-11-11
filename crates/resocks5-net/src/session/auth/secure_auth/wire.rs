@@ -1,6 +1,6 @@
 //! Proof computation and nonces shared by both sides.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use super::kdf::{KdfParams, KEY_LEN};
@@ -19,7 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// A fresh random nonce from the OS.
 pub(crate) fn random_nonce() -> Result<[u8; NONCE_LEN], SecureAuthError> {
     let mut nonce = [0u8; NONCE_LEN];
-    getrandom::getrandom(&mut nonce).map_err(|_| SecureAuthError::Kdf)?;
+    getrandom::fill(&mut nonce).map_err(|_| SecureAuthError::Kdf)?;
     Ok(nonce)
 }
 

@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tokio::time::Instant;
@@ -51,7 +51,7 @@ impl PasswordCache {
     /// A cache with a fresh process-random master key.
     pub(super) fn generate() -> Result<Self, getrandom::Error> {
         let mut master = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(master.as_mut_slice())?;
+        getrandom::fill(master.as_mut_slice())?;
         Ok(Self {
             master,
             inner: Mutex::new(Inner::default()),
