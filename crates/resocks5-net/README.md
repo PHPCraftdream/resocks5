@@ -410,6 +410,9 @@ too: `ProxyConfig::from_uri(uri)` / `from_uri_with(uri, &ProxyUriOptions)`
 parse `scheme://[user:password@]host:port` with schemes `socks5`, `socks5h`,
 `http`, `https` — percent-decoded credentials, a required port, no path,
 query or fragment; the typed `ProxyUriError` never carries the input text.
+`ProxyUriOptions::new().validate_auth(true)` also checks the credentials for
+the scheme's protocol (as `try_with_auth` does), so a URI that could never
+authenticate fails at parse time with `ProxyUriError::InvalidCredentials`.
 
 ```toml
 [dependencies]

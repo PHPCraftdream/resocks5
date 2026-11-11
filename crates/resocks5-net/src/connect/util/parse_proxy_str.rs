@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::fmt;
 
 use super::HostPort;
-use crate::types::{ProxyConfig, ProxyProtocol};
+use crate::types::{ProxyConfig, ProxyConfigError, ProxyProtocol};
 
 /// Why [`parse_proxy_str`] rejected a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +142,11 @@ pub enum ProxyUriError {
     QueryNotAllowed,
     /// A `#fragment` after the authority.
     FragmentNotAllowed,
+    /// [`ProxyUriOptions::validate_auth`] is set and the credentials are not
+    /// valid for the scheme's protocol (see
+    /// [`ProxyConfig::try_with_auth`]). The inner error names the rule and the
+    /// field, never the value.
+    InvalidCredentials(ProxyConfigError),
 }
 
 impl fmt::Display for ProxyUriError {
@@ -163,14 +168,27 @@ impl fmt::Display for ProxyUriError {
             Self::PathNotAllowed => "proxy URI has a path",
             Self::QueryNotAllowed => "proxy URI has a query",
             Self::FragmentNotAllowed => "proxy URI has a fragment",
-        })
+            Self::InvalidCredentials(_) => "invalid proxy URI credentials",
+        })?;
+        if let Self::InvalidCredentials(reason) = self {
+            write!(f, ": {reason}")?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for ProxyUriError {}
+impl std::error::Error for ProxyUriError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidCredentials(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
 
-/// Strictness switches for [`parse_proxy_uri`]. The default accepts host names
-/// and no trailing slash; a path, query or fragment is always rejected.
+/// Strictness switches for [`parse_proxy_uri`]. The default accepts host names,
+/// no trailing slash and credentials of any shape; a path, query or fragment is
+/// always rejected.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ProxyUriOptions {
@@ -178,6 +196,11 @@ pub struct ProxyUriOptions {
     pub ip_literal_only: bool,
     /// Tolerate a single trailing `/` (`http://host:8080/`).
     pub allow_trailing_slash: bool,
+    /// Check the decoded user name and password for the scheme's protocol, as
+    /// [`ProxyConfig::try_with_auth`] does (SOCKS5: 1..=255 bytes each; HTTP and
+    /// HTTPS: no `:` in the user name, no control characters), so a URI that
+    /// could never authenticate fails here instead of at the first dial.
+    pub validate_auth: bool,
 }
 
 impl ProxyUriOptions {
@@ -199,6 +222,13 @@ impl ProxyUriOptions {
         self.allow_trailing_slash = on;
         self
     }
+
+    /// Validate the credentials for the scheme's protocol.
+    #[must_use]
+    pub fn validate_auth(mut self, on: bool) -> Self {
+        self.validate_auth = on;
+        self
+    }
 }
 
 /// Parse `scheme://[user:password@]host:port` into a [`ProxyConfig`].
@@ -211,8 +241,10 @@ impl ProxyUriOptions {
 /// The host is an IPv4 literal, a bracketed IPv6 literal or a host name; the
 /// port is required and must be `1..=65535`. A path, a query or a fragment is
 /// an error (one trailing `/` can be allowed through
-/// [`ProxyUriOptions::allow_trailing_slash`]). The errors carry no input
-/// text, see [`ProxyUriError`].
+/// [`ProxyUriOptions::allow_trailing_slash`]). With
+/// [`ProxyUriOptions::validate_auth`] the credentials must also be valid for
+/// the protocol ([`ProxyUriError::InvalidCredentials`]). The errors carry no
+/// input text, see [`ProxyUriError`].
 ///
 /// # Errors
 ///
@@ -265,7 +297,14 @@ pub fn parse_proxy_uri(uri: &str, options: &ProxyUriOptions) -> Result<ProxyConf
     }
     let mut config = ProxyConfig::new(protocol, host, port);
     if let Some((user, password)) = credentials {
-        config = config.with_auth(user.into_owned(), password.into_owned());
+        let (user, password) = (user.into_owned(), password.into_owned());
+        config = if options.validate_auth {
+            config
+                .try_with_auth(user, password)
+                .map_err(ProxyUriError::InvalidCredentials)?
+        } else {
+            config.with_auth(user, password)
+        };
     }
     Ok(config)
 }
@@ -863,5 +902,91 @@ mod uri_tests {
             ProxyUriError::InvalidPercentEncoding
         );
         assert_eq!(percent_decode("%ff").unwrap_err(), ProxyUriError::NotUtf8);
+    }
+
+    fn validated(uri: &str) -> Result<ProxyConfig, ProxyUriError> {
+        parse_proxy_uri(uri, &ProxyUriOptions::new().validate_auth(true))
+    }
+
+    /// By default the credentials are taken as they come (the pre-existing
+    /// behaviour); `validate_auth` applies the protocol's rules.
+    /// Mutations: ignoring the option, or applying one protocol's rule to the
+    /// other, fails a row.
+    #[test]
+    fn validate_auth_applies_the_protocol_rules() {
+        use crate::types::{CredentialField, ProxyConfigError};
+        let bad = |reason| Err(ProxyUriError::InvalidCredentials(reason));
+        let long = "a".repeat(256);
+        let rows: [(String, Result<(), ProxyUriError>); 8] = [
+            // An empty SOCKS5 password (RFC 1929 needs 1..=255 bytes).
+            (
+                "socks5://u:@h:1".into(),
+                bad(ProxyConfigError::EmptyCredential {
+                    field: CredentialField::Password,
+                }),
+            ),
+            (
+                format!("socks5://{long}:p@h:1"),
+                bad(ProxyConfigError::CredentialTooLong {
+                    field: CredentialField::Username,
+                    len: 256,
+                }),
+            ),
+            // HTTP(S): no ':' in the user name (it would split wrong), no
+            // control characters (a decoded %0A would split the header).
+            (
+                "http://a%3Ab:p@h:1".into(),
+                bad(ProxyConfigError::UsernameContainsColon),
+            ),
+            (
+                "https://u:p%0Aq@h:1".into(),
+                bad(ProxyConfigError::ControlCharacter {
+                    field: CredentialField::Password,
+                }),
+            ),
+            // Valid for their own protocol.
+            ("socks5://u:p@h:1".into(), Ok(())),
+            ("http://u:@h:1".into(), Ok(())),
+            ("http://u:p%3Aq@h:1".into(), Ok(())),
+            ("socks5://h:1".into(), Ok(())),
+        ];
+        for (uri, expected) in rows {
+            assert_eq!(validated(&uri).map(|_| ()), expected, "{uri}");
+        }
+        // The same URIs parse when the option is off.
+        for uri in [
+            "socks5://u:@h:1",
+            "http://a%3Ab:p@h:1",
+            "https://u:p%0Aq@h:1",
+        ] {
+            assert!(parse(uri).is_ok(), "{uri}");
+        }
+        // And through the config constructor.
+        let options = ProxyUriOptions::new().validate_auth(true);
+        assert_eq!(
+            ProxyConfig::from_uri_with("socks5://u:@h:1", &options).map(|_| ()),
+            bad(ProxyConfigError::EmptyCredential {
+                field: CredentialField::Password,
+            }),
+        );
+    }
+
+    /// The error names the rule but never echoes the credentials, and exposes
+    /// the rule as its `source`.
+    #[test]
+    fn invalid_credentials_error_never_echoes_the_secret() {
+        use std::error::Error as _;
+        let error = validated("http://a%3Ab:topsecret@h:1").unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.starts_with("invalid proxy URI credentials: "),
+            "{text}"
+        );
+        assert!(
+            !text.contains("topsecret") && !text.contains("a:b"),
+            "{text}"
+        );
+        assert!(error.source().is_some());
+        assert!(ProxyUriError::Empty.source().is_none());
     }
 }
