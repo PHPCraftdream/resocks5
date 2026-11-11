@@ -25,8 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a tie counts) the failure is `Stage::Total` (`suggested_reply()` → REP 6).
   Before, a stage bound equal to or above the total made the result a coin
   toss between the stage error (REP 4 for a silent SOCKS5 greeting) and the
-  total deadline, so callers shortened the stage bound by hand. A stage error
-  is returned only when its own bound was strictly tighter.
+  total deadline. A stage error is returned only when its own bound was
+  strictly tighter, so a caller that wants REP 4 for a silent upstream keeps
+  the stage bounds below the total (for example `budget - budget / 10`);
+  equal bounds now always give REP 6.
 - `resocks5`: a first-login enrollment whose secret would not load again is
   refused instead of stored. A client may seal a salt of up to 64 bytes, the
   PHC string in `users.ktav` holds at most 48; such a claim used to succeed

@@ -88,8 +88,11 @@ impl DialOptions {
     }
 
     /// Set the whole-call bound. It wins every tie with a stage bound: with
-    /// `connect_timeout` or `handshake_timeout` at or above it the dial fails
-    /// with [`Stage::Total`] (SOCKS5 REP 6), deterministically.
+    /// `connect_timeout` or `handshake_timeout` at or above what is left of it
+    /// the dial fails with [`Stage::Total`] (SOCKS5 REP 6), deterministically.
+    /// Keep the stage bounds strictly below it when a silent upstream should
+    /// be reported as the stage's own error (REP 4 for a TCP connect or SOCKS5
+    /// greeting timeout).
     #[must_use]
     pub fn with_total_timeout(mut self, d: Duration) -> Self {
         self.total_timeout = Some(d);

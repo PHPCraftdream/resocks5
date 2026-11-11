@@ -505,7 +505,15 @@ let stream = dial_plain(&proxy, "example.com", 80, &opts).await?;
 it. When the budget is the binding limit (a stage bound equal to or above what
 is left), the failure is always `Stage::Total` (`suggested_reply()` → REP 6),
 never a stage error; a stage error means the stage's own bound was strictly
-tighter. There is no need to shorten the stage bounds yourself.
+tighter.
+
+So choose the bounds by the reply you want. With a stage bound at or above the
+total, a silent upstream ends as the total deadline (REP 6). To report it as
+`UpstreamUnavailable` (REP 4: TCP connect, SOCKS5 greeting, HTTPS TLS
+handshake), keep `connect_timeout` and `handshake_timeout` strictly below
+`total_timeout`, for example `budget - budget / 10`. A stage that starts after
+the earlier ones have spent more than that margin is cut by the budget and
+still ends as REP 6.
 
 ### Over an existing stream
 
